@@ -155,22 +155,49 @@ are picked up.
 https://<your-project>.vercel.app/api/webhook/gokwik/abandoned-cart
 ```
 
-with header `X-Webhook-Secret: <WEBHOOK_SECRET>`, or if they can only configure a plain
-URL, append `?secret=<WEBHOOK_SECRET>` instead.
+**with the secret in the URL**, because GoKwik's Custom Webhook screen accepts only a
+receiving HTTPS URL — there is no field for custom headers:
+
+```
+https://<your-project>.vercel.app/api/webhook/gokwik/abandoned-cart?secret=<WEBHOOK_SECRET>
+```
+
+Treat that full URL as a credential: it grants write access to the table. Don't paste it
+into shared docs or tickets. To rotate, change `WEBHOOK_SECRET` in Vercel, redeploy, and
+update the URL in the GoKwik dashboard.
+
+The `X-Webhook-Secret` header is still accepted, which is handy for `curl` testing and for
+any future sender that can set headers.
 
 Verify it end to end with the `curl` from section 2 pointed at the deployed URL, then
 load the dashboard at `https://<your-project>.vercel.app/`.
 
 ---
 
-## 4. Important: GoKwik's payload field names are not confirmed
+## 4. Payload mapping
 
-**The exact field names GoKwik sends have not been verified against their documentation.**
-`lib/normalize.js` guesses, checking a list of plausible variants for each field
-(`cart_id` / `checkoutId` / `token` / …, `total_price` / `amount` / `cartValue` / …), and
-also looks one level inside common envelope keys like `data`, `payload` and `cart`.
+GoKwik's Custom Webhook sends one complete JSON payload with no field-mapping options on
+their side, so all extraction happens in `lib/normalize.js`. It maps the documented fields:
 
-Because of that:
+| GoKwik field | Dashboard column |
+| --- | --- |
+| `request_id` | cart ID |
+| `customer` (name / phone / email) | customer, phone, email |
+| `totals` (`total`, falling back to `subtotal`/`grand_total`) | cart value |
+| `currency` | currency |
+| `item_count` (falls back to summing `items[].quantity`) | items |
+| `abc_url` | checkout link |
+| `created_at` | timestamp |
+
+`address`, `shipping`, `discounts`, `items` and `session` are **not** broken out into
+columns, but are kept in full in `raw_payload` and can be surfaced later without re-collecting
+anything.
+
+The parser still probes alternative key names (`checkout_url`, `cartValue`, `phone_number`, …)
+and looks one level inside envelope keys like `data`, `payload` and `cart`, so a payload that
+differs from the documented shape — or a future change on GoKwik's side — still maps.
+
+Because the field list came from documentation rather than an observed live event:
 
 - **Every event is stored twice** — once as parsed columns, and once in full as the
   `raw_payload` `jsonb` column. Nothing is ever discarded, even if the parser matches nothing.
@@ -187,9 +214,11 @@ Because of that:
   Run that in Vercel → Storage → your database → **Query**. Then add the real key names to
   the relevant array in `lib/normalize.js` and push — the fix deploys automatically.
 
-- **Please confirm the payload schema with GoKwik directly.** Ask them for a sample
-  abandoned-cart payload and the list of fields they send. Backfilling old rows afterwards is
-  straightforward, since `raw_payload` still holds everything.
+- **Confirm against the first real event.** The documented field list is the shape above,
+  but check one live payload's `raw_payload` to be sure the nesting matches — particularly
+  whether `totals.total` is the figure you want on the dashboard versus `subtotal` (pre-discount)
+  or a post-shipping number. Backfilling old rows afterwards is straightforward, since
+  `raw_payload` holds everything.
 
 ---
 
