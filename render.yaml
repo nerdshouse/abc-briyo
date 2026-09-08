@@ -1,0 +1,41 @@
+# Render Blueprint — free tier, no credit card required.
+# Create the service from this file: Render dashboard -> New -> Blueprint.
+#
+# Free web services sleep after 15 minutes of inactivity and take about a minute
+# to wake. Keep one warm by pinging /healthz every 10 minutes (see README).
+
+services:
+  - type: web
+    name: abc-briyo
+    runtime: node
+    plan: free
+    region: singapore          # closest Render region to India
+    branch: main
+    buildCommand: npm ci
+    startCommand: npm start
+    healthCheckPath: /healthz
+    autoDeploy: true
+    envVars:
+      - key: NODE_ENV
+        value: production
+      # Render terminates TLS, so the session cookie must be marked Secure.
+      - key: COOKIE_SECURE
+        value: "true"
+      - key: ELEVENZA_TEMPLATE_NAME
+        value: login_otp
+      - key: ELEVENZA_ORIGIN_WEBSITE
+        value: https://www.briyosupplements.com//
+      - key: ELEVENZA_API_URL
+        value: https://api.11za.in/apis/template/sendTemplate
+      # sync: false = Render prompts for the value and stores it encrypted,
+      # never in this file. Set these in the dashboard.
+      - key: DATABASE_URL
+        sync: false
+      - key: WEBHOOK_SECRET
+        sync: false
+      - key: SESSION_SECRET
+        sync: false
+      - key: ELEVENZA_AUTH_TOKEN
+        sync: false
+      - key: ALLOWED_PHONES
+        sync: false

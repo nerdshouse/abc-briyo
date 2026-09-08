@@ -229,6 +229,7 @@ login and webhook are all testable before Neon exists.
 | --- | --- | --- |
 | `POST /api/webhook/gokwik/abandoned-cart` | shared secret | **Give this URL to GoKwik.** Receives cart events |
 | `GET /api/webhook/gokwik/abandoned-cart` | none | Liveness check — confirms the URL is reachable |
+| `GET /healthz` | none | Uptime-pinger target; touches no database |
 | `GET /api/carts` | session | Stored carts, newest first |
 | `POST /api/status` | session | `{id, status, notes}` — updates one row |
 | `GET /api/config` | session | Mock-mode flag and the status list |
@@ -263,26 +264,70 @@ time out, the second succeeds).
 
 ---
 
-## Deploying to Firebase App Hosting
+## Deploying
 
-Target domain: **`abc.briyo.xyz`**. Firebase project: **`abc-briyo`**.
+Target domain: **`abc.briyo.xyz`**.
 
-App Hosting builds this repo with Cloud Buildpacks and runs it on **Cloud Run** — so the
-Express server runs as-is, `npm start` is the entrypoint, and `PORT` is injected. Config lives
-in [`apphosting.yaml`](apphosting.yaml).
+Two options. **Render's free tier needs no credit card** and is the default here;
+Firebase App Hosting is documented after it but requires the Blaze plan.
 
-> **Requires the Blaze (pay-as-you-go) plan.** App Hosting won't provision on Spark. For an
-> internal tool at this scale the cost is negligible, but it does need a billing account.
+### Option A — Render free tier (no card required)
 
-### 1. Create the secrets
+Free web services get custom domains and managed TLS, and deploy from GitHub on every push.
+Config is in [`render.yaml`](render.yaml).
 
-Secrets go to Cloud Secret Manager, never into `apphosting.yaml` or the repo:
+1. **Neon** — create the database first and copy the **pooled** connection string.
+2. Render dashboard → **New** → **Blueprint** → connect `nerdshouse/abc-briyo`. It reads
+   `render.yaml` and prompts for the five secret values:
+   `DATABASE_URL`, `WEBHOOK_SECRET`, `SESSION_SECRET`, `ELEVENZA_AUTH_TOKEN`, `ALLOWED_PHONES`.
+3. **Settings → Custom Domains** → add `abc.briyo.xyz`, then create the `CNAME` Render shows
+   you. TLS is issued automatically.
+4. Run `npm run db:check` locally against the same `DATABASE_URL` before going live.
+
+#### The one real catch: sleeping
+
+**A free service sleeps after 15 minutes without traffic and takes about a minute to wake.**
+For a webhook receiver that matters: if GoKwik posts a cart while the service is asleep, the
+request may exceed their timeout.
+
+Two things make this survivable, and one fixes it:
+
+- The webhook is **idempotent** — it deduplicates on `request_id`, so if GoKwik retries a
+  timed-out delivery, you get one row, not two.
+- The webhook **returns 200 even when the database write fails**, so a slow start never
+  triggers a retry storm.
+- **Keep it warm.** Point a free uptime pinger at `/healthz` every 10 minutes:
+
+  | | |
+  | --- | --- |
+  | URL | `https://abc.briyo.xyz/healthz` |
+  | Interval | 10 minutes |
+  | Service | [cron-job.org](https://cron-job.org) or [UptimeRobot](https://uptimerobot.com), both free |
+
+  `/healthz` is public, touches no database, and returns only `{ok, ts}`.
+
+#### Watch the instance-hour budget
+
+A free workspace gets **750 instance-hours per month across all free services**. Keeping one
+service awake 24/7 uses about **730**, which fits — but only just, and only for *one* service.
+A second free service in the same workspace will exhaust the quota and Render suspends
+**everything** until the next month. Keep this workspace to this one service.
+
+If the sleeping is intolerable and 730 hours is too tight, Render's cheapest paid instance
+removes both limits.
+
+### Option B — Firebase App Hosting (needs the Blaze plan)
+
+Config is in [`apphosting.yaml`](apphosting.yaml). App Hosting builds with Cloud Buildpacks and
+runs on **Cloud Run**, so the Express server runs as-is with no sleeping and no instance-hour
+cap.
+
+> **Requires the Blaze (pay-as-you-go) plan** — a billing account with a card. Cloud Run's
+> perpetual free tier means an internal tool at this volume typically costs about nothing, so
+> if the objection is a monthly bill rather than adding a card, this is the better option.
 
 ```bash
-npm install -g firebase-tools
-firebase login
 firebase use abc-briyo
-
 firebase apphosting:secrets:set DATABASE_URL
 firebase apphosting:secrets:set WEBHOOK_SECRET
 firebase apphosting:secrets:set SESSION_SECRET
@@ -290,50 +335,35 @@ firebase apphosting:secrets:set ELEVENZA_AUTH_TOKEN
 firebase apphosting:secrets:set ALLOWED_PHONES
 ```
 
-Each prompts for the value and offers to grant the backend access — say yes.
+Then console → **App Hosting** → connect the GitHub repo, live branch `main`, region
+`asia-south1`, and add `abc.briyo.xyz` as a custom domain.
 
-### 2. Create the backend
+### Give GoKwik the webhook URL
 
-Firebase console → **App Hosting** → **Get started** → connect the GitHub repo
-(`nerdshouse/abc-briyo`) → live branch `main` → region (pick `asia-south1` for Mumbai).
-
-Every push to `main` then builds and deploys automatically.
-
-### 3. Custom domain
-
-App Hosting → your backend → **Add custom domain** → `abc.briyo.xyz`, then create the DNS
-records Firebase shows you. TLS is provisioned automatically once DNS resolves.
-
-### 4. Give GoKwik the webhook URL
+Once either option is live and `npm run db:check` passes:
 
 ```
 https://abc.briyo.xyz/api/webhook/gokwik/abandoned-cart?secret=<WEBHOOK_SECRET>
 ```
 
+Confirm it's reachable first — this needs no secret and no login:
+
+```bash
+curl https://abc.briyo.xyz/api/webhook/gokwik/abandoned-cart
+```
+
 ### Why the OTP state is in Postgres
 
-Cloud Run runs **several instances** and **scales to zero**. If OTP codes and rate-limit
-counters lived in memory:
+Both hosts restart or replace instances freely, and Cloud Run runs several at once. If OTP
+codes and rate-limit counters lived in memory:
 
-- a code issued by instance A would be unverifiable on instance B, so logins would fail
-  intermittently and unpredictably;
-- scaling to zero between "send code" and "enter code" would drop the pending code entirely.
+- a code issued by one instance would be unverifiable on another;
+- a restart or a scale-to-zero between "send code" and "enter code" would drop the pending
+  code entirely.
 
 So `otp_state` is a Postgres table. Sessions don't need it — they're stateless signed cookies,
-valid on any instance. This is the one thing that *must not* be reverted to memory while the
-app runs on Cloud Run.
-
-`maxInstances` is capped at 2 in `apphosting.yaml`; that's about cost and Postgres connections,
-not correctness — the app is safe at any instance count.
-
-### Cold starts
-
-With `minInstances: 0` the first request after an idle period waits for a container start plus
-a Neon wake-up, which can take a few seconds and occasionally time out; a retry succeeds. If
-that becomes annoying, set `minInstances: 1` — it costs a little but keeps one warm.
-
-**GoKwik deliveries are unaffected either way**: the webhook returns `200` even if the database
-write fails, and logs the payload, so a cold start never triggers a retry storm.
+valid on any instance and across restarts. This is the one thing that must not be reverted to
+in-memory storage.
 
 ## What this app does not do
 

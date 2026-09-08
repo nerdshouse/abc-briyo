@@ -100,6 +100,15 @@ app.post('/api/webhook/gokwik/abandoned-cart', async (req, res) => {
   }
 });
 
+/**
+ * Public, dependency-free liveness endpoint.
+ * Free hosting tiers sleep after ~15 minutes idle and take up to a minute to
+ * wake, which is long enough for a webhook delivery to time out. Point a free
+ * uptime pinger at this every 10 minutes to keep the instance warm. It touches
+ * no database and reveals nothing.
+ */
+app.get('/healthz', (_req, res) => res.json({ ok: true, ts: new Date().toISOString() }));
+
 // Lets you confirm the URL is live before handing it to GoKwik.
 app.get('/api/webhook/gokwik/abandoned-cart', (_req, res) =>
   res.json({ ok: true, message: 'GoKwik abandoned-cart webhook receiver. POST here.' }));
