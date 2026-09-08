@@ -100,7 +100,7 @@ app.listen(port, () => {
   console.log(`Recovery Board on http://localhost:${port}`);
   console.log(MOCK
     ? 'Shopify: MOCK MODE — no token set, serving sample data.'
-    : `Shopify: live (${process.env.SHOPIFY_STORE_DOMAIN}, API ${process.env.SHOPIFY_API_VERSION || '2024-10'})`);
+    : `Shopify: live (${process.env.SHOPIFY_STORE_DOMAIN}, API ${process.env.SHOPIFY_API_VERSION || '2026-07'})`);
   console.log(`OTP delivery: ${driver() === 'console' ? 'CONSOLE (codes printed here, no WhatsApp sent)' : '11za WhatsApp'}`);
 
   const allowed = allowedPhones();

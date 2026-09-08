@@ -40,7 +40,7 @@ Status changes in mock mode reset when the server restarts.
 | --- | --- | --- |
 | `SHOPIFY_STORE_DOMAIN` | yes (live) | `briyo-supplements.myshopify.com` — no `https://`, no trailing slash |
 | `SHOPIFY_ACCESS_TOKEN` | yes (live) | Admin API access token from the custom app, starts with `shpat_` |
-| `SHOPIFY_API_VERSION` | no | Defaults to `2024-10` |
+| `SHOPIFY_API_VERSION` | no | Defaults to `2026-07`. Shopify supports each version ~12 months — bump this yearly. |
 | `PORT` | no | Defaults to `3000` |
 | `ALLOWED_PHONES` | **yes** | Comma-separated numbers permitted to sign in. **Empty means nobody can log in.** |
 | `SESSION_SECRET` | **yes** | Signs session cookies and hashes OTPs. `openssl rand -hex 32` |
@@ -135,6 +135,13 @@ an existing session dies when it expires (`SESSION_TTL_HOURS`, default 12h).
 
 ### 1. Create the custom app
 
+**Create it inside your store admin, not the Partner Dashboard.** A Partner-Dashboard app
+(dev.shopify.com) authenticates over OAuth and never shows you a static token — it expects an
+install callback this app doesn't have. The store-admin route below issues a `shpat_` token
+directly, which is what this server uses.
+
+Direct link: `https://admin.shopify.com/store/<your-handle>/settings/apps/development`
+
 1. Shopify admin → **Settings** → **Apps and sales channels** → **Develop apps**.
 2. **Allow custom app development** (one-time, needs store-owner permission) → **Create an app**.
    Name it e.g. `Cart Recovery Board`.
@@ -167,7 +174,7 @@ Save the configuration, then **Install app**, then **API credentials** → revea
 npm start
 ```
 
-The log should print `Live: your-store.myshopify.com (API 2024-10)` rather than `MOCK MODE`.
+The log should print `Live: your-store.myshopify.com (API 2026-07)` rather than `MOCK MODE`.
 Load the page — if the token or scopes are wrong you'll get a red banner naming the problem.
 
 ---
