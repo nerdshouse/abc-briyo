@@ -118,3 +118,11 @@ button.link:disabled { color: var(--muted); cursor: default; text-decoration: no
 
 /* signed-in chip in the board header */
 .session { display: flex; align-items: center; gap: 10px; font-size: 12.5px; color: var(--muted); }
+
+/* ---------- drop stage / risk ---------- */
+td.stage { font-size: 12.5px; max-width: 18ch; white-space: normal; }
+.risk { display: inline-block; margin-top: 3px; padding: 1px 7px; border-radius: 999px; font-size: 11px; font-weight: 500; }
+.risk-high { background: #fee4e2; color: #b42318; }
+.risk-medium { background: #fef0c7; color: #b54708; }
+.risk-low { background: #d1fadf; color: #05603a; }
+.risk-control { background: #eef0f3; color: var(--muted); }

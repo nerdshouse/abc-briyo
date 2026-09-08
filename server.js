@@ -7,7 +7,7 @@ import {
   isMockMode, ensureSchema, insertCart, listCarts, updateStatus, ping,
 } from './lib/db.js';
 import { mockInsertCart, mockListCarts, mockUpdateStatus } from './lib/mock.js';
-import { normalizePayload } from './lib/normalize.js';
+import { normalizePayload, parseLineItems } from './lib/normalize.js';
 import { router as authRouter, requireAuth } from './lib/auth-routes.js';
 import { activeUsers, seedAllowedUsers } from './lib/otp.js';
 import { driver } from './lib/whatsapp.js';
@@ -133,7 +133,15 @@ app.get('/api/config', (_req, res) => res.json({ mock: MOCK, statuses: [...VALID
 app.get('/api/carts', async (_req, res) => {
   try {
     if (!MOCK) await ensureSchema();
-    res.json({ ok: true, mock: MOCK, carts: await db.list() });
+    const carts = (await db.list()).map((c) => {
+      // Line items live in raw_payload, in either array or "#Name(Variant)*1"
+      // form. Parse server-side so the browser gets one consistent shape.
+      const raw = c.raw_payload || {};
+      const source = raw.line_items ?? raw['Line items'] ?? raw.items ?? raw.products;
+      const { raw_payload, ...rest } = c;
+      return { ...rest, items: parseLineItems(source) };
+    });
+    res.json({ ok: true, mock: MOCK, carts });
   } catch (err) { fail(res, err); }
 });
 

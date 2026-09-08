@@ -8,16 +8,33 @@ const STATUSES = [
   'Called – Declined',
 ];
 
+/** Call-priority ranking for the risk sort. Anything unrecognised sorts last. */
+const RISK_ORDER = {
+  'high risk': 3,
+  'medium risk': 2,
+  'low risk': 1,
+  control: 0,
+};
+
 const state = {
   carts: [],
   days: 7,       // default range: last 7 days
   status: '',
+  stage: '',
   sort: 'value',
 };
 
 const cartById = (id) => state.carts.find((c) => String(c.id) === String(id));
 
 const $ = (sel) => document.querySelector(sel);
+
+/** Attach a listener only if the element exists — a missing control should
+ *  never throw and take the whole board down with it. */
+function on(sel, event, handler) {
+  const el = $(sel);
+  if (el) el.addEventListener(event, handler);
+  else console.warn(`No element matches ${sel}; skipping ${event} handler.`);
+}
 const rowsEl = $('#rows');
 const errorEl = $('#errorBanner');
 
@@ -69,19 +86,22 @@ function waMessage(cart) {
 }
 
 /**
- * Line items aren't a column — they stay in raw_payload, since GoKwik's item
- * shape isn't fixed. Pull titles out of whichever key is present.
+ * Line items stay in raw_payload rather than becoming columns, because GoKwik
+ * sends them either as an array or as a "#Name(Variant)*1" string. The server
+ * exposes the parsed form on each cart; fall back to the raw shapes if absent.
  */
 function itemsOf(cart) {
+  if (Array.isArray(cart.items) && cart.items.length) return cart.items;
   const raw = cart.raw_payload || {};
-  const list = raw.items || raw.line_items || raw.lineItems || raw.products
-    || raw.cart?.items || raw.data?.items || [];
+  const list = raw.items || raw.line_items || raw.lineItems || raw.products || [];
   if (!Array.isArray(list)) return [];
   return list.map((i) => ({
     title: i?.title || i?.name || i?.product_name || i?.sku || 'Item',
     quantity: Number(i?.quantity ?? i?.qty ?? 1),
   }));
 }
+
+const riskClass = (flag) => 'risk-' + String(flag || '').toLowerCase().split(' ')[0];
 
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => (
   { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]
@@ -111,11 +131,21 @@ async function loadAll() {
     if (!carts.ok) throw new Error(carts.error || 'Could not load carts');
 
     state.carts = carts.carts;
+
+    const sel = $('#stageFilter');
+    if (sel) {
+      const stages = [...new Set(state.carts.map((c) => c.drop_stage).filter(Boolean))].sort();
+      const keep = sel.value;
+      sel.innerHTML = '<option value="">All drop stages</option>' +
+        stages.map((s) => `<option value="${esc(s)}">${esc(s)}</option>`).join('');
+      sel.value = keep;
+    }
+
     clearError();
     render();
   } catch (err) {
     showError(`Could not load the board: ${err.message}`);
-    rowsEl.innerHTML = '<tr><td colspan="6" class="empty">Failed to load.</td></tr>';
+    rowsEl.innerHTML = '<tr><td colspan="7" class="empty">Failed to load.</td></tr>';
   }
 }
 
@@ -160,12 +190,17 @@ function visibleCarts() {
   let list = state.carts.filter((c) => new Date(c.received_at).getTime() >= cutoff);
 
   if (state.status) list = list.filter((c) => (c.status || 'Not called') === state.status);
+  if (state.stage) list = list.filter((c) => (c.drop_stage || '') === state.stage);
 
-  return list.sort((a, b) => (
-    state.sort === 'value'
-      ? (b.total_price ?? 0) - (a.total_price ?? 0)
-      : new Date(b.received_at) - new Date(a.received_at)
-  ));
+  return list.sort((a, b) => {
+    if (state.sort === 'value') return (b.total_price ?? 0) - (a.total_price ?? 0);
+    if (state.sort === 'risk') {
+      const rank = (c) => RISK_ORDER[String(c.risk_flag || '').toLowerCase()] ?? -1;
+      // Within the same risk band, bigger carts first — that's the call order.
+      return (rank(b) - rank(a)) || ((b.total_price ?? 0) - (a.total_price ?? 0));
+    }
+    return new Date(b.received_at) - new Date(a.received_at);
+  });
 }
 
 function renderStats() {
@@ -190,7 +225,7 @@ function renderRows() {
   const list = visibleCarts();
 
   if (!list.length) {
-    rowsEl.innerHTML = '<tr><td colspan="6" class="empty">No abandoned carts in this range.</td></tr>';
+    rowsEl.innerHTML = '<tr><td colspan="7" class="empty">No abandoned carts in this range.</td></tr>';
     return;
   }
 
@@ -215,7 +250,15 @@ function renderRows() {
         <td><div class="cust-name">${esc(c.customer_name || 'Guest')}</div>
             <div class="cust-email">${esc(c.email || '—')}</div></td>
         <td class="items">${itemSummary}</td>
-        <td class="right">${money(c.total_price, c.currency)}</td>
+        <td class="right">
+          ${money(c.total_price, c.currency)}
+          ${c.discount_total ? `<div class="muted">−${money(c.discount_total, c.currency)} disc.</div>` : ''}
+        </td>
+        <td class="stage">
+          ${c.drop_stage ? esc(c.drop_stage) : '<span class="muted">—</span>'}
+          ${c.risk_flag ? `<div class="risk ${riskClass(c.risk_flag)}">${esc(c.risk_flag)}</div>` : ''}
+          ${c.utm_source ? `<div class="muted">via ${esc(c.utm_source)}</div>` : ''}
+        </td>
         <td><div class="links">${links.join('')}</div></td>
         <td class="status-cell">
           <select data-id="${esc(c.id)}" class="js-status" autocomplete="off">
@@ -273,7 +316,7 @@ rowsEl.addEventListener('keydown', (e) => {
   if (e.key === 'Enter' && e.target.classList.contains('js-notes')) e.target.blur();
 });
 
-$('#rangeGroup').addEventListener('click', (e) => {
+on('#rangeGroup', 'click', (e) => {
   const btn = e.target.closest('button');
   if (!btn) return;
   state.days = Number(btn.dataset.days);
@@ -281,11 +324,12 @@ $('#rangeGroup').addEventListener('click', (e) => {
   render();
 });
 
-$('#statusFilter').addEventListener('change', (e) => { state.status = e.target.value; render(); });
-$('#sort').addEventListener('change', (e) => { state.sort = e.target.value; render(); });
-$('#refresh').addEventListener('click', loadAll);
+on('#statusFilter', 'change', (e) => { state.status = e.target.value; render(); });
+on('#stageFilter', 'change', (e) => { state.stage = e.target.value; render(); });
+on('#sort', 'change', (e) => { state.sort = e.target.value; render(); });
+on('#refresh', 'click', loadAll);
 
-$('#logout').addEventListener('click', async () => {
+on('#logout', 'click', async () => {
   await fetch('/auth/logout', { method: 'POST' });
   window.location.href = '/login';
 });

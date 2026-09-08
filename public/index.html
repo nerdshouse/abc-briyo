@@ -42,9 +42,13 @@
       <select id="statusFilter" aria-label="Filter by status">
         <option value="">All statuses</option>
       </select>
+      <select id="stageFilter" aria-label="Filter by drop stage">
+        <option value="">All drop stages</option>
+      </select>
       <select id="sort" aria-label="Sort">
         <option value="value">Cart value: high → low</option>
         <option value="recent">Most recent first</option>
+        <option value="risk">Risk: high → low</option>
       </select>
     </div>
 
@@ -56,12 +60,13 @@
             <th>Customer</th>
             <th>Items</th>
             <th class="right">Value</th>
+            <th>Dropped at</th>
             <th>Contact</th>
             <th>Status &amp; notes</th>
           </tr>
         </thead>
         <tbody id="rows">
-          <tr><td colspan="6" class="empty">Loading…</td></tr>
+          <tr><td colspan="7" class="empty">Loading…</td></tr>
         </tbody>
       </table>
     </div>

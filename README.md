@@ -205,20 +205,42 @@ curl https://abc.briyo.xyz/api/webhook/gokwik/abandoned-cart
 
 ### Field mapping
 
+Key matching ignores case, spaces, underscores and hyphens, so `Customer Name`,
+`customer_name` and `customerName` are the same key. GoKwik's report CSV and their webhook
+JSON don't spell things identically, and this way both map.
+
 | GoKwik field | Column |
 | --- | --- |
-| `request_id` | `cart_id` (dedupe key) |
-| `customer` (name / phone / email) | `customer_name`, `phone`, `email` |
-| `totals.total` (falls back to `subtotal` / `grand_total`) | `total_price` |
-| `currency` | `currency` |
-| `item_count` (falls back to summing `items[].quantity`) | `item_count` |
-| `abc_url` | `checkout_url` |
-| `created_at` | `abandoned_at` |
+| `ID` / `request_id` | `cart_id` (dedupe key) |
+| `Customer Name` | `customer_name` |
+| `Phone Number` | `phone` |
+| `Email ID` | `email` |
+| `Amount` | `total_price` |
+| `MRP Total` | `mrp_total` |
+| `Discount Total` | `discount_total` |
+| `Abandoned Cart Link` / `abc_url` | `checkout_url` |
+| `Created At` | `abandoned_at` |
+| `Drop Stage` | `drop_stage` |
+| `Drop Off Reasons` | `drop_reason` |
+| `Risk Flag` | `risk_flag` |
+| `Utm Source` | `utm_source` |
+| `Customer Address` | `address` |
+| `Line items` | parsed for display, kept in `raw_payload` |
 
-`address`, `shipping`, `discounts`, `items` and `session` aren't given columns, but are kept
-in `raw_payload` — line-item names on the board are read from there. The parser also probes
-alternative key names and looks one level inside envelopes like `data` / `payload` / `cart`,
-so a payload that differs from the documented shape still maps.
+Everything else — UTM campaign/medium, landing page, discount codes, customer type, platform,
+exit discounts, remarks — stays in `raw_payload` and can be surfaced later without
+re-collecting anything.
+
+**Two GoKwik-specific quirks the parser handles:**
+
+- **Dates are `D/M/YYYY h:mm AM/PM` with no timezone.** `7/9/2026` is 7 September, not
+  9 July — `new Date()` would read it the American way and file carts two months out. They're
+  parsed explicitly and treated as IST.
+- **`Line items` is a single string**, `#Product(Variant)*2#Other(Variant)*1`, not an array.
+  It's split on `#`, quantity read from `*N`, and the variant extracted by scanning for the
+  matching bracket from the end — product names themselves contain brackets
+  (`All Around Gut Guardian (Box) - …`), which defeats a plain regex. Where the variant just
+  repeats the product name, only the variant is shown.
 
 **If columns come through blank on real events**, that's a mapping gap, not data loss:
 
