@@ -86,6 +86,10 @@ async function loadAll() {
     const [cfgRes, cartsRes, statusRes] = await Promise.all([
       fetch('/api/config'), fetch('/api/carts'), fetch('/api/status'),
     ]);
+    if ([cfgRes, cartsRes, statusRes].some((r) => r.status === 401)) {
+      window.location.href = '/login';
+      return;
+    }
     const cfg = await cfgRes.json();
     const carts = await cartsRes.json();
     const status = await statusRes.json();
@@ -254,6 +258,17 @@ $('#rangeGroup').addEventListener('click', (e) => {
 $('#statusFilter').addEventListener('change', (e) => { state.status = e.target.value; render(); });
 $('#sort').addEventListener('change', (e) => { state.sort = e.target.value; render(); });
 $('#refresh').addEventListener('click', loadAll);
+
+$('#logout').addEventListener('click', async () => {
+  await fetch('/auth/logout', { method: 'POST' });
+  window.location.href = '/login';
+});
+
+// Show who is signed in; bounce to login if the session expired mid-session.
+fetch('/auth/me').then((r) => r.json()).then((me) => {
+  if (!me.authenticated) { window.location.href = '/login'; return; }
+  $('#sessionPhone').textContent = `+${me.phone}`;
+}).catch(() => {});
 
 // Populate the status filter once.
 $('#statusFilter').insertAdjacentHTML('beforeend',

@@ -15,6 +15,9 @@
 
 *, *::before, *::after { box-sizing: border-box; }
 
+/* Author display rules below would otherwise beat the UA's [hidden] rule. */
+[hidden] { display: none !important; }
+
 body {
   margin: 0;
   background: var(--bg);
@@ -83,3 +86,35 @@ tr[data-status="Called – Declined"] { opacity: 0.72; }
 
 .note { margin-top: 22px; color: var(--muted); font-size: 12.5px; line-height: 1.6; }
 code { background: #eef0f3; padding: 1px 5px; border-radius: 4px; font-size: 12px; }
+
+/* ---------- login ---------- */
+.login-body { display: flex; align-items: center; justify-content: center; min-height: 100vh; padding: 20px; }
+.login-card {
+  background: var(--panel); border: 1px solid var(--border); border-radius: 12px;
+  padding: 28px; width: 100%; max-width: 380px;
+  box-shadow: 0 1px 2px rgba(16, 24, 40, 0.04), 0 8px 24px rgba(16, 24, 40, 0.05);
+}
+.login-card h1 { margin: 0; font-size: 19px; letter-spacing: -0.015em; }
+.login-card .sub { margin: 3px 0 20px; color: var(--muted); font-size: 13px; }
+.login-step { display: flex; flex-direction: column; gap: 7px; }
+.login-step label { font-weight: 500; font-size: 13px; }
+.login-step .hint { color: var(--muted); font-size: 12.5px; margin: 0 0 4px; }
+
+.phone-input { display: flex; align-items: stretch; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
+.phone-input .prefix { display: flex; align-items: center; padding: 0 10px; background: #f2f4f6; color: var(--muted); font-size: 13.5px; border-right: 1px solid var(--border); }
+.phone-input input { border: none; border-radius: 0; flex: 1; padding: 9px 11px; letter-spacing: 0.02em; }
+.phone-input input:focus { outline: none; }
+.phone-input:focus-within { outline: 2px solid var(--accent); outline-offset: 1px; }
+
+.otp-input { font-size: 20px; letter-spacing: 0.35em; text-align: center; padding: 10px; font-variant-numeric: tabular-nums; }
+
+button.primary { background: var(--accent); color: #fff; border-color: var(--accent); padding: 9px 14px; font-weight: 500; margin-top: 4px; }
+button.primary:hover:not(:disabled) { background: #1a5c3e; }
+button.primary:disabled { opacity: 0.6; cursor: default; }
+button.link { background: none; border: none; color: var(--accent); padding: 4px 0; font-size: 12.5px; }
+button.link:hover:not(:disabled) { background: none; text-decoration: underline; }
+button.link:disabled { color: var(--muted); cursor: default; text-decoration: none; }
+.row { display: flex; justify-content: space-between; align-items: center; margin-top: 2px; }
+
+/* signed-in chip in the board header */
+.session { display: flex; align-items: center; gap: 10px; font-size: 12.5px; color: var(--muted); }

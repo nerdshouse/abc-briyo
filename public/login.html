@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Sign in — Cart Recovery Board</title>
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body class="login-body">
+  <main class="login-card">
+    <h1>Cart Recovery Board</h1>
+    <p class="sub">Briyo Supplements</p>
+
+    <div id="banner" class="banner error" hidden></div>
+    <div id="consoleNote" class="banner mock" hidden>
+      <strong>Console mode.</strong> No 11za token configured — your code is printed in the
+      server log instead of being sent on WhatsApp.
+    </div>
+
+    <!-- Step 1 -->
+    <form id="phoneForm" class="login-step">
+      <label for="phone">Mobile number</label>
+      <div class="phone-input">
+        <span class="prefix">+91</span>
+        <input id="phone" name="phone" type="tel" inputmode="numeric" autocomplete="tel"
+               placeholder="98765 43210" maxlength="15" required />
+      </div>
+      <p class="hint">We'll send a one-time code to this number on WhatsApp.</p>
+      <button type="submit" class="primary" id="sendBtn">Send code</button>
+    </form>
+
+    <!-- Step 2 -->
+    <form id="otpForm" class="login-step" hidden>
+      <label for="code">Enter the 6-digit code</label>
+      <input id="code" name="code" type="text" inputmode="numeric" autocomplete="one-time-code"
+             maxlength="6" pattern="\d{6}" placeholder="······" class="otp-input" required />
+      <p class="hint">Sent on WhatsApp to <span id="sentTo"></span>. Expires in 5 minutes.</p>
+      <button type="submit" class="primary" id="verifyBtn">Verify &amp; sign in</button>
+      <div class="row">
+        <button type="button" class="link" id="changeNumber">Use a different number</button>
+        <button type="button" class="link" id="resend" disabled>Resend in 60s</button>
+      </div>
+    </form>
+  </main>
+
+  <script src="/login.js"></script>
+</body>
+</html>
