@@ -9,7 +9,7 @@ import {
 import { mockInsertCart, mockListCarts, mockUpdateStatus } from './lib/mock.js';
 import { normalizePayload } from './lib/normalize.js';
 import { router as authRouter, requireAuth } from './lib/auth-routes.js';
-import { allowedPhones } from './lib/otp.js';
+import { activeUsers, seedAllowedUsers } from './lib/otp.js';
 import { driver } from './lib/whatsapp.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -170,16 +170,23 @@ app.listen(port, async () => {
   if (!process.env.WEBHOOK_SECRET) {
     console.warn('\n  WARNING: WEBHOOK_SECRET is unset — the webhook will reject every delivery.\n');
   }
-  // Log which numbers actually parsed, masked. Without this, a mistyped or
-  // unsaved ALLOWED_PHONES looks identical to a delivery failure from the logs.
-  const allowed = allowedPhones();
-  if (allowed.size === 0) {
-    console.warn(
-      '\n  WARNING: ALLOWED_PHONES is empty or unparseable, so nobody can log in.\n' +
-      `  Raw value length: ${(process.env.ALLOWED_PHONES || '').length} chars\n`);
-  } else {
-    const masked = [...allowed.entries()]
-      .map(([phone, name]) => `${name}:...${phone.slice(-4)}`).join(', ');
-    console.log(`Allowed logins: ${allowed.size} number(s) — ${masked}`);
+  // Report the live allowlist, masked. Without this a mistyped or unsaved value
+  // looks identical to a WhatsApp delivery failure from the logs alone.
+  try {
+    const seed = await seedAllowedUsers();
+    if (seed.seeded) console.log(`Seeded allowed_users with ${seed.seeded} number(s) from ALLOWED_PHONES`);
+    const allowed = await activeUsers();
+    if (allowed.size === 0) {
+      console.warn(
+        '\n  WARNING: nobody can log in — allowed_users is empty and ALLOWED_PHONES is unset.\n' +
+        `  ALLOWED_PHONES raw length: ${(process.env.ALLOWED_PHONES || '').length} chars\n` +
+        "  Add someone:  INSERT INTO allowed_users (phone, name) VALUES ('91XXXXXXXXXX', 'Name');\n");
+    } else {
+      const masked = [...allowed.entries()]
+        .map(([phone, name]) => `${name}:...${phone.slice(-4)}`).join(', ');
+      console.log(`Allowed logins (${seed.source}): ${allowed.size} — ${masked}`);
+    }
+  } catch (err) {
+    console.error('Could not read the allowlist:', err.message);
   }
 });

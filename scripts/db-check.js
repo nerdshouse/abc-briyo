@@ -106,6 +106,13 @@ await step('otp: attempt counter', async () => {
   return r1.reason;
 });
 
+await step('allowlist table readable', async () => {
+  const { activeUsers } = await import('../lib/otp.js');
+  const m = await activeUsers();
+  if (m.size === 0) throw new Error('allowed_users is empty and ALLOWED_PHONES is unset — nobody could log in');
+  return `${m.size} active: ${[...m.keys()].map((p) => '...' + p.slice(-4)).join(', ')}`;
+});
+
 // ---- cleanup ---------------------------------------------------------------
 await step('cleanup', async () => {
   await getPool().query('DELETE FROM abandoned_carts WHERE cart_id = $1', [TEST_CART]);

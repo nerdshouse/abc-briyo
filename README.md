@@ -122,10 +122,44 @@ domain error, try it with a single trailing slash and with none.
 
 ### Adding or removing people
 
-Edit `ALLOWED_PHONES` and restart. Entries are either a bare number or `Name:number` — the
-name is passed to the template as `name`, so the message reads "Hi Asha" rather than "Hi Team".
-Numbers are normalised, so `9812345678`, `+91 98123 45678` and `09812345678` are all the same
-person. Removing a number blocks new logins immediately;
+The allowlist lives in the **`allowed_users` table**, so changing the team needs no redeploy.
+Run these in the Neon console:
+
+```sql
+-- see who can log in
+SELECT phone, name, active, added_at FROM allowed_users ORDER BY added_at;
+
+-- add someone (phone must be the normalised 91XXXXXXXXXX form)
+INSERT INTO allowed_users (phone, name) VALUES ('919812345678', 'Asha');
+
+-- revoke access, keeping the record
+UPDATE allowed_users SET active = false WHERE phone = '919812345678';
+
+-- or remove entirely
+DELETE FROM allowed_users WHERE phone = '919812345678';
+```
+
+Changes take effect on the **next login attempt** — no restart, no deploy.
+
+`name` is what the WhatsApp message greets them by, so the OTP reads "Hi Asha" rather than
+"Hi Team". Revoking someone blocks new logins immediately; an existing session survives until
+it expires (`SESSION_TTL_HOURS`, default 12h).
+
+#### The ALLOWED_PHONES fallback
+
+`ALLOWED_PHONES` still exists as a **bootstrap**. On startup, if `allowed_users` is empty, it's
+seeded from that variable. It's also the fallback if the table is unreadable, so a database
+problem can't lock everyone out of the board.
+
+Once the table has rows, the env var is ignored — **editing `ALLOWED_PHONES` will no longer
+change who can log in.** Use SQL.
+
+The startup log says which source is live and lists the loaded numbers masked to their last
+four digits:
+
+```
+Allowed logins (allowed_users table): 3 — Asha:...0125, Ravi:...0829, Priya:...3426
+``` Removing a number blocks new logins immediately;
 an existing session dies when it expires (`SESSION_TTL_HOURS`, default 12h).
 
 ---
