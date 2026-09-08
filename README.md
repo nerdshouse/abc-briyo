@@ -347,22 +347,33 @@ Two things make this survivable, and one fixes it:
   timed-out delivery, you get one row, not two.
 - The webhook **returns 200 even when the database write fails**, so a slow start never
   triggers a retry storm.
-- **Keep it warm.** Point a free uptime pinger at `/healthz` every 10 minutes:
+- **It keeps itself warm.** The server pings its own public URL every 10 minutes
+  (`lib/keepalive.js`), using `RENDER_EXTERNAL_URL`, which Render injects automatically. No
+  external cron account, no configuration. `/healthz` is public, touches no database, and
+  returns only `{ok, ts}`.
 
-  | | |
-  | --- | --- |
-  | URL | `https://abc.briyo.xyz/healthz` |
-  | Interval | 10 minutes |
-  | Service | [cron-job.org](https://cron-job.org) or [UptimeRobot](https://uptimerobot.com), both free |
+  | Variable | Default | Purpose |
+  | --- | --- | --- |
+  | `KEEPALIVE_ENABLED` | on | Set `false` to turn it off |
+  | `KEEPALIVE_MINUTES` | `10` | Interval; must be under 15 to beat the idle timeout |
+  | `KEEPALIVE_URL` | `RENDER_EXTERNAL_URL` | Override the target, e.g. to use the custom domain |
 
-  `/healthz` is public, touches no database, and returns only `{ok, ts}`.
+  **What this cannot do is wake a sleeping instance** — a sleeping instance isn't running to
+  fire its own timer. It only prevents sleep in the first place. If the service ever does go
+  down for long enough to sleep, the next visitor (or GoKwik delivery) pays the wake-up cost
+  once and it stays warm after that. An external pinger like
+  [cron-job.org](https://cron-job.org) is still the more robust belt-and-braces option, and
+  the two can run together harmlessly.
 
 ### Watch the instance-hour budget
 
-A free workspace gets **750 instance-hours per month across all free services**. Keeping one
-service awake 24/7 uses about **730**, which fits — but only just, and only for *one* service.
-A second free service in the same workspace will exhaust the quota and Render suspends
-**everything** until the next month. Keep this workspace to this one service.
+A free workspace gets **750 instance-hours per month across all free services**. The keep-alive
+holds this service awake 24/7, which uses about **730** — it fits, but only just, and only for
+*one* service. A second free service in the same workspace will exhaust the quota and Render
+suspends **everything** until the next month. Keep this workspace to this one service.
+
+If you need the headroom, set `KEEPALIVE_ENABLED=false` and accept the cold starts, or move to
+a paid instance.
 
 If the sleeping is intolerable or 730 hours is too tight, Render's cheapest paid instance
 removes both limits.

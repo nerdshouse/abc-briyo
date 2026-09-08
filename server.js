@@ -11,6 +11,7 @@ import { normalizePayload, parseLineItems } from './lib/normalize.js';
 import { router as authRouter, requireAuth } from './lib/auth-routes.js';
 import { activeUsers, seedAllowedUsers } from './lib/otp.js';
 import { driver } from './lib/whatsapp.js';
+import { startKeepAlive } from './lib/keepalive.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC = path.join(__dirname, 'public');
@@ -197,4 +198,6 @@ app.listen(port, async () => {
   } catch (err) {
     console.error('Could not read the allowlist:', err.message);
   }
+
+  startKeepAlive();
 });
