@@ -170,10 +170,16 @@ app.listen(port, async () => {
   if (!process.env.WEBHOOK_SECRET) {
     console.warn('\n  WARNING: WEBHOOK_SECRET is unset — the webhook will reject every delivery.\n');
   }
+  // Log which numbers actually parsed, masked. Without this, a mistyped or
+  // unsaved ALLOWED_PHONES looks identical to a delivery failure from the logs.
   const allowed = allowedPhones();
   if (allowed.size === 0) {
-    console.warn('\n  WARNING: ALLOWED_PHONES is empty, so nobody can log in.\n');
+    console.warn(
+      '\n  WARNING: ALLOWED_PHONES is empty or unparseable, so nobody can log in.\n' +
+      `  Raw value length: ${(process.env.ALLOWED_PHONES || '').length} chars\n`);
   } else {
-    console.log(`Allowed logins: ${allowed.size} number(s)`);
+    const masked = [...allowed.entries()]
+      .map(([phone, name]) => `${name}:...${phone.slice(-4)}`).join(', ');
+    console.log(`Allowed logins: ${allowed.size} number(s) — ${masked}`);
   }
 });
