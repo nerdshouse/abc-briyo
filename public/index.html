@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Abandoned Cart Recovery Board — Briyo Supplements</title>
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <div class="wrap">
+    <header class="page">
+      <div>
+        <h1>Abandoned Cart Recovery Board</h1>
+        <p class="sub">
+          Live from Shopify — call status and notes are saved to your Shopify store,
+          visible on every device.
+        </p>
+      </div>
+      <button id="refresh" type="button">Refresh</button>
+    </header>
+
+    <div id="mockBanner" class="banner mock" hidden>
+      <strong>Mock mode.</strong> No Shopify token configured, so this is sample data and
+      status changes are kept in memory only. Set <code>SHOPIFY_ACCESS_TOKEN</code> to go live.
+    </div>
+
+    <div id="errorBanner" class="banner error" hidden></div>
+
+    <section class="stats" id="stats"></section>
+
+    <div class="controls">
+      <div class="group" id="rangeGroup" role="group" aria-label="Date range">
+        <button type="button" data-days="1">Today</button>
+        <button type="button" data-days="3">Last 3 days</button>
+        <button type="button" data-days="7" class="active">Last 7 days</button>
+        <button type="button" data-days="0">All</button>
+      </div>
+      <select id="statusFilter" aria-label="Filter by status">
+        <option value="">All statuses</option>
+      </select>
+      <select id="sort" aria-label="Sort">
+        <option value="value">Cart value: high → low</option>
+        <option value="recent">Most recent first</option>
+      </select>
+    </div>
+
+    <div class="panel">
+      <table>
+        <thead>
+          <tr>
+            <th>Abandoned</th>
+            <th>Customer</th>
+            <th>Items</th>
+            <th class="right">Value</th>
+            <th>Contact</th>
+            <th>Status &amp; notes</th>
+          </tr>
+        </thead>
+        <tbody id="rows">
+          <tr><td colspan="6" class="empty">Loading…</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <p class="note">
+      Status and notes are stored as a single JSON blob in a Shopify shop metafield
+      (<code>cart_recovery_board.status_map</code>). Saves are last-write-wins: if two people
+      edit the same row within a second or two, the later save wins.
+    </p>
+  </div>
+
+  <script src="/app.js"></script>
+</body>
+</html>
