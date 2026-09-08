@@ -10,11 +10,12 @@ const STATUSES = [
 
 const state = {
   carts: [],
-  statusMap: {},
   days: 7,       // default range: last 7 days
   status: '',
   sort: 'value',
 };
+
+const cartById = (id) => state.carts.find((c) => String(c.id) === String(id));
 
 const $ = (sel) => document.querySelector(sel);
 const rowsEl = $('#rows');
@@ -62,9 +63,24 @@ function waNumber(phone) {
 }
 
 function waMessage(cart) {
-  const name = cart.name ? cart.name.split(' ')[0] : 'there';
+  const name = cart.customer_name ? cart.customer_name.split(' ')[0] : 'there';
   return `Hi ${name}! This is Briyo Supplements. We noticed you left a few items in your cart — ` +
-         `can we help you complete your order? Here's your cart: ${cart.checkoutUrl || ''}`;
+         `can we help you complete your order? Here's your cart: ${cart.checkout_url || ''}`;
+}
+
+/**
+ * Line items aren't a column — they stay in raw_payload, since GoKwik's item
+ * shape isn't fixed. Pull titles out of whichever key is present.
+ */
+function itemsOf(cart) {
+  const raw = cart.raw_payload || {};
+  const list = raw.items || raw.line_items || raw.lineItems || raw.products
+    || raw.cart?.items || raw.data?.items || [];
+  if (!Array.isArray(list)) return [];
+  return list.map((i) => ({
+    title: i?.title || i?.name || i?.product_name || i?.sku || 'Item',
+    quantity: Number(i?.quantity ?? i?.qty ?? 1),
+  }));
 }
 
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => (
@@ -83,23 +99,18 @@ function clearError() {
 
 async function loadAll() {
   try {
-    const [cfgRes, cartsRes, statusRes] = await Promise.all([
-      fetch('/api/config'), fetch('/api/carts'), fetch('/api/status'),
-    ]);
-    if ([cfgRes, cartsRes, statusRes].some((r) => r.status === 401)) {
+    const [cfgRes, cartsRes] = await Promise.all([fetch('/api/config'), fetch('/api/carts')]);
+    if ([cfgRes, cartsRes].some((r) => r.status === 401)) {
       window.location.href = '/login';
       return;
     }
     const cfg = await cfgRes.json();
     const carts = await cartsRes.json();
-    const status = await statusRes.json();
 
     if (cfg.mock) $('#mockBanner').hidden = false;
     if (!carts.ok) throw new Error(carts.error || 'Could not load carts');
-    if (!status.ok) throw new Error(status.error || 'Could not load statuses');
 
     state.carts = carts.carts;
-    state.statusMap = status.statusMap || {};
     clearError();
     render();
   } catch (err) {
@@ -122,9 +133,15 @@ async function saveRow(id, patch, noteEl) {
     const data = await res.json();
     if (!res.ok || !data.ok) throw new Error(data.error || `HTTP ${res.status}`);
 
-    state.statusMap = data.statusMap;
+    // Update the row in place; never re-render it, so an in-progress edit survives.
+    const cart = cartById(id);
+    if (cart) {
+      cart.status = data.entry.status;
+      cart.notes = data.entry.notes;
+      cart.status_updated_at = data.entry.status_updated_at;
+    }
     clearError();
-    if (cell) { cell.textContent = `Saved ${relativeTime(data.entry.updatedAt)}`; cell.className = 'saved'; }
+    if (cell) { cell.textContent = `Saved ${relativeTime(data.entry.status_updated_at)}`; cell.className = 'saved'; }
     renderStats();
     const tr = document.querySelector(`[data-row="${CSS.escape(id)}"]`);
     if (tr) tr.dataset.status = data.entry.status;
@@ -140,27 +157,22 @@ async function saveRow(id, patch, noteEl) {
 
 function visibleCarts() {
   const cutoff = state.days > 0 ? Date.now() - state.days * 86400000 : 0;
-  let list = state.carts.filter((c) => new Date(c.createdAt).getTime() >= cutoff);
+  let list = state.carts.filter((c) => new Date(c.received_at).getTime() >= cutoff);
 
-  if (state.status) {
-    list = list.filter((c) => (state.statusMap[c.id]?.status || 'Not called') === state.status);
-  }
+  if (state.status) list = list.filter((c) => (c.status || 'Not called') === state.status);
 
   return list.sort((a, b) => (
     state.sort === 'value'
-      ? b.amount - a.amount
-      : new Date(b.createdAt) - new Date(a.createdAt)
+      ? (b.total_price ?? 0) - (a.total_price ?? 0)
+      : new Date(b.received_at) - new Date(a.received_at)
   ));
 }
 
 function renderStats() {
   const list = visibleCarts();
-  const total = list.reduce((sum, c) => sum + c.amount, 0);
-  const called = list.filter((c) => {
-    const s = state.statusMap[c.id]?.status;
-    return s && s !== 'Not called';
-  }).length;
-  const recovered = list.filter((c) => state.statusMap[c.id]?.status === 'Called – Recovered').length;
+  const total = list.reduce((sum, c) => sum + (c.total_price ?? 0), 0);
+  const called = list.filter((c) => c.status && c.status !== 'Not called').length;
+  const recovered = list.filter((c) => c.status === 'Called – Recovered').length;
   const rate = list.length ? Math.round((recovered / list.length) * 100) : 0;
 
   $('#stats').innerHTML = [
@@ -183,38 +195,50 @@ function renderRows() {
   }
 
   rowsEl.innerHTML = list.map((c) => {
-    const entry = state.statusMap[c.id] || {};
-    const status = entry.status || 'Not called';
+    const status = c.status || 'Not called';
     const wa = waNumber(c.phone);
-    const itemSummary = c.items.length
-      ? c.items.map((i) => `<strong>${esc(i.title)}</strong>${i.quantity > 1 ? ` ×${i.quantity}` : ''}`).join('<br>')
-      : '—';
+    const items = itemsOf(c);
+    const itemSummary = items.length
+      ? items.map((i) => `<strong>${esc(i.title)}</strong>${i.quantity > 1 ? ` ×${i.quantity}` : ''}`).join('<br>')
+      : (c.item_count ? `${c.item_count} item${c.item_count === 1 ? '' : 's'}` : '—');
 
     const links = [];
     if (c.phone) links.push(`<a href="tel:${esc(String(c.phone).replace(/\s/g, ''))}">Call</a>`);
     if (wa) links.push(`<a href="https://wa.me/${wa}?text=${encodeURIComponent(waMessage(c))}" target="_blank" rel="noopener">WhatsApp</a>`);
-    if (c.checkoutUrl) links.push(`<a href="${esc(c.checkoutUrl)}" target="_blank" rel="noopener">Cart link</a>`);
+    if (c.checkout_url) links.push(`<a href="${esc(c.checkout_url)}" target="_blank" rel="noopener">Cart link</a>`);
     if (!c.phone) links.push('<span class="muted">No phone</span>');
 
     return `
       <tr data-row="${esc(c.id)}" data-status="${esc(status)}">
-        <td><div>${relativeTime(c.createdAt)}</div>
-            <div class="muted">${new Date(c.createdAt).toLocaleString('en-IN', { dateStyle: 'medium', timeStyle: 'short' })}</div></td>
-        <td><div class="cust-name">${esc(c.name || 'Guest')}</div>
+        <td><div>${relativeTime(c.received_at)}</div>
+            <div class="muted">${new Date(c.received_at).toLocaleString('en-IN', { dateStyle: 'medium', timeStyle: 'short' })}</div></td>
+        <td><div class="cust-name">${esc(c.customer_name || 'Guest')}</div>
             <div class="cust-email">${esc(c.email || '—')}</div></td>
         <td class="items">${itemSummary}</td>
-        <td class="right">${money(c.amount, c.currency)}</td>
+        <td class="right">${money(c.total_price, c.currency)}</td>
         <td><div class="links">${links.join('')}</div></td>
         <td class="status-cell">
-          <select data-id="${esc(c.id)}" class="js-status">
+          <select data-id="${esc(c.id)}" class="js-status" autocomplete="off">
             ${STATUSES.map((s) => `<option ${s === status ? 'selected' : ''}>${s}</option>`).join('')}
           </select>
-          <input type="text" class="js-notes" data-id="${esc(c.id)}"
-                 placeholder="Notes…" value="${esc(entry.notes || '')}" />
-          <div class="saved">${entry.updatedAt ? `Saved ${relativeTime(entry.updatedAt)}` : ''}</div>
+          <input type="text" class="js-notes" data-id="${esc(c.id)}" autocomplete="off"
+                 placeholder="Notes…" value="${esc(c.notes || '')}" />
+          <div class="saved">${c.status_updated_at ? `Saved ${relativeTime(c.status_updated_at)}` : ''}</div>
         </td>
       </tr>`;
   }).join('');
+
+  // Browsers restore form-control values across reloads, which would both show
+  // the wrong status and fire a change event that saves it. Re-assert every
+  // control from server state after inserting the markup.
+  for (const sel of rowsEl.querySelectorAll('.js-status')) {
+    const cart = cartById(sel.dataset.id);
+    if (cart) sel.value = cart.status || 'Not called';
+  }
+  for (const input of rowsEl.querySelectorAll('.js-notes')) {
+    const cart = cartById(input.dataset.id);
+    if (cart) input.value = cart.notes || '';
+  }
 }
 
 function render() {
@@ -228,6 +252,8 @@ function render() {
 rowsEl.addEventListener('change', (e) => {
   if (e.target.classList.contains('js-status')) {
     const id = e.target.dataset.id;
+    // Ignore no-op changes (e.g. browser form restoration re-firing on load).
+    if ((cartById(id)?.status || 'Not called') === e.target.value) return;
     const notes = document.querySelector(`.js-notes[data-id="${CSS.escape(id)}"]`)?.value ?? '';
     saveRow(id, { status: e.target.value, notes });
   }
@@ -237,7 +263,7 @@ rowsEl.addEventListener('change', (e) => {
 rowsEl.addEventListener('blur', (e) => {
   if (e.target.classList.contains('js-notes')) {
     const id = e.target.dataset.id;
-    if ((state.statusMap[id]?.notes || '') === e.target.value) return;
+    if ((cartById(id)?.notes || '') === e.target.value) return;
     const status = document.querySelector(`.js-status[data-id="${CSS.escape(id)}"]`)?.value;
     saveRow(id, { status, notes: e.target.value }, e.target);
   }

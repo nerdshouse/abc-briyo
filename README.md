@@ -1,19 +1,19 @@
 # Abandoned Cart Recovery Board — Briyo Supplements
 
-A single-page board that lists abandoned Shopify checkouts and tracks call / WhatsApp
-outreach on each one. Status and notes are stored **in your Shopify store**, so the whole
-team sees the same data on every device — no external database, no per-browser localStorage.
+A single-page board that lists abandoned carts **received from GoKwik** and tracks call /
+WhatsApp outreach on each one. Carts arrive by webhook, are stored in Postgres with their
+full original payload, and the whole team sees the same statuses and notes.
 
 Access is gated by **WhatsApp OTP login**: you enter your mobile number, receive a one-time
 code on WhatsApp via 11za, and only allowlisted numbers can get in.
 
 - **Frontend:** plain HTML / CSS / vanilla JS (no framework, no build step)
-- **Backend:** minimal Node + Express, proxies Shopify server-side
-- **Storage:** one JSON blob in a Shopify shop metafield (`cart_recovery_board.status_map`)
+- **Backend:** minimal Node + Express
+- **Storage:** Postgres (Neon free tier)
+- **Inbound:** GoKwik abandoned-cart webhook
 
-The Admin API token never reaches the browser.
-
----
+This app is a **passive receiver**. It never calls GoKwik's or Shopify's API, and touches
+nothing on the storefront — including the existing GoKwik / Meta pixel setup.
 
 ## Quick start
 
@@ -27,10 +27,10 @@ Open http://localhost:3000.
 
 ### Mock mode
 
-If `SHOPIFY_ACCESS_TOKEN` or `SHOPIFY_STORE_DOMAIN` is unset, the board starts in **mock
-mode**: five sample carts, an in-memory status map, and a yellow banner saying so. The UI is
-fully usable this way, which is handy for styling or a demo before the Shopify app exists.
-Status changes in mock mode reset when the server restarts.
+If `DATABASE_URL` is unset, the board starts in **mock mode**: five sample carts shaped like
+GoKwik's payload, held in memory, with a yellow banner saying so. The UI, the login flow and
+the webhook are all fully usable this way — handy before Neon is set up. Everything resets
+when the server restarts.
 
 ---
 
@@ -38,11 +38,8 @@ Status changes in mock mode reset when the server restarts.
 
 | Variable | Required | Notes |
 | --- | --- | --- |
-| `SHOPIFY_STORE_DOMAIN` | yes (live) | `briyo-supplements.myshopify.com` — no `https://`, no trailing slash |
-| `SHOPIFY_CLIENT_ID` | yes (live) | Dev Dashboard app client ID — the current method |
-| `SHOPIFY_CLIENT_SECRET` | yes (live) | Dev Dashboard app client secret |
-| `SHOPIFY_ACCESS_TOKEN` | alternative | Permanent `shpat_` token, only from a pre-2026 legacy custom app. Takes precedence if set. |
-| `SHOPIFY_API_VERSION` | no | Defaults to `2026-07`. Shopify supports each version ~12 months — bump this yearly. |
+| `DATABASE_URL` | yes (live) | Neon Postgres connection string. Unset ⇒ mock mode |
+| `WEBHOOK_SECRET` | **yes** | Shared secret GoKwik must send. `openssl rand -hex 32` |
 | `PORT` | no | Defaults to `3000` |
 | `ALLOWED_PHONES` | **yes** | Comma-separated numbers permitted to sign in. **Empty means nobody can log in.** |
 | `SESSION_SECRET` | **yes** | Signs session cookies and hashes OTPs. `openssl rand -hex 32` |
@@ -133,76 +130,101 @@ an existing session dies when it expires (`SESSION_TTL_HOURS`, default 12h).
 
 ---
 
-## Shopify setup
+## The GoKwik webhook
 
-### 1. Create the app
+### The URL to give GoKwik
 
-**Legacy custom apps can no longer be created.** Since 1 January 2026 the store admin's
-"Develop apps" page won't make new ones, so there is no permanent `shpat_` token to copy.
-Apps are now created in the **Dev Dashboard** and authenticate with a *client credentials
-grant*: the server swaps a client ID and secret for a token that lasts 24 hours and refreshes
-it automatically. That's handled for you in `lib/shopify.js` — you only supply the two values.
+GoKwik's Custom Webhook screen accepts only a receiving HTTPS URL — there is no field for
+custom headers — so the shared secret travels in the query string:
 
-1. Go to **[dev.shopify.com](https://dev.shopify.com)** → your organization → **Apps** →
-   **Create app**.
-2. **App settings** → copy the **Client ID** and **Client secret** into `.env` as
-   `SHOPIFY_CLIENT_ID` / `SHOPIFY_CLIENT_SECRET`.
-3. Set the app's **scopes** (next section), then **install it on the store**.
-
-> The client credentials grant only works when **the app and the store are in the same
-> Shopify organization**. Both must appear under the same org in the Dev Dashboard, otherwise
-> the token request fails with a permissions error.
-
-If you already have a **legacy custom app from before 2026**, it keeps working: set
-`SHOPIFY_ACCESS_TOKEN` to its permanent token instead and skip the client credentials entirely.
-The server prefers that variable when it's present.
-
-### 2. Scopes
-
-| Scope | Why |
-| --- | --- |
-| `read_orders` | Required by the `abandonedCheckouts` query. This is the documented scope. |
-
-Two caveats worth knowing before you hit a wall:
-
-- **`read_orders` only covers the last 60 days of orders.** If you need to read older
-  abandoned checkouts, you must also request `read_all_orders`, which Shopify grants only
-  after you request access and explain why. For a daily call list, 60 days is plenty.
-- **The metafield write has no dedicated scope.** There is no `write_metafields` scope in
-  the Admin API. Shopify's rule for `metafieldsSet` is "the same access level needed to
-  mutate the owner resource" — and they don't publish a scope name for the `Shop` owner.
-  In practice a custom app writing shop-owned metafields on its own store generally works
-  with the scopes above. **If it doesn't**, the board surfaces the exact `userErrors` from
-  Shopify in the red banner and the server log; see "If saving fails" below.
-
-### 3. Verify
-
-```bash
-npm start
+```
+https://abc.briyo.xyz/api/webhook/gokwik/abandoned-cart?secret=<WEBHOOK_SECRET>
 ```
 
-The log should print `Shopify: live (…) via client credentials (Dev Dashboard app)` rather
-than `MOCK MODE`, followed by `Shopify token acquired, valid ~24h` and the scopes Shopify
-actually granted — check `read_orders` is among them.
-Load the page — if the token or scopes are wrong you'll get a red banner naming the problem.
+Generate the secret with `openssl rand -hex 32` and set it as `WEBHOOK_SECRET`.
 
+**Treat that whole URL as a credential** — it grants write access to the cart table. Don't
+paste it into shared docs or tickets. To rotate: change `WEBHOOK_SECRET`, redeploy, then
+update the URL in GoKwik's dashboard.
+
+An `X-Webhook-Secret` header is also accepted, which is handy for `curl` testing.
+
+Before handing the URL over, confirm it's live:
+
+```bash
+curl https://abc.briyo.xyz/api/webhook/gokwik/abandoned-cart
+# -> {"ok":true,"message":"GoKwik abandoned-cart webhook receiver. POST here."}
+```
+
+### What it does with a delivery
+
+- **Authenticates** the shared secret in constant time, `401` if wrong or missing.
+- **Parses defensively.** The body is read as raw text and parsed by hand, so even a malformed
+  delivery is stored rather than rejected by a JSON parser before the handler runs.
+- **Deduplicates on `request_id`.** GoKwik retries; a repeat delivery updates the existing row
+  instead of creating a second one. **An existing call status and notes are never overwritten
+  by a retry** — only cart fields are refreshed, and only when the new payload actually has a
+  value for them.
+- **Keeps the full payload** in a `raw_payload` JSONB column, always.
+- **Returns 200 even when the database write fails**, logging the payload. Webhook senders
+  retry aggressively on non-2xx, and a retry storm is worse than reading logs.
+
+### Field mapping
+
+| GoKwik field | Column |
+| --- | --- |
+| `request_id` | `cart_id` (dedupe key) |
+| `customer` (name / phone / email) | `customer_name`, `phone`, `email` |
+| `totals.total` (falls back to `subtotal` / `grand_total`) | `total_price` |
+| `currency` | `currency` |
+| `item_count` (falls back to summing `items[].quantity`) | `item_count` |
+| `abc_url` | `checkout_url` |
+| `created_at` | `abandoned_at` |
+
+`address`, `shipping`, `discounts`, `items` and `session` aren't given columns, but are kept
+in `raw_payload` — line-item names on the board are read from there. The parser also probes
+alternative key names and looks one level inside envelopes like `data` / `payload` / `cart`,
+so a payload that differs from the documented shape still maps.
+
+**If columns come through blank on real events**, that's a mapping gap, not data loss:
+
+```sql
+SELECT id, received_at, raw_payload FROM abandoned_carts ORDER BY received_at DESC LIMIT 5;
+```
+
+Add the real key names to the relevant array in `lib/normalize.js` and redeploy. Old rows can
+be backfilled from `raw_payload` afterwards.
+
+## Database
+
+Create a free project at [neon.tech](https://neon.tech), copy the connection string, and set
+it as `DATABASE_URL`:
+
+```
+DATABASE_URL=postgresql://user:pass@ep-xxx.ap-southeast-1.aws.neon.tech/neondb?sslmode=require
+```
+
+The `abandoned_carts` table is created automatically on first use — there's no migration step.
+With `DATABASE_URL` unset the app runs in **mock mode** on in-memory sample data, so the UI,
+login and webhook are all testable before Neon exists.
 ---
 
 ## How it works
 
-| Endpoint | Purpose |
-| --- | --- |
-| `GET /api/carts` | Abandoned checkouts from the Admin GraphQL API, flattened for the UI |
-| `GET /api/status` | The parsed status map from the shop metafield |
-| `POST /api/status` | Accepts `{id, status, notes}` (read-merge-write) or a full `{statusMap}` |
-| `GET /api/config` | Whether the server is in mock mode, plus the status list |
+| Endpoint | Auth | Purpose |
+| --- | --- | --- |
+| `POST /api/webhook/gokwik/abandoned-cart` | shared secret | **Give this URL to GoKwik.** Receives cart events |
+| `GET /api/webhook/gokwik/abandoned-cart` | none | Liveness check — confirms the URL is reachable |
+| `GET /api/carts` | session | Stored carts, newest first |
+| `POST /api/status` | session | `{id, status, notes}` — updates one row |
+| `GET /api/config` | session | Mock-mode flag and the status list |
 | `POST /auth/request-otp` | Sends a code to an allowlisted number |
 | `POST /auth/verify-otp` | Exchanges a valid code for a session cookie |
 | `POST /auth/logout` | Clears the session |
 | `GET /auth/me` | Current session state (the only unauthenticated endpoint that returns anything) |
 
-Phone numbers come from `billingAddress.phone`, **not** `customer.phone` — the latter is
-almost always null on abandoned checkouts.
+Phone numbers come from GoKwik's `customer.phone`, falling back to any address block in the
+payload.
 
 The WhatsApp link converts Indian numbers to `wa.me`'s `91XXXXXXXXXX` form: a bare 10-digit
 mobile gets `91` prefixed, an already-country-coded number passes through, and a leading
@@ -210,29 +232,20 @@ trunk `0` is stripped. Anything else is passed through as digits.
 
 ### The concurrency limitation
 
-Status and notes live in **one JSON blob** in a single metafield. A save is a read-merge-write:
-the server re-reads the map, updates just the row you touched, and writes the whole thing back.
-
-That means edits to *different* rows are safe, but it is **last-write-wins per row**: if two
-people change the same row within a second or two of each other, the later write silently
-wins. For a small team working a daily call list this is fine, and deliberately not
-over-engineered — there's no locking or version check. If the team grows to the point where
-that bites, that's the signal to move the status map to a real database.
+Each save is a single-row `UPDATE`, so edits to different rows never interfere. Within one
+row it is **last-write-wins**: if two people change the same cart within a second or two, the
+later write wins silently. There's no locking or version check, deliberately — for a small
+team working a daily call list that's the right trade.
 
 ### If saving fails
 
-The red banner shows Shopify's own error text and **your in-progress edit stays on screen** —
+The red banner shows the server's error text and **your in-progress edit stays on screen** —
 nothing is discarded, so you can fix the cause and blur the field again to retry. The row
 shows `Not saved` until it succeeds.
 
-If the message mentions access or permissions, it's the metafield-scope caveat above. Options,
-cheapest first:
-
-1. Re-open the custom app's API config, save it again, and reinstall — scope changes need a reinstall.
-2. Add broader scopes (e.g. `write_products`) and retry, to confirm it's a scope issue at all.
-3. Fall back to storing the map elsewhere (a small SQLite/Postgres table); only `readStatusMap`
-   and `writeStatusMap` in `lib/shopify.js` would need to change — nothing else in the app knows
-   where the data lives.
+If it mentions the database, check `DATABASE_URL` and that the Neon project isn't suspended
+(free-tier projects idle out and take a few seconds to wake — the first request after that can
+time out, the second succeeds).
 
 ---
 
@@ -249,9 +262,9 @@ Target domain: **`abc.briyo.xyz`**.
 1. Push this repo to GitHub.
 2. New → **Web Service** → connect the repo.
 3. Build command `npm install`, start command `npm start`.
-4. Add the environment variables: `SHOPIFY_STORE_DOMAIN`, `SHOPIFY_ACCESS_TOKEN`,
-   `SHOPIFY_API_VERSION`, `ALLOWED_PHONES`, `SESSION_SECRET`, `COOKIE_SECURE=true`,
-   `ELEVENZA_AUTH_TOKEN`, `ELEVENZA_TEMPLATE_NAME`. The platform supplies `PORT` itself.
+4. Add the environment variables: `DATABASE_URL`, `WEBHOOK_SECRET`, `ALLOWED_PHONES`,
+   `SESSION_SECRET`, `COOKIE_SECURE=true`, `ELEVENZA_AUTH_TOKEN`, `ELEVENZA_TEMPLATE_NAME`,
+   `ELEVENZA_ORIGIN_WEBSITE`. The platform supplies `PORT` itself.
 5. Add the custom domain `abc.briyo.xyz` in the platform's domain settings, then create the
    `CNAME` record it gives you at your DNS provider. Both Render and Railway issue the TLS
    certificate automatically once DNS resolves.
@@ -292,7 +305,8 @@ short-lived OTP state that pins this to one process. If you ever need to scale o
 
 ## What this app does not do
 
-- It never writes to orders, customers, or checkouts — the only write is the status metafield.
+- It never calls GoKwik's or Shopify's API. It only receives, and touches nothing on the
+  storefront — including the existing GoKwik / Meta pixel setup.
 - It doesn't send WhatsApp messages to customers or place calls; the outreach links just open
   your own apps. The only message it sends is the login OTP, to your own team's numbers.
-- It doesn't poll. Click **Refresh** to re-fetch from Shopify.
+- It doesn't poll or push. New carts appear on the next **Refresh**.

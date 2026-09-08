@@ -12,8 +12,8 @@
       <div>
         <h1>Abandoned Cart Recovery Board</h1>
         <p class="sub">
-          Live from Shopify — call status and notes are saved to your Shopify store,
-          visible on every device.
+          Abandoned carts arrive live from GoKwik. Call status and notes are shared —
+          everyone sees the same board on every device.
         </p>
       </div>
       <div class="session">
@@ -24,8 +24,8 @@
     </header>
 
     <div id="mockBanner" class="banner mock" hidden>
-      <strong>Mock mode.</strong> No Shopify token configured, so this is sample data and
-      status changes are kept in memory only. Set <code>SHOPIFY_ACCESS_TOKEN</code> to go live.
+      <strong>Mock mode.</strong> No database configured, so this is sample data held in
+      memory and lost on restart. Set <code>DATABASE_URL</code> to go live.
     </div>
 
     <div id="errorBanner" class="banner error" hidden></div>
@@ -67,9 +67,9 @@
     </div>
 
     <p class="note">
-      Status and notes are stored as a single JSON blob in a Shopify shop metafield
-      (<code>cart_recovery_board.status_map</code>). Saves are last-write-wins: if two people
-      edit the same row within a second or two, the later save wins.
+      Carts are received from GoKwik's webhook and stored with their full original payload,
+      so nothing is lost even if a field isn't shown here. Status edits save immediately and
+      are last-write-wins per row.
     </p>
   </div>
 

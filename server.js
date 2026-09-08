@@ -4,9 +4,10 @@ import cookieParser from 'cookie-parser';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
-  isMockMode, authMode, fetchAbandonedCheckouts, readStatusMap, writeStatusMap,
-} from './lib/shopify.js';
-import { mockCarts, readMockStatusMap, writeMockStatusMap } from './lib/mock.js';
+  isMockMode, ensureSchema, insertCart, listCarts, updateStatus, ping,
+} from './lib/db.js';
+import { mockInsertCart, mockListCarts, mockUpdateStatus } from './lib/mock.js';
+import { normalizePayload } from './lib/normalize.js';
 import { router as authRouter, requireAuth } from './lib/auth-routes.js';
 import { allowedPhones } from './lib/otp.js';
 import { driver } from './lib/whatsapp.js';
@@ -16,24 +17,24 @@ const PUBLIC = path.join(__dirname, 'public');
 const app = express();
 const MOCK = isMockMode();
 
-app.set('trust proxy', 1);   // so secure cookies work behind Render/Railway/nginx
-app.use(express.json({ limit: '1mb' }));
+app.set('trust proxy', 1);
+
+/**
+ * The webhook takes the body as raw text and parses it itself, so a malformed
+ * delivery is still stored rather than being rejected by the JSON parser before
+ * our handler runs. Everything else uses the normal JSON parser.
+ */
+app.use('/api/webhook', express.text({ type: '*/*', limit: '2mb' }));
+app.use(express.json({ limit: '2mb' }));
 app.use(cookieParser());
 
-// --- public assets: only the login page and its own JS/CSS -------------------
-app.get('/login', (_req, res) => res.sendFile(path.join(PUBLIC, 'login.html')));
-app.use('/login.js', express.static(path.join(PUBLIC, 'login.js')));
-app.use('/styles.css', express.static(path.join(PUBLIC, 'styles.css')));
-
-app.use('/auth', authRouter);
-
-// --- everything below requires a session ------------------------------------
-app.use(requireAuth);
-app.use(express.static(PUBLIC));
-
-const getCarts = () => (MOCK ? Promise.resolve(mockCarts) : fetchAbandonedCheckouts());
-const getStatus = () => (MOCK ? readMockStatusMap() : readStatusMap());
-const putStatus = (map) => (MOCK ? writeMockStatusMap(map) : writeStatusMap(map));
+// Malformed JSON on any non-webhook route: answer in JSON, not an HTML stack trace.
+app.use((err, req, res, next) => {
+  if (err instanceof SyntaxError && 'body' in err) {
+    return res.status(400).json({ ok: false, error: 'Malformed JSON body.' });
+  }
+  return next(err);
+});
 
 const VALID_STATUSES = new Set([
   'Not called',
@@ -43,7 +44,77 @@ const VALID_STATUSES = new Set([
   'Called – Declined',
 ]);
 
-function fail(res, err, code = 502) {
+const db = {
+  insert: (n, raw) => (MOCK ? mockInsertCart(n, raw) : insertCart(n, raw)),
+  list: () => (MOCK ? mockListCarts() : listCarts()),
+  update: (id, patch) => (MOCK ? mockUpdateStatus(id, patch) : updateStatus(id, patch)),
+};
+
+// =========================================================================
+// Webhook — PUBLIC by design. GoKwik cannot send a session cookie, so this
+// route sits above requireAuth and authenticates with a shared secret instead.
+// =========================================================================
+
+/** Constant-time compare so the secret isn't leaked by response timing. */
+function secretMatches(candidate, expected) {
+  if (!candidate || !expected || candidate.length !== expected.length) return false;
+  let diff = 0;
+  for (let i = 0; i < candidate.length; i += 1) diff |= candidate.charCodeAt(i) ^ expected.charCodeAt(i);
+  return diff === 0;
+}
+
+app.post('/api/webhook/gokwik/abandoned-cart', async (req, res) => {
+  const expected = process.env.WEBHOOK_SECRET;
+  if (!expected) {
+    console.error('WEBHOOK_SECRET is not set; rejecting webhook');
+    return res.status(500).json({ ok: false, error: 'server_not_configured' });
+  }
+
+  const provided = req.get('x-webhook-secret') || req.query.secret;
+  if (!secretMatches(typeof provided === 'string' ? provided : '', expected)) {
+    console.warn('Webhook rejected: bad or missing secret');
+    return res.status(401).json({ ok: false, error: 'unauthorized' });
+  }
+
+  // Body arrives as text; parse defensively so nothing is ever dropped.
+  let payload;
+  try {
+    payload = JSON.parse(req.body || '{}');
+    if (!payload || typeof payload !== 'object') payload = { _unparsed_body: req.body };
+  } catch {
+    console.warn('Webhook body was not valid JSON; storing it raw.');
+    payload = { _unparsed_body: String(req.body ?? '') };
+  }
+  const normalized = normalizePayload(payload);
+
+  try {
+    if (!MOCK) await ensureSchema();
+    const { id, duplicate } = await db.insert(normalized, payload);
+    console.log(`Cart ${duplicate ? 'updated' : 'received'}: ${normalized.cartId || '(no id)'} -> row ${id}`);
+    return res.status(200).json({ ok: true, id, duplicate });
+  } catch (err) {
+    // Log loudly but still 200: GoKwik retries on non-2xx, and a retry storm is
+    // worse than a log dive. The full payload is in the log to replay from.
+    console.error('Failed to store cart:', err.message, JSON.stringify(payload));
+    return res.status(200).json({ ok: true, stored: false });
+  }
+});
+
+// Lets you confirm the URL is live before handing it to GoKwik.
+app.get('/api/webhook/gokwik/abandoned-cart', (_req, res) =>
+  res.json({ ok: true, message: 'GoKwik abandoned-cart webhook receiver. POST here.' }));
+
+// --- public: login page and its assets --------------------------------------
+app.get('/login', (_req, res) => res.sendFile(path.join(PUBLIC, 'login.html')));
+app.use('/login.js', express.static(path.join(PUBLIC, 'login.js')));
+app.use('/styles.css', express.static(path.join(PUBLIC, 'styles.css')));
+app.use('/auth', authRouter);
+
+// --- everything below requires a session ------------------------------------
+app.use(requireAuth);
+app.use(express.static(PUBLIC));
+
+function fail(res, err, code = 500) {
   console.error(err);
   res.status(code).json({ ok: false, error: err.message || String(err) });
 }
@@ -52,63 +123,47 @@ app.get('/api/config', (_req, res) => res.json({ mock: MOCK, statuses: [...VALID
 
 app.get('/api/carts', async (_req, res) => {
   try {
-    res.json({ ok: true, mock: MOCK, carts: await getCarts() });
+    if (!MOCK) await ensureSchema();
+    res.json({ ok: true, mock: MOCK, carts: await db.list() });
   } catch (err) { fail(res, err); }
 });
 
-app.get('/api/status', async (_req, res) => {
-  try {
-    res.json({ ok: true, statusMap: await getStatus() });
-  } catch (err) { fail(res, err); }
-});
-
-/**
- * Accepts either a single patch `{ id, status, notes }` or a full `{ statusMap }`.
- * A patch does read-merge-write so one person's save doesn't clobber rows they
- * never touched. Still last-write-wins per row — see README.
- */
 app.post('/api/status', async (req, res) => {
   try {
-    const { id, status, notes, statusMap } = req.body ?? {};
-
-    if (statusMap && typeof statusMap === 'object') {
-      return res.json({ ok: true, statusMap: await putStatus(statusMap) });
-    }
-    if (!id || typeof id !== 'string') {
-      return res.status(400).json({ ok: false, error: 'Provide either {id, status, notes} or {statusMap}.' });
+    const { id, status, notes } = req.body ?? {};
+    if (id === undefined || id === null) {
+      return res.status(400).json({ ok: false, error: 'Missing cart id.' });
     }
     if (status !== undefined && !VALID_STATUSES.has(status)) {
       return res.status(400).json({ ok: false, error: `Unknown status: ${status}` });
     }
-
-    const current = await getStatus();
-    const existing = current[id] ?? {};
-    current[id] = {
-      status: status ?? existing.status ?? 'Not called',
-      notes: notes ?? existing.notes ?? '',
-      updatedAt: new Date().toISOString(),
-    };
-    const saved = await putStatus(current);
-    return res.json({ ok: true, statusMap: saved, entry: saved[id] });
-  } catch (err) {
-    return fail(res, err);
-  }
+    const row = await db.update(id, { status, notes });
+    if (!row) return res.status(404).json({ ok: false, error: 'No such cart.' });
+    return res.json({ ok: true, entry: row });
+  } catch (err) { return fail(res, err); }
 });
 
 const port = process.env.PORT || 3000;
-app.listen(port, () => {
+app.listen(port, async () => {
   console.log(`Recovery Board on http://localhost:${port}`);
-  console.log(MOCK
-    ? 'Shopify: MOCK MODE — no token set, serving sample data.'
-    : `Shopify: live (${process.env.SHOPIFY_STORE_DOMAIN}, API ${process.env.SHOPIFY_API_VERSION || '2026-07'}) via ${authMode()}`);
-  console.log(`OTP delivery: ${driver() === 'console' ? 'CONSOLE (codes printed here, no WhatsApp sent)' : '11za WhatsApp'}`);
+  console.log(`Storage: ${MOCK ? 'MOCK (in-memory, resets on restart)' : 'Postgres'}`);
+  console.log(`OTP delivery: ${driver() === 'console' ? 'CONSOLE (codes printed here)' : '11za WhatsApp'}`);
 
+  if (!MOCK) {
+    try {
+      await ensureSchema();
+      const info = await ping();
+      console.log(`Postgres connected: ${String(info.version).split(',')[0]}`);
+    } catch (err) {
+      console.error(`\n  Postgres connection FAILED: ${err.message}\n  Check DATABASE_URL.\n`);
+    }
+  }
+  if (!process.env.WEBHOOK_SECRET) {
+    console.warn('\n  WARNING: WEBHOOK_SECRET is unset — the webhook will reject every delivery.\n');
+  }
   const allowed = allowedPhones();
   if (allowed.size === 0) {
-    console.warn(
-      '\n  WARNING: ALLOWED_PHONES is empty, so nobody can log in.\n' +
-      '  Add your team\'s numbers, comma-separated, e.g. ALLOWED_PHONES=9812345678,9820011223\n',
-    );
+    console.warn('\n  WARNING: ALLOWED_PHONES is empty, so nobody can log in.\n');
   } else {
     console.log(`Allowed logins: ${allowed.size} number(s)`);
   }
