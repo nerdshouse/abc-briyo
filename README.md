@@ -197,14 +197,28 @@ be backfilled from `raw_payload` afterwards.
 
 ## Database
 
-Create a free project at [neon.tech](https://neon.tech), copy the connection string, and set
-it as `DATABASE_URL`:
+Create a free project at [neon.tech](https://neon.tech), copy the **pooled** connection string
+(the host contains `-pooler`), and set it as `DATABASE_URL`:
 
 ```
 DATABASE_URL=postgresql://user:pass@ep-xxx.ap-southeast-1.aws.neon.tech/neondb?sslmode=require
 ```
 
-The `abandoned_carts` table is created automatically on first use — there's no migration step.
+Use the pooled string because Cloud Run may run several instances, each with its own
+connection pool; Neon's pooler keeps that within the connection limit.
+
+Two tables are created automatically on first use — `abandoned_carts` and `otp_state`. There's
+no migration step.
+
+**Verify the wiring in one command** once `DATABASE_URL` is set:
+
+```bash
+npm run db:check
+```
+
+It exercises every database path against the real database — insert, dedupe-on-retry,
+status update, retry-preserves-status, and the full OTP create/verify/replay/cooldown cycle —
+then deletes its own test rows. Run this before pointing GoKwik at the URL.
 With `DATABASE_URL` unset the app runs in **mock mode** on in-memory sample data, so the UI,
 login and webhook are all testable before Neon exists.
 ---
@@ -249,59 +263,77 @@ time out, the second succeeds).
 
 ---
 
-## Deploying
+## Deploying to Firebase App Hosting
 
-Any host that runs a long-lived Node process and holds env vars works. This app deliberately
-does **not** fit serverless-with-no-disk platforms any worse or better than a VM — it keeps no
-local state at all, so pick whatever's cheapest.
+Target domain: **`abc.briyo.xyz`**. Firebase project: **`abc-briyo`**.
 
-Target domain: **`abc.briyo.xyz`**.
+App Hosting builds this repo with Cloud Buildpacks and runs it on **Cloud Run** — so the
+Express server runs as-is, `npm start` is the entrypoint, and `PORT` is injected. Config lives
+in [`apphosting.yaml`](apphosting.yaml).
 
-**Render / Railway**
+> **Requires the Blaze (pay-as-you-go) plan.** App Hosting won't provision on Spark. For an
+> internal tool at this scale the cost is negligible, but it does need a billing account.
 
-1. Push this repo to GitHub.
-2. New → **Web Service** → connect the repo.
-3. Build command `npm install`, start command `npm start`.
-4. Add the environment variables: `DATABASE_URL`, `WEBHOOK_SECRET`, `ALLOWED_PHONES`,
-   `SESSION_SECRET`, `COOKIE_SECURE=true`, `ELEVENZA_AUTH_TOKEN`, `ELEVENZA_TEMPLATE_NAME`,
-   `ELEVENZA_ORIGIN_WEBSITE`. The platform supplies `PORT` itself.
-5. Add the custom domain `abc.briyo.xyz` in the platform's domain settings, then create the
-   `CNAME` record it gives you at your DNS provider. Both Render and Railway issue the TLS
-   certificate automatically once DNS resolves.
-6. Deploy. Every push to `main` redeploys.
+### 1. Create the secrets
 
-Set **`COOKIE_SECURE=true`** for this domain — it's served over HTTPS, and without that flag
-the session cookie is sent unprotected. `trust proxy` is already enabled, so the app sees the
-real protocol behind the platform's load balancer.
-
-**A small VM**
+Secrets go to Cloud Secret Manager, never into `apphosting.yaml` or the repo:
 
 ```bash
-git clone <your-repo> && cd cart-recovery-board
-npm install --omit=dev
-# put the env vars in /etc/environment, a systemd unit, or a .env file
-npm start
+npm install -g firebase-tools
+firebase login
+firebase use abc-briyo
+
+firebase apphosting:secrets:set DATABASE_URL
+firebase apphosting:secrets:set WEBHOOK_SECRET
+firebase apphosting:secrets:set SESSION_SECRET
+firebase apphosting:secrets:set ELEVENZA_AUTH_TOKEN
+firebase apphosting:secrets:set ALLOWED_PHONES
 ```
 
-Run it under systemd or pm2 so it restarts on reboot, and put nginx/Caddy in front for TLS.
+Each prompts for the value and offers to grant the backend access — say yes.
 
-### Before you expose it publicly
+### 2. Create the backend
 
-The board is behind OTP login, so it's safe to put on a public hostname — but two settings
-matter:
+Firebase console → **App Hosting** → **Get started** → connect the GitHub repo
+(`nerdshouse/abc-briyo`) → live branch `main` → region (pick `asia-south1` for Mumbai).
 
-- **Serve it over HTTPS and set `COOKIE_SECURE=true`.** Without TLS the session cookie
-  travels in the clear. Render and Railway terminate TLS for you; on a VM use Caddy or nginx.
-- **Set a real `SESSION_SECRET`.** Without one the server generates a random secret per
-  process, which logs everyone out on each restart and breaks entirely across multiple instances.
+Every push to `main` then builds and deploys automatically.
 
-**Run a single instance.** OTP codes and rate-limit counters are held in memory, so with two
-or more instances behind a load balancer a code issued by one is unverifiable on another.
-Sessions themselves are stateless signed cookies and would scale fine — it's only the
-short-lived OTP state that pins this to one process. If you ever need to scale out, move the
-`pending` and `requestLog` maps in `lib/otp.js` to Redis; nothing else changes.
+### 3. Custom domain
 
----
+App Hosting → your backend → **Add custom domain** → `abc.briyo.xyz`, then create the DNS
+records Firebase shows you. TLS is provisioned automatically once DNS resolves.
+
+### 4. Give GoKwik the webhook URL
+
+```
+https://abc.briyo.xyz/api/webhook/gokwik/abandoned-cart?secret=<WEBHOOK_SECRET>
+```
+
+### Why the OTP state is in Postgres
+
+Cloud Run runs **several instances** and **scales to zero**. If OTP codes and rate-limit
+counters lived in memory:
+
+- a code issued by instance A would be unverifiable on instance B, so logins would fail
+  intermittently and unpredictably;
+- scaling to zero between "send code" and "enter code" would drop the pending code entirely.
+
+So `otp_state` is a Postgres table. Sessions don't need it — they're stateless signed cookies,
+valid on any instance. This is the one thing that *must not* be reverted to memory while the
+app runs on Cloud Run.
+
+`maxInstances` is capped at 2 in `apphosting.yaml`; that's about cost and Postgres connections,
+not correctness — the app is safe at any instance count.
+
+### Cold starts
+
+With `minInstances: 0` the first request after an idle period waits for a container start plus
+a Neon wake-up, which can take a few seconds and occasionally time out; a retry succeeds. If
+that becomes annoying, set `minInstances: 1` — it costs a little but keeps one warm.
+
+**GoKwik deliveries are unaffected either way**: the webhook returns `200` even if the database
+write fails, and logs the payload, so a cold start never triggers a retry storm.
 
 ## What this app does not do
 

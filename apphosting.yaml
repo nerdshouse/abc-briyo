@@ -1,0 +1,68 @@
+# Firebase App Hosting configuration.
+# App Hosting builds this repo with Cloud Buildpacks and runs it on Cloud Run.
+# `npm start` is the entrypoint; the server already reads process.env.PORT.
+
+runConfig:
+  # Keep the fleet small: this is an internal tool for a handful of people.
+  minInstances: 0
+  maxInstances: 2
+  concurrency: 80
+  cpu: 1
+  memoryMiB: 512
+
+env:
+  # Non-secret values can live here in plain text.
+  - variable: NODE_ENV
+    value: production
+    availability:
+      - RUNTIME
+
+  # Cloud Run terminates TLS, so cookies must be marked Secure.
+  - variable: COOKIE_SECURE
+    value: "true"
+    availability:
+      - RUNTIME
+
+  - variable: ELEVENZA_TEMPLATE_NAME
+    value: login_otp
+    availability:
+      - RUNTIME
+
+  - variable: ELEVENZA_ORIGIN_WEBSITE
+    value: https://www.briyosupplements.com//
+    availability:
+      - RUNTIME
+
+  - variable: ELEVENZA_API_URL
+    value: https://api.11za.in/apis/template/sendTemplate
+    availability:
+      - RUNTIME
+
+  # Secrets live in Cloud Secret Manager, never in this file.
+  # Create each one first:  firebase apphosting:secrets:set <NAME>
+  - variable: DATABASE_URL
+    secret: DATABASE_URL
+    availability:
+      - RUNTIME
+
+  - variable: WEBHOOK_SECRET
+    secret: WEBHOOK_SECRET
+    availability:
+      - RUNTIME
+
+  - variable: SESSION_SECRET
+    secret: SESSION_SECRET
+    availability:
+      - RUNTIME
+
+  - variable: ELEVENZA_AUTH_TOKEN
+    secret: ELEVENZA_AUTH_TOKEN
+    availability:
+      - RUNTIME
+
+  # Team phone allowlist. Not strictly secret, but it's staff PII — keep it out
+  # of the repo, which is public.
+  - variable: ALLOWED_PHONES
+    secret: ALLOWED_PHONES
+    availability:
+      - RUNTIME
