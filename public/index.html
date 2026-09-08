@@ -49,7 +49,9 @@
         <option value="value">Cart value: high → low</option>
         <option value="recent">Most recent first</option>
         <option value="risk">Risk: high → low</option>
+        <option value="callback">Callback due soonest</option>
       </select>
+      <button type="button" id="overdueOnly" class="toggle">Overdue callbacks</button>
     </div>
 
     <div class="panel">
@@ -70,6 +72,28 @@
         </tbody>
       </table>
     </div>
+
+    <section class="insights">
+      <div class="panel insight">
+        <header>
+          <h2>Why they abandoned</h2>
+          <span class="muted" id="reasonMeta"></span>
+        </header>
+        <div id="reasonList"><p class="muted">Loading…</p></div>
+      </div>
+      <div class="panel insight">
+        <header><h2>By caller</h2></header>
+        <table class="mini">
+          <thead>
+            <tr>
+              <th>Caller</th><th class="right">Touched</th><th class="right">Recovered</th>
+              <th class="right">Rate</th><th class="right">Value</th>
+            </tr>
+          </thead>
+          <tbody id="callerRows"><tr><td colspan="5" class="empty">Loading…</td></tr></tbody>
+        </table>
+      </div>
+    </section>
 
     <p class="note">
       Carts are received from GoKwik's webhook and stored with their full original payload,

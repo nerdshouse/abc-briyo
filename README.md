@@ -39,7 +39,12 @@ when the server restarts.
 | Variable | Required | Notes |
 | --- | --- | --- |
 | `DATABASE_URL` | yes (live) | Neon Postgres connection string. Unset ⇒ mock mode |
-| `WEBHOOK_SECRET` | **yes** | Shared secret GoKwik must send. `openssl rand -hex 32` |
+| `WEBHOOK_SECRET` | **yes** | Shared secret GoKwik must send (both webhooks). `openssl rand -hex 32` |
+| `SLA_STALE_HOURS` | no | "Not called" for longer than this counts as stale. Default `6` |
+| `OPS_PHONE` | no | WhatsApp number for the stale-cart digest. Blank disables it |
+| `ELEVENZA_OPS_TEMPLATE_NAME` | no | Approved template for the digest. Unset ⇒ logged, not sent |
+| `SLA_ALERT_MINUTES` / `SLA_ALERT_THRESHOLD` | no | Digest cadence and trigger. Default `60` / `1` |
+| `KEEPALIVE_MINUTES` / `KEEPALIVE_ENABLED` | no | Self-ping cadence. Default `10` / on |
 | `PORT` | no | Defaults to `3000` |
 | `ALLOWED_PHONES` | **yes** | Comma-separated numbers permitted to sign in. **Empty means nobody can log in.** |
 | `SESSION_SECRET` | **yes** | Signs session cookies and hashes OTPs. `openssl rand -hex 32` |
@@ -251,6 +256,82 @@ SELECT id, received_at, raw_payload FROM abandoned_carts ORDER BY received_at DE
 Add the real key names to the relevant array in `lib/normalize.js` and redeploy. Old rows can
 be backfilled from `raw_payload` afterwards.
 
+## Working a call list
+
+### Callbacks
+
+Setting a row to **Callback scheduled** reveals a date+time picker inline. Once set, the row
+shows a badge: **Overdue** (red) when the time has passed, **Due today** (amber) otherwise, or
+the scheduled time in grey. Sort by **Callback due soonest** and use the **Overdue callbacks**
+toggle to work just those.
+
+Moving a row to any other status clears its callback, so a stale reminder can't keep showing
+as overdue after the cart is closed.
+
+### Reason tags
+
+Alongside the free-text notes, each row takes tags from a fixed vocabulary — Price objection,
+Shipping time, Out of stock, Already purchased elsewhere, Not interested, Changed mind,
+Product doubt/question, Other. They're stored in a `reason_tags TEXT[]` column and aggregated
+in the **Why they abandoned** panel, which is the feedback loop for product and marketing.
+
+The list is fixed deliberately: free text can't be counted. Anything that doesn't fit goes in
+the notes field next to it.
+
+### Who did what
+
+Every status or note change records the signed-in user's name automatically from their
+session — nobody picks it from a dropdown. Rows read *"Last updated by Priya, 2h ago"*, and
+the **By caller** panel shows carts touched, recovered, recovery rate and recovered value per
+teammate over the selected range.
+
+### SLA alerting
+
+Carts still at **Not called** after `SLA_STALE_HOURS` (default 6) are counted on every
+dashboard load and shown as a red **Stale — never called** card.
+
+An hourly job sends one WhatsApp digest to `OPS_PHONE` when the count crosses
+`SLA_ALERT_THRESHOLD` — one message per run, never one per cart, and only when the backlog has
+**grown** since the last alert, so an uncleared backlog doesn't re-alert every hour.
+
+> **This needs its own 11za template.** Their API sends approved templates, not free text, so
+> the digest requires `ELEVENZA_OPS_TEMPLATE_NAME` pointing at a template with a single body
+> variable. Reusing `login_otp` would deliver "Your OTP is *4 carts have been sitting…*".
+> **Without that variable set, the digest is written to the server log instead of being sent** —
+> the feature degrades rather than misfires. Set `OPS_PHONE` blank to disable it entirely.
+
+## Order-completed webhook (auto-recovery)
+
+**Status: built, but not yet receiving anything.** GoKwik has to be asked to send this event —
+same situation as the missing cart link on the abandoned-cart webhook.
+
+```
+POST https://abc.briyo.xyz/api/webhook/gokwik/order-completed?secret=<WEBHOOK_SECRET>
+```
+
+Same shared secret as the abandoned-cart webhook, so nothing new to configure on our side.
+
+**What to ask GoKwik for:** whichever event they fire on a successful order / confirmed
+payment — the counterpart to the abandoned-cart event you already have. The exact event name
+and payload shape are unconfirmed, so field extraction is best-effort across plausible key
+names and the full body is stored in `raw_payload` regardless. A payload missing a phone,
+email or order id logs a **warning**, not an error, and still returns `200`.
+
+On arrival it matches open carts by the **last 10 digits of the phone** or by **email**, and:
+
+- upgrades **Not called**, **No answer**, **Callback scheduled** → **Called – Recovered**
+- **never touches a manually-set Declined or Recovered cart** — a human's judgement wins
+- records `updated_by = "Auto (GoKwik order match)"`, the order id/name and a timestamp
+- writes an audit row to `auto_recovery_log` so a false match can be traced and reversed
+
+To review or reverse auto-matches:
+
+```sql
+SELECT l.matched_at, l.order_name, l.matched_on, c.cart_id, c.customer_name, c.phone
+FROM auto_recovery_log l JOIN abandoned_carts c ON c.id = l.cart_row_id
+ORDER BY l.matched_at DESC;
+```
+
 ## Database
 
 Create a free project at [neon.tech](https://neon.tech), copy the **pooled** connection string
@@ -288,7 +369,10 @@ login and webhook are all testable before Neon exists.
 | `GET /healthz` | none | Uptime-pinger target; touches no database |
 | `GET /api/carts` | session | Stored carts, newest first |
 | `POST /api/status` | session | `{id, status, notes}` — updates one row |
-| `GET /api/config` | session | Mock-mode flag and the status list |
+| `GET /api/config` | session | Mock-mode flag, status list, reason tags, SLA hours |
+| `POST /api/webhook/gokwik/order-completed` | shared secret | Auto-marks matching carts Recovered — **not yet enabled by GoKwik** |
+| `GET /api/reasons/summary?days=` | session | Reason-tag counts over the window |
+| `GET /api/stats/by-caller?days=` | session | Per-teammate activity |
 | `POST /auth/request-otp` | Sends a code to an allowlisted number |
 | `POST /auth/verify-otp` | Exchanges a valid code for a session cookie |
 | `POST /auth/logout` | Clears the session |
@@ -410,6 +494,30 @@ in-memory storage.
 
 - It never calls GoKwik's or Shopify's API. It only receives, and touches nothing on the
   storefront — including the existing GoKwik / Meta pixel setup.
-- It doesn't send WhatsApp messages to customers or place calls; the outreach links just open
-  your own apps. The only message it sends is the login OTP, to your own team's numbers.
+- It doesn't message customers. The outreach links open your own apps; the only automated
+  messages are the login OTP and the ops digest, both to your own team's numbers.
 - It doesn't poll or push. New carts appear on the next **Refresh**.
+
+## Status
+
+**Working end to end in production:** GoKwik abandoned-cart ingestion, dedupe-on-retry,
+WhatsApp OTP login, allowlist, the call board, callbacks, reason tags, caller attribution,
+stale-cart card, custom domain with TLS, self keep-alive.
+
+**Built but waiting on GoKwik:**
+
+| | |
+| --- | --- |
+| Order-completed webhook | Endpoint is live at `/api/webhook/gokwik/order-completed`. GoKwik must be asked to send their order-success event to it. Until then, "Recovered" stays a manual status. |
+| Cart recovery link | Their webhook payload has **no abandoned-cart URL** (their report CSV does). The WhatsApp recovery message therefore has no cart link. If they add it under any reasonable key name, the parser picks it up with no code change. |
+| `Drop Stage` / `Risk Flag` | Present in their report CSV, absent from the webhook. Columns and UI are ready if they can send them. |
+
+**Needs one setup step before it works:**
+
+| | |
+| --- | --- |
+| Stale-cart WhatsApp digest | Needs an approved 11za template (`ELEVENZA_OPS_TEMPLATE_NAME`) and `OPS_PHONE`. Until then the digest is logged, not sent. The on-screen stale card works regardless. |
+
+**Deliberately not built:** the automated first-touch customer nudge. See the note in the
+project history — it needs an approved marketing template, an opt-out path, and a decision
+about DND/consent before it should send anything to a customer.
