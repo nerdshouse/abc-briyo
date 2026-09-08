@@ -117,7 +117,14 @@ function clearError() {
   errorEl.hidden = true;
 }
 
-async function loadAll() {
+/**
+ * The free Render instance sleeps after 15 minutes and takes up to a minute to
+ * wake, so the first request after a quiet spell can fail outright at the
+ * network level ("Failed to fetch"). Retry a couple of times before giving up,
+ * and say what's happening rather than showing a bare error.
+ */
+async function loadAll(attempt = 1) {
+  const MAX_ATTEMPTS = 3;
   try {
     const [cfgRes, cartsRes] = await Promise.all([fetch('/api/config'), fetch('/api/carts')]);
     if ([cfgRes, cartsRes].some((r) => r.status === 401)) {
@@ -144,7 +151,18 @@ async function loadAll() {
     clearError();
     render();
   } catch (err) {
-    showError(`Could not load the board: ${err.message}`);
+    // A TypeError from fetch means the request never completed — server asleep,
+    // restarting, or the network dropped. An HTTP error would not land here.
+    const networkLevel = err instanceof TypeError;
+    if (networkLevel && attempt < MAX_ATTEMPTS) {
+      showError(`Server isn't responding — it may be waking up. Retrying (${attempt}/${MAX_ATTEMPTS - 1})…`);
+      rowsEl.innerHTML = '<tr><td colspan="7" class="empty">Waking the server…</td></tr>';
+      await new Promise((r) => setTimeout(r, attempt * 4000));
+      return loadAll(attempt + 1);
+    }
+    showError(networkLevel
+      ? "Couldn't reach the server after several tries — it may still be starting up. Press Refresh in a moment."
+      : `Could not load the board: ${err.message}`);
     rowsEl.innerHTML = '<tr><td colspan="7" class="empty">Failed to load.</td></tr>';
   }
 }
