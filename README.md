@@ -204,7 +204,7 @@ Create a free project at [neon.tech](https://neon.tech), copy the **pooled** con
 DATABASE_URL=postgresql://user:pass@ep-xxx.ap-southeast-1.aws.neon.tech/neondb?sslmode=require
 ```
 
-Use the pooled string because Cloud Run may run several instances, each with its own
+Use the pooled string because Render may run more than one instance, each with its own
 connection pool; Neon's pooler keeps that within the connection limit.
 
 Two tables are created automatically on first use — `abandoned_carts` and `otp_state`. There's
@@ -268,13 +268,8 @@ time out, the second succeeds).
 
 Target domain: **`abc.briyo.xyz`**.
 
-Two options. **Render's free tier needs no credit card** and is the default here;
-Firebase App Hosting is documented after it but requires the Blaze plan.
-
-### Option A — Render free tier (no card required)
-
-Free web services get custom domains and managed TLS, and deploy from GitHub on every push.
-Config is in [`render.yaml`](render.yaml).
+Hosted on **Render's free tier** — no credit card, custom domain, managed TLS, and a deploy on
+every push to `main`. Config is in [`render.yaml`](render.yaml).
 
 1. **Neon** — create the database first and copy the **pooled** connection string.
 2. Render dashboard → **New** → **Blueprint** → connect `nerdshouse/abc-briyo`. It reads
@@ -284,7 +279,7 @@ Config is in [`render.yaml`](render.yaml).
    you. TLS is issued automatically.
 4. Run `npm run db:check` locally against the same `DATABASE_URL` before going live.
 
-#### The one real catch: sleeping
+### The one real catch: sleeping
 
 **A free service sleeps after 15 minutes without traffic and takes about a minute to wake.**
 For a webhook receiver that matters: if GoKwik posts a cart while the service is asleep, the
@@ -306,37 +301,15 @@ Two things make this survivable, and one fixes it:
 
   `/healthz` is public, touches no database, and returns only `{ok, ts}`.
 
-#### Watch the instance-hour budget
+### Watch the instance-hour budget
 
 A free workspace gets **750 instance-hours per month across all free services**. Keeping one
 service awake 24/7 uses about **730**, which fits — but only just, and only for *one* service.
 A second free service in the same workspace will exhaust the quota and Render suspends
 **everything** until the next month. Keep this workspace to this one service.
 
-If the sleeping is intolerable and 730 hours is too tight, Render's cheapest paid instance
+If the sleeping is intolerable or 730 hours is too tight, Render's cheapest paid instance
 removes both limits.
-
-### Option B — Firebase App Hosting (needs the Blaze plan)
-
-Config is in [`apphosting.yaml`](apphosting.yaml). App Hosting builds with Cloud Buildpacks and
-runs on **Cloud Run**, so the Express server runs as-is with no sleeping and no instance-hour
-cap.
-
-> **Requires the Blaze (pay-as-you-go) plan** — a billing account with a card. Cloud Run's
-> perpetual free tier means an internal tool at this volume typically costs about nothing, so
-> if the objection is a monthly bill rather than adding a card, this is the better option.
-
-```bash
-firebase use abc-briyo
-firebase apphosting:secrets:set DATABASE_URL
-firebase apphosting:secrets:set WEBHOOK_SECRET
-firebase apphosting:secrets:set SESSION_SECRET
-firebase apphosting:secrets:set ELEVENZA_AUTH_TOKEN
-firebase apphosting:secrets:set ALLOWED_PHONES
-```
-
-Then console → **App Hosting** → connect the GitHub repo, live branch `main`, region
-`asia-south1`, and add `abc.briyo.xyz` as a custom domain.
 
 ### Give GoKwik the webhook URL
 
@@ -354,12 +327,13 @@ curl https://abc.briyo.xyz/api/webhook/gokwik/abandoned-cart
 
 ### Why the OTP state is in Postgres
 
-Both hosts restart or replace instances freely, and Cloud Run runs several at once. If OTP
-codes and rate-limit counters lived in memory:
+Render restarts and sleeps instances freely, and may run more than one. If OTP codes and
+rate-limit counters lived in memory:
 
 - a code issued by one instance would be unverifiable on another;
-- a restart or a scale-to-zero between "send code" and "enter code" would drop the pending
-  code entirely.
+- a restart or a spin-down between "send code" and "enter code" would drop the pending code
+  entirely — and free services spin down after 15 minutes, which is shorter than some people
+  take to find their phone.
 
 So `otp_state` is a Postgres table. Sessions don't need it — they're stateless signed cookies,
 valid on any instance and across restarts. This is the one thing that must not be reverted to
