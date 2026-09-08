@@ -4,7 +4,7 @@ import cookieParser from 'cookie-parser';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
-  isMockMode, fetchAbandonedCheckouts, readStatusMap, writeStatusMap,
+  isMockMode, authMode, fetchAbandonedCheckouts, readStatusMap, writeStatusMap,
 } from './lib/shopify.js';
 import { mockCarts, readMockStatusMap, writeMockStatusMap } from './lib/mock.js';
 import { router as authRouter, requireAuth } from './lib/auth-routes.js';
@@ -100,7 +100,7 @@ app.listen(port, () => {
   console.log(`Recovery Board on http://localhost:${port}`);
   console.log(MOCK
     ? 'Shopify: MOCK MODE — no token set, serving sample data.'
-    : `Shopify: live (${process.env.SHOPIFY_STORE_DOMAIN}, API ${process.env.SHOPIFY_API_VERSION || '2026-07'})`);
+    : `Shopify: live (${process.env.SHOPIFY_STORE_DOMAIN}, API ${process.env.SHOPIFY_API_VERSION || '2026-07'}) via ${authMode()}`);
   console.log(`OTP delivery: ${driver() === 'console' ? 'CONSOLE (codes printed here, no WhatsApp sent)' : '11za WhatsApp'}`);
 
   const allowed = allowedPhones();

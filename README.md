@@ -39,7 +39,9 @@ Status changes in mock mode reset when the server restarts.
 | Variable | Required | Notes |
 | --- | --- | --- |
 | `SHOPIFY_STORE_DOMAIN` | yes (live) | `briyo-supplements.myshopify.com` — no `https://`, no trailing slash |
-| `SHOPIFY_ACCESS_TOKEN` | yes (live) | Admin API access token from the custom app, starts with `shpat_` |
+| `SHOPIFY_CLIENT_ID` | yes (live) | Dev Dashboard app client ID — the current method |
+| `SHOPIFY_CLIENT_SECRET` | yes (live) | Dev Dashboard app client secret |
+| `SHOPIFY_ACCESS_TOKEN` | alternative | Permanent `shpat_` token, only from a pre-2026 legacy custom app. Takes precedence if set. |
 | `SHOPIFY_API_VERSION` | no | Defaults to `2026-07`. Shopify supports each version ~12 months — bump this yearly. |
 | `PORT` | no | Defaults to `3000` |
 | `ALLOWED_PHONES` | **yes** | Comma-separated numbers permitted to sign in. **Empty means nobody can log in.** |
@@ -133,19 +135,27 @@ an existing session dies when it expires (`SESSION_TTL_HOURS`, default 12h).
 
 ## Shopify setup
 
-### 1. Create the custom app
+### 1. Create the app
 
-**Create it inside your store admin, not the Partner Dashboard.** A Partner-Dashboard app
-(dev.shopify.com) authenticates over OAuth and never shows you a static token — it expects an
-install callback this app doesn't have. The store-admin route below issues a `shpat_` token
-directly, which is what this server uses.
+**Legacy custom apps can no longer be created.** Since 1 January 2026 the store admin's
+"Develop apps" page won't make new ones, so there is no permanent `shpat_` token to copy.
+Apps are now created in the **Dev Dashboard** and authenticate with a *client credentials
+grant*: the server swaps a client ID and secret for a token that lasts 24 hours and refreshes
+it automatically. That's handled for you in `lib/shopify.js` — you only supply the two values.
 
-Direct link: `https://admin.shopify.com/store/<your-handle>/settings/apps/development`
+1. Go to **[dev.shopify.com](https://dev.shopify.com)** → your organization → **Apps** →
+   **Create app**.
+2. **App settings** → copy the **Client ID** and **Client secret** into `.env` as
+   `SHOPIFY_CLIENT_ID` / `SHOPIFY_CLIENT_SECRET`.
+3. Set the app's **scopes** (next section), then **install it on the store**.
 
-1. Shopify admin → **Settings** → **Apps and sales channels** → **Develop apps**.
-2. **Allow custom app development** (one-time, needs store-owner permission) → **Create an app**.
-   Name it e.g. `Cart Recovery Board`.
-3. **Configuration** → **Admin API integration** → **Configure**.
+> The client credentials grant only works when **the app and the store are in the same
+> Shopify organization**. Both must appear under the same org in the Dev Dashboard, otherwise
+> the token request fails with a permissions error.
+
+If you already have a **legacy custom app from before 2026**, it keeps working: set
+`SHOPIFY_ACCESS_TOKEN` to its permanent token instead and skip the client credentials entirely.
+The server prefers that variable when it's present.
 
 ### 2. Scopes
 
@@ -165,16 +175,15 @@ Two caveats worth knowing before you hit a wall:
   with the scopes above. **If it doesn't**, the board surfaces the exact `userErrors` from
   Shopify in the red banner and the server log; see "If saving fails" below.
 
-Save the configuration, then **Install app**, then **API credentials** → reveal and copy the
-**Admin API access token**. It's shown once. Put it in `.env` as `SHOPIFY_ACCESS_TOKEN`.
-
 ### 3. Verify
 
 ```bash
 npm start
 ```
 
-The log should print `Live: your-store.myshopify.com (API 2026-07)` rather than `MOCK MODE`.
+The log should print `Shopify: live (…) via client credentials (Dev Dashboard app)` rather
+than `MOCK MODE`, followed by `Shopify token acquired, valid ~24h` and the scopes Shopify
+actually granted — check `read_orders` is among them.
 Load the page — if the token or scopes are wrong you'll get a red banner naming the problem.
 
 ---
