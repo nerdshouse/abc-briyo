@@ -46,11 +46,13 @@ Status changes in mock mode reset when the server restarts.
 | `SESSION_SECRET` | **yes** | Signs session cookies and hashes OTPs. `openssl rand -hex 32` |
 | `SESSION_TTL_HOURS` | no | How long a login lasts. Defaults to `12` |
 | `COOKIE_SECURE` | no | Set `true` when served over HTTPS |
-| `ELEVENZA_AUTH_TOKEN` | for live OTP | 11za API key. Blank ⇒ console mode |
-| `ELEVENZA_TEMPLATE_NAME` | for live OTP | Your approved login-OTP template name |
+| `ELEVENZA_AUTH_TOKEN` | for live OTP | 11za auth token. Blank ⇒ console mode |
+| `ELEVENZA_TEMPLATE_NAME` | for live OTP | Approved template name — `login_otp` |
+| `ELEVENZA_ORIGIN_WEBSITE` | for live OTP | Origin website registered on your 11za account |
+| `ELEVENZA_LANGUAGE` | no | Template language. Defaults to `en` |
 | `ELEVENZA_API_URL` | no | Defaults to `https://api.11za.in/apis/template/sendTemplate` |
-| `ELEVENZA_AUTH_HEADER` | no | Header carrying the key. Defaults to `authToken` |
-| `ELEVENZA_PAYLOAD_TEMPLATE` | no | JSON body; `{{phone}}`, `{{otp}}`, `{{template}}` are substituted |
+| `ELEVENZA_AUTH_HEADER` | no | Only if 11za also wants a header; the token goes in the body |
+| `ELEVENZA_PAYLOAD_TEMPLATE` | no | Full body override; see placeholders in `.env.example` |
 
 ---
 
@@ -84,37 +86,47 @@ account, which is how it was developed.
 
 ### Wiring up 11za
 
-The 11za API reference isn't public, so the request is built entirely from env vars — you can
-match their spec without editing code. The default body uses the field names from 11za's
-published Pabbly template endpoint:
+`POST https://api.11za.in/apis/template/sendTemplate` with this body — note the auth token
+goes in the **body**, not a header:
 
 ```json
-{ "TemplateName": "…", "PhoneNumber": "91…", "Language": "en", "BodyDynamicData": "123456" }
+{
+  "authToken": "…",
+  "name": "Asha",
+  "sendto": "919812345678",
+  "originWebsite": "https://www.briyosupplements.com//",
+  "templateName": "login_otp",
+  "language": "en",
+  "data": "482913"
+}
 ```
 
-**Confirm this against your account before relying on it.** Send one real message and read the
-raw response:
+`data` carries the OTP; `name` comes from `ALLOWED_PHONES` (see below). Everything is driven
+by env vars, so you can adjust any field without editing code.
+
+Send one real message and read 11za's raw reply (the token is redacted in the output):
 
 ```bash
 npm run otp:probe -- 9812345678
 ```
 
-It prints the exact URL, body and 11za's reply. If the field names are wrong, fix
-`ELEVENZA_PAYLOAD_TEMPLATE` in `.env` and re-run — no code change needed.
+If your template has more than one body variable, or is an **authentication-category**
+template with a *copy code* button (those often need the OTP repeated as a button parameter),
+override the whole body with `ELEVENZA_PAYLOAD_TEMPLATE` — the placeholders are listed in
+`.env.example`.
 
-Two things to check in your template:
-
-- The OTP must land in the **body variable** the template expects. If your template has more
-  than one variable, `BodyDynamicData` may need to be a comma-separated list or an array —
-  the probe output will tell you.
-- WhatsApp **authentication-category** templates usually carry a *copy code* button, which
-  often needs the OTP passed a second time as a button parameter (e.g. `ButtonValue`). Add it
-  to `ELEVENZA_PAYLOAD_TEMPLATE` if the message arrives with an empty button.
+**Check `ELEVENZA_ORIGIN_WEBSITE` character for character.** It's set to
+`https://www.briyosupplements.com//` — with the trailing double slash, exactly as supplied.
+That looks like a typo, but 11za may match it literally against what's registered on your
+account, so it was left as given rather than "corrected". If sends fail with an origin or
+domain error, try it with a single trailing slash and with none.
 
 ### Adding or removing people
 
-Edit `ALLOWED_PHONES` and restart. Numbers are normalised, so `9812345678`, `+91 98123 45678`
-and `09812345678` are all the same person. Removing a number blocks new logins immediately;
+Edit `ALLOWED_PHONES` and restart. Entries are either a bare number or `Name:number` — the
+name is passed to the template as `name`, so the message reads "Hi Asha" rather than "Hi Team".
+Numbers are normalised, so `9812345678`, `+91 98123 45678` and `09812345678` are all the same
+person. Removing a number blocks new logins immediately;
 an existing session dies when it expires (`SESSION_TTL_HOURS`, default 12h).
 
 ---
@@ -214,6 +226,8 @@ Any host that runs a long-lived Node process and holds env vars works. This app 
 does **not** fit serverless-with-no-disk platforms any worse or better than a VM — it keeps no
 local state at all, so pick whatever's cheapest.
 
+Target domain: **`abc.briyo.xyz`**.
+
 **Render / Railway**
 
 1. Push this repo to GitHub.
@@ -222,7 +236,14 @@ local state at all, so pick whatever's cheapest.
 4. Add the environment variables: `SHOPIFY_STORE_DOMAIN`, `SHOPIFY_ACCESS_TOKEN`,
    `SHOPIFY_API_VERSION`, `ALLOWED_PHONES`, `SESSION_SECRET`, `COOKIE_SECURE=true`,
    `ELEVENZA_AUTH_TOKEN`, `ELEVENZA_TEMPLATE_NAME`. The platform supplies `PORT` itself.
-5. Deploy. Every push to `main` redeploys.
+5. Add the custom domain `abc.briyo.xyz` in the platform's domain settings, then create the
+   `CNAME` record it gives you at your DNS provider. Both Render and Railway issue the TLS
+   certificate automatically once DNS resolves.
+6. Deploy. Every push to `main` redeploys.
+
+Set **`COOKIE_SECURE=true`** for this domain — it's served over HTTPS, and without that flag
+the session cookie is sent unprotected. `trust proxy` is already enabled, so the app sees the
+real protocol behind the platform's load balancer.
 
 **A small VM**
 
