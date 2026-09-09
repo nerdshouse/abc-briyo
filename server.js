@@ -6,6 +6,7 @@ import { fileURLToPath } from 'node:url';
 import {
   isMockMode, ensureSchema, insertCart, listCarts, updateStatus, ping,
   matchOrderToCarts, reasonSummary, statsByCaller, staleCarts,
+  recordSystemEvent, getSystemState, recordWebhookFailure, webhookFailureCount, cartCount,
 } from './lib/db.js';
 import {
   mockInsertCart, mockListCarts, mockUpdateStatus, mockMatchOrder,
@@ -18,7 +19,7 @@ import { router as authRouter, requireAuth, currentUserName } from './lib/auth-r
 import { activeUsers, seedAllowedUsers } from './lib/otp.js';
 import { driver } from './lib/whatsapp.js';
 import { startKeepAlive } from './lib/keepalive.js';
-import { startSlaAlerts } from './lib/sla-alert.js';
+import { startSlaAlerts, isIngestSilent } from './lib/sla-alert.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC = path.join(__dirname, 'public');
@@ -75,7 +76,15 @@ const db = {
   reasons: (days) => (MOCK ? mockReasonSummary(days) : reasonSummary(days)),
   byCaller: (days) => (MOCK ? mockStatsByCaller(days) : statsByCaller(days)),
   stale: (hours) => (MOCK ? mockStaleCarts(hours) : staleCarts(hours)),
+  noteIngest: async () => { if (!MOCK) await recordSystemEvent(LAST_INGEST_KEY); },
+  lastIngest: async () => {
+    if (MOCK) return null;
+    return (await getSystemState(LAST_INGEST_KEY))?.updated_at ?? null;
+  },
+  noteFailure: async (f) => { if (!MOCK) await recordWebhookFailure(f); },
 };
+
+const LAST_INGEST_KEY = 'last_cart_webhook';
 
 // =========================================================================
 // Webhook — PUBLIC by design. GoKwik cannot send a session cookie, so this
@@ -119,12 +128,16 @@ app.post('/api/webhook/gokwik/abandoned-cart', async (req, res) => {
   try {
     if (!MOCK) await ensureSchema();
     const { id, duplicate } = await db.insert(normalized, stored);
+    await db.noteIngest();
     console.log(`Cart ${duplicate ? 'updated' : 'received'}: ${normalized.cartId || '(no id)'} -> row ${id}`);
     return res.status(200).json({ ok: true, id, duplicate });
   } catch (err) {
-    // Log loudly but still 200: GoKwik retries on non-2xx, and a retry storm is
-    // worse than a log dive. The full payload is in the log to replay from.
-    console.error('Failed to store cart:', err.message, JSON.stringify(payload));
+    // Still 200: GoKwik retries on non-2xx and a retry storm is worse. But the
+    // failure is persisted rather than left in Render's rotating logs, so it can
+    // be counted on /readyz and replayed once the cause is fixed.
+    console.error('Failed to store cart:', err.message, JSON.stringify(payload).slice(0, 600));
+    await db.noteFailure({ kind: 'abandoned-cart', error: err.message, body: req.body })
+      .catch((e) => console.error('Could not even record the failure:', e.message));
     return res.status(200).json({ ok: true, stored: false });
   }
 });
@@ -137,6 +150,51 @@ app.post('/api/webhook/gokwik/abandoned-cart', async (req, res) => {
  * no database and reveals nothing.
  */
 app.get('/healthz', (_req, res) => res.json({ ok: true, ts: new Date().toISOString() }));
+
+/**
+ * Diagnostics. Deliberately separate from /healthz, which must stay
+ * dependency-free — the keep-alive pinger hits that one, and a database blip
+ * must never be able to make the instance look unhealthy and stop being pinged.
+ *
+ * This is the endpoint to open when someone asks "is the board broken?".
+ * Secret-gated with the webhook secret since it reports operational detail.
+ */
+app.get('/readyz', async (req, res) => {
+  const expected = process.env.WEBHOOK_SECRET;
+  const provided = req.get('x-webhook-secret') || req.query.secret;
+  if (!expected || !secretMatches(typeof provided === 'string' ? provided : '', expected)) {
+    return res.status(401).json({ ok: false, error: 'unauthorized' });
+  }
+
+  const out = {
+    ok: true, mock: MOCK, ts: new Date().toISOString(),
+    slaHours: SLA_HOURS, silenceHours: Number(process.env.INGEST_SILENCE_HOURS || 8),
+  };
+  if (MOCK) return res.json({ ...out, storage: 'mock' });
+
+  try {
+    const [info, last, carts, stale, failures] = await Promise.all([
+      ping(), db.lastIngest(), cartCount(), db.stale(SLA_HOURS), webhookFailureCount(24),
+    ]);
+    const ageHours = last ? (Date.now() - new Date(last).getTime()) / 3600000 : null;
+    const silent = isIngestSilent(last, out.silenceHours);
+    return res.json({
+      ...out,
+      storage: 'postgres',
+      database: String(info.version).split(',')[0],
+      carts,
+      lastCartWebhook: last,
+      lastCartWebhookAgeHours: ageHours === null ? null : Math.round(ageHours * 100) / 100,
+      ingestSilent: silent,
+      staleCarts: stale.count,
+      webhookFailures24h: failures,
+      // The one field to look at first — false here means something is wrong.
+      healthy: !silent && failures === 0,
+    });
+  } catch (err) {
+    return res.status(503).json({ ...out, ok: false, error: err.message });
+  }
+});
 
 // Lets you confirm the URL is live before handing it to GoKwik.
 app.get('/api/webhook/gokwik/abandoned-cart', (_req, res) =>
@@ -203,6 +261,8 @@ app.post('/api/webhook/gokwik/order-completed', async (req, res) => {
     return res.status(200).json({ ok: true, matched: matched.length });
   } catch (err) {
     console.error('Order webhook failed:', err.message, JSON.stringify(payload).slice(0, 600));
+    await db.noteFailure({ kind: 'order-completed', error: err.message, body: req.body })
+      .catch((e) => console.error('Could not even record the failure:', e.message));
     return res.status(200).json({ ok: true, matched: 0, stored: false });
   }
 });
@@ -350,5 +410,9 @@ app.listen(port, async () => {
   }
 
   startKeepAlive();
-  startSlaAlerts({ getStale: (h) => db.stale(h), slaHours: SLA_HOURS });
+  startSlaAlerts({
+    getStale: (h) => db.stale(h),
+    slaHours: SLA_HOURS,
+    getLastIngest: () => db.lastIngest(),
+  });
 });

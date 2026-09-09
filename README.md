@@ -362,6 +362,43 @@ FROM auto_recovery_log l JOIN abandoned_carts c ON c.id = l.cart_row_id
 ORDER BY l.matched_at DESC;
 ```
 
+## Is the board broken?
+
+```bash
+curl "https://abc.briyo.xyz/readyz?secret=<WEBHOOK_SECRET>"
+```
+
+Returns database version, cart count, how long since the last webhook, whether ingestion has
+gone silent, the stale-cart count, and webhook failures in the last 24h. **`healthy` is the
+one field to read first.**
+
+This is deliberately separate from `/healthz`, which stays dependency-free: the keep-alive
+pinger hits that one, and a database blip must never make the instance look unhealthy and stop
+being kept warm.
+
+### The silence alarm
+
+If GoKwik stops sending, every other signal gets *quieter* — the stale-cart backlog drains and
+the SLA alert stops firing, which looks identical to a team that has cleared its list. Nothing
+else in the system would notice.
+
+So an independent check runs on the same hourly timer: if no cart has arrived for
+`INGEST_SILENCE_HOURS` (default **8**), one WhatsApp goes to `OPS_PHONE`. It has its own latch
+separate from the stale-cart alert, re-alerts at most every 6 hours so a weekend outage doesn't
+message hourly, and re-arms automatically when ingestion resumes.
+
+The 8h default is measured, not guessed: the largest genuine gap in production so far is 3.3h
+(overnight), and this store takes orders through the night.
+
+"Never received anything" is deliberately **not** silence — a fresh deployment shouldn't alarm.
+
+### Failed deliveries
+
+The webhooks return `200` even when the database write fails, because GoKwik retries on non-2xx
+and a retry storm is worse than a log dive. That used to mean the only record was Render's
+rotating logs. Failures are now persisted to `webhook_failures` with the original body, counted
+on `/readyz`, and replayable once the cause is fixed.
+
 ## Database
 
 Create a free project at [neon.tech](https://neon.tech), copy the **pooled** connection string
@@ -397,6 +434,7 @@ login and webhook are all testable before Neon exists.
 | `POST /api/webhook/gokwik/abandoned-cart` | shared secret | **Give this URL to GoKwik.** Receives cart events |
 | `GET /api/webhook/gokwik/abandoned-cart` | none | Liveness check — confirms the URL is reachable |
 | `GET /healthz` | none | Uptime-pinger target; touches no database |
+| `GET /readyz?secret=` | shared secret | Diagnostics: DB, last webhook age, stale count, failures |
 | `GET /api/carts` | session | Stored carts, newest first |
 | `POST /api/status` | session | `{id, status, notes}` — updates one row |
 | `GET /api/config` | session | Mock-mode flag, status list, reason tags, SLA hours |

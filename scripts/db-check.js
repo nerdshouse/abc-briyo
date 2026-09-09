@@ -3,10 +3,12 @@ import {
   ensureSchema, getPool, isMockMode, insertCart, listCarts, updateStatus, ping,
   matchOrderToCarts, reasonSummary, statsByCaller, staleCarts,
   renormalizeRow, DERIVED_COLUMNS,
+  recordSystemEvent, getSystemState, recordWebhookFailure, webhookFailureCount,
 } from '../lib/db.js';
 import { createOtp, verifyOtp, checkRateLimit, normalisePhone } from '../lib/otp.js';
 import { normalizePayload, redactPayload, REDACTED_KEYS } from '../lib/normalize.js';
 import { GOKWIK_REAL_PAYLOAD } from './fixtures/gokwik-real.js';
+import { isIngestSilent } from '../lib/sla-alert.js';
 
 /**
  * Exercises every database code path against the real DATABASE_URL and cleans up
@@ -20,6 +22,8 @@ if (isMockMode()) {
 
 const TEST_CART = 'DBCHECK-DELETE-ME';
 const TEST_PHONE = normalisePhone('9000000000');
+const TEST_STATE_KEY = 'dbcheck_marker';
+const TEST_FAILURE_KIND = 'dbcheck-simulated';
 let failures = 0;
 
 const ok = (label, extra = '') => console.log(`  PASS  ${label}${extra ? ' — ' + extra : ''}`);
@@ -264,6 +268,41 @@ await step('backfill is idempotent', async () => {
   return 'running twice is a no-op';
 });
 
+await step('ingest marker round-trips', async () => {
+  await recordSystemEvent(TEST_STATE_KEY, 'db-check');
+  const row = await getSystemState(TEST_STATE_KEY);
+  if (!row || row.value !== 'db-check') throw new Error('marker did not persist');
+  const age = Date.now() - new Date(row.updated_at).getTime();
+  if (age > 60_000) throw new Error(`updated_at looks wrong (${age}ms old)`);
+  return 'written and read back';
+});
+
+await step('silence detector', async () => {
+  // The alarm for the one failure that hides itself: if ingestion stops, the
+  // stale-cart backlog drains and every other signal goes quiet.
+  const H = 3600_000;
+  const cases = [
+    [null, false, 'never received is not silence'],
+    [new Date(Date.now() - 3.3 * H), false, 'largest real gap observed (3.3h)'],
+    [new Date(Date.now() - 7.9 * H), false, 'just inside the window'],
+    [new Date(Date.now() - 8.1 * H), true, 'just outside'],
+    [new Date(Date.now() - 26 * H), true, 'a day of silence'],
+    ['not-a-date', false, 'garbage is not silence'],
+  ];
+  for (const [at, want, label] of cases) {
+    if (isIngestSilent(at, 8) !== want) throw new Error(`${label}: expected ${want}`);
+  }
+  return `${cases.length} cases correct at an 8h threshold`;
+});
+
+await step('webhook failures are recorded and counted', async () => {
+  const before = await webhookFailureCount(24);
+  await recordWebhookFailure({ kind: TEST_FAILURE_KIND, error: 'db-check simulated', body: '{"probe":1}' });
+  const after = await webhookFailureCount(24);
+  if (after !== before + 1) throw new Error(`count did not move: ${before} -> ${after}`);
+  return `${after} in the last 24h`;
+});
+
 await step('allowlist table readable', async () => {
   const { activeUsers } = await import('../lib/otp.js');
   const m = await activeUsers();
@@ -273,6 +312,8 @@ await step('allowlist table readable', async () => {
 
 // ---- cleanup ---------------------------------------------------------------
 await step('cleanup', async () => {
+  await getPool().query('DELETE FROM system_state WHERE key = $1', [TEST_STATE_KEY]);
+  await getPool().query('DELETE FROM webhook_failures WHERE kind = $1', [TEST_FAILURE_KIND]);
   await getPool().query('DELETE FROM auto_recovery_log WHERE cart_id = $1', [TEST_CART]);
   await getPool().query('DELETE FROM abandoned_carts WHERE cart_id = $1', [TEST_CART]);
   await getPool().query('DELETE FROM otp_state WHERE phone = $1', [TEST_PHONE]);
