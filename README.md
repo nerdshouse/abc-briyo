@@ -362,6 +362,31 @@ FROM auto_recovery_log l JOIN abandoned_carts c ON c.id = l.cart_row_id
 ORDER BY l.matched_at DESC;
 ```
 
+## How the board handles volume
+
+The date range is applied **server-side**, so the browser only ever holds one window's worth
+of carts and every other filter and sort stays client-side over that array. That's deliberate:
+paging would break value-sorting, the stats totals and the risk-then-value call ordering, which
+are the point of the board.
+
+`total` and `truncated` come back with every response, so the UI can say *"showing 500 of
+1,240 — narrow the date range"*. The previous behaviour was an unconditional `LIMIT 500` that
+silently dropped the oldest rows once volume passed it.
+
+**Search ignores the window entirely** — "that customer from three weeks ago just rang back" is
+the case it exists for. It matches name, email, cart id, and phone on digits only, so
+`98123 45678` and `+919812345678` both hit. Escape clears it.
+
+### Save conflicts
+
+Each save sends the `status_updated_at` the client last saw. If someone *else* has saved since,
+the server returns `409` and the board says who — your text stays on screen, and saving again
+goes through deliberately. Your own successive edits never conflict.
+
+This is not row locking, and deliberately so: for a three-person team the cost of a locking
+model (claims, expiry, release, "why can't I edit this") outweighs the occasional duplicate
+call. The 409 only guards the genuinely destructive case — silently overwriting someone's notes.
+
 ## Is the board broken?
 
 ```bash
@@ -435,7 +460,7 @@ login and webhook are all testable before Neon exists.
 | `GET /api/webhook/gokwik/abandoned-cart` | none | Liveness check — confirms the URL is reachable |
 | `GET /healthz` | none | Uptime-pinger target; touches no database |
 | `GET /readyz?secret=` | shared secret | Diagnostics: DB, last webhook age, stale count, failures |
-| `GET /api/carts` | session | Stored carts, newest first |
+| `GET /api/carts?days=&q=` | session | Carts in the date window, or a search across all history |
 | `POST /api/status` | session | `{id, status, notes}` — updates one row |
 | `GET /api/config` | session | Mock-mode flag, status list, reason tags, SLA hours |
 | `POST /api/webhook/gokwik/order-completed` | shared secret | Auto-marks matching carts Recovered — **not yet enabled by GoKwik** |

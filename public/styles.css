@@ -254,3 +254,10 @@ table.mini th { position: static; }
   .bar-row { grid-template-columns: 1fr 4rem 2rem; gap: 8px; }
   table.mini { white-space: normal; }
 }
+
+/* ---------- search + result note ---------- */
+#search { min-width: 240px; flex: 1 1 240px; max-width: 340px; }
+.result-note { margin: 0 0 10px; font-size: 12.5px; color: var(--muted); }
+@media (max-width: 760px) {
+  #search { min-width: 200px; max-width: none; }
+}

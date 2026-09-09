@@ -153,7 +153,14 @@ function clearError() {
 async function loadAll(attempt = 1) {
   const MAX_ATTEMPTS = 3;
   try {
-    const [cfgRes, cartsRes] = await Promise.all([fetch('/api/config'), fetch('/api/carts')]);
+    // The date range is now applied server-side, so the array stays small and
+    // every other filter and sort can stay client-side over it.
+    const params = state.query
+      ? `q=${encodeURIComponent(state.query)}`
+      : `days=${state.days}`;
+    const [cfgRes, cartsRes] = await Promise.all([
+      fetch('/api/config'), fetch(`/api/carts?${params}`),
+    ]);
     if ([cfgRes, cartsRes].some((r) => r.status === 401)) {
       window.location.href = '/login';
       return;
@@ -168,6 +175,9 @@ async function loadAll(attempt = 1) {
 
     state.carts = carts.carts;
     state.stale = carts.stale || null;
+    state.total = carts.total ?? carts.carts.length;
+    state.truncated = Boolean(carts.truncated);
+    renderResultNote();
 
     const sel = $('#stageFilter');
     if (sel) {
@@ -206,9 +216,19 @@ async function saveRow(id, patch, noteEl) {
     const res = await fetch('/api/status', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ id, ...patch }),
+      // Sent so the server can tell if someone else saved since we last read.
+      body: JSON.stringify({ id, seenAt: cartById(id)?.status_updated_at ?? null, ...patch }),
     });
     const data = await res.json();
+
+    if (res.status === 409 && data.conflict) {
+      showError(`${data.error} Your text is still here — reload to see theirs, or save again to overwrite.`);
+      if (cell) { cell.textContent = 'Not saved — conflict'; cell.className = 'saved failed'; }
+      // Adopt their timestamp so a deliberate second save goes through.
+      const cart = cartById(id);
+      if (cart && data.current) cart.status_updated_at = data.current.status_updated_at;
+      return;
+    }
     if (!res.ok || !data.ok) throw new Error(data.error || `HTTP ${res.status}`);
 
     // Update the row in place; never re-render it, so an in-progress edit survives.
@@ -237,7 +257,7 @@ async function saveRow(id, patch, noteEl) {
     }
     if (tr) tr.dataset.status = data.entry.status;
     renderStats();
-    renderInsights();
+    scheduleInsights();
   } catch (err) {
     // Keep the user's edit on screen; just tell them it isn't saved.
     showError(`Couldn't save that change: ${err.message} — your edit is still here, try again.`);
@@ -391,6 +411,14 @@ function renderRows() {
   }
 }
 
+let insightsTimer = null;
+/** Two network requests per save adds up across three callers on a free
+ *  instance; the panels are secondary so a trailing debounce is fine. */
+function scheduleInsights() {
+  clearTimeout(insightsTimer);
+  insightsTimer = setTimeout(renderInsights, 3000);
+}
+
 async function renderInsights() {
   const days = state.days;
   try {
@@ -428,6 +456,25 @@ async function renderInsights() {
   } catch {
     // Insights are secondary; never let them break the call list.
   }
+}
+
+/** Says what is on screen versus what exists — the old code silently dropped
+ *  everything past the 500th row with no indication. */
+function renderResultNote() {
+  const el = $('#resultNote');
+  if (!el) return;
+  if (state.query) {
+    el.textContent = `${state.carts.length} result${state.carts.length === 1 ? '' : 's'} for "${state.query}" — searching all history.`
+      + (state.truncated ? ' Showing the first 50; narrow the search.' : '');
+    el.hidden = false;
+    return;
+  }
+  if (state.truncated) {
+    el.textContent = `Showing ${state.carts.length} of ${state.total} carts in this range — narrow the date range to see the rest.`;
+    el.hidden = false;
+    return;
+  }
+  el.hidden = true;
 }
 
 function render() {
@@ -500,7 +547,22 @@ on('#rangeGroup', 'click', (e) => {
   if (!btn) return;
   state.days = Number(btn.dataset.days);
   $('#rangeGroup').querySelectorAll('button').forEach((b) => b.classList.toggle('active', b === btn));
-  render();
+  loadAll();   // the range is a server-side query now, not a local filter
+});
+
+let searchTimer = null;
+on('#search', 'input', (e) => {
+  const value = e.target.value.trim();
+  clearTimeout(searchTimer);
+  // Search hits the whole history, so don't fire on every keystroke.
+  searchTimer = setTimeout(() => {
+    if (value === state.query) return;
+    state.query = value;
+    loadAll();
+  }, 350);
+});
+on('#search', 'keydown', (e) => {
+  if (e.key === 'Escape') { e.target.value = ''; state.query = ''; loadAll(); }
 });
 
 on('#statusFilter', 'change', (e) => { state.status = e.target.value; render(); });

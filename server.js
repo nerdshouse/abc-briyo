@@ -5,12 +5,12 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   isMockMode, ensureSchema, insertCart, listCarts, updateStatus, ping,
-  matchOrderToCarts, reasonSummary, statsByCaller, staleCarts,
+  matchOrderToCarts, reasonSummary, statsByCaller, staleCarts, searchCarts, conflictingUpdate,
   recordSystemEvent, getSystemState, recordWebhookFailure, webhookFailureCount, cartCount,
 } from './lib/db.js';
 import {
   mockInsertCart, mockListCarts, mockUpdateStatus, mockMatchOrder,
-  mockReasonSummary, mockStatsByCaller, mockStaleCarts,
+  mockReasonSummary, mockStatsByCaller, mockStaleCarts, mockSearchCarts,
 } from './lib/mock.js';
 import {
   normalizePayload, normalizeOrderPayload, parseLineItems, redactPayload,
@@ -70,7 +70,8 @@ const SLA_HOURS = Number(process.env.SLA_STALE_HOURS || 6);
 
 const db = {
   insert: (n, raw) => (MOCK ? mockInsertCart(n, raw) : insertCart(n, raw)),
-  list: () => (MOCK ? mockListCarts() : listCarts()),
+  list: (opts) => (MOCK ? mockListCarts(opts) : listCarts(opts)),
+  search: (q, limit) => (MOCK ? mockSearchCarts(q, limit) : searchCarts(q, limit)),
   update: (id, patch) => (MOCK ? mockUpdateStatus(id, patch) : updateStatus(id, patch)),
   matchOrder: (o) => (MOCK ? mockMatchOrder(o) : matchOrderToCarts(o)),
   reasons: (days) => (MOCK ? mockReasonSummary(days) : reasonSummary(days)),
@@ -297,10 +298,18 @@ function req_user(req) {
   return req?.session?.phone ? { phone: req.session.phone } : null;
 }
 
-app.get('/api/carts', async (_req, res) => {
+app.get('/api/carts', async (req, res) => {
   try {
     if (!MOCK) await ensureSchema();
-    const carts = (await db.list()).map((c) => {
+
+    // `q` searches the whole history; otherwise the date range the UI already
+    // has bounds the query server-side. Either way the client receives a small
+    // enough array to keep filtering and sorting locally.
+    const q = String(req.query.q ?? '').trim();
+    const sinceDays = Math.max(0, Number.parseInt(req.query.days ?? '7', 10) || 0);
+    const result = q ? await db.search(q, 50) : await db.list({ sinceDays });
+
+    const carts = result.carts.map((c) => {
       // Line items live in raw_payload, in either array or "#Name(Variant)*1"
       // form. Parse server-side so the browser gets one consistent shape.
       const raw = c.raw_payload || {};
@@ -308,7 +317,12 @@ app.get('/api/carts', async (_req, res) => {
       const { raw_payload, ...rest } = c;
       return { ...rest, items: parseLineItems(source) };
     });
-    res.json({ ok: true, mock: MOCK, carts, stale: await db.stale(SLA_HOURS), slaHours: SLA_HOURS });
+    res.json({
+      ok: true, mock: MOCK, carts,
+      total: result.total, truncated: result.truncated,
+      query: q || null, days: q ? null : sinceDays,
+      stale: await db.stale(SLA_HOURS), slaHours: SLA_HOURS,
+    });
   } catch (err) { fail(res, err); }
 });
 
@@ -348,9 +362,23 @@ app.post('/api/status', async (req, res) => {
       cb = null;
     }
 
+    const updatedBy = await currentUserName(req);
+
+    // If someone else saved this row since the client last read it, stop rather
+    // than clobbering their notes. Only guards against *other* people.
+    if (!MOCK && req.body?.seenAt) {
+      const clash = await conflictingUpdate(id, req.body.seenAt, updatedBy);
+      if (clash) {
+        return res.status(409).json({
+          ok: false, conflict: true,
+          error: `${clash.updated_by || 'Someone'} changed this row while you were editing.`,
+          current: clash,
+        });
+      }
+    }
+
     const row = await db.update(id, {
-      status, notes, callbackAt: cb, reasonTags: tags,
-      updatedBy: await currentUserName(req),
+      status, notes, callbackAt: cb, reasonTags: tags, updatedBy,
     });
     if (!row) return res.status(404).json({ ok: false, error: 'No such cart.' });
     return res.json({ ok: true, entry: row });

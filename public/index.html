@@ -33,6 +33,8 @@
     <section class="stats" id="stats"></section>
 
     <div class="controls">
+      <input type="search" id="search" autocomplete="off" spellcheck="false"
+             placeholder="Search name, phone, email…" aria-label="Search all carts" />
       <div class="group" id="rangeGroup" role="group" aria-label="Date range">
         <button type="button" data-days="1">Today</button>
         <button type="button" data-days="3">Last 3 days</button>
@@ -53,6 +55,8 @@
       </select>
       <button type="button" id="overdueOnly" class="toggle">Overdue callbacks</button>
     </div>
+
+    <p id="resultNote" class="result-note" hidden></p>
 
     <div class="panel">
       <table>

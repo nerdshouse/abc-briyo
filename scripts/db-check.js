@@ -4,6 +4,7 @@ import {
   matchOrderToCarts, reasonSummary, statsByCaller, staleCarts,
   renormalizeRow, DERIVED_COLUMNS,
   recordSystemEvent, getSystemState, recordWebhookFailure, webhookFailureCount,
+  searchCarts, conflictingUpdate,
 } from '../lib/db.js';
 import { createOtp, verifyOtp, checkRateLimit, normalisePhone } from '../lib/otp.js';
 import { normalizePayload, redactPayload, REDACTED_KEYS } from '../lib/normalize.js';
@@ -301,6 +302,64 @@ await step('webhook failures are recorded and counted', async () => {
   const after = await webhookFailureCount(24);
   if (after !== before + 1) throw new Error(`count did not move: ${before} -> ${after}`);
   return `${after} in the last 24h`;
+});
+
+await step('date window is applied server-side', async () => {
+  // The old code took an unconditional LIMIT 500 and silently dropped the rest.
+  const { rows } = await getPool().query('SELECT id FROM abandoned_carts WHERE cart_id = $1', [TEST_CART]);
+  await getPool().query("UPDATE abandoned_carts SET received_at = now() - interval '30 days' WHERE id = $1", [rows[0].id]);
+
+  const recent = await listCarts({ sinceDays: 7 });
+  const all = await listCarts({ sinceDays: 0 });
+  const inRecent = recent.carts.some((c) => c.cart_id === TEST_CART);
+  const inAll = all.carts.some((c) => c.cart_id === TEST_CART);
+  if (inRecent) throw new Error('a 30-day-old cart leaked into the 7-day window');
+  if (!inAll) throw new Error('the 30-day-old cart is missing from the unbounded query');
+
+  await getPool().query('UPDATE abandoned_carts SET received_at = now() WHERE id = $1', [rows[0].id]);
+  return `7d excluded it, all included it (${all.total} total)`;
+});
+
+await step('truncation is reported, not silent', async () => {
+  const capped = await listCarts({ sinceDays: 0, limit: 1 });
+  if (capped.carts.length !== 1) throw new Error('limit not applied');
+  if (capped.total <= 1) throw new Error('total should count beyond the limit');
+  if (!capped.truncated) throw new Error('truncated flag not set — this is the silent-loss bug');
+  return `1 of ${capped.total} returned, truncated=true`;
+});
+
+await step('search finds by name, phone and email', async () => {
+  const byName = await searchCarts('DB Check');
+  const byPhone = await searchCarts('90000 00000');   // spaced — must still match
+  const byEmail = await searchCarts('db@check.local');
+  for (const [label, r] of [['name', byName], ['phone', byPhone], ['email', byEmail]]) {
+    if (!r.carts.some((c) => c.cart_id === TEST_CART)) throw new Error(`search by ${label} missed the test cart`);
+  }
+  const none = await searchCarts('zzz-no-such-cart-zzz');
+  if (none.carts.length) throw new Error('search returned rows for nonsense');
+  return 'name, spaced phone and email all matched';
+});
+
+await step('conflict guard catches another user, ignores your own edits', async () => {
+  const { rows } = await getPool().query('SELECT id FROM abandoned_carts WHERE cart_id = $1', [TEST_CART]);
+  const id = rows[0].id;
+
+  await updateStatus(id, { notes: 'first', updatedBy: 'Caller A' });
+  const seenAt = (await getPool().query('SELECT status_updated_at FROM abandoned_carts WHERE id = $1', [id])).rows[0].status_updated_at;
+
+  // Nobody has touched it since — no conflict for either user.
+  if (await conflictingUpdate(id, seenAt, 'Caller B')) throw new Error('false conflict with no intervening write');
+
+  // Caller A saves again; Caller B is now working from a stale read.
+  await updateStatus(id, { notes: 'second', updatedBy: 'Caller A' });
+  const clash = await conflictingUpdate(id, seenAt, 'Caller B');
+  if (!clash) throw new Error('did not detect another user overwriting');
+  if (clash.updated_by !== 'Caller A') throw new Error('reported the wrong user');
+
+  // The same person continuing to edit their own row must never conflict.
+  if (await conflictingUpdate(id, seenAt, 'Caller A')) throw new Error('a user conflicted with themselves');
+
+  return `flagged ${clash.updated_by}, same-user edits pass through`;
 });
 
 await step('allowlist table readable', async () => {
