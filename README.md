@@ -127,8 +127,34 @@ domain error, try it with a single trailing slash and with none.
 
 ### Adding or removing people
 
-The allowlist lives in the **`allowed_users` table**, so changing the team needs no redeploy.
-Run these in the Neon console:
+Use the **Members** page at `/admin` — the link appears in the board header for admins only.
+
+Add someone by name and mobile number and they can sign in immediately; there's no password
+to send them, just their number and a one-time code on WhatsApp. Each row shows their role,
+when they last signed in, and who added them. Every change is logged with who made it.
+
+**Only admins can manage members.** Everyone else works the board and never sees the page —
+otherwise the allowlist stops being a boundary, since any caller could grant access to anyone.
+
+**Removal takes effect within a minute**, not at session expiry. Membership is re-checked on
+each request (cached ~60s), so "Remove" actually removes access rather than blocking only the
+next login. `SESSION_EPOCH` remains the instant, everyone-at-once lever.
+
+#### The ADMIN_PHONES safety net
+
+Numbers in `ADMIN_PHONES` are admins regardless of the table, and **the panel refuses to
+demote, deactivate or remove them** — it would leave that person with admin rights but no way
+to sign in. Change the environment variable instead. They show as *env admin* with no action
+buttons.
+
+This exists because member management lives in the database: without a way to grant admin from
+outside it, one bad edit could leave nobody able to fix it.
+
+The panel also refuses any change that would leave **no active admins at all**.
+
+#### Or by SQL
+
+The table is still the source of truth if you'd rather not use the UI:
 
 ```sql
 -- see who can log in
@@ -506,6 +532,8 @@ login and webhook are all testable before Neon exists.
 | `GET /api/config` | session | Mock-mode flag, status list, reason tags, SLA hours |
 | `POST /api/webhook/gokwik/order-completed` | shared secret | Auto-marks matching carts Recovered — **not yet enabled by GoKwik** |
 | `GET /api/carts.csv?days=&q=` | session | CSV of the current view, no `raw_payload` |
+| `GET /admin` | **admin** | Member management page |
+| `GET/POST /api/members`, `PATCH/DELETE /api/members/:phone` | **admin** | Add, rename, promote, deactivate, remove |
 | `GET /api/reasons/summary?days=` | session | Reason-tag counts over the window |
 | `GET /api/stats/by-caller?days=` | session | Per-teammate activity |
 | `POST /auth/request-otp` | Sends a code to an allowlisted number |

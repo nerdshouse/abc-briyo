@@ -626,6 +626,8 @@ on('#logout', 'click', async () => {
 fetch('/auth/me').then((r) => r.json()).then((me) => {
   if (!me.authenticated) { window.location.href = '/login'; return; }
   $('#sessionPhone').textContent = `+${me.phone}`;
+  // Member management is admin-only, so don't advertise a link that 403s.
+  if (me.isAdmin) $('#adminLink').hidden = false;
 }).catch(() => {});
 
 // Populate the status filter once.

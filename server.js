@@ -7,6 +7,8 @@ import {
   isMockMode, ensureSchema, insertCart, listCarts, updateStatus, ping,
   matchOrderToCarts, reasonSummary, statsByCaller, staleCarts, searchCarts, conflictingUpdate,
   recordSystemEvent, getSystemState, recordWebhookFailure, webhookFailureCount, cartCount,
+  listMembers, upsertMember, updateMember, deleteMember, otherActiveAdminCount,
+  recordMemberChange, recentMemberChanges,
 } from './lib/db.js';
 import {
   mockInsertCart, mockListCarts, mockUpdateStatus, mockMatchOrder,
@@ -15,8 +17,10 @@ import {
 import {
   normalizePayload, normalizeOrderPayload, parseLineItems, redactPayload,
 } from './lib/normalize.js';
-import { router as authRouter, requireAuth, currentUserName } from './lib/auth-routes.js';
-import { activeUsers, seedAllowedUsers } from './lib/otp.js';
+import {
+  router as authRouter, requireAuth, requireAdmin, currentUserName, invalidateMembership,
+} from './lib/auth-routes.js';
+import { activeUsers, seedAllowedUsers, normalisePhone, bootstrapAdmins } from './lib/otp.js';
 import { driver } from './lib/whatsapp.js';
 import { startKeepAlive } from './lib/keepalive.js';
 import { startSlaAlerts, isIngestSilent } from './lib/sla-alert.js';
@@ -442,6 +446,131 @@ app.get('/api/carts.csv', async (req, res) => {
     res.setHeader('Content-Disposition', `attachment; filename="abandoned-carts-${stamp}.csv"`);
     // BOM so Excel opens UTF-8 correctly — customer names contain non-ASCII.
     return res.send('\uFEFF' + body);
+  } catch (err) { return fail(res, err); }
+});
+
+// =========================================================================
+// Member management — admins only
+// =========================================================================
+
+app.get('/admin', requireAdminPage, (_req, res) => res.sendFile(path.join(PUBLIC, 'admin.html')));
+
+function requireAdminPage(req, res, next) {
+  if (req.session?.isAdmin) return next();
+  return res.status(403).send(
+    '<p style="font:14px system-ui;padding:40px">Admins only. ' +
+    '<a href="/">Back to the board</a></p>');
+}
+
+app.get('/api/members', requireAdmin, async (_req, res) => {
+  try {
+    if (MOCK) return res.json({ ok: true, mock: true, members: [], log: [] });
+    const [members, log] = await Promise.all([listMembers(), recentMemberChanges(20)]);
+    return res.json({
+      ok: true,
+      members,
+      log,
+      bootstrapAdmins: [...bootstrapAdmins()],
+    });
+  } catch (err) { return fail(res, err); }
+});
+
+app.post('/api/members', requireAdmin, async (req, res) => {
+  try {
+    if (MOCK) return res.status(400).json({ ok: false, error: 'Member management needs a database.' });
+    const phone = normalisePhone(req.body?.phone);
+    if (!phone) return res.status(400).json({ ok: false, error: 'Enter a valid 10-digit Indian mobile number.' });
+
+    const name = String(req.body?.name ?? '').trim().slice(0, 60) || 'Team';
+    const isAdmin = Boolean(req.body?.isAdmin);
+    const actor = await currentUserName(req);
+
+    const member = await upsertMember({ phone, name, isAdmin, addedBy: actor });
+    invalidateMembership(phone);
+    await recordMemberChange({
+      actor, action: 'add', targetPhone: phone,
+      detail: `${name}${isAdmin ? ' (admin)' : ''}`,
+    });
+    console.log(`Member added by ${actor}: +${phone} (${name})${isAdmin ? ' [admin]' : ''}`);
+    return res.json({ ok: true, member });
+  } catch (err) { return fail(res, err); }
+});
+
+app.patch('/api/members/:phone', requireAdmin, async (req, res) => {
+  try {
+    if (MOCK) return res.status(400).json({ ok: false, error: 'Member management needs a database.' });
+    const phone = normalisePhone(req.params.phone);
+    if (!phone) return res.status(400).json({ ok: false, error: 'Invalid number.' });
+
+    const actor = await currentUserName(req);
+    const { name, active, isAdmin } = req.body ?? {};
+    const losingAdmin = active === false || isAdmin === false;
+
+    // A number in ADMIN_PHONES keeps admin rights no matter what this table
+    // says, so demoting or deactivating it here produces a half-state: still an
+    // admin, no longer able to sign in. Refuse it and point at the env var.
+    if (losingAdmin && bootstrapAdmins().has(phone)) {
+      return res.status(409).json({
+        ok: false,
+        error: 'That number is set in ADMIN_PHONES and always has admin access. Change the environment variable instead.',
+      });
+    }
+
+    // Refuse the one change that cannot be undone from inside the app: leaving
+    // nobody able to manage members.
+    if (losingAdmin && (await otherActiveAdminCount(phone)) === 0) {
+      return res.status(409).json({
+        ok: false,
+        error: 'That would leave no active admins. Promote someone else first.',
+      });
+    }
+
+    const member = await updateMember(phone, {
+      name: name === undefined ? null : String(name).trim().slice(0, 60),
+      active: active === undefined ? null : Boolean(active),
+      isAdmin: isAdmin === undefined ? null : Boolean(isAdmin),
+    });
+    if (!member) return res.status(404).json({ ok: false, error: 'No such member.' });
+
+    invalidateMembership(phone);
+    const what = [
+      name !== undefined ? `name="${member.name}"` : null,
+      active !== undefined ? (active ? 'reactivated' : 'deactivated') : null,
+      isAdmin !== undefined ? (isAdmin ? 'promoted to admin' : 'demoted') : null,
+    ].filter(Boolean).join(', ');
+    await recordMemberChange({ actor, action: 'update', targetPhone: phone, detail: what });
+    console.log(`Member updated by ${actor}: +${phone} — ${what}`);
+    return res.json({ ok: true, member });
+  } catch (err) { return fail(res, err); }
+});
+
+app.delete('/api/members/:phone', requireAdmin, async (req, res) => {
+  try {
+    if (MOCK) return res.status(400).json({ ok: false, error: 'Member management needs a database.' });
+    const phone = normalisePhone(req.params.phone);
+    if (!phone) return res.status(400).json({ ok: false, error: 'Invalid number.' });
+
+    if (bootstrapAdmins().has(phone)) {
+      return res.status(409).json({
+        ok: false,
+        error: 'That number is set in ADMIN_PHONES. Removing it here would leave them with admin rights but no way to sign in — change the environment variable instead.',
+      });
+    }
+    if ((await otherActiveAdminCount(phone)) === 0) {
+      return res.status(409).json({
+        ok: false,
+        error: 'That would leave no active admins. Promote someone else first.',
+      });
+    }
+
+    const actor = await currentUserName(req);
+    const gone = await deleteMember(phone);
+    if (!gone) return res.status(404).json({ ok: false, error: 'No such member.' });
+
+    invalidateMembership(phone);
+    await recordMemberChange({ actor, action: 'remove', targetPhone: phone, detail: null });
+    console.log(`Member removed by ${actor}: +${phone}`);
+    return res.json({ ok: true });
   } catch (err) { return fail(res, err); }
 });
 

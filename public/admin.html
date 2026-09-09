@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Members — Cart Recovery Board</title>
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <div class="wrap">
+    <header class="page">
+      <div>
+        <h1>Members</h1>
+        <p class="sub">
+          Only these numbers can sign in. Anyone here can see every customer's
+          name, phone and email — add people accordingly.
+        </p>
+      </div>
+      <div class="session">
+        <a class="btnlink" href="/">← Back to the board</a>
+      </div>
+    </header>
+
+    <div id="banner" class="banner error" hidden></div>
+    <div id="ok" class="banner success" hidden></div>
+
+    <section class="panel insight">
+      <header><h2>Add a member</h2></header>
+      <form id="addForm" class="addrow">
+        <div class="field">
+          <label for="mname">Name</label>
+          <input id="mname" type="text" placeholder="Priya" maxlength="60" required />
+        </div>
+        <div class="field">
+          <label for="mphone">Mobile number</label>
+          <div class="phone-input">
+            <span class="prefix">+91</span>
+            <input id="mphone" type="tel" inputmode="numeric" placeholder="98765 43210" required />
+          </div>
+        </div>
+        <label class="checkline" for="madmin">
+          <input id="madmin" type="checkbox" />
+          Can manage members
+        </label>
+        <button type="submit" class="primary" id="addBtn">Add member</button>
+      </form>
+      <p class="hint">
+        They sign in at the board with this number and a one-time code on WhatsApp.
+        No password to share, nothing to send them.
+      </p>
+    </section>
+
+    <div class="panel">
+      <table>
+        <thead>
+          <tr>
+            <th>Name</th><th>Mobile</th><th>Role</th>
+            <th>Last signed in</th><th>Added</th><th>Actions</th>
+          </tr>
+        </thead>
+        <tbody id="memberRows">
+          <tr><td colspan="6" class="empty">Loading…</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <section class="panel insight" style="margin-top:18px">
+      <header><h2>Recent changes</h2></header>
+      <div id="memberLog"><p class="muted">Loading…</p></div>
+    </section>
+
+    <p class="note">
+      Removing someone takes effect within a minute — their session is checked against this
+      list, not just their sign-in. To force everyone out immediately, bump
+      <code>SESSION_EPOCH</code> in the environment.
+    </p>
+  </div>
+
+  <script src="/admin.js"></script>
+</body>
+</html>

@@ -5,6 +5,8 @@ import {
   renormalizeRow, DERIVED_COLUMNS,
   recordSystemEvent, getSystemState, recordWebhookFailure, webhookFailureCount,
   searchCarts, conflictingUpdate, recordLogin, recentLogins,
+  listMembers, upsertMember, updateMember, deleteMember, otherActiveAdminCount,
+  recordMemberChange, recentMemberChanges,
 } from '../lib/db.js';
 import { createOtp, verifyOtp, checkRateLimit, normalisePhone } from '../lib/otp.js';
 import { normalizePayload, redactPayload, REDACTED_KEYS } from '../lib/normalize.js';
@@ -426,6 +428,55 @@ await step('per-IP rate limiter', async () => {
   return `3 allowed, 4th blocked for ${blocked.retryAfter}s, other IPs unaffected`;
 });
 
+const TEST_MEMBER = '919000000099';
+
+await step('member lifecycle: add, update, deactivate, remove', async () => {
+  await deleteMember(TEST_MEMBER);   // in case a previous run died mid-way
+
+  const added = await upsertMember({ phone: TEST_MEMBER, name: 'Scratch', addedBy: 'db-check' });
+  if (!added.active || added.is_admin) throw new Error('new members should be active, non-admin');
+
+  // Re-adding must update in place, not duplicate — the panel calls this on
+  // every "Add" and a stray duplicate would be invisible until login failed.
+  await upsertMember({ phone: TEST_MEMBER, name: 'Scratch Two', addedBy: 'db-check' });
+  const all = await listMembers();
+  if (all.filter((m) => m.phone === TEST_MEMBER).length !== 1) throw new Error('re-adding created a duplicate');
+  if (all.find((m) => m.phone === TEST_MEMBER).name !== 'Scratch Two') throw new Error('re-add did not update the name');
+
+  const promoted = await updateMember(TEST_MEMBER, { isAdmin: true });
+  if (!promoted.is_admin) throw new Error('promotion did not stick');
+
+  const off = await updateMember(TEST_MEMBER, { active: false });
+  if (off.active) throw new Error('deactivation did not stick');
+  if (off.name !== 'Scratch Two') throw new Error('a partial update clobbered the name');
+
+  if (!(await deleteMember(TEST_MEMBER))) throw new Error('delete reported nothing removed');
+  if ((await listMembers()).some((m) => m.phone === TEST_MEMBER)) throw new Error('member survived deletion');
+  return 'added, renamed in place, promoted, deactivated, removed';
+});
+
+await step('last-admin guard counts correctly', async () => {
+  // The count that stops the panel locking everyone out of member management.
+  const admins = (await listMembers()).filter((m) => m.active && m.is_admin);
+  if (!admins.length) throw new Error('no active admin in the table — the panel would be unusable');
+
+  for (const a of admins) {
+    const others = await otherActiveAdminCount(a.phone);
+    if (others !== admins.length - 1) {
+      throw new Error(`otherActiveAdminCount(${a.phone}) = ${others}, expected ${admins.length - 1}`);
+    }
+  }
+  return `${admins.length} active admin(s); guard would ${admins.length === 1 ? 'block' : 'allow'} a demotion`;
+});
+
+await step('member changes are audited', async () => {
+  await recordMemberChange({ actor: 'db-check', action: 'add', targetPhone: TEST_MEMBER, detail: 'simulated' });
+  const found = (await recentMemberChanges(20)).some(
+    (l) => l.target_phone === TEST_MEMBER && l.actor === 'db-check');
+  if (!found) throw new Error('member change was not recorded');
+  return 'add recorded with actor and target';
+});
+
 await step('allowlist table readable', async () => {
   const { activeUsers } = await import('../lib/otp.js');
   const m = await activeUsers();
@@ -436,6 +487,8 @@ await step('allowlist table readable', async () => {
 // ---- cleanup ---------------------------------------------------------------
 await step('cleanup', async () => {
   await getPool().query('DELETE FROM login_log WHERE phone = $1', [TEST_PHONE]);
+  await getPool().query('DELETE FROM member_log WHERE target_phone = $1', [TEST_MEMBER]);
+  await deleteMember(TEST_MEMBER);
   await getPool().query('DELETE FROM system_state WHERE key = $1', [TEST_STATE_KEY]);
   await getPool().query('DELETE FROM webhook_failures WHERE kind = $1', [TEST_FAILURE_KIND]);
   await getPool().query('DELETE FROM auto_recovery_log WHERE cart_id = $1', [TEST_CART]);

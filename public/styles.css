@@ -277,3 +277,35 @@ a.btnlink {
   text-decoration: none; cursor: pointer;
 }
 a.btnlink:hover { background: var(--accent-soft); border-color: var(--accent); }
+
+/* ---------- admin / members ---------- */
+.banner.success { background: #ecfdf3; border: 1px solid #a6f4c5; color: #05603a; }
+
+.addrow { display: flex; gap: 12px; align-items: flex-end; flex-wrap: wrap; }
+.field { display: flex; flex-direction: column; gap: 5px; }
+.field label { font-size: 12px; font-weight: 500; }
+.field input[type="text"] { min-width: 160px; padding: 8px 11px; }
+.addrow .phone-input { min-width: 190px; }
+.addrow .phone-input input { padding: 8px 11px; }
+.checkline { display: flex; align-items: center; gap: 7px; font-size: 13px; padding-bottom: 9px; cursor: pointer; }
+.addrow button.primary { margin-top: 0; }
+.hint { color: var(--muted); font-size: 12.5px; margin: 12px 0 0; }
+
+td.actions { white-space: nowrap; }
+td.actions button { padding: 5px 10px; font-size: 12.5px; margin-right: 5px; }
+td.actions button:disabled { opacity: 0.45; }
+td.actions button.danger { color: var(--danger); border-color: #fda29b; }
+td.actions button.danger:hover:not(:disabled) { background: var(--danger-soft); }
+
+tr.inactive { opacity: 0.55; }
+.logline { display: flex; gap: 10px; font-size: 12.5px; padding: 4px 0; border-bottom: 1px solid var(--border); }
+.logline:last-child { border-bottom: none; }
+.logline .muted { flex: 0 0 11rem; }
+
+@media (max-width: 760px) {
+  .addrow { flex-direction: column; align-items: stretch; }
+  .addrow button.primary { width: 100%; min-height: 44px; }
+  td.actions button { min-height: 38px; margin-bottom: 5px; }
+  .logline { flex-direction: column; gap: 2px; }
+  .logline .muted { flex: none; }
+}
