@@ -339,23 +339,23 @@ function renderRows() {
 
     return `
       <tr data-row="${esc(c.id)}" data-status="${esc(status)}">
-        <td><div>${relativeTime(c.received_at)}</div>
+        <td data-label="Abandoned"><div>${relativeTime(c.received_at)}</div>
             <div class="muted">${new Date(c.received_at).toLocaleString('en-IN', { dateStyle: 'medium', timeStyle: 'short' })}</div>
             ${cb ? `<div class="cb cb-${cb.kind}">${cb.kind === 'scheduled' ? 'Callback ' : ''}${esc(cb.label)}</div>` : ''}</td>
-        <td><div class="cust-name">${esc(c.customer_name || 'Guest')}</div>
+        <td data-label="Customer"><div class="cust-name">${esc(c.customer_name || 'Guest')}</div>
             <div class="cust-email">${esc(c.email || '—')}</div></td>
-        <td class="items">${itemSummary}</td>
-        <td class="right">
+        <td class="items" data-label="Items">${itemSummary}</td>
+        <td class="right" data-label="Value">
           ${money(c.total_price, c.currency)}
           ${c.discount_total ? `<div class="muted">−${money(c.discount_total, c.currency)} disc.</div>` : ''}
         </td>
-        <td class="stage">
+        <td class="stage" data-label="Dropped at">
           ${c.drop_stage ? esc(c.drop_stage) : '<span class="muted">—</span>'}
           ${c.risk_flag ? `<div class="risk ${riskClass(c.risk_flag)}">${esc(c.risk_flag)}</div>` : ''}
           ${c.utm_source ? `<div class="muted">via ${esc(c.utm_source)}</div>` : ''}
         </td>
-        <td><div class="links">${links.join('')}</div></td>
-        <td class="status-cell">
+        <td data-label="Contact"><div class="links">${links.join('')}</div></td>
+        <td class="status-cell" data-label="Status &amp; notes">
           <select data-id="${esc(c.id)}" class="js-status" autocomplete="off">
             ${STATUSES.map((s) => `<option ${s === status ? 'selected' : ''}>${s}</option>`).join('')}
           </select>

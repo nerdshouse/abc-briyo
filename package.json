@@ -9,7 +9,8 @@
     "start": "node server.js",
     "dev": "node --watch server.js",
     "otp:probe": "node scripts/probe-11za.js",
-    "db:check": "node scripts/db-check.js"
+    "db:check": "node scripts/db-check.js",
+    "db:renormalize": "node scripts/renormalize.js"
   },
   "dependencies": {
     "cookie-parser": "^1.4.7",

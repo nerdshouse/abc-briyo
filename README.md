@@ -300,6 +300,36 @@ An hourly job sends one WhatsApp digest to `OPS_PHONE` when the count crosses
 > **Without that variable set, the digest is written to the server log instead of being sent** —
 > the feature degrades rather than misfires. Set `OPS_PHONE` blank to disable it entirely.
 
+## Backfilling after a mapping fix
+
+`raw_payload` is the source of truth, so a mapping bug is always recoverable:
+
+```bash
+npm run db:renormalize                      # dry run — shows exactly what would change
+npm run db:renormalize -- --backup --apply  # snapshot the table, then write
+npm run db:renormalize -- --redact --apply  # also strip PII keys from stored payloads
+npm run db:renormalize -- --id=42           # one row
+```
+
+It re-derives **only** the mapped columns (`DERIVED_COLUMNS` in `lib/db.js`) and never touches
+`status`, `notes`, `callback_at`, `reason_tags`, `updated_by` or `recovered_*` — a backfill
+must not be able to erase a call log, and `db:check` asserts exactly that. Being a pure
+function of `raw_payload`, running it twice is a no-op.
+
+It deliberately does **not** reuse `insertCart`: that path is `COALESCE`-based so a webhook
+retry can never blank a field, which also means it can never *correct* a wrong one. The two
+write semantics are separate on purpose.
+
+Rows whose body never parsed (`_unparsed_body`) are skipped rather than normalised to nulls.
+
+### PII redaction
+
+`REDACTED_KEYS` in `lib/normalize.js` strips `ip`, `user_agent`, `session_id`,
+`shopifysessionid`, `domain_userid`, `gst_details_enc`, `mapped_email_*` and
+`billing_address_details_pii` **before storage**. Everything `normalizePayload` reads is kept,
+so backfill still works — `db:check` proves this by asserting the derived fields are identical
+before and after redaction.
+
 ## Order-completed webhook (auto-recovery)
 
 **Status: built, but not yet receiving anything.** GoKwik has to be asked to send this event —
@@ -509,8 +539,8 @@ stale-cart card, custom domain with TLS, self keep-alive.
 | | |
 | --- | --- |
 | Order-completed webhook | Endpoint is live at `/api/webhook/gokwik/order-completed`. GoKwik must be asked to send their order-success event to it. Until then, "Recovered" stays a manual status. |
-| Cart recovery link | Their webhook payload has **no abandoned-cart URL** (their report CSV does). The WhatsApp recovery message therefore has no cart link. If they add it under any reasonable key name, the parser picks it up with no code change. |
-| `Drop Stage` / `Risk Flag` | Present in their report CSV, absent from the webhook. Columns and UI are ready if they can send them. |
+| Cart recovery link | **Resolved.** Live payloads include `abc_url` and `checkout_url`; only GoKwik's *test* payload omitted them. |
+| `Drop Stage` / `Risk Flag` | **Resolved.** Live payloads send both — `drop_stage` and `rto_risk_flag`. |
 
 **Needs one setup step before it works:**
 

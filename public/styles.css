@@ -170,3 +170,87 @@ button.toggle.active:hover { background: #1a5c3e; }
 table.mini { white-space: nowrap; }
 table.mini th, table.mini td { padding: 7px 10px; font-size: 12.5px; }
 table.mini th { position: static; }
+
+/* ---------- mobile ----------
+   Callers work this list on a phone as much as a desktop. Below 760px the
+   table becomes a stack of cards: the header row is dropped and each cell
+   labels itself from its data-label attribute, so renderRows() needs no
+   separate mobile template. Call and WhatsApp come first and large — on a
+   phone that is the entire job. */
+@media (max-width: 760px) {
+  .wrap { padding: 16px 12px 48px; }
+  header.page h1 { font-size: 18px; }
+
+  /* Controls scroll sideways instead of stacking into four lines. */
+  .controls {
+    flex-wrap: nowrap;
+    overflow-x: auto;
+    padding-bottom: 6px;
+    -webkit-overflow-scrolling: touch;
+    scrollbar-width: none;
+  }
+  .controls::-webkit-scrollbar { display: none; }
+  .controls > * { flex: 0 0 auto; }
+
+  .stats { grid-template-columns: repeat(2, 1fr); gap: 8px; }
+  .stat { padding: 10px 12px; }
+  .stat .value { font-size: 19px; }
+
+  .panel { overflow-x: visible; border: none; background: transparent; }
+  table, thead, tbody, tr, td { display: block; width: auto; }
+  thead { display: none; }
+
+  tbody tr {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 12px 14px;
+    margin-bottom: 12px;
+  }
+  tbody tr:hover { background: var(--panel); }
+
+  td { border: none; padding: 3px 0; white-space: normal; }
+  td::before {
+    content: attr(data-label);
+    display: block;
+    font-size: 10.5px;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--muted);
+    margin-bottom: 1px;
+  }
+  /* The customer name is the card's heading; it needs no label above it. */
+  td[data-label="Customer"]::before { display: none; }
+  td[data-label="Customer"] .cust-name { font-size: 16px; }
+  td.right, td.right::before { text-align: left; }
+  td.items { max-width: none; }
+  td.empty::before { display: none; }
+
+  /* Contact actions: full-width tap targets, Call and WhatsApp first. */
+  td[data-label="Contact"] { margin: 10px 0 4px; }
+  .links { flex-direction: row; flex-wrap: wrap; gap: 8px; }
+  .links a {
+    flex: 1 1 auto;
+    min-height: 44px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border: 1px solid var(--accent);
+    border-radius: 8px;
+    padding: 0 14px;
+    font-weight: 500;
+    text-decoration: none;
+  }
+  .links a:hover { background: var(--accent-soft); text-decoration: none; }
+  .links .muted { align-self: center; }
+
+  .status-cell { min-width: 0; }
+  .status-cell select,
+  .status-cell input[type="text"],
+  .status-cell input[type="datetime-local"] { min-height: 40px; font-size: 15px; }
+  .tagmenu label { min-height: 32px; white-space: normal; }
+
+  .insights { grid-template-columns: 1fr; }
+  .bar-row { grid-template-columns: 1fr 4rem 2rem; gap: 8px; }
+  table.mini { white-space: normal; }
+}

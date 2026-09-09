@@ -11,7 +11,9 @@ import {
   mockInsertCart, mockListCarts, mockUpdateStatus, mockMatchOrder,
   mockReasonSummary, mockStatsByCaller, mockStaleCarts,
 } from './lib/mock.js';
-import { normalizePayload, normalizeOrderPayload, parseLineItems } from './lib/normalize.js';
+import {
+  normalizePayload, normalizeOrderPayload, parseLineItems, redactPayload,
+} from './lib/normalize.js';
 import { router as authRouter, requireAuth, currentUserName } from './lib/auth-routes.js';
 import { activeUsers, seedAllowedUsers } from './lib/otp.js';
 import { driver } from './lib/whatsapp.js';
@@ -64,6 +66,7 @@ const REASON_TAGS = [
 
 const SLA_HOURS = Number(process.env.SLA_STALE_HOURS || 6);
 
+
 const db = {
   insert: (n, raw) => (MOCK ? mockInsertCart(n, raw) : insertCart(n, raw)),
   list: () => (MOCK ? mockListCarts() : listCarts()),
@@ -109,11 +112,13 @@ app.post('/api/webhook/gokwik/abandoned-cart', async (req, res) => {
     console.warn('Webhook body was not valid JSON; storing it raw.');
     payload = { _unparsed_body: String(req.body ?? '') };
   }
+  // Normalise from the full payload, store the redacted one.
   const normalized = normalizePayload(payload);
+  const stored = redactPayload(payload);
 
   try {
     if (!MOCK) await ensureSchema();
-    const { id, duplicate } = await db.insert(normalized, payload);
+    const { id, duplicate } = await db.insert(normalized, stored);
     console.log(`Cart ${duplicate ? 'updated' : 'received'}: ${normalized.cartId || '(no id)'} -> row ${id}`);
     return res.status(200).json({ ok: true, id, duplicate });
   } catch (err) {

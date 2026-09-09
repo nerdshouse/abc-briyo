@@ -2,9 +2,11 @@ import 'dotenv/config';
 import {
   ensureSchema, getPool, isMockMode, insertCart, listCarts, updateStatus, ping,
   matchOrderToCarts, reasonSummary, statsByCaller, staleCarts,
+  renormalizeRow, DERIVED_COLUMNS,
 } from '../lib/db.js';
 import { createOtp, verifyOtp, checkRateLimit, normalisePhone } from '../lib/otp.js';
-import { normalizePayload } from '../lib/normalize.js';
+import { normalizePayload, redactPayload, REDACTED_KEYS } from '../lib/normalize.js';
+import { GOKWIK_REAL_PAYLOAD } from './fixtures/gokwik-real.js';
 
 /**
  * Exercises every database code path against the real DATABASE_URL and cleans up
@@ -182,6 +184,84 @@ await step('auto_recovery_log written', async () => {
     "SELECT count(*)::int AS n FROM auto_recovery_log WHERE order_id LIKE 'DBCHECK-ORD%'");
   if (rows[0].n < 1) throw new Error('no audit row written');
   return `${rows[0].n} audit row(s)`;
+});
+
+// ---- v3 --------------------------------------------------------------------
+await step('real GoKwik key shape maps', async () => {
+  // The regression test for the rto_risk_flag / mkt_source bugs, which were
+  // live for a day because no fixture used the real key names.
+  const n = normalizePayload(GOKWIK_REAL_PAYLOAD);
+  const required = {
+    riskFlag: 'High Risk', utmSource: 'facebook', dropStage: 'Payment Page',
+    utmCampaign: '120251248645910304', utmMedium: 'paid',
+  };
+  for (const [k, want] of Object.entries(required)) {
+    if (n[k] !== want) throw new Error(`${k}: expected ${want}, got ${JSON.stringify(n[k])}`);
+  }
+  for (const k of ['cartId', 'customerName', 'phone', 'email', 'checkoutUrl', 'totalPrice', 'address']) {
+    if (n[k] === null || n[k] === undefined) throw new Error(`${k} did not map`);
+  }
+  return 'risk, utm, stage and contact fields all mapped';
+});
+
+await step('redaction cannot break derivation', async () => {
+  // Proves REDACTED_KEYS only removes keys nothing derives from — the
+  // invariant that lets us strip PII while keeping raw_payload as the
+  // source of truth for backfill.
+  const full = normalizePayload(GOKWIK_REAL_PAYLOAD);
+  const after = normalizePayload(redactPayload(GOKWIK_REAL_PAYLOAD));
+  if (JSON.stringify(full) !== JSON.stringify(after)) {
+    throw new Error('redacting changed the derived fields');
+  }
+  const left = REDACTED_KEYS.filter((k) => k in redactPayload(GOKWIK_REAL_PAYLOAD));
+  if (left.length) throw new Error(`not stripped: ${left.join(', ')}`);
+  return `${REDACTED_KEYS.length} keys stripped, derived fields identical`;
+});
+
+await step('backfill corrects columns without touching the call log', async () => {
+  const { rows } = await getPool().query('SELECT id FROM abandoned_carts WHERE cart_id = $1', [TEST_CART]);
+  const id = rows[0].id;
+
+  // A human works the row, then a derived column is corrupted.
+  await updateStatus(id, {
+    status: 'Callback scheduled', notes: 'do not lose me',
+    reasonTags: ['Price objection'], updatedBy: 'Human Caller',
+  });
+  await getPool().query("UPDATE abandoned_carts SET risk_flag = 'WRONG', customer_name = 'WRONG' WHERE id = $1", [id]);
+
+  const before = (await getPool().query(
+    `SELECT status, notes, reason_tags, updated_by, callback_at, received_at
+     FROM abandoned_carts WHERE id = $1`, [id])).rows[0];
+
+  const { rows: [{ raw_payload }] } = await getPool().query('SELECT raw_payload FROM abandoned_carts WHERE id = $1', [id]);
+  await renormalizeRow(id, normalizePayload(raw_payload));
+
+  const after = (await getPool().query(
+    `SELECT status, notes, reason_tags, updated_by, callback_at, received_at, customer_name, risk_flag
+     FROM abandoned_carts WHERE id = $1`, [id])).rows[0];
+
+  if (after.customer_name === 'WRONG') throw new Error('derived column was not corrected');
+  for (const k of ['status', 'notes', 'updated_by']) {
+    if (String(before[k]) !== String(after[k])) throw new Error(`backfill changed ${k}: ${before[k]} -> ${after[k]}`);
+  }
+  if (JSON.stringify(before.reason_tags) !== JSON.stringify(after.reason_tags)) {
+    throw new Error('backfill changed reason_tags');
+  }
+  if (new Date(before.received_at).getTime() !== new Date(after.received_at).getTime()) {
+    throw new Error('backfill changed received_at');
+  }
+  return 'columns re-derived, status/notes/tags/attribution untouched';
+});
+
+await step('backfill is idempotent', async () => {
+  const { rows } = await getPool().query('SELECT id, raw_payload FROM abandoned_carts WHERE cart_id = $1', [TEST_CART]);
+  const snap = async () => (await getPool().query(
+    `SELECT ${DERIVED_COLUMNS.join(', ')} FROM abandoned_carts WHERE id = $1`, [rows[0].id])).rows[0];
+  await renormalizeRow(rows[0].id, normalizePayload(rows[0].raw_payload));
+  const first = await snap();
+  await renormalizeRow(rows[0].id, normalizePayload(rows[0].raw_payload));
+  if (JSON.stringify(first) !== JSON.stringify(await snap())) throw new Error('second run changed something');
+  return 'running twice is a no-op';
 });
 
 await step('allowlist table readable', async () => {
