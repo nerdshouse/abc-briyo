@@ -133,6 +133,19 @@ Add someone by name and mobile number and they can sign in immediately; there's 
 to send them, just their number and a one-time code on WhatsApp. Each row shows their role,
 when they last signed in, and who added them. Every change is logged with who made it.
 
+From each row you can:
+
+| | |
+| --- | --- |
+| **Rename** | Click the name and type. Saves on Enter or blur, Escape cancels — the same idiom as the notes field on the board. The name is what the OTP message greets them by. |
+| **Make admin / Make caller** | Promote or demote. Admins manage members; callers only work the board. |
+| **Deactivate / Reactivate** | Blocks sign-in but keeps the record and their history. |
+| **Change** (next to the number) | Moves them to a new number, keeping name, role and when they were added. Their old sign-in history stays under the old number — rewriting an audit trail to match the present is how audit trails stop being useful. |
+| **Remove** | Deletes the row entirely. |
+
+Changing a number is a move, not an edit — phone is the primary key — so it runs in a
+transaction and refuses cleanly if the new number already belongs to someone.
+
 **Only admins can manage members.** Everyone else works the board and never sees the page —
 otherwise the allowlist stops being a boundary, since any caller could grant access to anyone.
 

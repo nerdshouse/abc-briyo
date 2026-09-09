@@ -54,10 +54,14 @@ function renderMembers(members) {
     return `
       <tr class="${m.active ? '' : 'inactive'}">
         <td>
-          <span class="cust-name">${esc(m.name)}</span>
+          <input class="js-name" data-phone="${esc(m.phone)}" value="${esc(m.name)}"
+                 maxlength="60" aria-label="Name" autocomplete="off" />
           ${locked ? '<div class="muted" title="Set in ADMIN_PHONES — cannot be changed here">env admin</div>' : ''}
         </td>
-        <td>+${esc(m.phone)}</td>
+        <td>
+          <span class="mono">+${esc(m.phone)}</span>
+          ${locked ? '' : `<button class="linky" data-act="phone" data-phone="${esc(m.phone)}">Change</button>`}
+        </td>
         <td>
           ${m.is_admin ? '<span class="chip">Admin</span>' : '<span class="muted">Caller</span>'}
           ${m.active ? '' : '<div class="muted">deactivated</div>'}
@@ -125,6 +129,21 @@ $('#memberRows').addEventListener('click', async (e) => {
 
   if (act === 'remove' && !confirm(`Remove +${phone}? They will lose access within a minute.`)) return;
 
+  if (act === 'phone') {
+    const next = prompt(`New mobile number for +${phone}:`, '');
+    if (!next || !next.trim()) return;
+    try {
+      const data = await api(`/api/members/${phone}`, {
+        method: 'PATCH', body: JSON.stringify({ newPhone: next.trim() }),
+      });
+      showOk(`Number changed to +${data.member.phone}. They sign in with the new one from now on.`);
+      await load();
+    } catch (err) {
+      if (err.message !== 'forbidden') showError(err.message);
+    }
+    return;
+  }
+
   btn.disabled = true;
   try {
     if (act === 'remove') {
@@ -139,6 +158,37 @@ $('#memberRows').addEventListener('click', async (e) => {
   } catch (err) {
     if (err.message !== 'forbidden') showError(err.message);
     btn.disabled = false;
+  }
+});
+
+// Name saves on Enter or when the field loses focus — same as the notes field
+// on the board, so there is no second editing idiom to learn.
+$('#memberRows').addEventListener('blur', async (e) => {
+  if (!e.target.classList.contains('js-name')) return;
+  const input = e.target;
+  const phone = input.dataset.phone;
+  const value = input.value.trim();
+  if (!value || value === input.defaultValue) { input.value = input.defaultValue; return; }
+
+  clearBanners();
+  try {
+    const data = await api(`/api/members/${phone}`, {
+      method: 'PATCH', body: JSON.stringify({ name: value }),
+    });
+    input.defaultValue = data.member.name;
+    showOk(`Renamed to ${data.member.name}.`);
+    await load();
+  } catch (err) {
+    if (err.message !== 'forbidden') showError(err.message);
+    input.value = input.defaultValue;
+  }
+}, true);
+
+$('#memberRows').addEventListener('keydown', (e) => {
+  if (e.target.classList.contains('js-name') && e.key === 'Enter') e.target.blur();
+  if (e.target.classList.contains('js-name') && e.key === 'Escape') {
+    e.target.value = e.target.defaultValue;
+    e.target.blur();
   }
 });
 

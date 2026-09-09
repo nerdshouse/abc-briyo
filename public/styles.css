@@ -309,3 +309,18 @@ tr.inactive { opacity: 0.55; }
   .logline { flex-direction: column; gap: 2px; }
   .logline .muted { flex: none; }
 }
+
+/* ---------- inline member editing ---------- */
+input.js-name {
+  width: 100%; min-width: 120px; max-width: 200px;
+  padding: 6px 9px; font-size: 13.5px; font-weight: 500;
+  border: 1px solid transparent; background: transparent; border-radius: 6px;
+}
+input.js-name:hover { border-color: var(--border); background: var(--panel); }
+input.js-name:focus { border-color: var(--accent); background: var(--panel); outline: none; }
+.mono { font-variant-numeric: tabular-nums; }
+button.linky {
+  border: none; background: none; color: var(--accent);
+  padding: 2px 4px; font-size: 12px; margin-left: 6px;
+}
+button.linky:hover { background: none; text-decoration: underline; }

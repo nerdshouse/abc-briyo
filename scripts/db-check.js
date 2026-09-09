@@ -6,7 +6,7 @@ import {
   recordSystemEvent, getSystemState, recordWebhookFailure, webhookFailureCount,
   searchCarts, conflictingUpdate, recordLogin, recentLogins,
   listMembers, upsertMember, updateMember, deleteMember, otherActiveAdminCount,
-  recordMemberChange, recentMemberChanges,
+  recordMemberChange, recentMemberChanges, changeMemberPhone,
 } from '../lib/db.js';
 import { createOtp, verifyOtp, checkRateLimit, normalisePhone } from '../lib/otp.js';
 import { normalizePayload, redactPayload, REDACTED_KEYS } from '../lib/normalize.js';
@@ -453,6 +453,38 @@ await step('member lifecycle: add, update, deactivate, remove', async () => {
   if (!(await deleteMember(TEST_MEMBER))) throw new Error('delete reported nothing removed');
   if ((await listMembers()).some((m) => m.phone === TEST_MEMBER)) throw new Error('member survived deletion');
   return 'added, renamed in place, promoted, deactivated, removed';
+});
+
+await step('changing a number moves the member, keeping their details', async () => {
+  const MOVED = '919000000098';
+  await deleteMember(TEST_MEMBER); await deleteMember(MOVED);
+
+  await upsertMember({ phone: TEST_MEMBER, name: 'Mover', isAdmin: true, addedBy: 'db-check' });
+  const before = (await listMembers()).find((m) => m.phone === TEST_MEMBER);
+
+  const moved = await changeMemberPhone(TEST_MEMBER, MOVED);
+  if (!moved.ok) throw new Error(`move failed: ${moved.reason}`);
+  if (moved.member.name !== 'Mover' || !moved.member.is_admin) throw new Error('name or role lost in the move');
+  if (new Date(moved.member.added_at).getTime() !== new Date(before.added_at).getTime()) {
+    throw new Error('added_at was reset by the move');
+  }
+
+  const all = await listMembers();
+  if (all.some((m) => m.phone === TEST_MEMBER)) throw new Error('old number survived the move');
+  if (!all.some((m) => m.phone === MOVED)) throw new Error('new number is missing');
+
+  // Moving onto an occupied number must fail and leave both rows intact.
+  await upsertMember({ phone: TEST_MEMBER, name: 'Occupier', addedBy: 'db-check' });
+  const clash = await changeMemberPhone(MOVED, TEST_MEMBER);
+  if (clash.ok) throw new Error('moved onto an occupied number');
+  if (clash.reason !== 'taken') throw new Error(`unexpected reason: ${clash.reason}`);
+  const after = await listMembers();
+  if (!after.some((m) => m.phone === MOVED) || !after.some((m) => m.phone === TEST_MEMBER)) {
+    throw new Error('a failed move damaged the table');
+  }
+
+  await deleteMember(MOVED); await deleteMember(TEST_MEMBER);
+  return 'moved with name, role and added_at intact; collision refused cleanly';
 });
 
 await step('last-admin guard counts correctly', async () => {

@@ -8,7 +8,7 @@ import {
   matchOrderToCarts, reasonSummary, statsByCaller, staleCarts, searchCarts, conflictingUpdate,
   recordSystemEvent, getSystemState, recordWebhookFailure, webhookFailureCount, cartCount,
   listMembers, upsertMember, updateMember, deleteMember, otherActiveAdminCount,
-  recordMemberChange, recentMemberChanges,
+  recordMemberChange, recentMemberChanges, changeMemberPhone,
 } from './lib/db.js';
 import {
   mockInsertCart, mockListCarts, mockUpdateStatus, mockMatchOrder,
@@ -523,6 +523,40 @@ app.patch('/api/members/:phone', requireAdmin, async (req, res) => {
         ok: false,
         error: 'That would leave no active admins. Promote someone else first.',
       });
+    }
+
+    // Changing the number is a move, not an update — phone is the primary key.
+    if (req.body?.newPhone !== undefined) {
+      const newPhone = normalisePhone(req.body.newPhone);
+      if (!newPhone) return res.status(400).json({ ok: false, error: 'Enter a valid 10-digit Indian mobile number.' });
+
+      if (newPhone !== phone) {
+        // An env admin's rights are pinned to their number, so moving them here
+        // would leave admin on a number that no longer exists in the table.
+        if (bootstrapAdmins().has(phone)) {
+          return res.status(409).json({
+            ok: false,
+            error: 'That number is set in ADMIN_PHONES. Update the environment variable to change it.',
+          });
+        }
+        const moved = await changeMemberPhone(phone, newPhone);
+        if (!moved.ok) {
+          return res.status(moved.reason === 'taken' ? 409 : 404).json({
+            ok: false,
+            error: moved.reason === 'taken'
+              ? 'Another member already uses that number.'
+              : 'No such member.',
+          });
+        }
+        invalidateMembership(phone);
+        invalidateMembership(newPhone);
+        await recordMemberChange({
+          actor, action: 'change-number', targetPhone: newPhone,
+          detail: `moved from +${phone}`,
+        });
+        console.log(`Member number changed by ${actor}: +${phone} -> +${newPhone}`);
+        return res.json({ ok: true, member: moved.member });
+      }
     }
 
     const member = await updateMember(phone, {
