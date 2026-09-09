@@ -210,7 +210,17 @@ await step('real GoKwik key shape maps', async () => {
   for (const k of ['cartId', 'customerName', 'phone', 'email', 'checkoutUrl', 'totalPrice', 'address']) {
     if (n[k] === null || n[k] === undefined) throw new Error(`${k} did not map`);
   }
-  return 'risk, utm, stage and contact fields all mapped';
+
+  // The shipping block carries name "Free Shipping" and its own price. Both have
+  // hijacked a field before — the customer's name and the cart total — so assert
+  // neither leaks in.
+  if (/shipping/i.test(n.customerName)) {
+    throw new Error(`customerName picked up the shipping method: ${n.customerName}`);
+  }
+  if (n.customerName !== 'Fixture Customer') throw new Error(`wrong customer: ${n.customerName}`);
+  if (n.totalPrice === 0) throw new Error('totalPrice picked up shipping.price');
+
+  return 'risk, utm, stage and contact mapped; shipping block kept out of name and total';
 });
 
 await step('redaction cannot break derivation', async () => {

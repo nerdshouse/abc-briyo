@@ -81,8 +81,23 @@ td.empty { color: var(--muted); font-style: italic; text-align: center; padding:
 
 .cust-name { font-weight: 500; }
 .cust-email, .muted { color: var(--muted); font-size: 12.5px; }
-.items { font-size: 12.5px; color: var(--muted); max-width: 30ch; }
-.items strong { color: var(--text); font-weight: 500; }
+/* One line per product, ellipsised — full name is in the title attribute.
+   Stacking long names in full made a single row fill the screen. */
+.items { font-size: 12.5px; color: var(--muted); max-width: 26ch; }
+.items .item {
+  color: var(--text); font-weight: 500;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  line-height: 1.45;
+}
+.items .qty { color: var(--muted); font-weight: 400; }
+.items .itemcount { font-size: 11px; letter-spacing: 0.01em; margin-bottom: 1px; }
+.moreitems summary {
+  cursor: pointer; color: var(--accent); font-size: 11.5px;
+  list-style: none; margin-top: 2px;
+}
+.moreitems summary::-webkit-details-marker { display: none; }
+.moreitems summary:hover { text-decoration: underline; }
+.moreitems[open] summary { margin-bottom: 2px; }
 
 .links { display: flex; flex-direction: column; gap: 3px; font-size: 13px; white-space: nowrap; }
 .links a { color: var(--accent); text-decoration: none; }
@@ -238,6 +253,7 @@ table.mini th { position: static; }
   td[data-label="Customer"] .cust-name { font-size: 16px; }
   td.right, td.right::before { text-align: left; }
   td.items { max-width: none; }
+  .items .item { white-space: normal; overflow: visible; text-overflow: clip; }
   td.empty::before { display: none; }
 
   /* Contact actions: full-width tap targets, Call and WhatsApp first. */
@@ -352,4 +368,17 @@ tr[data-mine="true"] { box-shadow: inset 3px 0 0 var(--accent); }
   .session { flex-wrap: wrap; gap: 6px; }
   .session button, .session a.btnlink { min-height: 38px; padding: 0 12px; }
   #sessionPhone { flex: 1 1 100%; }
+}
+
+/* Pack size is the detail that distinguishes two otherwise identical products,
+   and it sits at the end of the name where truncation eats it. Keep it out. */
+.items .item { display: flex; align-items: baseline; gap: 5px; }
+.items .iname { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.items .pack {
+  flex: 0 0 auto; background: #eef0f3; color: var(--muted);
+  border-radius: 4px; padding: 0 5px; font-size: 10.5px; font-weight: 500;
+}
+@media (max-width: 760px) {
+  .items .item { display: block; }
+  .items .iname { white-space: normal; overflow: visible; }
 }

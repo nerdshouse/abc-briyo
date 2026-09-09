@@ -291,6 +291,14 @@ Everything else — UTM campaign/medium, landing page, discount codes, customer 
 exit discounts, remarks — stays in `raw_payload` and can be surfaced later without
 re-collecting anything.
 
+**Identity fields are read only from identity-bearing blocks.** GoKwik's `shipping` object is
+the shipping *method* and contains `name: "Free Shipping"` and its own `price`. Both have
+hijacked a field in production — the customer's name and the cart total — because those keys
+are generic. Name, phone and email now search `customer` / `billing_address` /
+`shipping_address` and never `shipping`, `totals` or `session`, and explicit `firstname` /
+`lastname` are preferred over a bare `name`. The fixture used by `db:check` carries that trap
+deliberately.
+
 **Two GoKwik-specific quirks the parser handles:**
 
 - **Dates are `D/M/YYYY h:mm AM/PM` with no timezone.** `7/9/2026` is 7 September, not

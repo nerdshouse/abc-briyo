@@ -114,6 +114,49 @@ function itemsOf(cart) {
 const riskClass = (flag) => 'risk-' + String(flag || '').toLowerCase().split(' ')[0];
 
 /**
+ * Product names here run long ("Daily Wellness Starter Bundle – Vitamin D3 +
+ * Fish Oil + B12"), and stacking three of them in full made a single row fill
+ * the screen. A caller needs to recognise the order at a glance, not read the
+ * catalogue: show a count, the first two names on one line each, and hide the
+ * rest behind a disclosure. Full text stays in the title attribute.
+ */
+function itemsCell(cart) {
+  const items = itemsOf(cart);
+  if (!items.length) {
+    return cart.item_count
+      ? `<span class="muted">${cart.item_count} item${cart.item_count === 1 ? '' : 's'}</span>`
+      : '<span class="muted">—</span>';
+  }
+
+  // The pack size is the part a caller needs and the part truncation eats, since
+  // it sits at the end of the name. Pull it out so it always stays visible.
+  const splitPack = (title) => {
+    const m = String(title).match(/^(.*?)\s*[-–]\s*((?:Pack of|Box of)\s*\d+|\d+\s*Box(?:es)?)\s*$/i);
+    return m ? { name: m[1].trim(), pack: m[2].trim() } : { name: title, pack: null };
+  };
+
+  const line = (i) => {
+    const { name, pack } = splitPack(i.title);
+    return `<div class="item" title="${esc(i.title)}">`
+      + `<span class="iname">${esc(name)}</span>`
+      + `${pack ? ` <span class="pack">${esc(pack)}</span>` : ''}`
+      + `${i.quantity > 1 ? ` <span class="qty">×${i.quantity}</span>` : ''}</div>`;
+  };
+
+  const units = items.reduce((n, i) => n + (i.quantity || 1), 0);
+  const head = items.slice(0, 2).map(line).join('');
+  const rest = items.slice(2);
+
+  return (items.length > 1
+      ? `<div class="itemcount">${items.length} products · ${units} unit${units === 1 ? '' : 's'}</div>`
+      : '')
+    + head
+    + (rest.length
+      ? `<details class="moreitems"><summary>+${rest.length} more</summary>${rest.map(line).join('')}</details>`
+      : '');
+}
+
+/**
  * GoKwik runs its own recovery email/messaging. Showing that lets a caller open
  * with the right line instead of repeating a message the customer already got —
  * and is why this board deliberately sends nothing automatically.
@@ -393,10 +436,7 @@ function renderRows() {
     const status = c.status || 'Not called';
     const cb = callbackState(c);
     const wa = waNumber(c.phone);
-    const items = itemsOf(c);
-    const itemSummary = items.length
-      ? items.map((i) => `<strong>${esc(i.title)}</strong>${i.quantity > 1 ? ` ×${i.quantity}` : ''}`).join('<br>')
-      : (c.item_count ? `${c.item_count} item${c.item_count === 1 ? '' : 's'}` : '—');
+    const itemSummary = itemsCell(c);
 
     const links = [];
     if (c.phone) links.push(`<a href="tel:${esc(String(c.phone).replace(/\s/g, ''))}">Call</a>`);

@@ -47,7 +47,10 @@ export const GOKWIK_REAL_PAYLOAD = {
     "country": "India"
   },
   "shipping": {
+    "name": "Free Shipping",
+    "title": "Free Shipping",
     "price": "0.00",
+    "postpaid_price": 19,
     "method": "Standard"
   },
   "abc_email_sent": false,
