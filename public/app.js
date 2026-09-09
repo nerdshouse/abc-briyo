@@ -211,7 +211,7 @@ async function loadAll(attempt = 1) {
     if (sel) {
       const stages = [...new Set(state.carts.map((c) => c.drop_stage).filter(Boolean))].sort();
       const keep = sel.value;
-      sel.innerHTML = '<option value="">All drop stages</option>' +
+      sel.innerHTML = '<option value="">Any drop stage</option>' +
         stages.map((s) => `<option value="${esc(s)}">${esc(s)}</option>`).join('');
       sel.value = keep;
     }
@@ -544,7 +544,20 @@ function syncExportLink() {
     : `/api/carts.csv?days=${state.days}`;
 }
 
+/** Highlight filters that are actually doing something, and offer a way out. */
+function markActiveFilters() {
+  for (const id of ['#statusFilter', '#assigneeFilter', '#stageFilter']) {
+    const el = $(id);
+    if (el) el.classList.toggle('on', Boolean(el.value));
+  }
+  const any = state.status || state.stage || state.assignee || state.mineOnly
+    || state.overdueOnly || state.query;
+  const btn = $('#clearFilters');
+  if (btn) btn.hidden = !any;
+}
+
 function render() {
+  markActiveFilters();
   renderStats();
   renderRows();
   renderInsights();
@@ -671,6 +684,18 @@ function syncAssigneeFilter() {
 }
 
 on('#assigneeFilter', 'change', (e) => { state.assignee = e.target.value; render(); });
+on('#clearFilters', 'click', () => {
+  const hadQuery = Boolean(state.query);
+  Object.assign(state, { status: '', stage: '', assignee: '', mineOnly: false, overdueOnly: false, query: '' });
+  for (const id of ['#statusFilter', '#assigneeFilter', '#stageFilter']) {
+    if ($(id)) $(id).value = '';
+  }
+  if ($('#search')) $('#search').value = '';
+  $('#mineOnly')?.classList.remove('active');
+  $('#overdueOnly')?.classList.remove('active');
+  // Clearing a search means refetching; clearing local filters does not.
+  if (hadQuery) loadAll(); else render();
+});
 on('#mineOnly', 'click', () => {
   state.mineOnly = !state.mineOnly;
   $('#mineOnly').classList.toggle('active', state.mineOnly);
@@ -699,7 +724,8 @@ fetch('/auth/me').then((r) => r.json()).then((me) => {
 }).catch(() => {});
 
 // Populate the status filter once.
-$('#statusFilter').insertAdjacentHTML('beforeend',
+// Populated once from the fixed status list; the placeholder option is in the HTML.
+$('#statusFilter')?.insertAdjacentHTML('beforeend',
   STATUSES.map((s) => `<option value="${s}">${s}</option>`).join(''));
 
 loadAll();

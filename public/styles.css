@@ -40,7 +40,21 @@ header.page h1 { margin: 0; font-size: 21px; letter-spacing: -0.015em; }
 .stat .label { color: var(--muted); font-size: 11.5px; text-transform: uppercase; letter-spacing: 0.05em; }
 .stat .value { font-size: 23px; font-weight: 600; margin-top: 3px; letter-spacing: -0.02em; }
 
-.controls { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; margin-bottom: 14px; }
+/* Two rows, by intent: what you're looking at, then how it's narrowed.
+   Eight controls in one undifferentiated row was unreadable. */
+.controls { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+.controls-primary { margin-bottom: 8px; }
+.controls-filters { margin-bottom: 14px; }
+.controls-filters select { font-size: 13px; padding: 6px 9px; }
+.controls-filters .toggle { font-size: 13px; padding: 6px 11px; }
+
+/* A filter that is doing something should look different from one that isn't —
+   with this many controls it is otherwise easy to forget one is on. */
+.controls-filters select.on {
+  border-color: var(--accent); background: var(--accent-soft); color: var(--accent); font-weight: 500;
+}
+.ctl-divider { width: 1px; height: 22px; background: var(--border); margin: 0 2px; }
+#clearFilters { margin-left: 2px; }
 .group { display: inline-flex; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; background: var(--panel); }
 .group button { border: none; border-right: 1px solid var(--border); border-radius: 0; background: transparent; }
 .group button:last-child { border-right: none; }
@@ -181,16 +195,16 @@ table.mini th { position: static; }
   .wrap { padding: 16px 12px 48px; }
   header.page h1 { font-size: 18px; }
 
-  /* Controls scroll sideways instead of stacking into four lines. */
-  .controls {
-    flex-wrap: nowrap;
-    overflow-x: auto;
-    padding-bottom: 6px;
-    -webkit-overflow-scrolling: touch;
-    scrollbar-width: none;
-  }
-  .controls::-webkit-scrollbar { display: none; }
-  .controls > * { flex: 0 0 auto; }
+  /* Eight controls are too many to scroll sideways through on a phone, so they
+     wrap and share the width instead. The range group stays one strip. */
+  .controls { gap: 6px; }
+  .controls-primary #search { flex: 1 1 100%; min-width: 0; }
+  .controls-primary #rangeGroup { flex: 1 1 100%; }
+  .controls-primary #rangeGroup button { flex: 1 1 0; min-height: 38px; }
+  .controls-filters select { flex: 1 1 45%; min-width: 0; min-height: 38px; }
+  .controls-filters .toggle { flex: 1 1 0; min-height: 38px; }
+  .ctl-divider { display: none; }
+  #clearFilters { flex: 1 1 100%; text-align: center; padding: 6px; }
 
   .stats { grid-template-columns: repeat(2, 1fr); gap: 8px; }
   .stat { padding: 10px 12px; }
@@ -330,3 +344,12 @@ td.owner { min-width: 130px; }
 td.owner select { width: 100%; font-size: 12.5px; padding: 5px 8px; }
 td.owner .js-takeit { margin: 3px 0 0; padding: 2px 0; }
 tr[data-mine="true"] { box-shadow: inset 3px 0 0 var(--accent); }
+
+/* Header actions shouldn't break mid-label ("Export / CSV", "Sign / out"). */
+.session > * { white-space: nowrap; }
+@media (max-width: 760px) {
+  header.page { gap: 10px; }
+  .session { flex-wrap: wrap; gap: 6px; }
+  .session button, .session a.btnlink { min-height: 38px; padding: 0 12px; }
+  #sessionPhone { flex: 1 1 100%; }
+}

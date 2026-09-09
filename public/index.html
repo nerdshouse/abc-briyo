@@ -34,20 +34,32 @@
 
     <section class="stats" id="stats"></section>
 
-    <div class="controls">
+    <!-- Primary: what you are looking at. Search overrides the range entirely. -->
+    <div class="controls controls-primary">
       <input type="search" id="search" autocomplete="off" spellcheck="false"
-             placeholder="Search name, phone, email…" aria-label="Search all carts" />
+             placeholder="Search all history — name, phone, email…" aria-label="Search all carts" />
       <div class="group" id="rangeGroup" role="group" aria-label="Date range">
         <button type="button" data-days="1">Today</button>
-        <button type="button" data-days="3">Last 3 days</button>
-        <button type="button" data-days="7" class="active">Last 7 days</button>
+        <button type="button" data-days="3">3 days</button>
+        <button type="button" data-days="7" class="active">7 days</button>
         <button type="button" data-days="0">All</button>
       </div>
+    </div>
+
+    <!-- Secondary: how it is narrowed and ordered. -->
+    <div class="controls controls-filters">
+      <button type="button" id="mineOnly" class="toggle">Mine</button>
+      <button type="button" id="overdueOnly" class="toggle">Overdue</button>
+      <span class="ctl-divider" aria-hidden="true"></span>
       <select id="statusFilter" aria-label="Filter by status">
-        <option value="">All statuses</option>
+        <option value="">Any status</option>
+      </select>
+      <select id="assigneeFilter" aria-label="Filter by assignee">
+        <option value="">Anyone</option>
+        <option value="__unassigned">Unassigned</option>
       </select>
       <select id="stageFilter" aria-label="Filter by drop stage">
-        <option value="">All drop stages</option>
+        <option value="">Any drop stage</option>
       </select>
       <select id="sort" aria-label="Sort">
         <option value="value">Cart value: high → low</option>
@@ -55,12 +67,7 @@
         <option value="risk">Risk: high → low</option>
         <option value="callback">Callback due soonest</option>
       </select>
-      <button type="button" id="overdueOnly" class="toggle">Overdue callbacks</button>
-      <button type="button" id="mineOnly" class="toggle">Assigned to me</button>
-      <select id="assigneeFilter" aria-label="Filter by assignee">
-        <option value="">Anyone</option>
-        <option value="__unassigned">Unassigned</option>
-      </select>
+      <button type="button" id="clearFilters" class="linky" hidden>Clear filters</button>
     </div>
 
     <p id="resultNote" class="result-note" hidden></p>
