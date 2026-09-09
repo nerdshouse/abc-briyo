@@ -430,6 +430,50 @@ await step('per-IP rate limiter', async () => {
 
 const TEST_MEMBER = '919000000099';
 
+await step('assignment: set, reassign, clear, and survive a status change', async () => {
+  const { rows } = await getPool().query('SELECT id FROM abandoned_carts WHERE cart_id = $1', [TEST_CART]);
+  const id = rows[0].id;
+  const members = (await listMembers()).filter((m) => m.active);
+  if (members.length < 2) throw new Error('need at least two active members to test reassignment');
+  const [a, b] = members;
+
+  let row = await updateStatus(id, { assignedTo: a.phone, updatedBy: 'db-check' });
+  if (row.assigned_to !== a.phone) throw new Error('assignment did not stick');
+  if (row.assigned_to_name !== a.name) throw new Error('display name was not resolved from allowed_users');
+
+  row = await updateStatus(id, { assignedTo: b.phone, updatedBy: 'db-check' });
+  if (row.assigned_to !== b.phone) throw new Error('reassignment did not stick');
+
+  // An unrelated edit must not silently drop the owner.
+  row = await updateStatus(id, { status: 'Called – No answer', updatedBy: 'db-check' });
+  if (row.assigned_to !== b.phone) throw new Error('a status change cleared the assignment');
+
+  // Explicit null must clear it — the same "was it supplied" problem callback_at has.
+  row = await updateStatus(id, { assignedTo: null, updatedBy: 'db-check' });
+  if (row.assigned_to !== null) throw new Error('explicit null did not unassign');
+
+  return `assigned to ${a.name}, reassigned to ${b.name}, survived a status change, cleared`;
+});
+
+await step('a rename follows through to assigned carts', async () => {
+  // assigned_to stores the phone and the name is resolved at read time, so a
+  // rename must not leave stale copies scattered across carts.
+  const { rows } = await getPool().query('SELECT id FROM abandoned_carts WHERE cart_id = $1', [TEST_CART]);
+  const me = (await listMembers()).find((m) => m.active);
+
+  await updateStatus(rows[0].id, { assignedTo: me.phone, updatedBy: 'db-check' });
+  await updateMember(me.phone, { name: 'Renamed For Check' });
+
+  const listed = (await listCarts({ sinceDays: 0 })).carts.find((c) => c.cart_id === TEST_CART);
+  if (listed.assigned_to_name !== 'Renamed For Check') {
+    throw new Error(`cart still shows "${listed.assigned_to_name}" after the rename`);
+  }
+
+  await updateMember(me.phone, { name: me.name });
+  await updateStatus(rows[0].id, { assignedTo: null, updatedBy: 'db-check' });
+  return 'cart reflected the new name immediately';
+});
+
 await step('member lifecycle: add, update, deactivate, remove', async () => {
   await deleteMember(TEST_MEMBER);   // in case a previous run died mid-way
 

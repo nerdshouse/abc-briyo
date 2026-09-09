@@ -432,6 +432,24 @@ silently dropped the oldest rows once volume passed it.
 the case it exists for. It matches name, email, cart id, and phone on digits only, so
 `98123 45678` and `+919812345678` both hit. Escape clears it.
 
+### Assignment
+
+Each row has an **Owner** column. Pick a teammate from the dropdown, or hit **Take it** to
+claim it yourself in one tap — the common case, and the whole point: three people working one
+list otherwise ring the same customer.
+
+Filter with **Assigned to me** or the assignee dropdown (which includes **Unassigned**, for
+picking up what nobody has taken). Your own rows are marked with a green edge.
+
+Assignment is stored as the member's **phone**, with the display name resolved at read time,
+so renaming someone in the admin panel updates every cart they own rather than leaving stale
+copies behind. Only active members can be assigned, so a cart can never be owned by someone
+who can't sign in to see it.
+
+Deliberately *not* a lock: assignment never blocks anyone from editing a row, and there's no
+expiry to deadlock on when someone shuts their laptop. The 409 conflict guard remains the thing
+that stops two people overwriting each other.
+
 ### What GoKwik already sent
 
 Rows show a **GoKwik: msg sent / email sent** badge and a **Repeat buyer** count, read from

@@ -19,8 +19,14 @@ const RISK_ORDER = {
 let REASON_TAGS = [];
 let SLA_HOURS = 6;
 
+let TEAM = [];
+let ME = null;
+
 const state = {
   carts: [],
+  query: '',
+  mineOnly: false,
+  assignee: '',
   overdueOnly: false,
   days: 7,       // default range: last 7 days
   status: '',
@@ -187,6 +193,9 @@ async function loadAll(attempt = 1) {
     const carts = await cartsRes.json();
     if (Array.isArray(cfg.reasonTags)) REASON_TAGS = cfg.reasonTags;
     if (cfg.slaHours) SLA_HOURS = cfg.slaHours;
+    if (Array.isArray(cfg.team)) TEAM = cfg.team;
+    ME = cfg.me ?? ME;
+    syncAssigneeFilter();
 
     if (cfg.mock) $('#mockBanner').hidden = false;
     if (!carts.ok) throw new Error(carts.error || 'Could not load carts');
@@ -215,14 +224,14 @@ async function loadAll(attempt = 1) {
     const networkLevel = err instanceof TypeError;
     if (networkLevel && attempt < MAX_ATTEMPTS) {
       showError(`Server isn't responding — it may be waking up. Retrying (${attempt}/${MAX_ATTEMPTS - 1})…`);
-      rowsEl.innerHTML = '<tr><td colspan="7" class="empty">Waking the server…</td></tr>';
+      rowsEl.innerHTML = '<tr><td colspan="8" class="empty">Waking the server…</td></tr>';
       await new Promise((r) => setTimeout(r, attempt * 4000));
       return loadAll(attempt + 1);
     }
     showError(networkLevel
       ? "Couldn't reach the server after several tries — it may still be starting up. Press Refresh in a moment."
       : `Could not load the board: ${err.message}`);
-    rowsEl.innerHTML = '<tr><td colspan="7" class="empty">Failed to load.</td></tr>';
+    rowsEl.innerHTML = '<tr><td colspan="8" class="empty">Failed to load.</td></tr>';
   }
 }
 
@@ -259,6 +268,10 @@ async function saveRow(id, patch, noteEl) {
       cart.callback_at = data.entry.callback_at ?? null;
       cart.reason_tags = data.entry.reason_tags ?? cart.reason_tags ?? [];
       cart.updated_by = data.entry.updated_by ?? cart.updated_by;
+      if ('assigned_to' in data.entry) {
+        cart.assigned_to = data.entry.assigned_to;
+        cart.assigned_to_name = data.entry.assigned_to_name;
+      }
     }
     clearError();
     if (cell) { cell.textContent = savedLabel(cart || data.entry); cell.className = 'saved'; }
@@ -273,6 +286,18 @@ async function saveRow(id, patch, noteEl) {
       }
       const summary = tr.querySelector('.tagpick summary');
       if (summary) summary.textContent = (cart.reason_tags || []).length ? 'Edit reasons' : '+ reason';
+
+      // Owner cell: keep the select, the "mine" marker and the Take it button
+      // in step without a full re-render, which would discard other rows' edits.
+      const assignSel = tr.querySelector('.js-assign');
+      if (assignSel) assignSel.value = cart.assigned_to || '';
+      tr.dataset.mine = String(cart.assigned_to === ME);
+      const takeIt = tr.querySelector('.js-takeit');
+      if (cart.assigned_to && takeIt) takeIt.remove();
+      if (!cart.assigned_to && !takeIt && ME && assignSel) {
+        assignSel.insertAdjacentHTML('afterend',
+          `<button type="button" class="linky js-takeit" data-id="${esc(cart.id)}">Take it</button>`);
+      }
     }
     if (tr) tr.dataset.status = data.entry.status;
     renderStats();
@@ -294,6 +319,9 @@ function visibleCarts() {
   if (state.status) list = list.filter((c) => (c.status || 'Not called') === state.status);
   if (state.stage) list = list.filter((c) => (c.drop_stage || '') === state.stage);
   if (state.overdueOnly) list = list.filter(isOverdue);
+  if (state.mineOnly) list = list.filter((c) => c.assigned_to === ME);
+  if (state.assignee === '__unassigned') list = list.filter((c) => !c.assigned_to);
+  else if (state.assignee) list = list.filter((c) => c.assigned_to === state.assignee);
 
   return list.sort((a, b) => {
     if (state.sort === 'value') return (b.total_price ?? 0) - (a.total_price ?? 0);
@@ -357,7 +385,7 @@ function renderRows() {
   const list = visibleCarts();
 
   if (!list.length) {
-    rowsEl.innerHTML = '<tr><td colspan="7" class="empty">No abandoned carts in this range.</td></tr>';
+    rowsEl.innerHTML = '<tr><td colspan="8" class="empty">No abandoned carts in this range.</td></tr>';
     return;
   }
 
@@ -377,7 +405,7 @@ function renderRows() {
     if (!c.phone) links.push('<span class="muted">No phone</span>');
 
     return `
-      <tr data-row="${esc(c.id)}" data-status="${esc(status)}">
+      <tr data-row="${esc(c.id)}" data-status="${esc(status)}" data-mine="${c.assigned_to === ME}">
         <td data-label="Abandoned"><div>${relativeTime(c.received_at)}</div>
             <div class="muted">${new Date(c.received_at).toLocaleString('en-IN', { dateStyle: 'medium', timeStyle: 'short' })}</div>
             ${cb ? `<div class="cb cb-${cb.kind}">${cb.kind === 'scheduled' ? 'Callback ' : ''}${esc(cb.label)}</div>` : ''}</td>
@@ -393,6 +421,13 @@ function renderRows() {
           ${c.drop_stage ? esc(c.drop_stage) : '<span class="muted">—</span>'}
           ${c.risk_flag ? `<div class="risk ${riskClass(c.risk_flag)}">${esc(c.risk_flag)}</div>` : ''}
           ${c.utm_source ? `<div class="muted">via ${esc(c.utm_source)}</div>` : ''}
+        </td>
+        <td class="owner" data-label="Owner">
+          <select class="js-assign" data-id="${esc(c.id)}" autocomplete="off" aria-label="Assign to">
+            <option value="">Unassigned</option>
+            ${TEAM.map((t) => `<option value="${esc(t.phone)}" ${t.phone === c.assigned_to ? 'selected' : ''}>${esc(t.name)}${t.phone === ME ? ' (me)' : ''}</option>`).join('')}
+          </select>
+          ${!c.assigned_to && ME ? `<button type="button" class="linky js-takeit" data-id="${esc(c.id)}">Take it</button>` : ''}
         </td>
         <td data-label="Contact"><div class="links">${links.join('')}</div></td>
         <td class="status-cell" data-label="Status &amp; notes">
@@ -424,6 +459,10 @@ function renderRows() {
   for (const sel of rowsEl.querySelectorAll('.js-status')) {
     const cart = cartById(sel.dataset.id);
     if (cart) sel.value = cart.status || 'Not called';
+  }
+  for (const sel of rowsEl.querySelectorAll('.js-assign')) {
+    const cart = cartById(sel.dataset.id);
+    if (cart) sel.value = cart.assigned_to || '';
   }
   for (const input of rowsEl.querySelectorAll('.js-notes')) {
     const cart = cartById(input.dataset.id);
@@ -549,6 +588,12 @@ rowsEl.addEventListener('change', (e) => {
     return;
   }
 
+  if (e.target.classList.contains('js-assign')) {
+    if ((cartById(id)?.assigned_to || '') === e.target.value) return;
+    saveRow(id, { assignedTo: e.target.value || null });
+    return;
+  }
+
   if (e.target.classList.contains('js-tag')) {
     const boxes = [...document.querySelectorAll(`.js-tag[data-id="${CSS.escape(id)}"]`)];
     const reasonTags = boxes.filter((b) => b.checked).map((b) => b.value);
@@ -568,6 +613,13 @@ rowsEl.addEventListener('blur', (e) => {
 
 rowsEl.addEventListener('keydown', (e) => {
   if (e.key === 'Enter' && e.target.classList.contains('js-notes')) e.target.blur();
+});
+
+// One-tap self-assign — the common case, and the whole point of this feature is
+// stopping two people ringing the same customer.
+rowsEl.addEventListener('click', (e) => {
+  const btn = e.target.closest('.js-takeit');
+  if (btn) saveRow(btn.dataset.id, { assignedTo: ME });
 });
 
 on('#rangeGroup', 'click', (e) => {
@@ -609,6 +661,22 @@ on('#search', 'keydown', (e) => {
 
 on('#statusFilter', 'change', (e) => { state.status = e.target.value; render(); });
 on('#stageFilter', 'change', (e) => { state.stage = e.target.value; render(); });
+function syncAssigneeFilter() {
+  const sel = $('#assigneeFilter');
+  if (!sel) return;
+  const keep = sel.value;
+  sel.innerHTML = '<option value="">Anyone</option><option value="__unassigned">Unassigned</option>'
+    + TEAM.map((t) => `<option value="${esc(t.phone)}">${esc(t.name)}${t.phone === ME ? ' (me)' : ''}</option>`).join('');
+  sel.value = keep;
+}
+
+on('#assigneeFilter', 'change', (e) => { state.assignee = e.target.value; render(); });
+on('#mineOnly', 'click', () => {
+  state.mineOnly = !state.mineOnly;
+  $('#mineOnly').classList.toggle('active', state.mineOnly);
+  render();
+});
+
 on('#overdueOnly', 'click', () => {
   state.overdueOnly = !state.overdueOnly;
   $('#overdueOnly').classList.toggle('active', state.overdueOnly);

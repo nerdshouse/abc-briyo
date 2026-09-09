@@ -290,17 +290,25 @@ function fail(res, err, code = 500) {
   res.status(code).json({ ok: false, error: err.message || String(err) });
 }
 
-app.get('/api/config', (_req, res) => res.json({
-  mock: MOCK,
-  statuses: [...VALID_STATUSES],
-  reasonTags: REASON_TAGS,
-  slaHours: SLA_HOURS,
-  user: req_user(_req),
-}));
-
-function req_user(req) {
-  return req?.session?.phone ? { phone: req.session.phone } : null;
-}
+app.get('/api/config', async (req, res) => {
+  // The team list is needed by every caller for the assignee dropdown, so it
+  // lives here rather than behind the admin-only /api/members.
+  let team = [];
+  try {
+    team = [...(await activeUsers()).entries()].map(([phone, name]) => ({ phone, name }));
+  } catch (err) {
+    console.error('Could not load the team list:', err.message);
+  }
+  res.json({
+    mock: MOCK,
+    statuses: [...VALID_STATUSES],
+    reasonTags: REASON_TAGS,
+    slaHours: SLA_HOURS,
+    team,
+    me: req.session?.phone ?? null,
+    isAdmin: Boolean(req.session?.isAdmin),
+  });
+});
 
 app.get('/api/carts', async (req, res) => {
   try {
@@ -332,7 +340,7 @@ app.get('/api/carts', async (req, res) => {
 
 app.post('/api/status', async (req, res) => {
   try {
-    const { id, status, notes, callbackAt, reasonTags } = req.body ?? {};
+    const { id, status, notes, callbackAt, reasonTags, assignedTo } = req.body ?? {};
     if (id === undefined || id === null) {
       return res.status(400).json({ ok: false, error: 'Missing cart id.' });
     }
@@ -366,6 +374,21 @@ app.post('/api/status', async (req, res) => {
       cb = null;
     }
 
+    // null unassigns; anything else must be a current, active member, so a cart
+    // can never be assigned to someone who cannot sign in to see it.
+    let assignee;
+    if (assignedTo !== undefined) {
+      if (assignedTo === null || assignedTo === '') {
+        assignee = null;
+      } else {
+        const phone = normalisePhone(assignedTo);
+        if (!phone || !(await activeUsers()).has(phone)) {
+          return res.status(400).json({ ok: false, error: 'That person is not an active member.' });
+        }
+        assignee = phone;
+      }
+    }
+
     const updatedBy = await currentUserName(req);
 
     // If someone else saved this row since the client last read it, stop rather
@@ -383,6 +406,7 @@ app.post('/api/status', async (req, res) => {
 
     const row = await db.update(id, {
       status, notes, callbackAt: cb, reasonTags: tags, updatedBy,
+      ...(assignedTo !== undefined ? { assignedTo: assignee } : {}),
     });
     if (!row) return res.status(404).json({ ok: false, error: 'No such cart.' });
     return res.json({ ok: true, entry: row });

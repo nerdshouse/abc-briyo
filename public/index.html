@@ -56,6 +56,11 @@
         <option value="callback">Callback due soonest</option>
       </select>
       <button type="button" id="overdueOnly" class="toggle">Overdue callbacks</button>
+      <button type="button" id="mineOnly" class="toggle">Assigned to me</button>
+      <select id="assigneeFilter" aria-label="Filter by assignee">
+        <option value="">Anyone</option>
+        <option value="__unassigned">Unassigned</option>
+      </select>
     </div>
 
     <p id="resultNote" class="result-note" hidden></p>
@@ -69,12 +74,13 @@
             <th>Items</th>
             <th class="right">Value</th>
             <th>Dropped at</th>
+            <th>Owner</th>
             <th>Contact</th>
             <th>Status &amp; notes</th>
           </tr>
         </thead>
         <tbody id="rows">
-          <tr><td colspan="7" class="empty">Loading…</td></tr>
+          <tr><td colspan="8" class="empty">Loading…</td></tr>
         </tbody>
       </table>
     </div>

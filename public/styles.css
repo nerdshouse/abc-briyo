@@ -324,3 +324,9 @@ button.linky {
   padding: 2px 4px; font-size: 12px; margin-left: 6px;
 }
 button.linky:hover { background: none; text-decoration: underline; }
+
+/* ---------- assignment ---------- */
+td.owner { min-width: 130px; }
+td.owner select { width: 100%; font-size: 12.5px; padding: 5px 8px; }
+td.owner .js-takeit { margin: 3px 0 0; padding: 2px 0; }
+tr[data-mine="true"] { box-shadow: inset 3px 0 0 var(--accent); }
