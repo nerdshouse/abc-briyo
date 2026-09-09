@@ -559,21 +559,35 @@ async function renderInsights() {
 
 /** Says what is on screen versus what exists — the old code silently dropped
  *  everything past the 500th row with no indication. */
+const RANGE_LABEL = { 1: 'today', 3: 'the last 3 days', 7: 'the last 7 days', 0: 'all time' };
+
+/**
+ * Always says what is on screen. Previously it only appeared when results were
+ * truncated, so switching between ranges that happen to hold the same carts
+ * looked like the button had done nothing.
+ */
 function renderResultNote() {
   const el = $('#resultNote');
   if (!el) return;
+  el.hidden = false;
+
   if (state.query) {
     el.textContent = `${state.carts.length} result${state.carts.length === 1 ? '' : 's'} for "${state.query}" — searching all history.`
       + (state.truncated ? ' Showing the first 50; narrow the search.' : '');
-    el.hidden = false;
     return;
   }
+
+  const shown = visibleCarts().length;
+  const inRange = state.total ?? state.carts.length;
+  const label = RANGE_LABEL[state.days] ?? `the last ${state.days} days`;
+
   if (state.truncated) {
-    el.textContent = `Showing ${state.carts.length} of ${state.total} carts in this range — narrow the date range to see the rest.`;
-    el.hidden = false;
+    el.textContent = `Showing ${state.carts.length} of ${inRange} carts from ${label} — narrow the date range to see the rest.`;
     return;
   }
-  el.hidden = true;
+  el.textContent = shown === inRange
+    ? `${inRange} cart${inRange === 1 ? '' : 's'} from ${label}.`
+    : `${shown} of ${inRange} carts from ${label} shown — filters are narrowing this.`;
 }
 
 function syncExportLink() {
@@ -598,6 +612,7 @@ function markActiveFilters() {
 
 function render() {
   markActiveFilters();
+  renderResultNote();
   renderStats();
   renderRows();
   renderInsights();

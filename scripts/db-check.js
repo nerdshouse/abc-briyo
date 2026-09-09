@@ -318,6 +318,31 @@ await step('webhook failures are recorded and counted', async () => {
   return `${after} in the last 24h`;
 });
 
+await step('ranges are calendar days, not rolling hours', async () => {
+  // "Today" returning most of yesterday is what made the range buttons look
+  // broken: a 24h rolling window is not the day the callers are living in.
+  const { rows } = await getPool().query('SELECT id FROM abandoned_carts WHERE cart_id = $1', [TEST_CART]);
+  const id = rows[0].id;
+
+  // Yesterday, late enough that a rolling 24h window would still include it.
+  await getPool().query(
+    `UPDATE abandoned_carts SET received_at =
+       (date_trunc('day', (now() AT TIME ZONE 'Asia/Kolkata')) - interval '2 hours') AT TIME ZONE 'Asia/Kolkata'
+     WHERE id = $1`, [id]);
+
+  const today = await listCarts({ sinceDays: 1 });
+  if (today.carts.some((c) => c.cart_id === TEST_CART)) {
+    throw new Error('a cart from yesterday evening appeared under "Today"');
+  }
+  const twoDays = await listCarts({ sinceDays: 2 });
+  if (!twoDays.carts.some((c) => c.cart_id === TEST_CART)) {
+    throw new Error('yesterday\'s cart is missing from a 2-day window');
+  }
+
+  await getPool().query('UPDATE abandoned_carts SET received_at = now() WHERE id = $1', [id]);
+  return 'yesterday evening excluded from today, included in 2 days';
+});
+
 await step('date window is applied server-side', async () => {
   // The old code took an unconditional LIMIT 500 and silently dropped the rest.
   const { rows } = await getPool().query('SELECT id FROM abandoned_carts WHERE cart_id = $1', [TEST_CART]);

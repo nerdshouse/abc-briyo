@@ -436,6 +436,14 @@ are the point of the board.
 1,240 — narrow the date range"*. The previous behaviour was an unconditional `LIMIT 500` that
 silently dropped the oldest rows once volume passed it.
 
+The ranges are **calendar days in `BOARD_TIMEZONE`** (default `Asia/Kolkata`), not rolling
+hours — "Today" means since midnight where the callers are, not the last 24 hours. A rolling
+window made "Today" return most of yesterday, which made the buttons look broken.
+
+The board always states what it is showing (*"26 carts from the last 7 days"*), so switching
+between ranges that happen to contain the same carts still gives visible feedback, and a
+filtered view says so explicitly (*"3 of 26 carts shown — filters are narrowing this"*).
+
 **Search ignores the window entirely** — "that customer from three weeks ago just rang back" is
 the case it exists for. It matches name, email, cart id, and phone on digits only, so
 `98123 45678` and `+919812345678` both hit. Escape clears it.
