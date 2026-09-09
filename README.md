@@ -150,6 +150,22 @@ Changes take effect on the **next login attempt** — no restart, no deploy.
 "Hi Team". Revoking someone blocks new logins immediately; an existing session survives until
 it expires (`SESSION_TTL_HOURS`, default 12h).
 
+#### Emergency logout and audit
+
+Sessions are stateless signed cookies, so deactivating someone in `allowed_users` blocks new
+logins but leaves their existing session valid until it expires (`SESSION_TTL_HOURS`, 12h).
+
+**Bump `SESSION_EPOCH`** to kill every token instantly. It's baked into each token, so changing
+it invalidates all of them — a global logout for one env-var change, no session store and no
+per-request database read. Per-user revocation isn't worth a session table for a team this size.
+
+Every login attempt — success, wrong code, non-allowlisted number — is written to `login_log`
+with the IP. Render's logs rotate, so this is the only durable record of who signed in.
+
+`POST /auth/request-otp` is unauthenticated, so it's also capped per-IP (`OTP_IP_LIMIT`,
+default 10/hour) on top of the existing per-phone limit. The damage from abuse is burnt 11za
+credits and a flagged WhatsApp sender, not compute.
+
 #### The ALLOWED_PHONES fallback
 
 `ALLOWED_PHONES` still exists as a **bootstrap**. On startup, if `allowed_users` is empty, it's
@@ -377,6 +393,31 @@ silently dropped the oldest rows once volume passed it.
 the case it exists for. It matches name, email, cart id, and phone on digits only, so
 `98123 45678` and `+919812345678` both hit. Escape clears it.
 
+### What GoKwik already sent
+
+Rows show a **GoKwik: msg sent / email sent** badge and a **Repeat buyer** count, read from
+`message_enqueued`, `abc_email_sent` and `brand_order_count` in the payload.
+
+This matters more than it looks: GoKwik runs its own recovery flows (and integrates Gupshup and
+Limechat). Right now **every live cart has `message_enqueued: true`** — the customer has already
+been messaged before anyone picks up the phone. A caller who knows that opens differently, and
+it's the concrete reason this board sends nothing to customers automatically.
+
+### Export
+
+**Export CSV** downloads the current view — same date range or search, no `raw_payload`, and
+nothing the board doesn't already show. Exports are logged with who ran them; it's the largest
+data-egress path in the app and it carries customer PII.
+
+Values starting `=`, `+`, `-` or `@` are prefixed with an apostrophe so an exported note can't
+execute as a formula when someone opens it in Excel.
+
+### Staying in sync
+
+The board reloads every 60 seconds so a teammate's change appears without a manual refresh.
+It skips the reload while a field is focused or a search is active — pulling data out from
+under someone mid-sentence is exactly what the conflict guard exists to prevent.
+
 ### Save conflicts
 
 Each save sends the `status_updated_at` the client last saw. If someone *else* has saved since,
@@ -464,6 +505,7 @@ login and webhook are all testable before Neon exists.
 | `POST /api/status` | session | `{id, status, notes}` — updates one row |
 | `GET /api/config` | session | Mock-mode flag, status list, reason tags, SLA hours |
 | `POST /api/webhook/gokwik/order-completed` | shared secret | Auto-marks matching carts Recovered — **not yet enabled by GoKwik** |
+| `GET /api/carts.csv?days=&q=` | session | CSV of the current view, no `raw_payload` |
 | `GET /api/reasons/summary?days=` | session | Reason-tag counts over the window |
 | `GET /api/stats/by-caller?days=` | session | Per-teammate activity |
 | `POST /auth/request-otp` | Sends a code to an allowlisted number |

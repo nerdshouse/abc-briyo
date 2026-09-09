@@ -107,6 +107,24 @@ function itemsOf(cart) {
 
 const riskClass = (flag) => 'risk-' + String(flag || '').toLowerCase().split(' ')[0];
 
+/**
+ * GoKwik runs its own recovery email/messaging. Showing that lets a caller open
+ * with the right line instead of repeating a message the customer already got —
+ * and is why this board deliberately sends nothing automatically.
+ */
+function gokwikTouch(cart) {
+  const bits = [];
+  if (cart.gokwik_message_queued) bits.push('msg sent');
+  if (cart.gokwik_email_sent) bits.push('email sent');
+  const already = bits.length
+    ? `<div class="touched" title="GoKwik already contacted this customer">GoKwik: ${bits.join(' + ')}</div>`
+    : '';
+  const repeat = cart.brand_order_count > 0
+    ? `<div class="repeat" title="Has ordered before">Repeat buyer (${cart.brand_order_count})</div>`
+    : '';
+  return already + repeat;
+}
+
 /** Overdue / due-today state for a scheduled callback. */
 function callbackState(cart) {
   if (cart.status !== 'Callback scheduled' || !cart.callback_at) return null;
@@ -178,6 +196,7 @@ async function loadAll(attempt = 1) {
     state.total = carts.total ?? carts.carts.length;
     state.truncated = Boolean(carts.truncated);
     renderResultNote();
+    syncExportLink();
 
     const sel = $('#stageFilter');
     if (sel) {
@@ -370,6 +389,7 @@ function renderRows() {
           ${c.discount_total ? `<div class="muted">−${money(c.discount_total, c.currency)} disc.</div>` : ''}
         </td>
         <td class="stage" data-label="Dropped at">
+          ${gokwikTouch(c)}
           ${c.drop_stage ? esc(c.drop_stage) : '<span class="muted">—</span>'}
           ${c.risk_flag ? `<div class="risk ${riskClass(c.risk_flag)}">${esc(c.risk_flag)}</div>` : ''}
           ${c.utm_source ? `<div class="muted">via ${esc(c.utm_source)}</div>` : ''}
@@ -477,6 +497,14 @@ function renderResultNote() {
   el.hidden = true;
 }
 
+function syncExportLink() {
+  const a = $('#exportCsv');
+  if (!a) return;
+  a.href = state.query
+    ? `/api/carts.csv?q=${encodeURIComponent(state.query)}`
+    : `/api/carts.csv?days=${state.days}`;
+}
+
 function render() {
   renderStats();
   renderRows();
@@ -547,7 +575,21 @@ on('#rangeGroup', 'click', (e) => {
   if (!btn) return;
   state.days = Number(btn.dataset.days);
   $('#rangeGroup').querySelectorAll('button').forEach((b) => b.classList.toggle('active', b === btn));
-  loadAll();   // the range is a server-side query now, not a local filter
+  loadAll();
+
+/**
+ * Poll so a teammate's change shows up without a manual refresh. Skipped while
+ * a field is focused — reloading under someone's cursor would discard what they
+ * are typing, which is exactly what the conflict guard exists to prevent.
+ */
+const REFRESH_MS = Number(60_000);
+setInterval(() => {
+  if (document.hidden) return;
+  const active = document.activeElement;
+  if (active && active.closest?.('#rows')) return;
+  if (state.query) return;   // don't yank a search result set away
+  loadAll();
+}, REFRESH_MS);   // the range is a server-side query now, not a local filter
 });
 
 let searchTimer = null;

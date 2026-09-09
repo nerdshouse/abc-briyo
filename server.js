@@ -385,6 +385,66 @@ app.post('/api/status', async (req, res) => {
   } catch (err) { return fail(res, err); }
 });
 
+/**
+ * CSV of the current view, for the "can I get a report" ask.
+ *
+ * Deliberately excludes raw_payload and exposes nothing the board doesn't
+ * already show on screen. Exports are logged — this is the app's largest
+ * data-egress path and it carries customer PII.
+ */
+app.get('/api/carts.csv', async (req, res) => {
+  try {
+    if (!MOCK) await ensureSchema();
+    const q = String(req.query.q ?? '').trim();
+    const sinceDays = Math.max(0, Number.parseInt(req.query.days ?? '7', 10) || 0);
+    const result = q ? await db.search(q, 1000) : await db.list({ sinceDays });
+
+    const who = await currentUserName(req);
+    console.log(`CSV export by ${who}: ${result.carts.length} row(s), ${q ? `q="${q}"` : `${sinceDays}d`}`);
+
+    const COLUMNS = [
+      ['Abandoned at', (c) => c.received_at],
+      ['Cart ID', (c) => c.cart_id],
+      ['Customer', (c) => c.customer_name],
+      ['Phone', (c) => c.phone],
+      ['Email', (c) => c.email],
+      ['Value', (c) => c.total_price],
+      ['Currency', (c) => c.currency],
+      ['Items', (c) => c.item_count],
+      ['Drop stage', (c) => c.drop_stage],
+      ['Risk', (c) => c.risk_flag],
+      ['Source', (c) => c.utm_source],
+      ['Status', (c) => c.status],
+      ['Notes', (c) => c.notes],
+      ['Reasons', (c) => (c.reason_tags || []).join('; ')],
+      ['Callback at', (c) => c.callback_at],
+      ['Updated by', (c) => c.updated_by],
+      ['Updated at', (c) => c.status_updated_at],
+      ['Checkout URL', (c) => c.checkout_url],
+    ];
+
+    // Excel treats a leading =, +, - or @ as a formula; prefix those so an
+    // exported note can never execute in someone's spreadsheet.
+    const cell = (v) => {
+      if (v === null || v === undefined) return '';
+      let out = v instanceof Date ? v.toISOString() : String(v);
+      if (/^[=+\-@]/.test(out)) out = `'${out}`;
+      return `"${out.replace(/"/g, '""')}"`;
+    };
+
+    const body = [
+      COLUMNS.map(([h]) => cell(h)).join(','),
+      ...result.carts.map((c) => COLUMNS.map(([, get]) => cell(get(c))).join(',')),
+    ].join('\r\n');
+
+    const stamp = new Date().toISOString().slice(0, 10);
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', `attachment; filename="abandoned-carts-${stamp}.csv"`);
+    // BOM so Excel opens UTF-8 correctly — customer names contain non-ASCII.
+    return res.send('\uFEFF' + body);
+  } catch (err) { return fail(res, err); }
+});
+
 app.get('/api/reasons/summary', async (req, res) => {
   try {
     const days = Math.max(0, Number.parseInt(req.query.days ?? '7', 10) || 0);

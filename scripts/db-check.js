@@ -4,12 +4,14 @@ import {
   matchOrderToCarts, reasonSummary, statsByCaller, staleCarts,
   renormalizeRow, DERIVED_COLUMNS,
   recordSystemEvent, getSystemState, recordWebhookFailure, webhookFailureCount,
-  searchCarts, conflictingUpdate,
+  searchCarts, conflictingUpdate, recordLogin, recentLogins,
 } from '../lib/db.js';
 import { createOtp, verifyOtp, checkRateLimit, normalisePhone } from '../lib/otp.js';
 import { normalizePayload, redactPayload, REDACTED_KEYS } from '../lib/normalize.js';
 import { GOKWIK_REAL_PAYLOAD } from './fixtures/gokwik-real.js';
 import { isIngestSilent } from '../lib/sla-alert.js';
+import { issueSession, verifySession } from '../lib/session.js';
+import { rateLimit, _reset as resetRateLimit } from '../lib/rate-limit.js';
 
 /**
  * Exercises every database code path against the real DATABASE_URL and cleans up
@@ -362,6 +364,68 @@ await step('conflict guard catches another user, ignores your own edits', async 
   return `flagged ${clash.updated_by}, same-user edits pass through`;
 });
 
+await step('GoKwik outreach signals persist', async () => {
+  // These exist so a caller can see the customer has already been messaged —
+  // the reason this board sends nothing automatically.
+  const payload = {
+    request_id: TEST_CART, message_enqueued: 'true', abc_email_sent: false,
+    brand_order_count: '4', total_price: '99',
+  };
+  await insertCart(normalizePayload(payload), payload);
+  const { rows } = await getPool().query(
+    `SELECT gokwik_message_queued, gokwik_email_sent, brand_order_count
+     FROM abandoned_carts WHERE cart_id = $1`, [TEST_CART]);
+  const r = rows[0];
+  if (r.gokwik_message_queued !== true) throw new Error('string "true" did not become a boolean');
+  if (r.gokwik_email_sent !== false) throw new Error('boolean false was lost');
+  if (r.brand_order_count !== 4) throw new Error('brand_order_count did not persist');
+  return 'message queued, email not sent, 4 prior orders';
+});
+
+await step('login attempts are audited', async () => {
+  await recordLogin({ phone: TEST_PHONE, ok: false, reason: 'db-check simulated', ip: '203.0.113.1' });
+  await recordLogin({ phone: TEST_PHONE, ok: true, reason: null, ip: '203.0.113.1' });
+  const mine = (await recentLogins(20)).filter((l) => l.phone === TEST_PHONE);
+  if (mine.length < 2) throw new Error('login attempts were not recorded');
+  if (!mine.some((l) => l.ok) || !mine.some((l) => !l.ok)) throw new Error('outcome not captured');
+  return 'success and failure both recorded';
+});
+
+await step('SESSION_EPOCH invalidates every token', async () => {
+  // The emergency lever for stateless sessions: a deactivated teammate would
+  // otherwise keep access until their token expired.
+  const before = process.env.SESSION_EPOCH;
+  process.env.SESSION_SECRET = process.env.SESSION_SECRET || 'db-check-secret-0123456789';
+  process.env.SESSION_EPOCH = '1';
+  const token = issueSession('919000000000');
+  if (!verifySession(token)) throw new Error('a fresh token did not verify');
+
+  process.env.SESSION_EPOCH = '2';
+  if (verifySession(token)) throw new Error('token survived an epoch bump — global logout is broken');
+
+  process.env.SESSION_EPOCH = '1';
+  if (!verifySession(token)) throw new Error('token did not come back when the epoch was restored');
+
+  if (before === undefined) delete process.env.SESSION_EPOCH; else process.env.SESSION_EPOCH = before;
+  return 'valid, killed by bump, valid again';
+});
+
+await step('per-IP rate limiter', async () => {
+  resetRateLimit();
+  const key = 'dbcheck-ip';
+  const opts = { key, limit: 3, windowMs: 60_000 };
+  for (let i = 0; i < 3; i += 1) {
+    if (!rateLimit(opts).ok) throw new Error(`blocked early at attempt ${i + 1}`);
+  }
+  const blocked = rateLimit(opts);
+  if (blocked.ok) throw new Error('did not block past the limit');
+  if (!(blocked.retryAfter > 0)) throw new Error('no Retry-After hint');
+  // A different caller must be unaffected.
+  if (!rateLimit({ ...opts, key: 'other-ip' }).ok) throw new Error('limited the wrong key');
+  resetRateLimit();
+  return `3 allowed, 4th blocked for ${blocked.retryAfter}s, other IPs unaffected`;
+});
+
 await step('allowlist table readable', async () => {
   const { activeUsers } = await import('../lib/otp.js');
   const m = await activeUsers();
@@ -371,6 +435,7 @@ await step('allowlist table readable', async () => {
 
 // ---- cleanup ---------------------------------------------------------------
 await step('cleanup', async () => {
+  await getPool().query('DELETE FROM login_log WHERE phone = $1', [TEST_PHONE]);
   await getPool().query('DELETE FROM system_state WHERE key = $1', [TEST_STATE_KEY]);
   await getPool().query('DELETE FROM webhook_failures WHERE kind = $1', [TEST_FAILURE_KIND]);
   await getPool().query('DELETE FROM auto_recovery_log WHERE cart_id = $1', [TEST_CART]);
