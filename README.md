@@ -319,6 +319,30 @@ SELECT id, received_at, raw_payload FROM abandoned_carts ORDER BY received_at DE
 Add the real key names to the relevant array in `lib/normalize.js` and redeploy. Old rows can
 be backfilled from `raw_payload` afterwards.
 
+## Admin dashboard
+
+`/dashboard`, admin-only, linked from the board header. One screen answering "is this
+working?":
+
+- **Headline** — carts in, cart value, worked, recovered, recovered value, recovery rate,
+  not-called-yet, and the **median time to first call**. That last one is the number that says
+  whether the team is keeping up; it currently reads around 7 hours.
+- **Needs attention** — only appears when something is wrong: ingestion silent, webhook
+  failures, or carts past the SLA.
+- **Who's online** — who is on the board right now. Presence is written on authenticated
+  requests, piggy-backed on the membership cache, so it costs about one write per person per
+  minute rather than one per request. "Online" means seen in the last 5 minutes
+  (`ONLINE_WINDOW_MINUTES`).
+- **By caller**, **carts per day** (recovered shaded over the total), **where they drop**,
+  **risk mix**, **traffic source**.
+
+It uses the same calendar-day boundary as the board, and `db:check` asserts the totals agree
+with what the board would list — an overview that quietly disagrees with the list is worse
+than no overview.
+
+Callers get `403` on both the page and `/api/admin/overview`: it aggregates every teammate's
+performance, which is not the whole team's business.
+
 ## Working a call list
 
 ### Callbacks

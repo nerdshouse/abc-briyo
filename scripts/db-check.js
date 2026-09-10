@@ -7,6 +7,7 @@ import {
   searchCarts, conflictingUpdate, recordLogin, recentLogins,
   listMembers, upsertMember, updateMember, deleteMember, otherActiveAdminCount,
   recordMemberChange, recentMemberChanges, changeMemberPhone,
+  adminOverview, whoIsOnline, touchLastSeen,
 } from '../lib/db.js';
 import { createOtp, verifyOtp, checkRateLimit, normalisePhone } from '../lib/otp.js';
 import { normalizePayload, redactPayload, REDACTED_KEYS } from '../lib/normalize.js';
@@ -586,6 +587,51 @@ await step('member changes are audited', async () => {
     (l) => l.target_phone === TEST_MEMBER && l.actor === 'db-check');
   if (!found) throw new Error('member change was not recorded');
   return 'add recorded with actor and target';
+});
+
+await step('presence: last seen is recorded and ages out', async () => {
+  await upsertMember({ phone: TEST_MEMBER, name: 'Presence Test', addedBy: 'db-check' });
+
+  await touchLastSeen(TEST_MEMBER);
+  const online = await whoIsOnline(5);
+  if (!online.some((o) => o.phone === TEST_MEMBER)) throw new Error('a just-seen member is not online');
+
+  // Backdate them past the window; they must drop off rather than linger.
+  await getPool().query(
+    "UPDATE allowed_users SET last_seen_at = now() - interval '30 minutes' WHERE phone = $1", [TEST_MEMBER]);
+  if ((await whoIsOnline(5)).some((o) => o.phone === TEST_MEMBER)) {
+    throw new Error('a member seen 30 minutes ago still counts as online');
+  }
+
+  // A deactivated member must never show as online.
+  await touchLastSeen(TEST_MEMBER);
+  await updateMember(TEST_MEMBER, { active: false });
+  if ((await whoIsOnline(5)).some((o) => o.phone === TEST_MEMBER)) {
+    throw new Error('a deactivated member shows as online');
+  }
+
+  await deleteMember(TEST_MEMBER);
+  return 'seen now = online, 30m ago = offline, deactivated = never';
+});
+
+await step('admin overview aggregates agree with the board', async () => {
+  const o = await adminOverview(0);
+  const list = await listCarts({ sinceDays: 0 });
+
+  if (o.totals.carts !== list.total) {
+    throw new Error(`overview counts ${o.totals.carts} carts, the board ${list.total}`);
+  }
+  if (o.totals.recovered > o.totals.worked) throw new Error('recovered exceeds worked');
+  if (o.totals.worked > o.totals.carts) throw new Error('worked exceeds total carts');
+
+  const byDayTotal = o.byDay.reduce((n, d) => n + d.carts, 0);
+  if (byDayTotal !== o.totals.carts) {
+    throw new Error(`per-day rows sum to ${byDayTotal}, totals say ${o.totals.carts}`);
+  }
+  for (const key of ['stages', 'risk', 'sources', 'callers']) {
+    if (!Array.isArray(o[key])) throw new Error(`${key} missing from the overview`);
+  }
+  return `${o.totals.carts} carts, ${o.totals.worked} worked, ${o.totals.recovered} recovered; per-day sums match`;
 });
 
 await step('allowlist table readable', async () => {

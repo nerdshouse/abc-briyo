@@ -144,15 +144,20 @@ function itemsCell(cart) {
   };
 
   const units = items.reduce((n, i) => n + (i.quantity || 1), 0);
-  const head = items.slice(0, 2).map(line).join('');
-  const rest = items.slice(2);
+  const head = items.slice(0, 3).map(line).join('');
+  const rest = items.slice(3);
 
   return (items.length > 1
       ? `<div class="itemcount">${items.length} products · ${units} unit${units === 1 ? '' : 's'}</div>`
       : '')
     + head
     + (rest.length
-      ? `<details class="moreitems"><summary>+${rest.length} more</summary>${rest.map(line).join('')}</details>`
+      // The label has to change when it opens, or expanding looks like nothing
+      // happened — the extra rows appear but the toggle still says "+1 more".
+      ? `<details class="moreitems">
+           <summary><span class="lbl-more">+${rest.length} more</span><span class="lbl-less">Show less</span></summary>
+           ${rest.map(line).join('')}
+         </details>`
       : '');
 }
 
@@ -771,11 +776,25 @@ on('#logout', 'click', async () => {
 });
 
 // Show who is signed in; bounce to login if the session expired mid-session.
+/** "Good morning, Axit" reads better than a phone number, and confirms at a
+ *  glance which account you are signed in as. */
+function greeting(name) {
+  const hour = Number(new Intl.DateTimeFormat('en-GB', {
+    hour: 'numeric', hour12: false, timeZone: 'Asia/Kolkata',
+  }).format(new Date()));
+  const part = hour < 12 ? 'Good morning' : hour < 17 ? 'Good afternoon' : 'Good evening';
+  return name ? `${part}, ${name}` : part;
+}
+
 fetch('/auth/me').then((r) => r.json()).then((me) => {
   if (!me.authenticated) { window.location.href = '/login'; return; }
-  $('#sessionPhone').textContent = `+${me.phone}`;
-  // Member management is admin-only, so don't advertise a link that 403s.
-  if (me.isAdmin) $('#adminLink').hidden = false;
+  $('#sessionPhone').textContent = greeting(me.name);
+  $('#sessionPhone').title = `+${me.phone}`;
+  // Admin-only pages: don't advertise links that 403.
+  if (me.isAdmin) {
+    $('#adminLink').hidden = false;
+    if ($('#dashLink')) $('#dashLink').hidden = false;
+  }
 }).catch(() => {});
 
 // Populate the status filter once.

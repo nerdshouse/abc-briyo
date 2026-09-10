@@ -98,6 +98,9 @@ td.empty { color: var(--muted); font-style: italic; text-align: center; padding:
 .moreitems summary::-webkit-details-marker { display: none; }
 .moreitems summary:hover { text-decoration: underline; }
 .moreitems[open] summary { margin-bottom: 2px; }
+.moreitems .lbl-less { display: none; }
+.moreitems[open] .lbl-more { display: none; }
+.moreitems[open] .lbl-less { display: inline; }
 
 .links { display: flex; flex-direction: column; gap: 3px; font-size: 13px; white-space: nowrap; }
 .links a { color: var(--accent); text-decoration: none; }
@@ -413,4 +416,30 @@ table.board .status-cell { min-width: 0; }
   table.board { table-layout: auto; }
   table.board th, table.board td { width: auto !important; }
   table.board .cust-name, table.board .cust-email { white-space: normal; overflow: visible; }
+}
+
+#sessionPhone { font-weight: 500; color: var(--text); }
+
+/* ---------- admin dashboard ---------- */
+.stat.stat-good { border-color: #a6f4c5; background: #f6fffa; }
+.stat.stat-good .value { color: #05603a; }
+
+.onliner { display: flex; align-items: center; gap: 8px; padding: 5px 0; font-size: 13px; }
+.onliner .dot {
+  width: 8px; height: 8px; border-radius: 50%; background: #12b76a;
+  box-shadow: 0 0 0 3px rgba(18, 183, 106, 0.15); flex: 0 0 auto;
+}
+.onliner .oname { font-weight: 500; }
+.onliner .muted { margin-left: auto; }
+
+/* Recovered is drawn over the total, so the shaded part is the win. */
+.bar { position: relative; }
+.bar-fill.bar-good { position: absolute; left: 0; top: 0; background: #12b76a; }
+
+#dashRange { flex: 0 0 auto; }
+#dashRange button { font-size: 13px; padding: 6px 11px; }
+
+@media (max-width: 760px) {
+  #dashRange { flex: 1 1 100%; }
+  #dashRange button { flex: 1 1 0; min-height: 38px; }
 }

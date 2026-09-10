@@ -9,6 +9,7 @@ import {
   recordSystemEvent, getSystemState, recordWebhookFailure, webhookFailureCount, cartCount,
   listMembers, upsertMember, updateMember, deleteMember, otherActiveAdminCount,
   recordMemberChange, recentMemberChanges, changeMemberPhone,
+  adminOverview, whoIsOnline,
 } from './lib/db.js';
 import {
   mockInsertCart, mockListCarts, mockUpdateStatus, mockMatchOrder,
@@ -485,6 +486,45 @@ function requireAdminPage(req, res, next) {
     '<p style="font:14px system-ui;padding:40px">Admins only. ' +
     '<a href="/">Back to the board</a></p>');
 }
+
+app.get('/dashboard', requireAdminPage, (_req, res) => res.sendFile(path.join(PUBLIC, 'dashboard.html')));
+
+/** Everything the overview needs, in one round trip. Admin-only: it aggregates
+ *  every caller's performance, which is not the whole team's business. */
+app.get('/api/admin/overview', requireAdmin, async (req, res) => {
+  try {
+    if (MOCK) return res.status(400).json({ ok: false, error: 'The dashboard needs a database.' });
+    const days = Math.max(0, Number.parseInt(req.query.days ?? '7', 10) || 0);
+    const [overview, online, lastIngest, failures, stale, members] = await Promise.all([
+      adminOverview(days),
+      whoIsOnline(Number(process.env.ONLINE_WINDOW_MINUTES || 5)),
+      db.lastIngest(),
+      webhookFailureCount(24),
+      db.stale(SLA_HOURS),
+      listMembers(),
+    ]);
+
+    const lastIngestAgeMin = lastIngest
+      ? Math.round((Date.now() - new Date(lastIngest).getTime()) / 60000) : null;
+
+    return res.json({
+      ok: true,
+      days,
+      ...overview,
+      online,
+      team: members.filter((m) => m.active).length,
+      health: {
+        lastIngest,
+        lastIngestAgeMinutes: lastIngestAgeMin,
+        ingestSilent: isIngestSilent(lastIngest, Number(process.env.INGEST_SILENCE_HOURS || 8)),
+        webhookFailures24h: failures,
+        staleCarts: stale.count,
+        staleValue: stale.value,
+        slaHours: SLA_HOURS,
+      },
+    });
+  } catch (err) { return fail(res, err); }
+});
 
 app.get('/api/members', requireAdmin, async (_req, res) => {
   try {

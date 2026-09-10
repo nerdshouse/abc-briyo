@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Dashboard — Cart Recovery Board</title>
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <div class="wrap">
+    <header class="page">
+      <div>
+        <h1 id="hello">Dashboard</h1>
+        <p class="sub">How recovery is going. Visible to admins only.</p>
+      </div>
+      <div class="session">
+        <div class="group" id="dashRange" role="group" aria-label="Range">
+          <button type="button" data-days="1">Today</button>
+          <button type="button" data-days="7" class="active">7 days</button>
+          <button type="button" data-days="30">30 days</button>
+          <button type="button" data-days="0">All</button>
+        </div>
+        <a class="btnlink" href="/admin">Members</a>
+        <a class="btnlink" href="/">← Board</a>
+      </div>
+    </header>
+
+    <div id="banner" class="banner error" hidden></div>
+    <div id="health" class="banner" hidden></div>
+
+    <section class="stats" id="headline"></section>
+
+    <section class="insights">
+      <div class="panel insight">
+        <header><h2>Who's online</h2><span class="muted" id="onlineMeta"></span></header>
+        <div id="online"><p class="muted">Loading…</p></div>
+      </div>
+      <div class="panel insight">
+        <header><h2>By caller</h2><span class="muted">in range</span></header>
+        <table class="mini">
+          <thead><tr><th>Caller</th><th class="right">Worked</th><th class="right">Recovered</th><th class="right">Rate</th><th class="right">Value</th></tr></thead>
+          <tbody id="callers"><tr><td colspan="5" class="empty">Loading…</td></tr></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="insights">
+      <div class="panel insight">
+        <header><h2>Carts per day</h2><span class="muted">recovered shaded</span></header>
+        <div id="byDay"><p class="muted">Loading…</p></div>
+      </div>
+      <div class="panel insight">
+        <header><h2>Where they drop</h2></header>
+        <div id="stages"><p class="muted">Loading…</p></div>
+      </div>
+    </section>
+
+    <section class="insights">
+      <div class="panel insight">
+        <header><h2>Risk mix</h2><span class="muted">GoKwik RTO flag</span></header>
+        <div id="risk"><p class="muted">Loading…</p></div>
+      </div>
+      <div class="panel insight">
+        <header><h2>Traffic source</h2></header>
+        <div id="sources"><p class="muted">Loading…</p></div>
+      </div>
+    </section>
+
+    <p class="note" id="footnote"></p>
+  </div>
+
+  <script src="/dashboard.js"></script>
+</body>
+</html>
