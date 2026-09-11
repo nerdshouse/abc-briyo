@@ -112,6 +112,8 @@ function itemsOf(cart) {
 }
 
 const riskClass = (flag) => 'risk-' + String(flag || '').toLowerCase().split(' ')[0];
+/** "Medium Risk" -> "Medium". The column header and colour already say risk. */
+const shortRisk = (flag) => String(flag || '').replace(/\s*risk\s*/i, '').trim() || flag;
 
 /**
  * Product names here run long ("Daily Wellness Starter Bundle – Vitamin D3 +
@@ -171,10 +173,10 @@ function gokwikTouch(cart) {
   if (cart.gokwik_message_queued) bits.push('msg sent');
   if (cart.gokwik_email_sent) bits.push('email sent');
   const already = bits.length
-    ? `<div class="touched" title="GoKwik already contacted this customer">GoKwik: ${bits.join(' + ')}</div>`
+    ? `<div class="touched" title="GoKwik already contacted this customer — ${bits.join(' + ')}">Nudged</div>`
     : '';
   const repeat = cart.brand_order_count > 0
-    ? `<div class="repeat" title="Has ordered before">Repeat buyer (${cart.brand_order_count})</div>`
+    ? `<div class="repeat" title="Has ordered ${cart.brand_order_count} time(s) before">Repeat ×${cart.brand_order_count}</div>`
     : '';
   return already + repeat;
 }
@@ -272,7 +274,7 @@ async function loadAll(attempt = 1) {
     const networkLevel = err instanceof TypeError;
     if (networkLevel && attempt < MAX_ATTEMPTS) {
       showError(`Server isn't responding — it may be waking up. Retrying (${attempt}/${MAX_ATTEMPTS - 1})…`);
-      rowsEl.innerHTML = '<tr><td colspan="8" class="empty">Waking the server…</td></tr>';
+      rowsEl.innerHTML = skeletonRows(3);
       await new Promise((r) => setTimeout(r, attempt * 4000));
       return loadAll(attempt + 1);
     }
@@ -429,11 +431,29 @@ function savedLabel(cart) {
     : `Saved ${when}`;
 }
 
+/** Shape-of-the-content placeholder — less jarring than the word "Loading". */
+function skeletonRows(n = 5) {
+  const cell = (widths) => `<td>${widths.map((w) => `<span class="sk ${w}"></span>`).join('')}</td>`;
+  return Array.from({ length: n }, () => `<tr class="skeleton">
+    ${cell(['w80', 'w60'])}${cell(['w80', 'w60'])}${cell(['w80', 'w80', 'w40'])}
+    ${cell(['w60'])}${cell(['w60', 'w80'])}${cell(['w80'])}${cell(['w80', 'w80'])}${cell(['w80', 'w60'])}
+  </tr>`).join('');
+}
+
 function renderRows() {
   const list = visibleCarts();
 
   if (!list.length) {
-    rowsEl.innerHTML = '<tr><td colspan="8" class="empty">No abandoned carts in this range.</td></tr>';
+    const filtered = state.status || state.stage || state.assignee || state.mineOnly || state.overdueOnly;
+    rowsEl.innerHTML = `<tr><td colspan="8">
+      <div class="empty-state">
+        <h3>${state.query ? 'No carts match that search' : filtered ? 'No carts match these filters' : 'No abandoned carts in this range'}</h3>
+        <p>${state.query
+          ? 'Try a phone number or part of an email.'
+          : filtered
+            ? 'Clear the filters above to see everything in this range.'
+            : 'Widen the date range, or wait for the next cart from GoKwik.'}</p>
+      </div></td></tr>`;
     return;
   }
 
@@ -443,29 +463,32 @@ function renderRows() {
     const wa = waNumber(c.phone);
     const itemSummary = itemsCell(c);
 
+    // Call is the job, so it is the only filled button; the rest are secondary.
     const links = [];
-    if (c.phone) links.push(`<a href="tel:${esc(String(c.phone).replace(/\s/g, ''))}">Call</a>`);
+    if (c.phone) links.push(`<a class="call" href="tel:${esc(String(c.phone).replace(/\s/g, ''))}">Call</a>`);
     if (wa) links.push(`<a href="https://wa.me/${wa}?text=${encodeURIComponent(waMessage(c))}" target="_blank" rel="noopener">WhatsApp</a>`);
-    if (c.checkout_url) links.push(`<a href="${esc(c.checkout_url)}" target="_blank" rel="noopener">Cart link</a>`);
+    if (c.checkout_url) links.push(`<a href="${esc(c.checkout_url)}" target="_blank" rel="noopener">Cart</a>`);
     if (!c.phone) links.push('<span class="muted">No phone</span>');
 
     return `
       <tr data-row="${esc(c.id)}" data-status="${esc(status)}" data-mine="${c.assigned_to === ME}">
-        <td data-label="Abandoned"><div>${relativeTime(c.received_at)}</div>
-            <div class="muted">${new Date(c.received_at).toLocaleString('en-IN', { dateStyle: 'medium', timeStyle: 'short' })}</div>
+        <td data-label="Abandoned"><div class="when-rel">${relativeTime(c.received_at)}</div>
+            <div class="when-abs" title="${esc(new Date(c.received_at).toLocaleString('en-IN', { dateStyle: 'full', timeStyle: 'short' }))}">${new Date(c.received_at).toLocaleString('en-IN', { day: 'numeric', month: 'short', hour: 'numeric', minute: '2-digit' })}</div>
             ${cb ? `<div class="cb cb-${cb.kind}">${cb.kind === 'scheduled' ? 'Callback ' : ''}${esc(cb.label)}</div>` : ''}</td>
-        <td data-label="Customer"><div class="cust-name">${esc(c.customer_name || 'Guest')}</div>
-            <div class="cust-email">${esc(c.email || '—')}</div></td>
+        <td data-label="Customer">
+          <div class="cust-name" title="${esc(c.customer_name || 'Guest')}">${esc(c.customer_name || 'Guest')}</div>
+          <div class="cust-email" title="${esc(c.email || '')}">${esc(c.email || '—')}</div>
+        </td>
         <td class="items" data-label="Items">${itemSummary}</td>
         <td class="right" data-label="Value">
-          ${money(c.total_price, c.currency)}
-          ${c.discount_total ? `<div class="muted">−${money(c.discount_total, c.currency)} disc.</div>` : ''}
+          <div class="amount">${money(c.total_price, c.currency)}</div>
+          ${c.discount_total ? `<div class="disc">−${money(c.discount_total, c.currency)} off</div>` : ''}
         </td>
         <td class="stage" data-label="Dropped at">
+          ${c.risk_flag ? `<div class="risk ${riskClass(c.risk_flag)}" title="${esc(c.risk_flag)} of return-to-origin">${esc(shortRisk(c.risk_flag))}</div>` : ''}
           ${gokwikTouch(c)}
-          ${c.drop_stage ? esc(c.drop_stage) : '<span class="muted">—</span>'}
-          ${c.risk_flag ? `<div class="risk ${riskClass(c.risk_flag)}">${esc(c.risk_flag)}</div>` : ''}
-          ${c.utm_source ? `<div class="muted">via ${esc(c.utm_source)}</div>` : ''}
+          <div class="meta">${c.drop_stage ? esc(c.drop_stage) : '—'}</div>
+          ${c.utm_source ? `<div class="meta">via ${esc(c.utm_source)}</div>` : ''}
         </td>
         <td class="owner" data-label="Owner">
           <select class="js-assign" data-id="${esc(c.id)}" autocomplete="off" aria-label="Assign to">
@@ -494,6 +517,7 @@ function renderRows() {
           </details>
           <div class="chips">${(c.reason_tags || []).map((t) => `<span class="chip">${esc(t)}</span>`).join('')}</div>
           <div class="saved">${savedLabel(c)}</div>
+        
         </td>
       </tr>`;
   }).join('');
