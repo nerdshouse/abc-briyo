@@ -66,6 +66,41 @@
       </div>
     </section>
 
+    <section class="panel insight" style="margin-bottom:18px">
+      <header>
+        <h2>Reports</h2>
+        <span class="session" style="gap:8px">
+          <span class="group" id="periodGroup" role="group" aria-label="Report period">
+            <button type="button" data-period="day" class="active">Daily</button>
+            <button type="button" data-period="week">Weekly</button>
+            <button type="button" data-period="month">Monthly</button>
+          </span>
+          <a class="btnlink" id="reportCsv" href="/api/admin/report.csv?period=day" download>Download CSV</a>
+        </span>
+      </header>
+      <div class="panel" style="overflow-x:auto;box-shadow:none;border:none">
+        <table class="mini" id="reportTable">
+          <thead>
+            <tr>
+              <th id="periodHead">Date</th>
+              <th class="right">Carts</th>
+              <th class="right">Cart value</th>
+              <th class="right">Called</th>
+              <th class="right">Contact</th>
+              <th class="right">Recovered</th>
+              <th class="right">Rate</th>
+              <th class="right">Recovered value</th>
+            </tr>
+          </thead>
+          <tbody id="reportRows"><tr><td colspan="8" class="empty">Loading…</td></tr></tbody>
+        </table>
+      </div>
+      <p class="hint">
+        Recovery rate is measured against carts <strong>called</strong>, not carts received —
+        you cannot recover a cart nobody rang, and mixing the two hides whether calling works.
+      </p>
+    </section>
+
     <p class="note" id="footnote"></p>
   </div>
 

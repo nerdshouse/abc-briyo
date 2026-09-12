@@ -50,18 +50,23 @@ function render(d) {
   const rate = t.worked ? Math.round((t.recovered / t.worked) * 100) : 0;
   const uncalled = t.carts - t.worked;
 
+  // A headline number invites "which ones?", so the countable ones link to the
+  // board already filtered rather than leaving you to rebuild it by hand.
+  const board = (params) => `/?days=${days}&${params}`;
   $('#headline').innerHTML = [
-    ['Carts in', t.carts, ''],
-    ['Cart value', money(t.value), ''],
-    ['Worked', `${t.worked}`, ''],
-    ['Recovered', `${t.recovered}`, t.recovered ? 'stat-good' : ''],
-    ['Recovered value', money(t.recovered_value), t.recovered ? 'stat-good' : ''],
-    ['Recovery rate', `${rate}%`, ''],
-    ['Not called yet', uncalled, uncalled ? 'stat-warn' : ''],
-    ['Median time to first call', duration(d.medianSecondsToFirstTouch), ''],
-  ].map(([label, value, cls]) => `
-    <div class="stat ${cls}"><div class="label">${label}</div><div class="value">${value}</div></div>
-  `).join('');
+    ['Carts in', t.carts, '', board('')],
+    ['Cart value', money(t.value), '', null],
+    ['Worked', `${t.worked}`, '', board('status=__called')],
+    ['Recovered', `${t.recovered}`, t.recovered ? 'stat-good' : '', board(`status=${encodeURIComponent('Called – Recovered')}`)],
+    ['Recovered value', money(t.recovered_value), t.recovered ? 'stat-good' : '', board(`status=${encodeURIComponent('Called – Recovered')}`)],
+    ['Recovery rate', `${rate}%`, '', null],
+    ['Not called yet', uncalled, uncalled ? 'stat-warn' : '', board(`status=${encodeURIComponent('Not called')}`)],
+    ['Median time to first call', duration(d.medianSecondsToFirstTouch), '', null],
+  ].map(([label, value, cls, href]) => (href
+    ? `<a class="stat stat-click ${cls}" href="${href}" title="See these carts on the board">
+         <div class="label">${label}</div><div class="value">${value}</div></a>`
+    : `<div class="stat ${cls}"><div class="label">${label}</div><div class="value">${value}</div></div>`
+  )).join('');
 
   // Health banner — only speaks up when something is actually wrong.
   const h = d.health;
@@ -123,6 +128,52 @@ function render(d) {
     + ` · ${t.declined} declined.`;
 }
 
+let period = 'day';
+const PERIOD_HEAD = { day: 'Date', week: 'Week starting', month: 'Month' };
+
+function periodLabel(bucket) {
+  // bucket is a YYYY-MM-DD string, deliberately not a Date — parsing it as one
+  // reintroduces the timezone shift the server query exists to avoid.
+  const [y, m, dd] = bucket.split('-').map(Number);
+  const d = new Date(y, m - 1, dd);
+  if (period === 'month') return d.toLocaleDateString('en-IN', { month: 'long', year: 'numeric' });
+  return d.toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: period === 'week' ? undefined : undefined });
+}
+
+async function loadReport() {
+  try {
+    const res = await fetch(`/api/admin/report?period=${period}&limit=14`);
+    const d = await res.json();
+    if (!d.ok) throw new Error(d.error || 'Could not load the report');
+
+    $('#periodHead').textContent = PERIOD_HEAD[period];
+    $('#reportCsv').href = `/api/admin/report.csv?period=${period}`;
+    $('#reportRows').innerHTML = d.rows.length
+      ? d.rows.map((r) => `
+          <tr>
+            <td>${esc(periodLabel(r.bucket))}</td>
+            <td class="right">${r.carts}</td>
+            <td class="right">${money(r.cart_value)}</td>
+            <td class="right">${r.worked}</td>
+            <td class="right">${r.contact_rate}%</td>
+            <td class="right">${r.recovered}</td>
+            <td class="right"><strong>${r.recovery_rate}%</strong></td>
+            <td class="right">${money(r.recovered_value)}</td>
+          </tr>`).join('')
+      : '<tr><td colspan="8" class="empty">No carts yet.</td></tr>';
+  } catch (err) {
+    $('#reportRows').innerHTML = `<tr><td colspan="8" class="empty">${esc(err.message)}</td></tr>`;
+  }
+}
+
+$('#periodGroup').addEventListener('click', (e) => {
+  const btn = e.target.closest('button');
+  if (!btn) return;
+  period = btn.dataset.period;
+  $('#periodGroup').querySelectorAll('button').forEach((b) => b.classList.toggle('active', b === btn));
+  loadReport();
+});
+
 $('#dashRange').addEventListener('click', (e) => {
   const btn = e.target.closest('button');
   if (!btn) return;
@@ -138,4 +189,5 @@ fetch('/auth/me').then((r) => r.json()).then((me) => {
 }).catch(() => {});
 
 load();
+loadReport();
 setInterval(load, 60_000);

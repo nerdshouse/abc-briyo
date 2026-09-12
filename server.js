@@ -9,7 +9,7 @@ import {
   recordSystemEvent, getSystemState, recordWebhookFailure, webhookFailureCount, cartCount,
   listMembers, upsertMember, updateMember, deleteMember, otherActiveAdminCount,
   recordMemberChange, recentMemberChanges, changeMemberPhone,
-  adminOverview, whoIsOnline,
+  adminOverview, whoIsOnline, periodReport,
 } from './lib/db.js';
 import {
   mockInsertCart, mockListCarts, mockUpdateStatus, mockMatchOrder,
@@ -523,6 +523,50 @@ app.get('/api/admin/overview', requireAdmin, async (req, res) => {
         slaHours: SLA_HOURS,
       },
     });
+  } catch (err) { return fail(res, err); }
+});
+
+const PERIODS = new Set(['day', 'week', 'month']);
+
+app.get('/api/admin/report', requireAdmin, async (req, res) => {
+  try {
+    if (MOCK) return res.status(400).json({ ok: false, error: 'Reports need a database.' });
+    const period = String(req.query.period ?? 'day');
+    if (!PERIODS.has(period)) return res.status(400).json({ ok: false, error: `Unknown period: ${period}` });
+    const limit = Math.min(60, Math.max(1, Number.parseInt(req.query.limit ?? '12', 10) || 12));
+    return res.json({ ok: true, period, rows: await periodReport(period, limit) });
+  } catch (err) { return fail(res, err); }
+});
+
+app.get('/api/admin/report.csv', requireAdmin, async (req, res) => {
+  try {
+    if (MOCK) return res.status(400).json({ ok: false, error: 'Reports need a database.' });
+    const period = String(req.query.period ?? 'day');
+    if (!PERIODS.has(period)) return res.status(400).json({ ok: false, error: `Unknown period: ${period}` });
+    const rows = await periodReport(period, 60);
+
+    const cols = [
+      [period === 'day' ? 'Date' : period === 'week' ? 'Week starting' : 'Month', (r) => r.bucket],
+      ['Carts', (r) => r.carts],
+      ['Cart value', (r) => r.cart_value],
+      ['Called', (r) => r.worked],
+      ['Contact rate %', (r) => r.contact_rate],
+      ['Recovered', (r) => r.recovered],
+      ['Recovery rate %', (r) => r.recovery_rate],
+      ['Recovered value', (r) => r.recovered_value],
+      ['Declined', (r) => r.declined],
+      ['Never called', (r) => r.never_called],
+    ];
+    const cell = (v) => `"${String(v ?? '').replace(/"/g, '""')}"`;
+    const body = [
+      cols.map(([h]) => cell(h)).join(','),
+      ...rows.map((r) => cols.map(([, get]) => cell(get(r))).join(',')),
+    ].join('\r\n');
+
+    console.log(`Report CSV (${period}) exported by ${await currentUserName(req)}`);
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', `attachment; filename="recovery-${period}-${new Date().toISOString().slice(0, 10)}.csv"`);
+    return res.send('\uFEFF' + body);
   } catch (err) { return fail(res, err); }
 });
 

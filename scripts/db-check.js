@@ -7,7 +7,7 @@ import {
   searchCarts, conflictingUpdate, recordLogin, recentLogins,
   listMembers, upsertMember, updateMember, deleteMember, otherActiveAdminCount,
   recordMemberChange, recentMemberChanges, changeMemberPhone,
-  adminOverview, whoIsOnline, touchLastSeen,
+  adminOverview, whoIsOnline, touchLastSeen, periodReport, cartsByStatus,
 } from '../lib/db.js';
 import { createOtp, verifyOtp, checkRateLimit, normalisePhone } from '../lib/otp.js';
 import { normalizePayload, redactPayload, REDACTED_KEYS } from '../lib/normalize.js';
@@ -587,6 +587,48 @@ await step('member changes are audited', async () => {
     (l) => l.target_phone === TEST_MEMBER && l.actor === 'db-check');
   if (!found) throw new Error('member change was not recorded');
   return 'add recorded with actor and target';
+});
+
+await step('period report buckets day, week and month consistently', async () => {
+  const [day, week, month] = await Promise.all([
+    periodReport('day', 60), periodReport('week', 60), periodReport('month', 60),
+  ]);
+  const sum = (rows) => rows.reduce((n, r) => n + r.carts, 0);
+  if (sum(day) !== sum(week) || sum(week) !== sum(month)) {
+    throw new Error(`totals disagree: day ${sum(day)}, week ${sum(week)}, month ${sum(month)}`);
+  }
+
+  // Buckets are text, not timestamps: a `timestamp without time zone` returns as
+  // a local Date and toISOString() then shifts every IST bucket a day earlier.
+  for (const r of day) {
+    if (typeof r.bucket !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(r.bucket)) {
+      throw new Error(`bucket should be a YYYY-MM-DD string, got ${typeof r.bucket}: ${r.bucket}`);
+    }
+    if (r.recovered > r.worked) throw new Error('recovered exceeds worked in a bucket');
+    if (r.worked > r.carts) throw new Error('worked exceeds carts in a bucket');
+  }
+
+  // Daily buckets must agree with the dashboard's own per-day rollup.
+  const ov = await adminOverview(0);
+  for (const d of day) {
+    const match = ov.byDay.find((x) => x.day === d.bucket);
+    if (match && match.carts !== d.carts) {
+      throw new Error(`${d.bucket}: report says ${d.carts}, dashboard says ${match.carts}`);
+    }
+  }
+  return `${sum(day)} carts across ${day.length} day(s), ${week.length} week(s), ${month.length} month(s)`;
+});
+
+await step('drill-down returns exactly the carts behind a number', async () => {
+  const ov = await adminOverview(0);
+  const recovered = await cartsByStatus('Called – Recovered', { sinceDays: 0 });
+  if (recovered.length !== ov.totals.recovered) {
+    throw new Error(`headline says ${ov.totals.recovered} recovered, drill-down returns ${recovered.length}`);
+  }
+  if (recovered.some((c) => c.status !== 'Called – Recovered')) {
+    throw new Error('drill-down returned a cart with the wrong status');
+  }
+  return `${recovered.length} recovered cart(s), matching the headline`;
 });
 
 await step('presence: last seen is recorded and ages out', async () => {

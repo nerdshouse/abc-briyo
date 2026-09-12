@@ -224,7 +224,42 @@ function clearError() {
  * network level ("Failed to fetch"). Retry a couple of times before giving up,
  * and say what's happening rather than showing a bare error.
  */
+/**
+ * Filters can arrive in the URL so other pages can link to a filtered board —
+ * "which ones?" from the dashboard lands here already narrowed.
+ *
+ * Applied from inside loadAll rather than at module top level: this is the code
+ * path that definitely runs before the first render, and it cannot race the
+ * DOM being ready.
+ */
+let urlFiltersApplied = false;
+function applyUrlFilters() {
+  if (urlFiltersApplied) return;
+  urlFiltersApplied = true;
+
+  const p = new URLSearchParams(window.location.search);
+  if (p.has('days')) {
+    state.days = Number(p.get('days'));
+    $('#rangeGroup')?.querySelectorAll('button').forEach((b) =>
+      b.classList.toggle('active', Number(b.dataset.days) === state.days));
+  }
+  if (p.has('status')) state.status = p.get('status');
+  if (p.has('assignee')) state.assignee = p.get('assignee');
+  if (p.has('stage')) state.stage = p.get('stage');
+  if (p.has('q')) { state.query = p.get('q'); if ($('#search')) $('#search').value = state.query; }
+  if (p.get('overdue') === '1') state.overdueOnly = true;
+  if (p.get('mine') === '1') state.mineOnly = true;
+
+  // Reflect it in the controls, or the board would look unfiltered while showing
+  // a filtered list.
+  if ($('#statusFilter') && state.status !== CALLED_SENTINEL) $('#statusFilter').value = state.status;
+  if ($('#assigneeFilter')) $('#assigneeFilter').value = state.assignee;
+  $('#mineOnly')?.classList.toggle('active', state.mineOnly);
+  $('#overdueOnly')?.classList.toggle('active', state.overdueOnly);
+}
+
 async function loadAll(attempt = 1) {
+  applyUrlFilters();
   const MAX_ATTEMPTS = 3;
   try {
     // The date range is now applied server-side, so the array stays small and
@@ -366,7 +401,8 @@ function visibleCarts() {
   const cutoff = state.days > 0 ? Date.now() - state.days * 86400000 : 0;
   let list = state.carts.filter((c) => new Date(c.received_at).getTime() >= cutoff);
 
-  if (state.status) list = list.filter((c) => (c.status || 'Not called') === state.status);
+  if (state.status === CALLED_SENTINEL) list = list.filter((c) => (c.status || 'Not called') !== 'Not called');
+  else if (state.status) list = list.filter((c) => (c.status || 'Not called') === state.status);
   if (state.stage) list = list.filter((c) => (c.drop_stage || '') === state.stage);
   if (state.overdueOnly) list = list.filter(isOverdue);
   if (state.mineOnly) list = list.filter((c) => c.assigned_to === ME);
@@ -390,6 +426,33 @@ function visibleCarts() {
   });
 }
 
+/** "Called" means anything other than Not called, which no single select value
+ *  expresses — hence the sentinel rather than a plain status string. */
+const CALLED_SENTINEL = '__called';
+
+function isCardActive(f) {
+  if (f.clear) return !(state.status || state.stage || state.assignee || state.mineOnly || state.overdueOnly);
+  if (f.overdue) return state.overdueOnly;
+  return state.status === f.status;
+}
+
+function applyCardFilter(f) {
+  if (f.clear) {
+    Object.assign(state, { status: '', stage: '', assignee: '', mineOnly: false, overdueOnly: false });
+  } else if (f.overdue) {
+    Object.assign(state, { status: '', overdueOnly: !state.overdueOnly });
+  } else {
+    // Clicking the same card again is the way back out.
+    Object.assign(state, { overdueOnly: false, status: state.status === f.status ? '' : f.status });
+  }
+  if ($('#statusFilter')) $('#statusFilter').value = state.status === CALLED_SENTINEL ? '' : state.status;
+  if ($('#assigneeFilter')) $('#assigneeFilter').value = state.assignee;
+  if ($('#stageFilter')) $('#stageFilter').value = state.stage;
+  $('#mineOnly')?.classList.toggle('active', state.mineOnly);
+  $('#overdueOnly')?.classList.toggle('active', state.overdueOnly);
+  render();
+}
+
 function renderStats() {
   const list = visibleCarts();
   const total = list.reduce((sum, c) => sum + (c.total_price ?? 0), 0);
@@ -397,12 +460,13 @@ function renderStats() {
   const recovered = list.filter((c) => c.status === 'Called – Recovered').length;
   const rate = list.length ? Math.round((recovered / list.length) * 100) : 0;
 
+  // Each card is the question "which ones?", so each is a filter.
   const cards = [
-    ['Abandoned carts', list.length, ''],
-    ['Total cart value', money(total, 'INR'), ''],
-    ['Called', called, ''],
-    ['Recovered', recovered, ''],
-    ['Recovery rate', `${rate}%`, ''],
+    ['Abandoned carts', list.length, '', { clear: true }],
+    ['Total cart value', money(total, 'INR'), '', null],
+    ['Called', called, '', { status: '__called' }],
+    ['Recovered', recovered, '', { status: 'Called – Recovered' }],
+    ['Recovery rate', `${rate}%`, '', null],
   ];
 
   // Stale is a whole-table figure from the server, not filtered — it is an
@@ -412,14 +476,22 @@ function renderStats() {
     `Stale — never called (${SLA_HOURS}h+)`,
     staleCount,
     staleCount > 0 ? 'stat-alarm' : '',
+    { status: 'Not called' },
   ]);
 
   const overdue = state.carts.filter(isOverdue).length;
-  if (overdue > 0) cards.push(['Overdue callbacks', overdue, 'stat-warn']);
+  if (overdue > 0) cards.push(['Overdue callbacks', overdue, 'stat-warn', { overdue: true }]);
 
-  $('#stats').innerHTML = cards.map(([label, value, cls]) => `
-    <div class="stat ${cls}"><div class="label">${label}</div><div class="value">${value}</div></div>
-  `).join('');
+  $('#stats').innerHTML = cards.map(([label, value, cls, filter]) => {
+    const active = filter && isCardActive(filter);
+    return filter
+      ? `<button type="button" class="stat stat-click ${cls} ${active ? 'stat-on' : ''}"
+                 data-filter='${esc(JSON.stringify(filter))}'
+                 title="${filter.clear ? 'Show everything' : 'Show only these'}">
+           <div class="label">${label}</div><div class="value">${value}</div>
+         </button>`
+      : `<div class="stat ${cls}"><div class="label">${label}</div><div class="value">${value}</div></div>`;
+  }).join('');
 }
 
 /** "Last updated by Priya, 2h ago" — attribution without asking anyone to pick it. */
@@ -754,6 +826,11 @@ on('#search', 'input', (e) => {
 });
 on('#search', 'keydown', (e) => {
   if (e.key === 'Escape') { e.target.value = ''; state.query = ''; loadAll(); }
+});
+
+on('#stats', 'click', (e) => {
+  const card = e.target.closest('.stat-click');
+  if (card) applyCardFilter(JSON.parse(card.dataset.filter));
 });
 
 on('#statusFilter', 'change', (e) => { state.status = e.target.value; render(); });

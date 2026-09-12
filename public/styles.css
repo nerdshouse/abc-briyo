@@ -603,3 +603,18 @@ table.board td { padding-top: 10px; padding-bottom: 10px; }
   .items .item { line-height: 1.35; }
   .status-cell select, .status-cell input[type="text"] { min-height: 40px; }
 }
+
+/* Stat cards are the "which ones?" control, so they look pressable. */
+button.stat {
+  font: inherit; text-align: left; width: 100%; cursor: pointer;
+  border: 1px solid var(--border); background: var(--panel);
+}
+button.stat:hover { border-color: var(--accent); background: #fbfdfc; }
+button.stat.stat-on { border-color: var(--accent); background: var(--accent-soft); }
+button.stat.stat-on .label { color: var(--accent); }
+button.stat.stat-alarm:hover, button.stat.stat-alarm.stat-on { border-color: #fda29b; background: var(--danger-soft); }
+button.stat.stat-warn:hover, button.stat.stat-warn.stat-on { border-color: var(--warn-border); background: var(--warn-soft); }
+
+a.stat.stat-click { text-decoration: none; color: inherit; display: block; }
+a.stat.stat-click:hover { border-color: var(--accent); background: #fbfdfc; }
+#periodGroup button { font-size: 12.5px; padding: 5px 10px; }

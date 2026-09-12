@@ -343,6 +343,38 @@ than no overview.
 Callers get `403` on both the page and `/api/admin/overview`: it aggregates every teammate's
 performance, which is not the whole team's business.
 
+### Drilling into a number
+
+Every countable headline is a link to the carts behind it. On the board the stat cards are
+filter buttons — clicking **Recovered** shows those carts, clicking it again clears. On the
+dashboard the cards link through to the board already filtered.
+
+The board reads its filters from the URL, so those links are shareable:
+
+```
+/?days=7&status=Called%20%E2%80%93%20Recovered   the recovered carts of the last week
+/?status=Not%20called&days=1                     today's uncalled
+/?mine=1&overdue=1                               my overdue callbacks
+/?q=9812345678                                   one customer, across all history
+```
+
+`status=__called` is a sentinel for "anything other than Not called", which no single status
+value expresses.
+
+### Reports
+
+The dashboard has **daily / weekly / monthly** rollups with a CSV download. Buckets use
+`BOARD_TIMEZONE`, so a "day" is the team's day.
+
+**Recovery rate is measured against carts called, not carts received.** You cannot recover a
+cart nobody rang, and mixing the two hides whether calling works — the contact rate is shown
+separately so both are visible.
+
+Buckets come back from SQL as `YYYY-MM-DD` strings rather than timestamps on purpose: a
+`timestamp without time zone` arrives as a local `Date`, and `toISOString()` then shifts every
+IST bucket to the previous day. `db:check` asserts the type and that the report agrees with the
+dashboard's own per-day rollup.
+
 ## Working a call list
 
 ### Callbacks
