@@ -116,11 +116,14 @@ fetch('/api/config').then((r) => r.json()).then((cfg) => {
     // Credentials are in place but the store has never authorised us. One
     // browser round-trip fixes it, so offer the button rather than an error.
     el.textContent = 'needs authorising';
-    $('#pullBtn').disabled = true;
+    // The Connect action is its own control rather than a link inside
+    // #pullResult, which any pull error would overwrite.
+    $('#connectBtn').hidden = false;
+    $('#pullBtn').hidden = true;
     $('#pullResult').innerHTML =
       '<div class="banner mock">The credentials are set, but the store has not granted access yet. '
-      + '<a class="primary" href="/auth/shopify/install">Connect Shopify</a> — you will be sent to '
-      + 'Shopify to approve, then straight back here. This is a one-time step.</div>';
+      + 'Use <strong>Connect Shopify</strong> above — you will be sent to Shopify to approve, then '
+      + 'straight back here. This is a one-time step.</div>';
   } else {
     el.textContent = 'not connected';
     $('#pullBtn').disabled = true;
