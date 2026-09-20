@@ -27,7 +27,7 @@ import { driver } from './lib/whatsapp.js';
 import { startKeepAlive } from './lib/keepalive.js';
 import { startSlaAlerts, isIngestSilent } from './lib/sla-alert.js';
 import { startShopifyPoll, pollShopifyOnce } from './lib/shopify-poll.js';
-import { shopifyConfigured } from './lib/shopify.js';
+import { shopifyConfigured, authMode, apiVersionWarning, getAccessToken } from './lib/shopify.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC = path.join(__dirname, 'public');
@@ -171,6 +171,31 @@ app.get('/healthz', (_req, res) => res.json({ ok: true, ts: new Date().toISOStri
  * This is the endpoint to open when someone asks "is the board broken?".
  * Secret-gated with the webhook secret since it reports operational detail.
  */
+/**
+ * Shopify's side of /readyz. The live token check is opt-in (?shopify=1) so the
+ * routine diagnostic stays free of an outbound call — but it is the only way to
+ * tell "credentials present" from "credentials work".
+ */
+async function shopifyStatus(probe) {
+  const out = {
+    configured: shopifyConfigured(),
+    mode: authMode(),
+    lastPoll: MOCK ? null
+      : (await getSystemState('last_shopify_poll').catch(() => null))?.updated_at ?? null,
+  };
+  const warn = apiVersionWarning();
+  if (warn) out.apiVersionWarning = warn;
+  if (!probe || !out.configured) return out;
+  try {
+    await getAccessToken({ force: true });
+    out.tokenOk = true;
+  } catch (err) {
+    out.tokenOk = false;
+    out.tokenError = err.message;
+  }
+  return out;
+}
+
 app.get('/readyz', async (req, res) => {
   const expected = process.env.WEBHOOK_SECRET;
   const provided = req.get('x-webhook-secret') || req.query.secret;
@@ -200,6 +225,7 @@ app.get('/readyz', async (req, res) => {
       ingestSilent: silent,
       staleCarts: stale.count,
       webhookFailures24h: failures,
+      shopify: await shopifyStatus(req.query.shopify === '1'),
       // The one field to look at first — false here means something is wrong.
       healthy: !silent && failures === 0,
     });
