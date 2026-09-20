@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Import checkouts — Cart Recovery Board</title>
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <div class="wrap">
+    <header class="page">
+      <div>
+        <h1>Import a Shopify export</h1>
+        <p class="sub">
+          Upload the CSV from Shopify → Orders → Abandoned checkouts → Export.
+          Only the columns this board uses are kept; the rest are ignored.
+        </p>
+      </div>
+      <div class="session">
+        <a class="btnlink" href="/dashboard">Dashboard</a>
+        <a class="btnlink" href="/">← Board</a>
+      </div>
+    </header>
+
+    <div id="banner" class="banner error" hidden></div>
+    <div id="ok" class="banner success" hidden></div>
+
+    <section class="panel insight">
+      <header><h2>Choose a file</h2></header>
+      <div class="addrow">
+        <div class="field">
+          <label for="file">Shopify checkouts CSV</label>
+          <input id="file" type="file" accept=".csv,text/csv" />
+        </div>
+        <div class="field">
+          <label for="assignTo">Assign these carts to</label>
+          <select id="assignTo"><option value="">Nobody</option></select>
+        </div>
+        <button type="button" class="primary" id="previewBtn" disabled>Preview</button>
+      </div>
+      <p class="hint">
+        Nothing is written until you confirm. Re-importing the same file is safe — matching
+        checkouts are updated, and call statuses, notes and owners are never overwritten.
+      </p>
+    </section>
+
+    <section class="panel insight" id="previewPanel" hidden style="margin-top:18px">
+      <header><h2>Preview</h2><span class="muted" id="previewMeta"></span></header>
+      <div id="previewStats" class="stats"></div>
+      <div id="warnings"></div>
+      <div class="panel" style="box-shadow:none;border:none;overflow-x:auto">
+        <table class="mini">
+          <thead><tr><th>Checkout</th><th>Customer</th><th>Phone</th><th>Email</th><th class="right">Value</th><th class="right">Items</th><th>Abandoned</th></tr></thead>
+          <tbody id="sampleRows"></tbody>
+        </table>
+      </div>
+      <div class="addrow" style="margin-top:14px">
+        <button type="button" class="primary" id="applyBtn">Import these checkouts</button>
+        <button type="button" id="cancelBtn">Cancel</button>
+      </div>
+    </section>
+
+    <section class="panel insight" style="margin-top:18px">
+      <header><h2>Live Shopify sync</h2><span class="muted" id="shopifyState">checking…</span></header>
+      <p class="hint" style="margin-top:0">
+        Shopify has no abandoned-checkout webhook — it decides a checkout is abandoned only
+        after time passes — so the board <strong>polls</strong> Shopify instead of being pushed
+        to. Once connected it pulls automatically; this button is for when you don't want to
+        wait for the next run. Carts pulled this way <em>do</em> carry a working recovery link,
+        which the CSV export does not.
+      </p>
+      <div class="addrow">
+        <button type="button" class="primary" id="pullBtn">Pull from Shopify now</button>
+      </div>
+      <div id="pullResult"></div>
+    </section>
+
+    <p class="note">
+      Shopify's export carries no recovery link, so the <strong>Cart link</strong> button will be
+      empty on imported rows — callers can still phone and WhatsApp. Shopify also has no
+      equivalent of GoKwik's drop stage or RTO risk flag, so those stay blank rather than being
+      invented.
+    </p>
+  </div>
+  <script src="/import.js"></script>
+</body>
+</html>

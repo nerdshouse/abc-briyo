@@ -895,6 +895,7 @@ fetch('/auth/me').then((r) => r.json()).then((me) => {
   if (me.isAdmin) {
     $('#adminLink').hidden = false;
     if ($('#dashLink')) $('#dashLink').hidden = false;
+    if ($('#importLink')) $('#importLink').hidden = false;
   }
 }).catch(() => {});
 

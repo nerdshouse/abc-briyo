@@ -9,7 +9,7 @@ import {
   recordSystemEvent, getSystemState, recordWebhookFailure, webhookFailureCount, cartCount,
   listMembers, upsertMember, updateMember, deleteMember, otherActiveAdminCount,
   recordMemberChange, recentMemberChanges, changeMemberPhone,
-  adminOverview, whoIsOnline, periodReport,
+  adminOverview, whoIsOnline, periodReport, importCarts,
 } from './lib/db.js';
 import {
   mockInsertCart, mockListCarts, mockUpdateStatus, mockMatchOrder,
@@ -21,10 +21,13 @@ import {
 import {
   router as authRouter, requireAuth, requireAdmin, currentUserName, invalidateMembership,
 } from './lib/auth-routes.js';
-import { activeUsers, seedAllowedUsers, normalisePhone, bootstrapAdmins } from './lib/otp.js';
+import { activeUsers, seedAllowedUsers, normalisePhone, bootstrapAdmins, nameFor } from './lib/otp.js';
+import { mapShopifyCsv } from './lib/shopify-csv.js';
 import { driver } from './lib/whatsapp.js';
 import { startKeepAlive } from './lib/keepalive.js';
 import { startSlaAlerts, isIngestSilent } from './lib/sla-alert.js';
+import { startShopifyPoll, pollShopifyOnce } from './lib/shopify-poll.js';
+import { shopifyConfigured } from './lib/shopify.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC = path.join(__dirname, 'public');
@@ -39,6 +42,9 @@ app.set('trust proxy', 1);
  * our handler runs. Everything else uses the normal JSON parser.
  */
 app.use('/api/webhook', express.text({ type: '*/*', limit: '2mb' }));
+// The CSV is posted as raw text rather than multipart — no upload dependency,
+// and a Shopify export of a few thousand checkouts is well under this cap.
+app.use('/api/admin/import', express.text({ type: '*/*', limit: '20mb' }));
 app.use(express.json({ limit: '2mb' }));
 app.use(cookieParser());
 
@@ -306,6 +312,8 @@ app.get('/api/config', async (req, res) => {
     reasonTags: REASON_TAGS,
     slaHours: SLA_HOURS,
     team,
+    importDefaultCaller: normalisePhone(process.env.IMPORT_DEFAULT_CALLER || '') || null,
+    shopifyConnected: shopifyConfigured(),
     me: req.session?.phone ?? null,
     isAdmin: Boolean(req.session?.isAdmin),
   });
@@ -523,6 +531,89 @@ app.get('/api/admin/overview', requireAdmin, async (req, res) => {
         slaHours: SLA_HOURS,
       },
     });
+  } catch (err) { return fail(res, err); }
+});
+
+app.get('/import', requireAdminPage, (_req, res) => res.sendFile(path.join(PUBLIC, 'import.html')));
+
+/**
+ * Import a Shopify abandoned-checkout CSV export.
+ *
+ * Dry run by default — the same discipline as scripts/renormalize.js, because
+ * this writes customer rows in bulk and people will paste the wrong file.
+ */
+app.post('/api/admin/import', requireAdmin, async (req, res) => {
+  try {
+    if (MOCK) return res.status(400).json({ ok: false, error: 'Importing needs a database.' });
+    const text = typeof req.body === 'string' ? req.body : '';
+    if (!text.trim()) return res.status(400).json({ ok: false, error: 'The file was empty.' });
+
+    let mapped;
+    try {
+      mapped = mapShopifyCsv(text);
+    } catch (err) {
+      return res.status(400).json({ ok: false, error: err.message });
+    }
+    if (!mapped.carts.length) {
+      return res.status(400).json({ ok: false, error: 'No checkouts found in that file.' });
+    }
+
+    // Who the carts land with. Defaults to IMPORT_DEFAULT_CALLER.
+    const wanted = String(req.query.assignTo ?? process.env.IMPORT_DEFAULT_CALLER ?? '').trim();
+    let assignedTo = null;
+    if (wanted) {
+      const phone = normalisePhone(wanted);
+      if (!phone || !(await activeUsers()).has(phone)) {
+        return res.status(400).json({ ok: false, error: `${wanted} is not an active member.` });
+      }
+      assignedTo = phone;
+    }
+
+    const preview = {
+      ok: true,
+      rows: mapped.totalRows,
+      checkouts: mapped.carts.length,
+      skipped: mapped.skipped,
+      assignedTo,
+      assignedToName: assignedTo ? await nameFor(assignedTo) : null,
+      sample: mapped.carts.slice(0, 5).map((c) => ({
+        cartId: c.cartId, customerName: c.customerName, phone: c.phone,
+        email: c.email, totalPrice: c.totalPrice, itemCount: c.itemCount,
+        abandonedAt: c.abandonedAt,
+      })),
+      missing: {
+        customerName: mapped.carts.filter((c) => !c.customerName).length,
+        phone: mapped.carts.filter((c) => !c.phone).length,
+        checkoutUrl: mapped.carts.filter((c) => !c.checkoutUrl).length,
+      },
+    };
+
+    if (String(req.query.apply) !== 'true') {
+      return res.json({ ...preview, applied: false });
+    }
+
+    await ensureSchema();
+    const result = await importCarts(mapped.carts, { source: 'shopify-csv', assignedTo });
+    console.log(`CSV import by ${await currentUserName(req)}: ` +
+      `${result.inserted} new, ${result.updated} updated, assigned to ${preview.assignedToName || 'nobody'}`);
+    return res.json({ ...preview, applied: true, ...result });
+  } catch (err) { return fail(res, err); }
+});
+
+/** Pull from Shopify now, rather than waiting for the next scheduled poll. */
+app.post('/api/admin/shopify/pull', requireAdmin, async (req, res) => {
+  try {
+    if (MOCK) return res.status(400).json({ ok: false, error: 'Pulling needs a database.' });
+    if (!shopifyConfigured()) {
+      return res.status(400).json({
+        ok: false,
+        error: 'Shopify is not connected. Set SHOPIFY_STORE_DOMAIN, SHOPIFY_CLIENT_ID and SHOPIFY_CLIENT_SECRET.',
+      });
+    }
+    const assignedTo = normalisePhone(process.env.IMPORT_DEFAULT_CALLER || '') || null;
+    const r = await pollShopifyOnce({ assignedTo });
+    console.log(`Manual Shopify pull by ${await currentUserName(req)}: ${JSON.stringify(r)}`);
+    return res.json({ ok: true, ...r });
   } catch (err) { return fail(res, err); }
 });
 
@@ -774,4 +865,5 @@ app.listen(port, async () => {
     slaHours: SLA_HOURS,
     getLastIngest: () => db.lastIngest(),
   });
+  if (!MOCK) startShopifyPoll();
 });

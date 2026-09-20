@@ -224,6 +224,72 @@ an existing session dies when it expires (`SESSION_TTL_HOURS`, default 12h).
 
 ---
 
+## Getting carts in
+
+Three ways in, all landing in the same table and told apart by a `source` column:
+
+| Source | How | Recovery link? |
+| --- | --- | --- |
+| `gokwik` | Webhook, live | Yes (`abc_url`) |
+| `shopify` | Admin API poll, every 15 min | Yes (`abandonedCheckoutUrl`) |
+| `shopify-csv` | Manual upload at `/import` | **No** — the export has no link |
+
+### Importing a Shopify CSV
+
+**Shopify admin → Orders → Abandoned checkouts → Export**, then upload it at `/import`
+(admins only, linked from the board header).
+
+Nothing is written until you confirm: the preview shows how many checkouts were found, who
+they will be assigned to, and what is missing before you commit. Carts land with
+`IMPORT_DEFAULT_CALLER` as their owner.
+
+Two things about the format the importer handles, and which a naive read would get wrong:
+
+- **It is one row per line item, not per checkout.** A checkout's first row carries the
+  checkout-level fields; continuation rows repeat only `Name` and `Email` and leave `Id` and
+  `Total` blank. Rows are grouped by `Name` to reassemble a cart — the 97-row example export
+  is 76 checkouts. Getting this wrong double-counts carts and loses items.
+- **`Created at` carries an explicit offset** (`2026-09-16 11:06:32 +0530`), which is honoured
+  rather than assumed UTC.
+
+**Re-importing the same file is safe.** Carts upsert on `shopify-<id>`, so matching checkouts
+are refreshed and call statuses, notes and owners are never touched. `db:check` asserts exactly
+that, because people re-upload.
+
+Shopify's export carries no recovery URL, so **Cart link is empty on imported rows** — callers
+can still phone and WhatsApp. It also has no equivalent of GoKwik's drop stage or RTO risk
+flag; those stay blank rather than being invented.
+
+### Connecting Shopify for live carts
+
+**Shopify has no abandoned-checkout webhook.** The only checkout topics are
+`checkouts/create`, `checkouts/update` and `checkouts/delete`, and abandonment is a time-based
+judgement Shopify makes itself. So the board **polls** the Admin API's `abandonedCheckouts`
+query every `SHOPIFY_POLL_MINUTES` (default 15) instead of being pushed to.
+
+Unlike the CSV, API-sourced carts **do** carry `abandonedCheckoutUrl`, so Cart link works.
+
+To connect:
+
+1. **[dev.shopify.com](https://dev.shopify.com)** → your organization → **Apps** → create an
+   app (or reuse `abc-briyo <> nerdshouse`).
+2. Give it the **`read_orders`** scope and install it on the store. `read_orders` covers the
+   last 60 days; older checkouts need `read_all_orders`, which Shopify grants on request.
+3. Copy the **Client ID** and **Client secret** into `SHOPIFY_CLIENT_ID` /
+   `SHOPIFY_CLIENT_SECRET`, and set `SHOPIFY_STORE_DOMAIN` to `<handle>.myshopify.com`.
+
+The app exchanges those for a 24-hour token and refreshes it automatically — Shopify stopped
+issuing permanent tokens when legacy custom apps were retired on 1 January 2026. **The grant
+only works when the app and the store are in the same Shopify organization.**
+
+`/import` shows whether Shopify is connected and has a **Pull from Shopify now** button for
+when you don't want to wait for the next run. Polling is idempotent, so a missed run costs
+nothing — the next one catches up.
+
+> A leftover placeholder (`shpat_xxxx…`) counts as *not configured* rather than being tried and
+> failing with an opaque 401 — that exact trap cost an afternoon once already. The board also
+> warns at startup if `SHOPIFY_API_VERSION` is past Shopify's ~12-month support window.
+
 ## The GoKwik webhook
 
 ### The URL to give GoKwik

@@ -7,11 +7,12 @@ import {
   searchCarts, conflictingUpdate, recordLogin, recentLogins,
   listMembers, upsertMember, updateMember, deleteMember, otherActiveAdminCount,
   recordMemberChange, recentMemberChanges, changeMemberPhone,
-  adminOverview, whoIsOnline, touchLastSeen, periodReport, cartsByStatus,
+  adminOverview, whoIsOnline, touchLastSeen, periodReport, cartsByStatus, importCarts,
 } from '../lib/db.js';
 import { createOtp, verifyOtp, checkRateLimit, normalisePhone } from '../lib/otp.js';
 import { normalizePayload, redactPayload, REDACTED_KEYS } from '../lib/normalize.js';
 import { GOKWIK_REAL_PAYLOAD } from './fixtures/gokwik-real.js';
+import { mapShopifyCsv } from '../lib/shopify-csv.js';
 import { isIngestSilent } from '../lib/sla-alert.js';
 import { issueSession, verifySession } from '../lib/session.js';
 import { rateLimit, _reset as resetRateLimit } from '../lib/rate-limit.js';
@@ -587,6 +588,62 @@ await step('member changes are audited', async () => {
     (l) => l.target_phone === TEST_MEMBER && l.actor === 'db-check');
   if (!found) throw new Error('member change was not recorded');
   return 'add recorded with actor and target';
+});
+
+await step('Shopify CSV: one row per line item becomes one cart', async () => {
+  // The export repeats a checkout across rows, one per line item, with only the
+  // first row carrying Total/Id. Getting this wrong would double-count carts.
+  const csv = [
+    'Name,Id,Created at,Email,Total,Subtotal,Currency,Discount Amount,Billing Name,Billing Phone,Lineitem name,Lineitem quantity,Shipping City,Source',
+    '#1001,5551001,2026-09-16 11:06:32 +0530,a@b.com,900.00,900.00,INR,0.00,Asha Rao,9812345678,Whey 1kg,2,Pune,web',
+    '#1001,,,a@b.com,,,,,,,Shaker,1,,',
+    '#1002,5551002,2026-09-16 09:00:00 +0530,c@d.com,250.00,250.00,INR,0.00,,,"Multivitamin, 60 tabs",1,,web',
+  ].join('\n');
+
+  const { carts, totalRows } = mapShopifyCsv(csv);
+  if (totalRows !== 3) throw new Error(`expected 3 rows, got ${totalRows}`);
+  if (carts.length !== 2) throw new Error(`3 rows should collapse to 2 carts, got ${carts.length}`);
+
+  const a = carts.find((c) => c.cartId === 'shopify-5551001');
+  if (!a) throw new Error('cart id should be namespaced as shopify-<id>');
+  if (a.items.length !== 2) throw new Error('the continuation row was dropped');
+  if (a.itemCount !== 3) throw new Error(`item count should sum quantities, got ${a.itemCount}`);
+  if (a.customerName !== 'Asha Rao' || a.phone !== '9812345678') throw new Error('checkout-level fields lost');
+  // "+0530" must be honoured, not assumed UTC.
+  if (a.abandonedAt !== '2026-09-16T05:36:32.000Z') throw new Error(`timezone mishandled: ${a.abandonedAt}`);
+
+  const b = carts.find((c) => c.cartId === 'shopify-5551002');
+  if (b.items[0].title !== 'Multivitamin, 60 tabs') throw new Error('quoted comma broke the parse');
+
+  return '3 rows -> 2 carts, quantities summed, +0530 honoured';
+});
+
+await step('importing twice never duplicates or overwrites a call log', async () => {
+  const cart = {
+    cartId: TEST_CART, customerName: 'Import Check', phone: '9000000000',
+    email: 'import@check.local', totalPrice: 100, currency: 'INR',
+    abandonedAt: new Date().toISOString(), itemCount: 1, raw: { _source: 'db-check' },
+  };
+  await importCarts([cart], { source: 'shopify-csv' });
+  const { rows } = await getPool().query('SELECT id FROM abandoned_carts WHERE cart_id = $1', [TEST_CART]);
+  const id = rows[0].id;
+
+  await updateStatus(id, { status: 'Called – Recovered', notes: 'keep me', updatedBy: 'A Human' });
+
+  // Re-import the same file, as people do.
+  await importCarts([{ ...cart, customerName: 'Import Check Renamed' }], { source: 'shopify-csv' });
+
+  const { rows: after } = await getPool().query(
+    'SELECT status, notes, updated_by, customer_name, source FROM abandoned_carts WHERE cart_id = $1', [TEST_CART]);
+  const { rows: count } = await getPool().query(
+    'SELECT count(*)::int AS n FROM abandoned_carts WHERE cart_id = $1', [TEST_CART]);
+
+  if (count[0].n !== 1) throw new Error(`re-import created ${count[0].n} rows`);
+  if (after[0].status !== 'Called – Recovered') throw new Error('re-import reset the status');
+  if (after[0].notes !== 'keep me') throw new Error('re-import wiped the notes');
+  if (after[0].updated_by !== 'A Human') throw new Error('re-import overwrote the attribution');
+  if (after[0].customer_name !== 'Import Check Renamed') throw new Error('cart fields were not refreshed');
+  return 'one row, call log intact, cart fields refreshed';
 });
 
 await step('period report buckets day, week and month consistently', async () => {
