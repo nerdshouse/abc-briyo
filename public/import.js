@@ -109,9 +109,18 @@ $('#applyBtn').addEventListener('click', async () => {
 // --- live Shopify sync ---
 fetch('/api/config').then((r) => r.json()).then((cfg) => {
   const el = $('#shopifyState');
-  if (cfg.shopifyConnected) {
+  if (cfg.shopifyAuthorized) {
     el.textContent = 'connected';
     el.style.color = 'var(--accent)';
+  } else if (cfg.shopifyConnected) {
+    // Credentials are in place but the store has never authorised us. One
+    // browser round-trip fixes it, so offer the button rather than an error.
+    el.textContent = 'needs authorising';
+    $('#pullBtn').disabled = true;
+    $('#pullResult').innerHTML =
+      '<div class="banner mock">The credentials are set, but the store has not granted access yet. '
+      + '<a class="primary" href="/auth/shopify/install">Connect Shopify</a> — you will be sent to '
+      + 'Shopify to approve, then straight back here. This is a one-time step.</div>';
   } else {
     el.textContent = 'not connected';
     $('#pullBtn').disabled = true;
@@ -119,6 +128,10 @@ fetch('/api/config').then((r) => r.json()).then((cfg) => {
       '<div class="banner mock">Add <code>SHOPIFY_STORE_DOMAIN</code>, <code>SHOPIFY_CLIENT_ID</code> '
       + 'and <code>SHOPIFY_CLIENT_SECRET</code> to the environment to turn this on. '
       + 'Until then, use the CSV export above.</div>';
+  }
+  if (new URLSearchParams(location.search).get('shopify') === 'connected') {
+    $('#pullResult').innerHTML =
+      '<div class="banner">Shopify connected. The first pull is running now — reload in a moment.</div>';
   }
 }).catch(() => {});
 

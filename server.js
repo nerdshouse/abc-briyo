@@ -2,6 +2,7 @@ import 'dotenv/config';
 import express from 'express';
 import cookieParser from 'cookie-parser';
 import path from 'node:path';
+import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import {
   isMockMode, ensureSchema, insertCart, listCarts, updateStatus, ping,
@@ -28,6 +29,10 @@ import { startKeepAlive } from './lib/keepalive.js';
 import { startSlaAlerts, isIngestSilent } from './lib/sla-alert.js';
 import { startShopifyPoll, pollShopifyOnce } from './lib/shopify-poll.js';
 import { shopifyConfigured, authMode, apiVersionWarning, getAccessToken } from './lib/shopify.js';
+import {
+  SCOPES as SHOPIFY_SCOPES, normaliseShop, installUrl, verifyHmac, exchangeCode,
+  storeToken, loadToken,
+} from './lib/shopify-oauth.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC = path.join(__dirname, 'public');
@@ -183,6 +188,10 @@ async function shopifyStatus(probe) {
     lastPoll: MOCK ? null
       : (await getSystemState('last_shopify_poll').catch(() => null))?.updated_at ?? null,
   };
+  const oauth = await loadToken(process.env.SHOPIFY_STORE_DOMAIN).catch(() => null);
+  out.oauthConnected = Boolean(oauth?.token);
+  if (oauth?.scope) out.grantedScopes = oauth.scope;
+  out.neededScopes = SHOPIFY_SCOPES;
   const warn = apiVersionWarning();
   if (warn) out.apiVersionWarning = warn;
   if (!probe || !out.configured) return out;
@@ -195,6 +204,61 @@ async function shopifyStatus(probe) {
   }
   return out;
 }
+
+/**
+ * Connecting Shopify — the one-time OAuth handshake.
+ *
+ * Admin-only, because it grants this app read access to the store's orders.
+ * The `state` nonce lives in a short cookie and is compared on the way back, so
+ * a callback we did not initiate is rejected even if it carries a valid HMAC.
+ */
+const OAUTH_STATE_COOKIE = 'shopify_oauth_state';
+
+const callbackUrl = (req) =>
+  `${process.env.APP_BASE_URL || `${req.protocol}://${req.get('host')}`}/auth/shopify/callback`;
+
+app.get('/auth/shopify/install', requireAdmin, (req, res) => {
+  const shop = normaliseShop(req.query.shop || process.env.SHOPIFY_STORE_DOMAIN);
+  if (!shop) {
+    return res.status(400).send('Set SHOPIFY_STORE_DOMAIN to your <store>.myshopify.com domain first.');
+  }
+  if (!process.env.SHOPIFY_CLIENT_ID || !process.env.SHOPIFY_CLIENT_SECRET) {
+    return res.status(400).send('SHOPIFY_CLIENT_ID and SHOPIFY_CLIENT_SECRET must be set.');
+  }
+  const state = crypto.randomBytes(16).toString('hex');
+  res.cookie(OAUTH_STATE_COOKIE, state, {
+    httpOnly: true, sameSite: 'lax', maxAge: 10 * 60_000,
+    secure: process.env.COOKIE_SECURE !== 'false',
+  });
+  return res.redirect(installUrl({ shop, state, redirectUri: callbackUrl(req) }));
+});
+
+app.get('/auth/shopify/callback', async (req, res) => {
+  const shop = normaliseShop(req.query.shop);
+  const expected = req.cookies?.[OAUTH_STATE_COOKIE];
+  res.clearCookie(OAUTH_STATE_COOKIE);
+
+  if (!shop) return res.status(400).send('Shopify sent an unrecognised shop domain.');
+  if (!expected || expected !== req.query.state) {
+    return res.status(403).send('This link did not come from here. Start again from /admin.');
+  }
+  if (!verifyHmac(req.query)) {
+    return res.status(403).send('Shopify signature check failed.');
+  }
+
+  try {
+    const { access_token: token, scope } = await exchangeCode({ shop, code: req.query.code });
+    await storeToken({ shop, token, scope });
+    console.log(`Shopify connected to ${shop}. Scopes: ${scope || '(none reported)'}`);
+    // Pull straight away rather than making someone wait out the poll interval.
+    pollShopifyOnce({ assignedTo: normalisePhone(process.env.IMPORT_DEFAULT_CALLER || '') || null })
+      .catch((err) => console.error('First Shopify pull failed:', err.message));
+    return res.redirect('/import?shopify=connected');
+  } catch (err) {
+    console.error('Shopify OAuth failed:', err.message);
+    return res.status(502).send(`Could not complete the Shopify connection: ${err.message}`);
+  }
+});
 
 app.get('/readyz', async (req, res) => {
   const expected = process.env.WEBHOOK_SECRET;
@@ -339,7 +403,10 @@ app.get('/api/config', async (req, res) => {
     slaHours: SLA_HOURS,
     team,
     importDefaultCaller: normalisePhone(process.env.IMPORT_DEFAULT_CALLER || '') || null,
+    // Two distinct states: credentials present, and the store actually authorised.
     shopifyConnected: shopifyConfigured(),
+    shopifyAuthorized: shopifyConfigured()
+      && Boolean((await loadToken(process.env.SHOPIFY_STORE_DOMAIN).catch(() => null))?.token),
     me: req.session?.phone ?? null,
     isAdmin: Boolean(req.session?.isAdmin),
   });
