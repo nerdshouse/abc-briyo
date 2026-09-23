@@ -631,13 +631,33 @@ function scheduleInsights() {
 async function renderInsights() {
   const days = state.days;
   try {
+    // Fetched and rendered independently: by-caller is admin-only, so for a
+    // caller it comes back 403 — and when the two shared a failure check, that
+    // 403 silently blanked the reasons panel they are allowed to see.
     const [rRes, cRes] = await Promise.all([
       fetch(`/api/reasons/summary?days=${days}`),
       fetch(`/api/stats/by-caller?days=${days}`),
     ]);
-    if (!rRes.ok || !cRes.ok) return;
+
+    if (cRes.ok) {
+      const callers = await cRes.json();
+      $('#callerRows').innerHTML = callers.callers.length
+        ? callers.callers.map((c) => `
+            <tr>
+              <td>${esc(c.caller)}</td>
+              <td class="right">${c.touched}</td>
+              <td class="right">${c.recovered}</td>
+              <td class="right">${c.recovery_rate}%</td>
+              <td class="right">${money(c.recovered_value, 'INR')}</td>
+            </tr>`).join('')
+        : '<tr><td colspan="5" class="empty">Nobody has worked a cart in this range yet.</td></tr>';
+    } else {
+      // Not an error to show anyone: this panel simply isn't theirs.
+      $('#callerPanel')?.setAttribute('hidden', '');
+    }
+
+    if (!rRes.ok) return;
     const reasons = await rRes.json();
-    const callers = await cRes.json();
 
     const max = Math.max(1, ...reasons.reasons.map((r) => r.count));
     $('#reasonList').innerHTML = reasons.reasons.length
@@ -652,16 +672,6 @@ async function renderInsights() {
       ? `${reasons.taggedCarts} cart${reasons.taggedCarts === 1 ? '' : 's'} tagged`
       : '';
 
-    $('#callerRows').innerHTML = callers.callers.length
-      ? callers.callers.map((c) => `
-          <tr>
-            <td>${esc(c.caller)}</td>
-            <td class="right">${c.touched}</td>
-            <td class="right">${c.recovered}</td>
-            <td class="right">${c.recovery_rate}%</td>
-            <td class="right">${money(c.recovered_value, 'INR')}</td>
-          </tr>`).join('')
-      : '<tr><td colspan="5" class="empty">Nobody has worked a cart in this range yet.</td></tr>';
   } catch {
     // Insights are secondary; never let them break the call list.
   }

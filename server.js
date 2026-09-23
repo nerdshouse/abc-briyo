@@ -11,6 +11,7 @@ import {
   listMembers, upsertMember, updateMember, deleteMember, otherActiveAdminCount,
   recordMemberChange, recentMemberChanges, changeMemberPhone,
   adminOverview, whoIsOnline, periodReport, importCarts,
+  actionQueue, cartsForBucket, cartsByStatus, ACTION_BUCKETS, dailySnapshot,
 } from './lib/db.js';
 import {
   mockInsertCart, mockListCarts, mockUpdateStatus, mockMatchOrder,
@@ -600,8 +601,10 @@ app.get('/api/admin/overview', requireAdmin, async (req, res) => {
   try {
     if (MOCK) return res.status(400).json({ ok: false, error: 'The dashboard needs a database.' });
     const days = Math.max(0, Number.parseInt(req.query.days ?? '7', 10) || 0);
-    const [overview, online, lastIngest, failures, stale, members] = await Promise.all([
+    const [overview, queue, daily, online, lastIngest, failures, stale, members] = await Promise.all([
       adminOverview(days),
+      actionQueue(SLA_HOURS),
+      dailySnapshot(),
       whoIsOnline(Number(process.env.ONLINE_WINDOW_MINUTES || 5)),
       db.lastIngest(),
       webhookFailureCount(24),
@@ -616,6 +619,11 @@ app.get('/api/admin/overview', requireAdmin, async (req, res) => {
       ok: true,
       days,
       ...overview,
+      // Deliberately not windowed by `days` — see ACTION_BUCKETS. A callback
+      // overdue since last month is the most urgent thing on the page, and a
+      // 7-day filter would be precisely what hides it.
+      queue,
+      daily,
       online,
       team: members.filter((m) => m.active).length,
       health: {
@@ -628,6 +636,32 @@ app.get('/api/admin/overview', requireAdmin, async (req, res) => {
         slaHours: SLA_HOURS,
       },
     });
+  } catch (err) { return fail(res, err); }
+});
+
+/**
+ * The rows behind a headline number.
+ *
+ * `bucket` is either an action-queue name (all-time, by definition) or a status
+ * value (windowed, like the rest of the page). Both paths reuse the queries the
+ * counts themselves come from, so a number can never open a list that disagrees
+ * with it.
+ */
+app.get('/api/admin/carts', requireAdmin, async (req, res) => {
+  try {
+    if (MOCK) return res.status(400).json({ ok: false, error: 'This needs a database.' });
+    const bucket = String(req.query.bucket || '');
+    const days = Math.max(0, Number.parseInt(req.query.days ?? '7', 10) || 0);
+
+    if (bucket in ACTION_BUCKETS) {
+      const carts = await cartsForBucket(bucket, { slaHours: SLA_HOURS });
+      return res.json({ ok: true, bucket, windowed: false, carts });
+    }
+    if (VALID_STATUSES.has(bucket)) {
+      const carts = await cartsByStatus(bucket, { sinceDays: days });
+      return res.json({ ok: true, bucket, windowed: true, days, carts });
+    }
+    return res.status(400).json({ ok: false, error: `Unknown bucket: ${bucket}` });
   } catch (err) { return fail(res, err); }
 });
 
@@ -911,7 +945,13 @@ app.get('/api/reasons/summary', async (req, res) => {
   } catch (err) { fail(res, err); }
 });
 
-app.get('/api/stats/by-caller', async (req, res) => {
+/**
+ * Admin-only: this is individual performance. /api/reasons/summary above is
+ * deliberately left open — it aggregates *why customers abandon*, with no
+ * person attached, and the callers are the ones who tag it. Taking that away
+ * would remove the only feedback they get from their own data entry.
+ */
+app.get('/api/stats/by-caller', requireAdmin, async (req, res) => {
   try {
     const days = Math.max(0, Number.parseInt(req.query.days ?? '7', 10) || 0);
     res.json({ ok: true, days, callers: await db.byCaller(days) });

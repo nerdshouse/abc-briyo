@@ -3,15 +3,15 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Dashboard — Cart Recovery Board</title>
+  <title>Owner view — Cart Recovery Board</title>
   <link rel="stylesheet" href="/styles.css" />
 </head>
 <body>
   <div class="wrap">
     <header class="page">
       <div>
-        <h1 id="hello">Dashboard</h1>
-        <p class="sub">How recovery is going. Visible to admins only.</p>
+        <h1 id="hello">Owner view</h1>
+        <p class="sub">What is happening with the carts, and what needs doing. Admins only.</p>
       </div>
       <div class="session">
         <div class="group" id="dashRange" role="group" aria-label="Range">
@@ -28,48 +28,114 @@
     <div id="banner" class="banner error" hidden></div>
     <div id="health" class="banner" hidden></div>
 
-    <section class="stats" id="headline"></section>
+    <!-- 1. Work first. Anything that needs a call is more urgent than any number. -->
+    <section class="panel insight" style="margin-bottom:18px">
+      <header>
+        <h2>Needs doing now</h2>
+        <span class="muted">all time — the range above does not apply here</span>
+      </header>
+      <div class="stats" id="queue"></div>
+      <div id="drawer"></div>
+      <p class="hint">
+        A callback overdue since last month is the most urgent thing on this page, so these
+        four counts deliberately ignore the date range — filtering them by “last 7 days” would
+        hide exactly the work that has been ignored longest. Click any number to see the carts.
+      </p>
+    </section>
 
-    <section class="insights">
-      <div class="panel insight">
-        <header><h2>Who's online</h2><span class="muted" id="onlineMeta"></span></header>
-        <div id="online"><p class="muted">Loading…</p></div>
-      </div>
-      <div class="panel insight">
-        <header><h2>By caller</h2><span class="muted">in range</span></header>
-        <table class="mini">
-          <thead><tr><th>Caller</th><th class="right">Worked</th><th class="right">Recovered</th><th class="right">Rate</th><th class="right">Value</th></tr></thead>
-          <tbody id="callers"><tr><td colspan="5" class="empty">Loading…</td></tr></tbody>
-        </table>
-      </div>
+    <!-- 2. Today, which is the question the page gets opened to answer. -->
+    <section class="panel insight" style="margin-bottom:18px">
+      <header><h2>Today</h2><span class="muted" id="todayMeta">vs yesterday</span></header>
+      <div class="stats" id="today"></div>
+    </section>
+
+    <!-- 3. Money. Everything below here follows the range selector. -->
+    <section class="panel insight" style="margin-bottom:18px">
+      <header><h2>Money</h2><span class="muted" id="moneyMeta"></span></header>
+      <div class="stats" id="money"></div>
+      <p class="hint">
+        These are <strong>cart</strong> values — what the customer had in the basket when they
+        left. Recovered is not the value of the order that eventually landed, which we never
+        fetch from Shopify. A cart nobody has called yet is <strong>still open</strong>, not
+        lost; only a customer who actually said no counts as lost.
+      </p>
     </section>
 
     <section class="insights">
+      <div class="panel insight">
+        <header><h2>Pipeline</h2><span class="muted">in range</span></header>
+        <div id="funnel"><p class="muted">Loading…</p></div>
+      </div>
       <div class="panel insight">
         <header><h2>Carts per day</h2><span class="muted">recovered shaded</span></header>
         <div id="byDay"><p class="muted">Loading…</p></div>
       </div>
+    </section>
+
+    <!-- 4. Team. -->
+    <section class="insights">
       <div class="panel insight">
-        <header><h2>Where they drop</h2></header>
-        <div id="stages"><p class="muted">Loading…</p></div>
+        <header><h2>By caller</h2><span class="muted">in range</span></header>
+        <table class="mini">
+          <thead><tr>
+            <th>Caller</th>
+            <th class="right" title="Carts where this person saved the last change">Touched</th>
+            <th class="right">Recovered</th>
+            <th class="right" title="Recovered ÷ touched">Rate</th>
+            <th class="right">Value</th>
+          </tr></thead>
+          <tbody id="callers"><tr><td colspan="5" class="empty">Loading…</td></tr></tbody>
+        </table>
+        <p class="hint">
+          “Touched” is who saved the <strong>last</strong> change, not who called first — the
+          board records one owner per cart, not an attempt log. With three callers that is close
+          enough to read as activity; it is not a call count.
+        </p>
+      </div>
+      <div class="panel insight">
+        <header><h2>Who's online</h2><span class="muted" id="onlineMeta"></span></header>
+        <div id="online"><p class="muted">Loading…</p></div>
+      </div>
+    </section>
+
+    <!-- 5. Where carts come from, and what each source can actually tell us. -->
+    <section class="insights">
+      <div class="panel insight">
+        <header><h2>Where carts come from</h2><span class="muted">in range</span></header>
+        <div id="sources"><p class="muted">Loading…</p></div>
+      </div>
+      <div class="panel insight">
+        <header><h2>Why they abandoned</h2><span class="muted" id="reasonMeta"></span></header>
+        <div id="reasons"><p class="muted">Loading…</p></div>
       </div>
     </section>
 
     <section class="insights">
       <div class="panel insight">
-        <header><h2>Risk mix</h2><span class="muted">GoKwik RTO flag</span></header>
-        <div id="risk"><p class="muted">Loading…</p></div>
+        <header><h2>Where they drop</h2><span class="muted" id="stageMeta"></span></header>
+        <div id="stages"><p class="muted">Loading…</p></div>
       </div>
       <div class="panel insight">
-        <header><h2>Traffic source</h2></header>
-        <div id="sources"><p class="muted">Loading…</p></div>
+        <header><h2>Risk mix</h2><span class="muted">split by source</span></header>
+        <div id="risk"><p class="muted">Loading…</p></div>
+        <p class="hint">
+          GoKwik's RTO flag and Shopify's risk level are different scores that happen to share
+          the words High and Low, so they are listed separately rather than added together.
+        </p>
       </div>
     </section>
 
     <section class="panel insight" style="margin-bottom:18px">
+      <header><h2>Marketing source</h2><span class="muted" id="utmMeta"></span></header>
+      <div id="utm"><p class="muted">Loading…</p></div>
+    </section>
+
+    <!-- 6. The long view. -->
+    <section class="panel insight" style="margin-bottom:18px">
       <header>
-        <h2>Reports</h2>
+        <h2>Report</h2>
         <span class="session" style="gap:8px">
+          <span class="muted">last 14 periods, independent of the range above</span>
           <span class="group" id="periodGroup" role="group" aria-label="Report period">
             <button type="button" data-period="day" class="active">Daily</button>
             <button type="button" data-period="week">Weekly</button>
@@ -98,6 +164,7 @@
       <p class="hint">
         Recovery rate is measured against carts <strong>called</strong>, not carts received —
         you cannot recover a cart nobody rang, and mixing the two hides whether calling works.
+        The board uses this same definition.
       </p>
     </section>
 

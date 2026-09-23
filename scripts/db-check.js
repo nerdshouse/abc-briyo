@@ -8,6 +8,7 @@ import {
   listMembers, upsertMember, updateMember, deleteMember, otherActiveAdminCount,
   recordMemberChange, recentMemberChanges, changeMemberPhone,
   adminOverview, whoIsOnline, touchLastSeen, periodReport, cartsByStatus, importCarts,
+  actionQueue, cartsForBucket, ACTION_BUCKETS, dailySnapshot,
 } from '../lib/db.js';
 import { createOtp, verifyOtp, checkRateLimit, normalisePhone } from '../lib/otp.js';
 import { normalizePayload, redactPayload, REDACTED_KEYS } from '../lib/normalize.js';
@@ -723,11 +724,20 @@ await step('admin overview aggregates agree with the board', async () => {
   if (o.totals.recovered > o.totals.worked) throw new Error('recovered exceeds worked');
   if (o.totals.worked > o.totals.carts) throw new Error('worked exceeds total carts');
 
+  // Recovered + still open + lost must be the whole pot. If these ever drift,
+  // the money panel is telling the owner something untrue.
+  const parts = o.totals.recovered_value + o.totals.open_value + o.totals.declined_value;
+  if (Math.abs(parts - o.totals.value) > 0.01) {
+    throw new Error(`money splits sum to ${parts}, total cart value is ${o.totals.value}`);
+  }
+
   const byDayTotal = o.byDay.reduce((n, d) => n + d.carts, 0);
   if (byDayTotal !== o.totals.carts) {
     throw new Error(`per-day rows sum to ${byDayTotal}, totals say ${o.totals.carts}`);
   }
-  for (const key of ['stages', 'risk', 'sources', 'callers']) {
+  // `sources` was split in two: utm_source is the marketing channel, source is
+  // which system sent us the cart. They were never the same thing.
+  for (const key of ['stages', 'risk', 'utm', 'bySource', 'callers']) {
     if (!Array.isArray(o[key])) throw new Error(`${key} missing from the overview`);
   }
   return `${o.totals.carts} carts, ${o.totals.worked} worked, ${o.totals.recovered} recovered; per-day sums match`;
@@ -785,6 +795,85 @@ await step('cart_events is removed with its cart', async () => {
      WHERE conrelid = 'cart_events'::regclass AND contype = 'f'`);
   if (!fk.length || fk[0].confdeltype !== 'c') throw new Error('ON DELETE CASCADE is missing');
   return `${n[0].n} event(s), cascade constraint present`;
+});
+
+/**
+ * The whole point of ACTION_BUCKETS being one shared constant: a headline count
+ * and the list it opens must never disagree. This is the check that keeps them
+ * honest as either query gets edited.
+ */
+await step('action queue counts match the carts behind them', async () => {
+  const q = await actionQueue(6);
+  const pairs = [
+    ['unassigned', q.unassigned],
+    ['callbacks_today', q.callbacks_today],
+    ['callbacks_overdue', q.callbacks_overdue],
+    ['stale', q.stale],
+  ];
+  for (const [bucket, n] of pairs) {
+    const rows = await cartsForBucket(bucket, { slaHours: 6, limit: 1000 });
+    if (rows.length !== n) {
+      throw new Error(`${bucket}: count says ${n}, drill-down returned ${rows.length}`);
+    }
+  }
+  if (Object.keys(ACTION_BUCKETS).length !== pairs.length) {
+    throw new Error('a bucket was added without a matching check');
+  }
+  return pairs.map(([b, n]) => `${b}=${n}`).join(', ');
+});
+
+await step('an unknown bucket is refused, not silently empty', async () => {
+  try {
+    await cartsForBucket('everything');
+    throw new Error('a bogus bucket returned rows instead of throwing');
+  } catch (err) {
+    if (!/Unknown bucket/.test(err.message)) throw err;
+    return 'rejected';
+  }
+});
+
+await step('the report is bounded by the buckets it displays', async () => {
+  const rows = await periodReport('day', 3);
+  if (rows.length > 3) throw new Error(`asked for 3 buckets, got ${rows.length}`);
+  const oldest = rows.at(-1)?.bucket;
+  if (oldest) {
+    const ageDays = Math.round((Date.now() - new Date(oldest + 'T00:00:00Z').getTime()) / 86400000);
+    if (ageDays > 4) throw new Error(`oldest bucket ${oldest} is ${ageDays}d old, window not applied`);
+  }
+  return `${rows.length} bucket(s), oldest ${oldest ?? 'none'}`;
+});
+
+/**
+ * received_at is when the cart reached us; abandoned_at is when the customer
+ * left. Conflating them made a late CSV import read as an instant SLA breach
+ * against callers who had only just been given it.
+ */
+await step('an imported cart is received now, not when it was abandoned', async () => {
+  const tenDaysAgo = new Date(Date.now() - 10 * 86400000).toISOString();
+  await importCarts([{
+    cartId: TEST_CART, customerName: 'DBCheck Import', phone: '9000000001',
+    totalPrice: 10, currency: 'INR', abandonedAt: tenDaysAgo, raw: { dbcheck: true },
+  }], { source: 'shopify-csv' });
+  const { rows } = await getPool().query(
+    `SELECT received_at, abandoned_at,
+            EXTRACT(EPOCH FROM (now() - received_at))::int AS received_age_s
+     FROM abandoned_carts WHERE cart_id = $1`, [TEST_CART]);
+  if (rows[0].received_age_s > 120) {
+    throw new Error(`received_at is ${rows[0].received_age_s}s old — it took abandoned_at`);
+  }
+  const abandonedAgeDays = Math.round((Date.now() - new Date(rows[0].abandoned_at).getTime()) / 86400000);
+  if (abandonedAgeDays !== 10) throw new Error(`abandoned_at is ${abandonedAgeDays}d old, expected 10`);
+  return 'received now, abandoned 10 days ago';
+});
+
+await step('today and yesterday are reported separately', async () => {
+  const d = await dailySnapshot();
+  for (const k of ['today', 'yesterday']) {
+    for (const f of ['carts', 'value', 'called', 'recovered', 'recovered_value']) {
+      if (d[k][f] === undefined) throw new Error(`${k}.${f} missing`);
+    }
+  }
+  return `today ${d.today.carts} cart(s), yesterday ${d.yesterday.carts}`;
 });
 
 // ---- cleanup ---------------------------------------------------------------
