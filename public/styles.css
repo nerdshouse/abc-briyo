@@ -670,7 +670,12 @@ a.stat.stat-click:hover { border-color: var(--accent); background: #fbfdfc; }
 .cc-act .links a.call { background: var(--accent); border-color: var(--accent); color: #fff; }
 
 .cc-record { display: flex; flex-direction: column; gap: 6px; }
-.cc-outcome { display: flex; gap: 6px; }
+/* Status and callback time share a line only while both stay readable. At
+   phone width they were splitting it 50/50, which truncated the status to
+   "Callback s…" — the one word on the card that has to be legible. */
+.cc-outcome { display: flex; gap: 6px; flex-wrap: wrap; }
+.cc-outcome select { flex: 1 1 11rem; min-width: 0; }
+.cc-outcome input[type="datetime-local"] { flex: 1 1 11rem; min-width: 0; }
 .cc-record select, .cc-record input[type="text"], .cc-record input[type="datetime-local"] {
   width: 100%; font-size: 13px;
 }
