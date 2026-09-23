@@ -618,3 +618,74 @@ button.stat.stat-warn:hover, button.stat.stat-warn.stat-on { border-color: var(-
 a.stat.stat-click { text-decoration: none; color: inherit; display: block; }
 a.stat.stat-click:hover { border-color: var(--accent); background: #fbfdfc; }
 #periodGroup button { font-size: 12.5px; padding: 5px 10px; }
+
+/* ---------------------------------------------------------------------------
+   Call queue
+   ---------------------------------------------------------------------------
+   The board used to be an eight-column table whose last column was an editing
+   form, so a caller read a dropdown per row to see where a cart stood. These
+   cards put the same controls in three fixed zones — who and why, the act of
+   calling, recording what happened — which reads the same on a phone and on a
+   desktop without a separate mobile layout.
+--------------------------------------------------------------------------- */
+.queue { display: flex; flex-direction: column; gap: 10px; margin-bottom: 22px; }
+
+.callcard {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto minmax(280px, 320px);
+  gap: 18px;
+  align-items: start;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  padding: var(--s3) var(--s4);
+}
+.callcard + .callcard { margin-top: 0; }
+
+/* Worked, but deliberately still on screen — see saveRow. */
+.callcard.cc-done { opacity: .5; }
+
+.cc-top { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
+.cc-value { font-size: 18px; font-weight: 650; letter-spacing: -0.01em; }
+.cc-name { font-weight: 550; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 100%; }
+.cc-meta { color: var(--muted); font-size: 12.5px; margin-top: 2px; }
+.cc-chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 7px; }
+.cc-items { margin-top: 8px; font-size: 12.5px; }
+
+.tag {
+  display: inline-block; padding: 1px 8px; border-radius: 999px;
+  font-size: 11.5px; font-weight: 550; border: 1px solid var(--border);
+}
+.tag-stage { color: var(--muted); }
+.tag.risk-high { background: var(--danger-soft); border-color: #fda29b; color: #b42318; }
+.tag.risk-medium { background: var(--warn-soft); border-color: var(--warn-border); color: #b54708; }
+.tag.risk-low, .tag.risk-control { color: var(--muted); }
+
+/* Calling is the job, so it gets its own zone and the only filled button. */
+.cc-act .links { display: flex; flex-direction: column; gap: 6px; min-width: 104px; }
+.cc-act .links a {
+  display: block; text-align: center; padding: 9px 14px; border-radius: var(--r-md);
+  border: 1px solid var(--border); text-decoration: none; font-size: 13px; font-weight: 550;
+}
+.cc-act .links a.call { background: var(--accent); border-color: var(--accent); color: #fff; }
+
+.cc-record { display: flex; flex-direction: column; gap: 6px; }
+.cc-outcome { display: flex; gap: 6px; }
+.cc-record select, .cc-record input[type="text"], .cc-record input[type="datetime-local"] {
+  width: 100%; font-size: 13px;
+}
+.cc-foot { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; font-size: 11.5px; }
+.cc-foot .js-assign { width: auto; flex: 1 1 120px; font-size: 12px; }
+.cc-foot .saved { color: var(--muted); }
+.cc-foot .saved.pending { color: var(--accent); }
+.cc-foot .saved.failed { color: var(--danger); }
+
+.callcard.skeleton { display: block; }
+.callcard.skeleton .sk { display: block; margin-bottom: 8px; }
+
+@media (max-width: 900px) {
+  /* One column, in working order: who, then call, then record. */
+  .callcard { grid-template-columns: 1fr; gap: 12px; }
+  .cc-act .links { flex-direction: row; }
+  .cc-act .links a { flex: 1; padding: 11px 14px; }   /* ~44px touch targets */
+}

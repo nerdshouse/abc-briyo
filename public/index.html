@@ -12,8 +12,8 @@
       <div>
         <h1>Abandoned Cart Recovery Board</h1>
         <p class="sub">
-          Abandoned carts arrive live from GoKwik. Call status and notes are shared —
-          everyone sees the same board on every device.
+          Work top to bottom. Call status and notes are shared — everyone sees the same
+          queue on every device.
         </p>
       </div>
       <div class="session">
@@ -34,73 +34,48 @@
 
     <div id="errorBanner" class="banner error" hidden></div>
 
-    <section class="stats" id="stats"></section>
+    <p class="sub" id="rangeSummary"></p>
 
-    <!-- Primary: what you are looking at. Search overrides the range entirely. -->
+    <div id="staleBanner" class="banner" hidden></div>
+
+    <!--
+      One filter surface, not three. The queue modes carry their own counts, so
+      the numbers and the filters are the same control — the old board had
+      clickable stat cards, two toggles and four dropdowns all driving the same
+      state, and they could disagree with each other on screen.
+    -->
     <div class="controls controls-primary">
+      <div class="group" id="modeGroup" role="group" aria-label="Queue">
+        <button type="button" data-mode="tocall" class="active">To call</button>
+        <button type="button" data-mode="callbacks">Callbacks</button>
+        <button type="button" data-mode="mine">Mine</button>
+        <button type="button" data-mode="all">All</button>
+      </div>
       <input type="search" id="search" autocomplete="off" spellcheck="false"
              placeholder="Search all history — name, phone, email…" aria-label="Search all carts" />
+    </div>
+
+    <div class="controls controls-filters">
       <div class="group" id="rangeGroup" role="group" aria-label="Date range">
         <button type="button" data-days="1">Today</button>
         <button type="button" data-days="3">3 days</button>
         <button type="button" data-days="7" class="active">7 days</button>
         <button type="button" data-days="0">All</button>
       </div>
-    </div>
-
-    <!-- Secondary: how it is narrowed and ordered. -->
-    <div class="controls controls-filters">
-      <button type="button" id="mineOnly" class="toggle">Mine</button>
-      <button type="button" id="overdueOnly" class="toggle">Overdue</button>
-      <span class="ctl-divider" aria-hidden="true"></span>
-      <select id="statusFilter" aria-label="Filter by status">
-        <option value="">Any status</option>
-      </select>
-      <select id="assigneeFilter" aria-label="Filter by assignee">
-        <option value="">Anyone</option>
-        <option value="__unassigned">Unassigned</option>
-      </select>
-      <select id="stageFilter" aria-label="Filter by drop stage">
-        <option value="">Any drop stage</option>
-      </select>
       <select id="sort" aria-label="Sort">
-        <option value="value">Cart value: high → low</option>
-        <option value="recent">Most recent first</option>
-        <option value="risk">Risk: high → low</option>
+        <option value="value">Biggest carts first</option>
+        <option value="risk">Riskiest first</option>
+        <option value="recent">Newest first</option>
         <option value="callback">Callback due soonest</option>
       </select>
-      <button type="button" id="clearFilters" class="linky" hidden>Clear filters</button>
     </div>
 
     <p id="resultNote" class="result-note" hidden></p>
 
-    <div class="panel">
-      <table class="board">
-        <thead>
-          <tr>
-            <th>Abandoned</th>
-            <th>Customer</th>
-            <th>Items</th>
-            <th class="right">Value</th>
-            <th>Dropped at</th>
-            <th>Owner</th>
-            <th>Contact</th>
-            <th>Status &amp; notes</th>
-          </tr>
-        </thead>
-        <tbody id="rows">
-          <tr class="skeleton">
-            <td><span class="sk w80"></span><span class="sk w60"></span></td>
-            <td><span class="sk w80"></span><span class="sk w60"></span></td>
-            <td><span class="sk w80"></span><span class="sk w80"></span><span class="sk w40"></span></td>
-            <td><span class="sk w60"></span></td>
-            <td><span class="sk w60"></span><span class="sk w80"></span></td>
-            <td><span class="sk w80"></span></td>
-            <td><span class="sk w80"></span><span class="sk w80"></span></td>
-            <td><span class="sk w80"></span><span class="sk w60"></span></td>
-          </tr>
-        </tbody>
-      </table>
+    <div id="queue" class="queue">
+      <div class="callcard skeleton">
+        <span class="sk w40"></span><span class="sk w80"></span><span class="sk w60"></span>
+      </div>
     </div>
 
     <section class="insights">
@@ -127,8 +102,9 @@
 
     <p class="note">
       Carts are received from GoKwik's webhook and stored with their full original payload,
-      so nothing is lost even if a field isn't shown here. Status edits save immediately and
-      are last-write-wins per row.
+      so nothing is lost even if a field isn't shown here. Outcome edits save immediately;
+      if someone else changed the same cart while you were typing, the board says so rather
+      than overwriting them.
     </p>
   </div>
 
