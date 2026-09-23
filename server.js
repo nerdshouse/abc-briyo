@@ -1001,6 +1001,14 @@ app.listen(port, async () => {
     getStale: (h) => db.stale(h),
     slaHours: SLA_HOURS,
     getLastIngest: () => db.lastIngest(),
+    // Same numbers the owner view shows, so the evening message and the page
+    // can never tell two different stories about the same day.
+    getDailyStats: MOCK ? null : async () => {
+      const [daily, queue, callers] = await Promise.all([
+        dailySnapshot(), actionQueue(SLA_HOURS), statsByCaller(1),
+      ]);
+      return { today: daily.today, queue, callers };
+    },
   });
   if (!MOCK) startShopifyPoll();
 });

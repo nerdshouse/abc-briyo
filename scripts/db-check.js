@@ -14,7 +14,9 @@ import { createOtp, verifyOtp, checkRateLimit, normalisePhone } from '../lib/otp
 import { normalizePayload, redactPayload, REDACTED_KEYS } from '../lib/normalize.js';
 import { GOKWIK_REAL_PAYLOAD } from './fixtures/gokwik-real.js';
 import { mapShopifyCsv } from '../lib/shopify-csv.js';
-import { isIngestSilent } from '../lib/sla-alert.js';
+import {
+  isIngestSilent, buildDailySummary, shouldSendSummary, boardDay,
+} from '../lib/sla-alert.js';
 import { issueSession, verifySession } from '../lib/session.js';
 import { rateLimit, _reset as resetRateLimit } from '../lib/rate-limit.js';
 
@@ -874,6 +876,49 @@ await step('today and yesterday are reported separately', async () => {
     }
   }
   return `today ${d.today.carts} cart(s), yesterday ${d.yesterday.carts}`;
+});
+
+/**
+ * The evening digest, checked without spending a WhatsApp credit — the whole
+ * reason the wording and the timing were kept as pure functions.
+ */
+await step('daily summary says what happened and what is outstanding', async () => {
+  const text = buildDailySummary({
+    today: { carts: 10, value: 7016.92, called: 4, recovered: 2, recovered_value: 1840 },
+    queue: { unassigned: 8, stale: 1, callbacks_overdue: 2 },
+    callers: [{ caller: 'Prayag Patel', touched: 4 }, { caller: 'Idle Person', touched: 0 }],
+    slaHours: 6,
+  });
+  for (const want of ['10 carts in', '₹7,017', '4 called', '2 recovered', '8 unassigned',
+                      '1 uncalled 6h+', '2 callbacks missed', 'Prayag Patel: 4']) {
+    if (!text.includes(want)) throw new Error(`summary is missing "${want}":\n${text}`);
+  }
+  // Somebody who did nothing today should not be listed as having done nothing.
+  if (text.includes('Idle Person')) throw new Error('listed a caller with no activity');
+
+  const quiet = buildDailySummary({
+    today: { carts: 3, value: 1200, called: 3, recovered: 0, recovered_value: 0 },
+    queue: { unassigned: 0, stale: 0, callbacks_overdue: 0 }, callers: [], slaHours: 6,
+  });
+  if (quiet.includes('Needs doing')) throw new Error('a clear queue still produced a to-do line');
+  return `${text.split('\n').length} lines busy, ${quiet.split('\n').length} quiet`;
+});
+
+await step('the summary latch survives a redeploy', async () => {
+  // IST is UTC+5:30, so IST h:00 is UTC (h-6):30.
+  const at = (h) => new Date(Date.UTC(2026, 8, 23, h - 6, 30));
+  const cases = [
+    ['before the hour', shouldSendSummary(null, { hour: 20, now: at(19) }), false],
+    ['after, unsent', shouldSendSummary(null, { hour: 20, now: at(21) }), true],
+    // This is the one that matters: a restart re-runs the timer, and without a
+    // day latch the same evening's message would go out again.
+    ['already sent today', shouldSendSummary(boardDay(at(21)), { hour: 20, now: at(21) }), false],
+    ['sent yesterday', shouldSendSummary('2026-09-22', { hour: 20, now: at(21) }), true],
+  ];
+  for (const [label, got, want] of cases) {
+    if (got !== want) throw new Error(`${label}: got ${got}, expected ${want}`);
+  }
+  return `${cases.length} timing cases correct`;
 });
 
 // ---- cleanup ---------------------------------------------------------------
