@@ -12,6 +12,7 @@ import {
   recordMemberChange, recentMemberChanges, changeMemberPhone,
   adminOverview, whoIsOnline, periodReport, importCarts,
   actionQueue, cartsForBucket, cartsByStatus, ACTION_BUCKETS, dailySnapshot,
+  cartEvents, recentEvents, callbackAtOf,
 } from './lib/db.js';
 import {
   mockInsertCart, mockListCarts, mockUpdateStatus, mockMatchOrder,
@@ -481,6 +482,25 @@ app.post('/api/status', async (req, res) => {
       cb = null;
     }
 
+    /*
+     * A callback with no time is not a callback.
+     *
+     * Every one of the first ten carts to reach this status had a null
+     * callback_at, because the time was optional and easy to skip — which made
+     * the status decorative: nothing could be sorted by when it was due and
+     * "overdue" could never be true. The time is now required whenever the cart
+     * ends up in that status, whether it is being set now or was already there.
+     */
+    if (status === 'Callback scheduled') {
+      const settled = cb !== undefined ? cb : await callbackAtOf(id);
+      if (!settled) {
+        return res.status(400).json({
+          ok: false, needsCallbackTime: true,
+          error: 'Pick the date and time you promised to call back.',
+        });
+      }
+    }
+
     // null unassigns; anything else must be a current, active member, so a cart
     // can never be assigned to someone who cannot sign in to see it.
     let assignee;
@@ -527,6 +547,23 @@ app.post('/api/status', async (req, res) => {
  * already show on screen. Exports are logged — this is the app's largest
  * data-egress path and it carries customer PII.
  */
+/** One cart's history. Shared board, shared history — any member can read it. */
+app.get('/api/carts/:id/events', async (req, res) => {
+  try {
+    if (MOCK) return res.json({ ok: true, events: [] });
+    return res.json({ ok: true, events: await cartEvents(req.params.id) });
+  } catch (err) { return fail(res, err); }
+});
+
+/** The whole board's activity. Admin-only: it is everyone's work in one list. */
+app.get('/api/admin/events', requireAdmin, async (req, res) => {
+  try {
+    if (MOCK) return res.json({ ok: true, events: [] });
+    const limit = Math.min(200, Math.max(1, Number.parseInt(req.query.limit ?? '60', 10) || 60));
+    return res.json({ ok: true, events: await recentEvents({ limit }) });
+  } catch (err) { return fail(res, err); }
+});
+
 app.get('/api/carts.csv', async (req, res) => {
   try {
     if (!MOCK) await ensureSchema();

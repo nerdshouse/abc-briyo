@@ -9,6 +9,7 @@ import {
   recordMemberChange, recentMemberChanges, changeMemberPhone,
   adminOverview, whoIsOnline, touchLastSeen, periodReport, cartsByStatus, importCarts,
   actionQueue, cartsForBucket, ACTION_BUCKETS, dailySnapshot,
+  cartEvents, recentEvents, callbackAtOf,
 } from '../lib/db.js';
 import { createOtp, verifyOtp, checkRateLimit, normalisePhone } from '../lib/otp.js';
 import { normalizePayload, redactPayload, REDACTED_KEYS } from '../lib/normalize.js';
@@ -757,11 +758,14 @@ await step('allowlist table readable', async () => {
  * checks both directions: a real transition logs exactly one event, and a
  * notes-only save logs none.
  */
-await step('cart_events records transitions, not note edits', async () => {
+await step('a note edit is never counted as a call attempt', async () => {
   const { rows } = await getPool().query('SELECT id FROM abandoned_carts WHERE cart_id = $1', [TEST_CART]);
   const id = rows[0].id;
+  // Status events only. Note edits are logged too now, but as their own kind —
+  // the thing that must never inflate is the count of call attempts.
   const countEvents = async () => (await getPool().query(
-    'SELECT count(*)::int AS n FROM cart_events WHERE cart_id = $1', [id])).rows[0].n;
+    `SELECT count(*)::int AS n FROM cart_events
+     WHERE cart_id = $1 AND kind = 'status'`, [id])).rows[0].n;
 
   const before = await countEvents();
   await updateStatus(id, { status: 'Not called', updatedBy: 'DBCheck Bot' });
@@ -775,7 +779,8 @@ await step('cart_events records transitions, not note edits', async () => {
 
   const { rows: last } = await getPool().query(
     `SELECT from_status, to_status, actor, note_len FROM cart_events
-     WHERE cart_id = $1 ORDER BY at DESC, id DESC LIMIT 1`, [id]);
+     WHERE cart_id = $1 AND kind = 'status'
+     ORDER BY at DESC, id DESC LIMIT 1`, [id]);
   if (last[0].to_status !== 'Called – No answer') {
     throw new Error(`last event to_status was ${last[0].to_status}`);
   }
@@ -919,6 +924,62 @@ await step('the summary latch survives a redeploy', async () => {
     if (got !== want) throw new Error(`${label}: got ${got}, expected ${want}`);
   }
   return `${cases.length} timing cases correct`;
+});
+
+/**
+ * The log has to record what changed, not merely that something did — and one
+ * row per changed thing, so a notes edit never reads as another call attempt.
+ */
+await step('every kind of change is logged, separately', async () => {
+  const { rows } = await getPool().query('SELECT id FROM abandoned_carts WHERE cart_id = $1', [TEST_CART]);
+  const id = rows[0].id;
+  await getPool().query('DELETE FROM cart_events WHERE cart_id = $1', [id]);
+
+  const when = new Date(Date.now() + 7200_000).toISOString();
+  await updateStatus(id, { status: 'Callback scheduled', callbackAt: when, updatedBy: 'DBCheck Bot' });
+  await updateStatus(id, { notes: 'rang, will call at 4', updatedBy: 'DBCheck Bot' });
+  await updateStatus(id, { reasonTags: ['Shipping time', 'Out of stock'], updatedBy: 'DBCheck Bot' });
+
+  const events = await cartEvents(id);
+  const kinds = events.map((e) => e.kind);
+  for (const want of ['status', 'callback', 'note', 'reason']) {
+    if (!kinds.includes(want)) throw new Error(`no "${want}" event logged; got ${kinds.join(', ')}`);
+  }
+  const note = events.find((e) => e.kind === 'note');
+  if (note.detail !== 'rang, will call at 4') throw new Error(`note detail was "${note.detail}"`);
+  const reason = events.find((e) => e.kind === 'reason');
+  if (reason.detail !== 'Shipping time, Out of stock') throw new Error(`reason detail was "${reason.detail}"`);
+  const cb = events.find((e) => e.kind === 'callback');
+  if (!/\d{2} \w{3} \d{4}/.test(cb.detail)) throw new Error(`callback detail unreadable: "${cb.detail}"`);
+
+  // Saving the same values again must add nothing at all.
+  const before = events.length;
+  await updateStatus(id, { notes: 'rang, will call at 4', reasonTags: ['Shipping time', 'Out of stock'], updatedBy: 'DBCheck Bot' });
+  const after = (await cartEvents(id)).length;
+  if (after !== before) throw new Error(`a no-op save logged ${after - before} event(s)`);
+
+  return `${kinds.join(' + ')}; no-op save logged nothing`;
+});
+
+await step('the activity log reads across carts with context', async () => {
+  const feed = await recentEvents({ limit: 20 });
+  if (!feed.length) throw new Error('activity log is empty');
+  const mine = feed.find((e) => e.actor === 'DBCheck Bot');
+  if (!mine) throw new Error('recent change missing from the feed');
+  for (const f of ['kind', 'actor', 'at', 'cart_id']) {
+    if (mine[f] === undefined) throw new Error(`feed row is missing ${f}`);
+  }
+  if (!('customer_name' in mine)) throw new Error('feed does not join the cart it belongs to');
+  return `${feed.length} entries, newest by ${feed[0].actor ?? 'unknown'}`;
+});
+
+await step('a callback time can be read back for validation', async () => {
+  const { rows } = await getPool().query('SELECT id FROM abandoned_carts WHERE cart_id = $1', [TEST_CART]);
+  const set = await callbackAtOf(rows[0].id);
+  if (!set) throw new Error('callback time did not persist');
+  const missing = await callbackAtOf(-1);
+  if (missing !== undefined) throw new Error('a non-existent cart should report undefined');
+  return 'present for a real cart, undefined for a missing one';
 });
 
 // ---- cleanup ---------------------------------------------------------------

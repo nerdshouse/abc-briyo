@@ -277,6 +277,43 @@ function render(d) {
     + ` · ${t.declined} declined.`;
 }
 
+const ACTIVITY_VERB = {
+  status: (e) => `${e.from_status || 'new'} → <strong>${esc(e.to_status)}</strong>`,
+  note: (e) => (e.detail ? `noted “${esc(e.detail)}”` : 'cleared the note'),
+  callback: (e) => (e.detail === 'cleared' ? 'cleared the callback' : `callback set for ${esc(e.detail)}`),
+  reason: (e) => (e.detail === 'cleared' ? 'cleared the reasons' : `reason: ${esc(e.detail)}`),
+  assign: (e) => (e.detail === 'unassigned' ? 'unassigned it' : `assigned to ${esc(e.detail)}`),
+};
+
+const when = (iso) => new Date(iso).toLocaleString('en-IN', {
+  day: 'numeric', month: 'short', hour: 'numeric', minute: '2-digit', hour12: true,
+});
+
+/** Who did what to which cart, newest first. */
+async function loadActivity() {
+  try {
+    const res = await fetch('/api/admin/events?limit=60');
+    const d = await res.json();
+    if (!d.ok) throw new Error(d.error || 'Could not load the activity log');
+    $('#activity').innerHTML = d.events.length
+      ? `<div class="hist">${d.events.map((e) => {
+          const verb = ACTIVITY_VERB[e.kind];
+          const what = verb ? verb(e) : esc(e.detail || e.kind || 'changed');
+          const who = esc(e.customer_name || `cart ${e.cart_id}`);
+          return `<div class="hist-row">
+            <span class="hist-when">${esc(when(e.at))}</span>
+            <span class="hist-what"><strong>${esc(e.actor || 'system')}</strong> — ${what}
+              <span class="muted">on ${who}</span></span>
+            <span class="hist-who">${e.total_price != null ? money(e.total_price) : ''}</span>
+          </div>`;
+        }).join('')}</div>`
+      : '<p class="muted">Nothing recorded yet.</p>';
+    $('#activityMeta').textContent = `${d.events.length} most recent changes`;
+  } catch (err) {
+    $('#activity').innerHTML = `<p class="muted">${esc(err.message)}</p>`;
+  }
+}
+
 /** Reasons live on their own endpoint, shared with the board. */
 async function loadReasons() {
   try {
@@ -346,6 +383,7 @@ $('#dashRange').addEventListener('click', (e) => {
   $('#drawer').innerHTML = '';
   load();
   loadReasons();
+  loadActivity();
 });
 
 fetch('/auth/me').then((r) => r.json()).then((me) => {
@@ -357,4 +395,5 @@ fetch('/auth/me').then((r) => r.json()).then((me) => {
 load();
 loadReasons();
 loadReport();
+loadActivity();
 setInterval(load, 60_000);

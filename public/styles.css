@@ -694,3 +694,49 @@ a.stat.stat-click:hover { border-color: var(--accent); background: #fbfdfc; }
   .cc-act .links { flex-direction: row; }
   .cc-act .links a { flex: 1; padding: 11px 14px; }   /* ~44px touch targets */
 }
+
+/* --- outcome: notes, reasons, history ------------------------------------ */
+.cc-record textarea.js-notes {
+  width: 100%; font: inherit; font-size: 13px; line-height: 1.45;
+  padding: 7px 9px; border: 1px solid var(--border); border-radius: var(--r-sm);
+  resize: vertical; min-height: 44px; background: var(--panel); color: var(--text);
+}
+.cc-record textarea.js-notes:focus { outline: 2px solid var(--accent-soft); border-color: var(--accent); }
+
+/* A callback with no time is the one save the server refuses, so the field
+   says so itself rather than leaving the caller to find a banner. */
+.js-callback.needed { border-color: var(--warn-border); background: var(--warn-soft); }
+.cb-hint { font-size: 11.5px; color: var(--warn); }
+.cb.cb-missing { background: var(--warn-soft); border-color: var(--warn-border); color: var(--warn); }
+
+/* Reasons read as one question with tappable answers, not a checkbox list. */
+.tagpick > summary { font-size: 12px; color: var(--muted); cursor: pointer; padding: 2px 0; }
+.tagpick[open] > summary { color: var(--text-soft); margin-bottom: 4px; }
+/* Overrides the original stacked checkbox list above. The selectors carry the
+   extra class deliberately: `.tagmenu label` beats a bare `.rtag` on
+   specificity, so the pills would silently stay full-width rows without it. */
+.cc-record .tagmenu {
+  display: flex; flex-direction: row; flex-wrap: wrap; gap: 5px;
+  padding: 2px 0 4px; margin-top: 0; background: none; border: none;
+}
+.tagmenu .rtag {
+  display: inline-flex; align-items: center; gap: 5px; white-space: nowrap;
+  border: 1px solid var(--border); border-radius: 999px;
+  padding: 5px 10px; font-size: 12px; cursor: pointer; user-select: none;
+}
+.tagmenu .rtag:hover { border-color: var(--border-strong); }
+.tagmenu .rtag.on { background: var(--accent-soft); border-color: var(--accent); color: var(--accent); }
+.tagmenu .rtag input { margin: 0; }
+
+.history > summary { font-size: 12px; color: var(--muted); cursor: pointer; padding: 2px 0; }
+.hist { display: flex; flex-direction: column; gap: 3px; padding: 4px 0 2px; font-size: 11.5px; }
+.hist-row { display: grid; grid-template-columns: auto 1fr auto; gap: 8px; align-items: baseline; }
+.hist-when { color: var(--muted); white-space: nowrap; }
+.hist-what { color: var(--text-soft); overflow-wrap: anywhere; }
+.hist-who { color: var(--muted); white-space: nowrap; }
+
+@media (max-width: 900px) {
+  /* Three columns of log line do not fit a phone; stack the attribution. */
+  .hist-row { grid-template-columns: 1fr; gap: 0; padding-bottom: 4px; }
+  .hist-who::before { content: '— '; }
+}

@@ -76,6 +76,20 @@ function money(amount, currency) {
   }
 }
 
+/**
+ * The wall-clock time a thing happened, in the caller's own timezone.
+ *
+ * "15m ago" is fine for scanning but useless for "when exactly did you ring
+ * them?" — which is the question an outcome record has to answer.
+ */
+function exactTime(iso) {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return '';
+  return d.toLocaleString('en-IN', {
+    day: 'numeric', month: 'short', hour: 'numeric', minute: '2-digit', hour12: true,
+  });
+}
+
 function relativeTime(iso) {
   const then = new Date(iso).getTime();
   if (Number.isNaN(then)) return '—';
@@ -195,14 +209,17 @@ function gokwikTouch(cart) {
 
 /** Overdue / due-today state for a scheduled callback. */
 function callbackState(cart) {
-  if (cart.status !== 'Callback scheduled' || !cart.callback_at) return null;
+  if (cart.status !== 'Callback scheduled') return null;
+  // Ten carts reached this status before a time was required. They are not
+  // scheduled anything — say so rather than showing a blank chip.
+  if (!cart.callback_at) return { kind: 'missing', label: 'No time set', due: null };
   const due = new Date(cart.callback_at);
   if (Number.isNaN(due.getTime())) return null;
   const now = new Date();
-  if (due < now) return { kind: 'overdue', label: 'Overdue', due };
+  if (due < now) return { kind: 'overdue', label: `Overdue · ${exactTime(cart.callback_at)}`, due };
   const endOfDay = new Date(now); endOfDay.setHours(23, 59, 59, 999);
-  if (due <= endOfDay) return { kind: 'due-today', label: 'Due today', due };
-  return { kind: 'scheduled', label: due.toLocaleString('en-IN', { dateStyle: 'medium', timeStyle: 'short' }), due };
+  if (due <= endOfDay) return { kind: 'due-today', label: `Due today, ${exactTime(cart.callback_at)}`, due };
+  return { kind: 'scheduled', label: exactTime(cart.callback_at), due };
 }
 
 /** Used by the Callbacks queue's sort tie-break and by the overdue chip. */
@@ -326,6 +343,28 @@ async function loadAll(attempt = 1) {
   }
 }
 
+/**
+ * Ask for the callback time, next to the field that needs it.
+ *
+ * The alternative — a banner at the top of a long queue — makes the caller hunt
+ * for which card it meant. Returns nothing; it is pure UI.
+ */
+function flagCallbackNeeded(id, message) {
+  const card = document.querySelector(`[data-row="${CSS.escape(id)}"]`);
+  const input = card?.querySelector('.js-callback');
+  if (!input) return;
+  input.hidden = false;
+  input.classList.add('needed');
+  let hint = card.querySelector('.cb-hint');
+  if (!hint) {
+    hint = document.createElement('div');
+    hint.className = 'cb-hint';
+    input.insertAdjacentElement('afterend', hint);
+  }
+  hint.textContent = message || 'Pick the date and time you promised to call back.';
+  input.focus();
+}
+
 /** Save one row. Never re-renders the row being edited, so in-progress text survives. */
 async function saveRow(id, patch, noteEl) {
   const cell = document.querySelector(`[data-row="${CSS.escape(id)}"] .saved`);
@@ -348,6 +387,11 @@ async function saveRow(id, patch, noteEl) {
       if (cart && data.current) cart.status_updated_at = data.current.status_updated_at;
       return;
     }
+    if (data.needsCallbackTime) {
+      flagCallbackNeeded(id, data.error);
+      if (cell) { cell.textContent = 'Not saved'; cell.className = 'saved failed'; }
+      return;
+    }
     if (!res.ok || !data.ok) throw new Error(data.error || `HTTP ${res.status}`);
 
     // Update the row in place; never re-render it, so an in-progress edit survives.
@@ -365,7 +409,7 @@ async function saveRow(id, patch, noteEl) {
       }
     }
     clearError();
-    if (cell) { cell.textContent = savedLabel(cart || data.entry); cell.className = 'saved'; }
+    if (cell) { cell.innerHTML = savedLabel(cart || data.entry); cell.className = 'saved'; }
 
     // Chips and the callback badge reflect the just-saved values without a
     // full re-render, which would discard any in-progress edit on other rows.
@@ -375,8 +419,14 @@ async function saveRow(id, patch, noteEl) {
       if (chips) {
         chips.innerHTML = (cart.reason_tags || []).map((t) => `<span class="chip">${esc(t)}</span>`).join('');
       }
+      // Name the reason rather than saying a reason exists — the whole point of
+      // a collapsed section is that you can read it without opening it.
       const summary = tr.querySelector('.tagpick summary');
-      if (summary) summary.textContent = (cart.reason_tags || []).length ? 'Edit reasons' : '+ reason';
+      if (summary) {
+        summary.textContent = (cart.reason_tags || []).length
+          ? `Reason: ${(cart.reason_tags || []).join(', ')}`
+          : 'Why did they not buy?';
+      }
 
       // Owner cell: keep the select, the "mine" marker and the Take it button
       // in step without a full re-render, which would discard other rows' edits.
@@ -427,9 +477,13 @@ function visibleCarts() {
   return list.sort((a, b) => {
     if (state.sort === 'value') return (b.total_price ?? 0) - (a.total_price ?? 0);
     if (state.sort === 'callback') {
-      // Carts with a callback come first, soonest due at the top.
-      const due = (c) => (c.status === 'Callback scheduled' && c.callback_at
-        ? new Date(c.callback_at).getTime() : Infinity);
+      // Soonest due at the top — and carts whose time was never set above even
+      // those, because they cannot be worked until somebody fixes them.
+      const due = (c) => {
+        if (c.status !== 'Callback scheduled') return Infinity;
+        if (!c.callback_at) return -Infinity;
+        return new Date(c.callback_at).getTime();
+      };
       return due(a) - due(b);
     }
     if (state.sort === 'risk') {
@@ -471,13 +525,13 @@ function renderSummary() {
     : '';
 }
 
-/** "Last updated by Priya, 2h ago" — attribution without asking anyone to pick it. */
+/** Who, and exactly when — attribution without asking anyone to type it. */
 function savedLabel(cart) {
   if (!cart.status_updated_at) return '';
-  const when = relativeTime(cart.status_updated_at);
-  return cart.updated_by
-    ? `Last updated by ${esc(cart.updated_by)}, ${when}`
-    : `Saved ${when}`;
+  const exact = exactTime(cart.status_updated_at);
+  const rel = relativeTime(cart.status_updated_at);
+  const who = cart.updated_by ? `${esc(cart.updated_by)} · ` : '';
+  return `<span title="${esc(rel)}">${who}${esc(exact)}</span>`;
 }
 
 /** Shape-of-the-content placeholder — less jarring than the word "Loading". */
@@ -558,17 +612,25 @@ function renderQueue() {
                    aria-label="Callback time" value="${toLocalInput(c.callback_at)}"
                    ${status === 'Callback scheduled' ? '' : 'hidden'} />
           </div>
-          <input type="text" class="js-notes" data-id="${esc(c.id)}" autocomplete="off"
-                 placeholder="Notes…" aria-label="Notes" value="${esc(c.notes || '')}" />
+          ${cb?.kind === 'missing' ? '<div class="cb-hint">No time was ever set for this callback — pick one.</div>' : ''}
+          <textarea class="js-notes" data-id="${esc(c.id)}" rows="2" autocomplete="off"
+                    placeholder="What happened on the call…" aria-label="Call notes">${esc(c.notes || '')}</textarea>
           <details class="tagpick" data-id="${esc(c.id)}">
-            <summary>${(c.reason_tags || []).length ? 'Edit reasons' : '+ reason'}</summary>
+            <summary>${(c.reason_tags || []).length
+              ? `Reason: ${esc((c.reason_tags || []).join(', '))}`
+              : 'Why did they not buy?'}</summary>
             <div class="tagmenu">
               ${REASON_TAGS.map((t) => `
-                <label><input type="checkbox" class="js-tag" data-id="${esc(c.id)}" value="${esc(t)}"
-                  ${(c.reason_tags || []).includes(t) ? 'checked' : ''} /> ${esc(t)}</label>`).join('')}
+                <label class="rtag${(c.reason_tags || []).includes(t) ? ' on' : ''}">
+                  <input type="checkbox" class="js-tag" data-id="${esc(c.id)}" value="${esc(t)}"
+                    ${(c.reason_tags || []).includes(t) ? 'checked' : ''} />${esc(t)}</label>`).join('')}
             </div>
           </details>
           <div class="chips">${(c.reason_tags || []).map((t) => `<span class="chip">${esc(t)}</span>`).join('')}</div>
+          <details class="history" data-id="${esc(c.id)}">
+            <summary>History</summary>
+            <div class="hist"><span class="muted">Loading…</span></div>
+          </details>
           <div class="cc-foot">
             <select class="js-assign" data-id="${esc(c.id)}" autocomplete="off" aria-label="Owner">
               <option value="">Unassigned</option>
@@ -595,6 +657,15 @@ function renderQueue() {
   for (const input of queueEl.querySelectorAll('.js-notes')) {
     const cart = cartById(input.dataset.id);
     if (cart) input.value = cart.notes || '';
+  }
+  // Keep the picker visible on the carts whose callback time was never set,
+  // so the thing that needs fixing is the thing on screen.
+  for (const card of queueEl.querySelectorAll('.callcard')) {
+    const cart = cartById(card.dataset.row);
+    if (cart?.status === 'Callback scheduled' && !cart.callback_at) {
+      const input = card.querySelector('.js-callback');
+      if (input) { input.hidden = false; input.classList.add('needed'); }
+    }
   }
 }
 
@@ -689,6 +760,22 @@ function renderResultNote() {
     el.textContent = `Showing ${state.carts.length} of ${inRange} carts from ${label} — narrow the date range to see the rest.`;
     return;
   }
+  if (state.mode === 'callbacks') {
+    // "5 callbacks" does not say whether anything has been missed, which is the
+    // only part of it that needs acting on today.
+    const cbs = state.carts.filter(MODES.callbacks.match);
+    const kinds = cbs.map((c) => callbackState(c)?.kind);
+    const n = (k) => kinds.filter((x) => x === k).length;
+    const parts = [
+      n('overdue') && `${n('overdue')} missed`,
+      n('due-today') && `${n('due-today')} due today`,
+      n('scheduled') && `${n('scheduled')} later`,
+      n('missing') && `${n('missing')} with no time set`,
+    ].filter(Boolean);
+    el.textContent = `${cbs.length} callback${cbs.length === 1 ? '' : 's'}`
+      + (parts.length ? ` — ${parts.join(' · ')}.` : '.');
+    return;
+  }
   el.textContent = `${shown} in ${MODES[state.mode].label.toLowerCase()}, of ${inRange} cart${inRange === 1 ? '' : 's'} from ${label}.`;
 }
 
@@ -732,18 +819,30 @@ queueEl.addEventListener('change', (e) => {
     const notes = document.querySelector(`.js-notes[data-id="${CSS.escape(id)}"]`)?.value ?? '';
     const payload = { status, notes };
     if (status === 'Callback scheduled') {
-      payload.callbackAt = cbInput?.value ? new Date(cbInput.value).toISOString() : null;
+      // Nothing is saved until there is a time. The js-callback handler below
+      // completes the save the moment one is picked, so the caller does one
+      // thing rather than choosing the status twice.
+      if (!cbInput?.value) {
+        flagCallbackNeeded(id);
+        return;
+      }
+      payload.callbackAt = new Date(cbInput.value).toISOString();
     } else {
       payload.callbackAt = null;
+      cbInput?.classList.remove('needed');
+      document.querySelector(`[data-row="${CSS.escape(id)}"] .cb-hint`)?.remove();
     }
     saveRow(id, payload);
     return;
   }
 
   if (e.target.classList.contains('js-callback')) {
+    if (!e.target.value) { flagCallbackNeeded(id); return; }
+    e.target.classList.remove('needed');
+    document.querySelector(`[data-row="${CSS.escape(id)}"] .cb-hint`)?.remove();
     saveRow(id, {
       status: 'Callback scheduled',
-      callbackAt: e.target.value ? new Date(e.target.value).toISOString() : null,
+      callbackAt: new Date(e.target.value).toISOString(),
     });
     return;
   }
@@ -757,6 +856,14 @@ queueEl.addEventListener('change', (e) => {
   if (e.target.classList.contains('js-tag')) {
     const boxes = [...document.querySelectorAll(`.js-tag[data-id="${CSS.escape(id)}"]`)];
     const reasonTags = boxes.filter((b) => b.checked).map((b) => b.value);
+    // Reflect the choice immediately; the save round-trip should not be what
+    // tells you whether your tap registered.
+    for (const b of boxes) b.closest('.rtag')?.classList.toggle('on', b.checked);
+    const summary = document.querySelector(`.tagpick[data-id="${CSS.escape(id)}"] > summary`);
+    if (summary) {
+      summary.textContent = reasonTags.length
+        ? `Reason: ${reasonTags.join(', ')}` : 'Why did they not buy?';
+    }
     saveRow(id, { reasonTags });
   }
 });
@@ -772,8 +879,53 @@ queueEl.addEventListener('blur', (e) => {
 }, true);
 
 queueEl.addEventListener('keydown', (e) => {
-  if (e.key === 'Enter' && e.target.classList.contains('js-notes')) e.target.blur();
+  // Enter saves, Shift+Enter starts a new line — a textarea has to allow both.
+  if (e.key === 'Enter' && !e.shiftKey && e.target.classList.contains('js-notes')) {
+    e.preventDefault();
+    e.target.blur();
+  }
 });
+
+const HISTORY_VERB = {
+  status: (e) => `${e.from_status || 'new'} → ${e.to_status}`,
+  note: (e) => (e.detail ? `note: "${e.detail}"` : 'note cleared'),
+  callback: (e) => (e.detail === 'cleared' ? 'callback cleared' : `callback set for ${e.detail}`),
+  reason: (e) => (e.detail === 'cleared' ? 'reasons cleared' : `reason: ${e.detail}`),
+  assign: (e) => (e.detail === 'unassigned' ? 'unassigned' : `assigned to ${e.detail}`),
+};
+
+/** Falls back on the fields themselves, so an unknown kind still reads as
+ *  something rather than as a blank line in an audit trail. */
+function describeEvent(ev) {
+  const fn = HISTORY_VERB[ev.kind];
+  if (fn) return fn(ev);
+  if (ev.to_status) return `${ev.from_status || 'new'} → ${ev.to_status}`;
+  return ev.detail || ev.kind || 'changed';
+}
+
+/** Fetched on open, not on render — most cards are never expanded. */
+queueEl.addEventListener('toggle', async (e) => {
+  const d = e.target;
+  if (!d.classList?.contains('history') || !d.open || d.dataset.loaded) return;
+  d.dataset.loaded = '1';
+  const box = d.querySelector('.hist');
+  try {
+    const res = await fetch(`/api/carts/${encodeURIComponent(d.dataset.id)}/events`);
+    const data = await res.json();
+    if (!data.ok) throw new Error(data.error || 'Could not load the history');
+    box.innerHTML = data.events.length
+      ? data.events.map((ev) => `
+          <div class="hist-row">
+            <span class="hist-when">${esc(exactTime(ev.at))}</span>
+            <span class="hist-what">${esc(describeEvent(ev))}</span>
+            <span class="hist-who">${esc(ev.actor || 'system')}</span>
+          </div>`).join('')
+      : '<span class="muted">Nothing recorded yet. History starts from the first change after 23 Sep 2026.</span>';
+  } catch (err) {
+    box.innerHTML = `<span class="muted">${esc(err.message)}</span>`;
+    d.dataset.loaded = '';
+  }
+}, true);
 
 // One-tap self-assign — the common case, and the whole point of this feature is
 // stopping two people ringing the same customer.
