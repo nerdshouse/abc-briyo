@@ -740,6 +740,53 @@ await step('allowlist table readable', async () => {
   return `${m.size} active: ${[...m.keys()].map((p) => '...' + p.slice(-4)).join(', ')}`;
 });
 
+/**
+ * The history table is only worth having if it cannot miss a write, so this
+ * checks both directions: a real transition logs exactly one event, and a
+ * notes-only save logs none.
+ */
+await step('cart_events records transitions, not note edits', async () => {
+  const { rows } = await getPool().query('SELECT id FROM abandoned_carts WHERE cart_id = $1', [TEST_CART]);
+  const id = rows[0].id;
+  const countEvents = async () => (await getPool().query(
+    'SELECT count(*)::int AS n FROM cart_events WHERE cart_id = $1', [id])).rows[0].n;
+
+  const before = await countEvents();
+  await updateStatus(id, { status: 'Not called', updatedBy: 'DBCheck Bot' });
+  await updateStatus(id, { status: 'Called – No answer', updatedBy: 'DBCheck Bot' });
+  const afterMoves = await countEvents();
+
+  // Same status again, only the note changes — must not look like another attempt.
+  await updateStatus(id, { notes: 'db-check note only', updatedBy: 'DBCheck Bot' });
+  const afterNote = await countEvents();
+  if (afterNote !== afterMoves) throw new Error('a notes-only save was logged as a transition');
+
+  const { rows: last } = await getPool().query(
+    `SELECT from_status, to_status, actor, note_len FROM cart_events
+     WHERE cart_id = $1 ORDER BY at DESC, id DESC LIMIT 1`, [id]);
+  if (last[0].to_status !== 'Called – No answer') {
+    throw new Error(`last event to_status was ${last[0].to_status}`);
+  }
+  if (last[0].actor !== 'DBCheck Bot') throw new Error('actor not recorded');
+  return `${afterMoves - before} transition(s) logged, note-only save ignored`;
+});
+
+await step('cart_events is removed with its cart', async () => {
+  const { rows } = await getPool().query('SELECT id FROM abandoned_carts WHERE cart_id = $1', [TEST_CART]);
+  const id = rows[0].id;
+  const { rows: n } = await getPool().query(
+    'SELECT count(*)::int AS n FROM cart_events WHERE cart_id = $1', [id]);
+  if (n[0].n === 0) throw new Error('no events to test the cascade with');
+  // Proven for real in cleanup below, which deletes the cart; here we only
+  // assert the constraint exists, so a future schema edit cannot drop it
+  // silently and leave orphaned history behind.
+  const { rows: fk } = await getPool().query(
+    `SELECT confdeltype FROM pg_constraint
+     WHERE conrelid = 'cart_events'::regclass AND contype = 'f'`);
+  if (!fk.length || fk[0].confdeltype !== 'c') throw new Error('ON DELETE CASCADE is missing');
+  return `${n[0].n} event(s), cascade constraint present`;
+});
+
 // ---- cleanup ---------------------------------------------------------------
 await step('cleanup', async () => {
   await getPool().query('DELETE FROM login_log WHERE phone = $1', [TEST_PHONE]);

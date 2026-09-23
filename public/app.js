@@ -398,8 +398,13 @@ async function saveRow(id, patch, noteEl) {
 // ---------- rendering ----------
 
 function visibleCarts() {
-  const cutoff = state.days > 0 ? Date.now() - state.days * 86400000 : 0;
-  let list = state.carts.filter((c) => new Date(c.received_at).getTime() >= cutoff);
+  // No date filter here on purpose. The server already applied the range in
+  // listCarts, using a calendar-day boundary; this used to re-apply a *rolling*
+  // days*24h cutoff over the same rows, so "Today" hid rows the server had sent
+  // and the board disagreed with the dashboard. Worse, searchCarts deliberately
+  // ignores the range — "that customer from three weeks ago just rang back" —
+  // and this line threw those hits away before they could ever be shown.
+  let list = state.carts.slice();
 
   if (state.status === CALLED_SENTINEL) list = list.filter((c) => (c.status || 'Not called') !== 'Not called');
   else if (state.status) list = list.filter((c) => (c.status || 'Not called') === state.status);
@@ -458,7 +463,10 @@ function renderStats() {
   const total = list.reduce((sum, c) => sum + (c.total_price ?? 0), 0);
   const called = list.filter((c) => c.status && c.status !== 'Not called').length;
   const recovered = list.filter((c) => c.status === 'Called – Recovered').length;
-  const rate = list.length ? Math.round((recovered / list.length) * 100) : 0;
+  // Recovered over *called*, never over all carts: you cannot recover a cart
+  // nobody rang, and counting those as failures hides whether calling works.
+  // The dashboard and periodReport use this same denominator.
+  const rate = called ? Math.round((recovered / called) * 100) : 0;
 
   // Each card is the question "which ones?", so each is a filter.
   const cards = [
@@ -466,7 +474,7 @@ function renderStats() {
     ['Total cart value', money(total, 'INR'), '', null],
     ['Called', called, '', { status: '__called' }],
     ['Recovered', recovered, '', { status: 'Called – Recovered' }],
-    ['Recovery rate', `${rate}%`, '', null],
+    ['Recovered % of called', `${rate}%`, '', null, 'Recovered \u00f7 carts called. A cart nobody rang is not a failed call.'],
   ];
 
   // Stale is a whole-table figure from the server, not filtered — it is an
@@ -482,7 +490,7 @@ function renderStats() {
   const overdue = state.carts.filter(isOverdue).length;
   if (overdue > 0) cards.push(['Overdue callbacks', overdue, 'stat-warn', { overdue: true }]);
 
-  $('#stats').innerHTML = cards.map(([label, value, cls, filter]) => {
+  $('#stats').innerHTML = cards.map(([label, value, cls, filter, tip]) => {
     const active = filter && isCardActive(filter);
     return filter
       ? `<button type="button" class="stat stat-click ${cls} ${active ? 'stat-on' : ''}"
@@ -490,7 +498,8 @@ function renderStats() {
                  title="${filter.clear ? 'Show everything' : 'Show only these'}">
            <div class="label">${label}</div><div class="value">${value}</div>
          </button>`
-      : `<div class="stat ${cls}"><div class="label">${label}</div><div class="value">${value}</div></div>`;
+      : `<div class="stat ${cls}"${tip ? ` title="${esc(tip)}"` : ''}>
+           <div class="label">${label}</div><div class="value">${value}</div></div>`;
   }).join('');
 }
 
