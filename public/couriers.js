@@ -26,6 +26,10 @@ async function load() {
       : c.tracking_url_template ? `<span class="mono">${esc(c.tracking_url_template)}</span>` : '<span class="muted">No link — pasted by hand</span>'}</td>
     <td>${c.id ? (isAdmin ? `<label class="soft" style="font-size:12.5px;display:inline-flex;gap:6px;align-items:center"><input type="checkbox" name="active"${c.active ? ' checked' : ''} />Active</label>`
       : (c.active ? 'Active' : '<span class="muted">Off</span>')) : ''}</td>
+    <td>${!c.id || !c.tracking_url_template ? '<span class="muted">—</span>'
+      : isAdmin ? `<label class="soft" style="font-size:12.5px;display:inline-flex;gap:6px;align-items:center" title="Tick only after opening a generated link for a real AWB and seeing the right parcel"><input type="checkbox" name="verified"${c.template_verified_at ? ' checked' : ''} />Verified</label>`
+      : (c.template_verified_at ? 'Verified' : '<span class="muted">Unverified</span>')}
+      ${c.template_verified_at ? `<div class="muted" style="font-size:11.5px">${esc(c.template_verified_by || '')}</div>` : ''}</td>
     <td class="r">${isAdmin ? `<button class="btn" type="button" data-save>${c.id ? 'Save' : 'Add'}</button>` : ''}</td>
   </tr>`;
   $('#cpRows').innerHTML = couriers.map(row).join('') + (isAdmin ? row({ name: '', tracking_url_template: '' }) : '');
@@ -41,6 +45,8 @@ $('#cpRows').addEventListener('click', async (e) => {
   };
   const active = tr.querySelector('[name=active]');
   if (active) body.active = active.checked;
+  const verified = tr.querySelector('[name=verified]');
+  if (verified) body.verified = verified.checked;
   btn.disabled = true;
   try {
     if (tr.dataset.id) await api(`/api/couriers/${tr.dataset.id}`, { method: 'PATCH', body: JSON.stringify(body) });

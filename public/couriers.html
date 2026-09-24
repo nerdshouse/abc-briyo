@@ -83,14 +83,14 @@
         <div class="pane">
           <div class="table-wrap">
             <table class="table cp-table">
-              <colgroup><col style="width:22%" /><col /><col style="width:96px" /><col style="width:96px" /></colgroup>
-              <thead><tr><th>Name</th><th>Tracking link pattern</th><th>Status</th><th class="r"><span class="sr-only">Save</span></th></tr></thead>
+              <colgroup><col style="width:20%" /><col /><col style="width:96px" /><col style="width:120px" /><col style="width:96px" /></colgroup>
+              <thead><tr><th>Name</th><th>Tracking link pattern</th><th>Status</th><th title="Checked by opening a generated link for a real AWB">Link pattern</th><th class="r"><span class="sr-only">Save</span></th></tr></thead>
               <tbody id="cpRows"></tbody>
             </table>
           </div>
         </div>
       </section>
-      <p class="footnote">A pattern is a web address containing <span class="mono">{awb}</span>, which is replaced with the AWB when an order is saved. Leave it blank for couriers without a per-parcel tracking page. Couriers are switched off rather than deleted, so past orders keep their name.</p>
+      <p class="footnote">A pattern is a web address containing <span class="mono">{awb}</span>, which is replaced with the AWB when an order is saved. Leave it blank for couriers without a per-parcel tracking page. The seeded patterns are unverified: tick Verified only after a generated link for a real AWB opened the right parcel. Changing a pattern clears it. Couriers are switched off rather than deleted, so past orders keep their name.</p>
     </main>
   </div>
 </div>

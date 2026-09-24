@@ -7,7 +7,7 @@ import {
   $, $$, esc, money, count, icon, renderIcons, setTimezone, dateShort, dateTime, initShell,
 } from './ui/components.js';
 
-const LABEL_OVERRIDES = { rto: 'RTO', not_ready: 'Not ready', cod: 'COD' };
+const LABEL_OVERRIDES = { rto: 'RTO', not_ready: 'Not ready', cod: 'COD', third_party: 'Third party' };
 const label = (v) => (v ? LABEL_OVERRIDES[v] || (v[0].toUpperCase() + v.slice(1)).replaceAll('_', ' ') : '—');
 
 // Dot colours reuse the board's status palette: grey waiting, amber in hand,
@@ -211,17 +211,22 @@ function closeDrawer() {
 }
 
 const opt = (value, text, selected) => `<option value="${esc(value)}"${selected ? ' selected' : ''}>${esc(text)}</option>`;
-const toLocalInput = (iso) => {
+/** An instant as "YYYY-MM-DDTHH:mm" on the team's clock (not the browser's). */
+const toTeamInput = (iso) => {
   if (!iso) return '';
-  const d = new Date(iso);
-  return new Date(d.getTime() - d.getTimezoneOffset() * 60000).toISOString().slice(0, 16);
+  const p = Object.fromEntries(new Intl.DateTimeFormat('en-CA', {
+    timeZone: state.meta.timezone, hourCycle: 'h23', year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit',
+  }).formatToParts(new Date(iso)).map((x) => [x.type, x.value]));
+  return `${p.year}-${p.month}-${p.day}T${p.hour}:${p.minute}`;
 };
 const bytes = (n) => (n >= 1048576 ? `${(n / 1048576).toFixed(1)} MB` : `${Math.max(1, Math.round(n / 1024))} KB`);
 
 function renderDrawer() {
-  const { order: o, documents, events } = state.detail;
+  const { order: o, shipments, documents, events } = state.detail;
   const m = state.meta;
-  const courier = courierById(o.courier_partner_id);
+  const ship = shipments[0];
+  const courier = courierById(ship.courier_partner_id);
   const autoLink = Boolean(courier?.tracking_url_template);
   const notes = events.filter((e) => e.event_type === 'note_added');
 
@@ -235,7 +240,8 @@ function renderDrawer() {
         <dt>Channel</dt><dd>${esc(o.channel_label)}</dd>
         <dt>Source order ID</dt><dd class="mono">${esc(o.source_order_id)}</dd>
         <dt>Order date</dt><dd>${esc(dateTime(o.order_date))}</dd>
-        <dt>Payment</dt><dd>${esc([o.payment_method, o.payment_status && label(o.payment_status)].filter(Boolean).join(' · ') || '—')}</dd>
+        <dt>Payment</dt><dd>${esc([o.payment_method && label(o.payment_method), o.payment_status && label(o.payment_status)].filter(Boolean).join(' · ') || 'Not known')}</dd>
+        <dt>Fulfillment</dt><dd>${esc(o.fulfillment_type ? label(o.fulfillment_type) : 'Not set')}</dd>
         <dt>Entered</dt><dd>${esc(o.created_by || 'System')}, ${esc(dateTime(o.created_at))}${o.source !== 'manual' ? ` · via ${esc(o.source)}` : ''}</dd>
       </dl>
       <div class="d-row" style="margin-top:12px">
@@ -255,29 +261,29 @@ function renderDrawer() {
     </section>
 
     <section class="dsec">
-      <h3 class="dsec-title">Shipment <span class="dsec-meta">${indicator(o.shipment_status)}</span></h3>
+      <h3 class="dsec-title">Shipment${shipments.length > 1 ? ` 1 of ${shipments.length}` : ''} <span class="dsec-meta">${indicator(ship.shipment_status)}</span></h3>
       <form id="shipForm" class="form-grid" novalidate>
         <label class="fld"><span>Courier</span>
-          <select class="select" name="courier_partner_id">${opt('', 'Choose courier', !o.courier_partner_id)}
-            ${m.couriers.filter((c) => c.active || c.id === o.courier_partner_id).map((c) => opt(c.id, c.name, c.id === o.courier_partner_id)).join('')}
+          <select class="select" name="courier_partner_id">${opt('', 'Choose courier', !ship.courier_partner_id)}
+            ${m.couriers.filter((c) => c.active || c.id === ship.courier_partner_id).map((c) => opt(c.id, c.name, c.id === ship.courier_partner_id)).join('')}
           </select></label>
-        <label class="fld"><span>AWB / tracking ID</span><input class="input mono" name="tracking_id" value="${esc(o.tracking_id || '')}" maxlength="80" autocomplete="off" /></label>
+        <label class="fld"><span>AWB / tracking ID</span><input class="input mono" name="tracking_id" value="${esc(ship.tracking_id || '')}" maxlength="80" autocomplete="off" /></label>
         <label class="fld wide"><span>Tracking link</span>
-          <input class="input" name="tracking_url" value="${esc(o.tracking_url || '')}" ${autoLink ? 'readonly' : ''}
+          <input class="input" name="tracking_url" value="${esc(ship.tracking_url || '')}" ${autoLink ? 'readonly' : ''}
                  placeholder="${autoLink ? 'Filled from the courier and AWB' : 'Paste a link, if the courier gives one'}" maxlength="500" autocomplete="off" />
-          <span class="help" id="trackHelp">${autoLink ? 'Built from the courier\'s link pattern when you save.' : 'This courier has no link pattern, so paste one if you have it.'}
-            ${o.tracking_url ? ` <a class="track-link" href="${esc(o.tracking_url)}" target="_blank" rel="noopener noreferrer">Open tracking</a>` : ''}</span></label>
-        <label class="fld"><span>Expected delivery</span><input class="input" type="date" name="expected_delivery_date" value="${esc(o.expected_delivery_date || '')}" /></label>
+          <span class="help" id="trackHelp">${trackHelp(courier)}</span>
+          ${ship.tracking_url ? `<span class="help"><a class="track-link" href="${esc(ship.tracking_url)}" target="_blank" rel="noopener noreferrer">Open tracking</a></span>` : ''}</label>
+        <label class="fld"><span>Expected delivery</span><input class="input" type="date" name="expected_delivery_date" value="${esc(ship.expected_delivery_date || '')}" /></label>
         <label class="fld"><span>Shipment status</span>
-          <select class="select" name="shipment_status">${m.shipmentStatuses.map((s) => opt(s, label(s), s === o.shipment_status)).join('')}</select></label>
+          <select class="select" name="shipment_status">${m.shipmentStatuses.map((s) => opt(s, label(s), s === ship.shipment_status)).join('')}</select></label>
       </form>
       <div class="form-actions"><button class="btn primary" type="button" id="dShipSave">Save shipment</button></div>
-      ${(NEXT_STEPS[o.shipment_status] || []).length && o.order_status !== 'cancelled' ? `<div class="steps">
-        ${NEXT_STEPS[o.shipment_status].map((s) => `<button class="btn" type="button" data-step="${s}">${esc(STEP_TEXT[s])}</button>`).join('')}
+      ${(NEXT_STEPS[ship.shipment_status] || []).length ? `<div class="steps">
+        ${NEXT_STEPS[ship.shipment_status].map((s) => `<button class="btn" type="button" data-step="${s}">${esc(STEP_TEXT[s])}</button>`).join('')}
       </div>` : ''}
       <dl class="kv" style="margin-top:12px">
-        <dt>Dispatched</dt><dd>${o.dispatch_date ? esc(dateTime(o.dispatch_date)) : '—'}</dd>
-        <dt>Delivered</dt><dd>${o.delivered_at ? esc(dateTime(o.delivered_at)) : '—'}</dd>
+        <dt>Dispatched</dt><dd>${ship.dispatch_date ? esc(dateTime(ship.dispatch_date)) : '—'}</dd>
+        <dt>Delivered</dt><dd>${ship.delivered_at ? esc(dateTime(ship.delivered_at)) : '—'}</dd>
       </dl>
     </section>
 
@@ -293,13 +299,13 @@ function renderDrawer() {
           </div>
           ${d.removed_at ? '' : `<button class="icon-btn bare" type="button" data-remove-doc="${d.id}" title="Remove" aria-label="Remove ${esc(d.original_filename)}">${icon('trash-2')}</button>`}
         </li>`).join('')}</ul>` : '<p class="soft" style="margin:0;font-size:12.5px">No documents yet.</p>'}
-      <form class="upload" id="uploadForm">
+      ${m.storage.error ? `<div class="storage-note">${esc(m.storage.error)}</div>` : `<form class="upload" id="uploadForm">
         <select class="select" name="type" aria-label="Document type">${m.documentTypes.map((t) => opt(t, label(t), t === 'tax_invoice')).join('')}</select>
         <input type="file" name="file" accept=".pdf,.png,.jpg,.jpeg,application/pdf,image/png,image/jpeg" aria-label="File" />
         <button class="btn" type="submit" id="uploadBtn">${icon('upload')}Upload</button>
       </form>
-      <div class="doc-meta" style="margin-top:6px">PDF, PNG or JPG, up to ${bytes(m.maxDocumentBytes)}.</div>
-      ${m.storage.durable ? '' : '<div class="storage-note">Files are on this server\'s local disk for now and will not survive a redeploy until durable storage is chosen.</div>'}
+      <div class="doc-meta" style="margin-top:6px">PDF, PNG or JPG, up to ${bytes(m.maxDocumentBytes)}.</div>`}
+      ${m.storage.driver === 'local' ? '<div class="storage-note">Development storage (this machine\'s disk). Production uses R2.</div>' : ''}
     </section>
 
     <section class="dsec">
@@ -364,16 +370,20 @@ function describeEvent(e) {
   }
 }
 
-/** Every edit carries the version it was based on; a stale one is refused. */
-async function patchOrder(fields, doneText = 'Saved') {
+/**
+ * Every edit carries the version it was based on; a stale one is refused.
+ * Order fields and shipment fields are separate records with separate versions.
+ */
+async function patchOrder(fields, doneText = 'Saved', { shipment = false } = {}) {
   const o = state.detail.order;
+  const ship = state.detail.shipments[0];
+  const url = shipment ? `/api/orders/${o.id}/shipments/${ship.id}` : `/api/orders/${o.id}`;
+  const version = shipment ? ship.version : o.version;
   const saved = $('#dSaved');
   saved.className = 'saved pending';
   saved.textContent = 'Saving…';
   try {
-    const data = await api(`/api/orders/${o.id}`, {
-      method: 'PATCH', body: JSON.stringify({ ...fields, version: o.version }),
-    });
+    const data = await api(url, { method: 'PATCH', body: JSON.stringify({ ...fields, version }) });
     saved.className = 'saved';
     saved.textContent = data.changed ? doneText : 'Nothing changed';
     await openOrder(o.id);
@@ -391,6 +401,14 @@ async function patchOrder(fields, doneText = 'Saved') {
   }
 }
 
+function trackHelp(courier) {
+  if (!courier) return 'Choose a courier first.';
+  if (!courier.tracking_url_template) return 'This courier has no link pattern, so paste one if you have it.';
+  return courier.template_verified_at
+    ? 'Built from the courier\'s link pattern when you save.'
+    : 'Built from the courier\'s link pattern when you save. The pattern has not been checked with a real AWB yet.';
+}
+
 const dBody = $('#dBody');
 dBody.addEventListener('change', (e) => {
   if (e.target.id === 'dOrderStatus') patchOrder({ order_status: e.target.value }, 'Order status saved');
@@ -400,8 +418,7 @@ dBody.addEventListener('change', (e) => {
     const url = $('#shipForm [name=tracking_url]');
     url.readOnly = Boolean(c?.tracking_url_template);
     url.placeholder = url.readOnly ? 'Filled from the courier and AWB' : 'Paste a link, if the courier gives one';
-    $('#trackHelp').textContent = url.readOnly ? 'Built from the courier\'s link pattern when you save.'
-      : 'This courier has no link pattern, so paste one if you have it.';
+    $('#trackHelp').textContent = trackHelp(c);
   }
 });
 
@@ -420,9 +437,12 @@ function shipmentFields() {
 }
 
 dBody.addEventListener('click', async (e) => {
-  if (e.target.closest('#dShipSave')) return patchOrder(shipmentFields(), 'Shipment saved');
+  if (e.target.closest('#dShipSave')) return patchOrder(shipmentFields(), 'Shipment saved', { shipment: true });
   const step = e.target.closest('[data-step]');
-  if (step) return patchOrder({ ...shipmentFields(), shipment_status: step.dataset.step }, STEP_TEXT[step.dataset.step].replace(/^Mark /, 'Marked '));
+  if (step) {
+    return patchOrder({ ...shipmentFields(), shipment_status: step.dataset.step },
+      STEP_TEXT[step.dataset.step].replace(/^Mark /, 'Marked '), { shipment: true });
+  }
   if (e.target.closest('#dEdit')) return openForm(state.detail.order);
   if (e.target.closest('#dNoteAdd')) {
     const note = $('#dNote').value.trim();
@@ -457,7 +477,7 @@ dBody.addEventListener('click', async (e) => {
 });
 
 dBody.addEventListener('submit', async (e) => {
-  if (e.target.id === 'shipForm') { e.preventDefault(); return patchOrder(shipmentFields(), 'Shipment saved'); }
+  if (e.target.id === 'shipForm') { e.preventDefault(); return patchOrder(shipmentFields(), 'Shipment saved', { shipment: true }); }
   if (e.target.id !== 'uploadForm') return;
   e.preventDefault();
   const form = e.target;
@@ -497,14 +517,18 @@ function openForm(order = null) {
   $('#fSaved').textContent = '';
   form.channel.innerHTML = state.meta.channels.filter((c) => c.active || c.key === order?.channel)
     .map((c) => opt(c.key, c.label, c.key === (order?.channel || state.channel))).join('');
-  form.payment_status.innerHTML = opt('', '—', !order?.payment_status)
+  form.payment_status.innerHTML = opt('', 'Not known', !order?.payment_status)
     + state.meta.paymentStatuses.map((s) => opt(s, label(s), s === order?.payment_status)).join('');
+  form.payment_method.innerHTML = opt('', 'Not known', !order?.payment_method)
+    + state.meta.paymentMethods.map((s) => opt(s, label(s), s === order?.payment_method)).join('');
+  form.fulfillment_type.innerHTML = opt('', 'Not set', !order?.fulfillment_type)
+    + state.meta.fulfillmentTypes.map((s) => opt(s, label(s), s === order?.fulfillment_type)).join('');
   if (order) {
-    for (const k of ['source_order_id', 'customer_name', 'customer_phone', 'customer_email', 'payment_method']) form[k].value = order[k] || '';
+    for (const k of ['source_order_id', 'customer_name', 'customer_phone', 'customer_email']) form[k].value = order[k] || '';
     form.order_value.value = order.order_value;
-    form.order_date.value = toLocalInput(order.order_date);
+    form.order_date.value = toTeamInput(order.order_date);
   } else {
-    form.order_date.value = toLocalInput(new Date().toISOString());
+    form.order_date.value = toTeamInput(new Date().toISOString());
   }
   $('#fTitle').textContent = order ? `Edit ${order.internal_order_id}` : 'New order';
   $('#fSub').textContent = order ? 'Every change is recorded in the timeline.' : 'Logistics details are added after the order exists.';
@@ -529,7 +553,7 @@ $('#orderForm').addEventListener('submit', async (e) => {
   const missing = [['channel', 'channel'], ['source_order_id', 'source order ID'], ['order_date', 'order date'], ['order_value', 'order value']]
     .filter(([k]) => !String(body[k] || '').trim()).map(([, l]) => l);
   if (missing.length) { err.textContent = `Enter the ${missing.join(', ')}.`; err.hidden = false; return; }
-  body.order_date = new Date(body.order_date).toISOString();
+  // Sent as wall-clock time; the server reads it in the team's timezone.
   const btn = $('#fSubmit');
   btn.disabled = true;
   try {
@@ -629,6 +653,7 @@ function bind() {
     const [me, meta] = await Promise.all([api('/auth/me'), api('/api/orders/meta')]);
     state.meta = meta;
     setTimezone(meta.timezone);
+    $('#tzNote').textContent = meta.timezone === 'Asia/Kolkata' ? '(IST)' : `(${meta.timezone})`;
     initShell(me);
     readUrl();
     fillFilters();

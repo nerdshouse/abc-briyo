@@ -170,7 +170,7 @@
       <div class="form-grid">
         <label class="fld"><span>Channel <em>*</em></span><select class="select" name="channel" required></select></label>
         <label class="fld"><span>Source order ID <em>*</em></span><input class="input" name="source_order_id" required maxlength="100" autocomplete="off" /></label>
-        <label class="fld"><span>Order date <em>*</em></span><input class="input" name="order_date" type="datetime-local" required /></label>
+        <label class="fld"><span>Order date <em>*</em> <span class="soft" id="tzNote"></span></span><input class="input" name="order_date" type="datetime-local" required /></label>
         <label class="fld"><span>Order value (₹) <em>*</em></span><input class="input" name="order_value" inputmode="decimal" required autocomplete="off" /></label>
       </div>
     </section>
@@ -183,10 +183,12 @@
       </div>
     </section>
     <section class="dsec">
-      <h3 class="dsec-title">Payment <span class="dsec-meta soft">optional</span></h3>
+      <h3 class="dsec-title">Payment &amp; fulfillment <span class="dsec-meta soft">optional</span></h3>
       <div class="form-grid">
-        <label class="fld"><span>Method</span><input class="input" name="payment_method" maxlength="40" placeholder="UPI, COD, card…" autocomplete="off" /></label>
-        <label class="fld"><span>Status</span><select class="select" name="payment_status"><option value="">—</option></select></label>
+        <label class="fld"><span>Method</span><select class="select" name="payment_method"></select></label>
+        <label class="fld"><span>Status</span><select class="select" name="payment_status"></select></label>
+        <label class="fld wide"><span>Fulfillment</span><select class="select" name="fulfillment_type"></select>
+          <span class="help">Who ships it — independent of the channel.</span></label>
       </div>
     </section>
   </form>
