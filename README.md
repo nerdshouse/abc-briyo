@@ -267,6 +267,12 @@ flag; those stay blank rather than being invented.
 judgement Shopify makes itself. So the board **polls** the Admin API's `abandonedCheckouts`
 query every `SHOPIFY_POLL_MINUTES` (default 15) instead of being pushed to.
 
+> **Currently off in production** (`SHOPIFY_POLL_ENABLED=false`): the Shopify
+> app is not installed on the store, so every scheduled pull failed with
+> `app_not_installed`. Carts still arrive from the GoKwik webhook, and Shopify
+> CSV exports can still be imported on **/import**. To turn the pull back on,
+> connect Shopify via `/auth/shopify/install`, then set it to `true`.
+
 Unlike the CSV, API-sourced carts **do** carry `abandonedCheckoutUrl`, so Cart link works.
 
 To connect:

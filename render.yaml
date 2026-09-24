@@ -45,6 +45,10 @@ services:
         sync: false
       # Shopify is used only by abandoned-cart recovery (checkout pull + CSV
       # import). 2024-10 is retired; keep this on a supported version.
+      # Scheduled Shopify abandoned-checkout pull: off until the Shopify app is
+      # installed on the store (it currently fails with app_not_installed).
+      - key: SHOPIFY_POLL_ENABLED
+        value: "false"
       - key: SHOPIFY_API_VERSION
         value: "2026-07"
       # Every operational date/time is shown, entered and filtered in IST.
