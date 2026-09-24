@@ -39,3 +39,24 @@ services:
         sync: false
       - key: ALLOWED_PHONES
         sync: false
+      # Shopify is used only by abandoned-cart recovery (checkout pull + CSV
+      # import). 2024-10 is retired; keep this on a supported version.
+      - key: SHOPIFY_API_VERSION
+        value: "2026-07"
+      # Every operational date/time is shown, entered and filtered in IST.
+      - key: BOARD_TIMEZONE
+        value: Asia/Kolkata
+      - key: APP_BASE_URL
+        value: https://abc.briyo.xyz
+      # Orders & Logistics documents. Production refuses local disk; without
+      # the four R2 values below, uploads are disabled (the rest still works).
+      - key: DOCUMENT_STORAGE
+        value: r2
+      - key: R2_ACCOUNT_ID
+        sync: false
+      - key: R2_ACCESS_KEY_ID
+        sync: false
+      - key: R2_SECRET_ACCESS_KEY
+        sync: false
+      - key: R2_BUCKET
+        sync: false
