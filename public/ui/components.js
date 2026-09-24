@@ -122,7 +122,7 @@ let sparkId = 0;
  * A small trend line with a soft fill, coloured by direction like the rest of
  * the comparison: green rising, red falling, grey flat or neutral.
  */
-export function sparkline(values, { tone = 'flat', width = 118, height = 40 } = {}) {
+export function sparkline(values, { tone = 'flat', width = 80, height = 30 } = {}) {
   const id = `sp${++sparkId}`;
   const colour = tone === 'up' ? '#12A66A' : tone === 'down' ? '#F04438' : '#98A2B3';
   if (!values.length) return `<svg class="spark" width="${width}" height="${height}"></svg>`;
@@ -138,15 +138,15 @@ export function sparkline(values, { tone = 'flat', width = 118, height = 40 } = 
   const min = Math.min(...values);
   const rng = max - min || 1;
   const step = values.length > 1 ? width / (values.length - 1) : 0;
-  const pts = values.map((v, i) => [i * step, height - 4 - ((v - min) / rng) * (height - 10)]);
+  const pts = values.map((v, i) => [i * step, height - 3 - ((v - min) / rng) * (height - 8)]);
   const line = pts.map(([x, y], i) => `${i ? 'L' : 'M'}${x.toFixed(1)},${y.toFixed(1)}`).join(' ');
   const area = `${line} L${width},${height} L0,${height} Z`;
   return `<svg class="spark" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}" preserveAspectRatio="none" aria-hidden="true">
     <defs><linearGradient id="${id}" x1="0" y1="0" x2="0" y2="1">
-      <stop offset="0" stop-color="${colour}" stop-opacity=".22"/><stop offset="1" stop-color="${colour}" stop-opacity="0"/>
+      <stop offset="0" stop-color="${colour}" stop-opacity=".12"/><stop offset="1" stop-color="${colour}" stop-opacity="0"/>
     </linearGradient></defs>
     <path d="${area}" fill="url(#${id})"/>
-    <path d="${line}" fill="none" stroke="${colour}" stroke-width="1.5" stroke-linejoin="round" stroke-linecap="round" vector-effect="non-scaling-stroke"/>
+    <path d="${line}" fill="none" stroke="${colour}" stroke-width="1.25" stroke-linejoin="round" stroke-linecap="round" vector-effect="non-scaling-stroke"/>
   </svg>`;
 }
 
@@ -216,8 +216,8 @@ export function barChart(el, { points, format = count, labelStyle = 'weekday' })
     const max = niceMax(Math.max(...points.map((p) => p.value)));
     const n = points.length;
     const slot = plotW / n;
-    const barW = Math.max(3, Math.min(56, slot * 0.72));
-    const r = Math.min(8, barW / 2.4);
+    const barW = Math.max(3, Math.min(44, slot * 0.66));
+    const r = Math.min(7, barW / 2.6);
     const yOf = (v) => baseY - (v / max) * (baseY - 8);
     const ticks = [0, 0.25, 0.5, 0.75, 1].map((f) => max * f);
     const every = Math.ceil(n / (W < 520 ? 5 : 9));
@@ -238,7 +238,7 @@ export function barChart(el, { points, format = count, labelStyle = 'weekday' })
 
     el.innerHTML = `<svg viewBox="0 0 ${W} ${H}" role="img" aria-label="Bar chart">
       <defs>
-        <linearGradient id="barFill" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#EAECEF"/><stop offset="1" stop-color="#F5F6F8"/></linearGradient>
+        <linearGradient id="barFill" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#ECEEF1"/><stop offset="1" stop-color="#F6F7F9"/></linearGradient>
         <linearGradient id="barInk" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#344054"/><stop offset="1" stop-color="#1B2433"/></linearGradient>
       </defs>
       ${ticks.map((t) => `<line class="grid-line" x1="0" x2="${plotW}" y1="${yOf(t)}" y2="${yOf(t)}"/>
@@ -246,7 +246,7 @@ export function barChart(el, { points, format = count, labelStyle = 'weekday' })
       ${bars}
       ${labels}
       <line class="guide" x1="0" x2="${plotW}" y1="0" y2="0" hidden/>
-      <circle class="guide-dot" r="3" hidden/>
+      <circle class="guide-dot" r="2.5" hidden/>
     </svg><div class="chart-tip" hidden></div>`;
 
     const svg = el.querySelector('svg');

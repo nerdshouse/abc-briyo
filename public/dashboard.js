@@ -45,7 +45,7 @@ async function getJSON(url) {
 
 /** "vs yesterday" / "vs previous 7 days" — what the comparison is against. */
 const compareLabel = () => (state.days === 1 ? 'vs yesterday'
-  : state.days ? `vs previous ${state.days} days` : 'All time');
+  : state.days ? `vs prior ${state.days} days` : 'All time');
 
 /**
  * Sum the daily report over `n` days ending `offset` days ago. The report is
@@ -186,7 +186,7 @@ function renderChart() {
   $('#chartTotal').textContent = isMoney ? money(cur.sum[m]) : count(cur.sum[m]);
   const d = prev.sum.carts > 0 ? delta(cur.sum[m], prev.sum[m], { goodWhenUp: m === 'carts' ? null : true }) : null;
   $('#chartDelta').className = `delta ${d ? d.tone : ''}`;
-  $('#chartDelta').innerHTML = d ? `<b>${esc(d.text)}</b>vs previous ${n} days` : 'no earlier period to compare';
+  $('#chartDelta').innerHTML = d ? `<b>${esc(d.text)}</b>vs prior ${n} days` : 'no earlier period to compare';
   $('#chartMeta').textContent = `last ${n} days`;
 
   barChart($('#chart'), {
