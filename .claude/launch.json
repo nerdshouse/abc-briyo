@@ -6,7 +6,7 @@
       "runtimeExecutable": "sh",
       "runtimeArgs": [
         "-c",
-        "SLA_ALERTS_ENABLED=false DAILY_SUMMARY_ENABLED=false SHOPIFY_POLL_MINUTES=0 PORT=3010 node server.js"
+        "APP_ENV=development SLA_ALERTS_ENABLED=false DAILY_SUMMARY_ENABLED=false SHOPIFY_POLL_MINUTES=0 PORT=3010 node server.js"
       ],
       "port": 3010
     }

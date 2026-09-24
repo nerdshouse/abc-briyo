@@ -23,6 +23,7 @@ const has = (f) => args.includes(f);
 const APPLY = has('--apply');
 const REDACT = has('--redact');
 const BACKUP = has('--backup');
+const PRODUCTION_OK = has('--production');
 const ONLY_ID = Number((args.find((a) => a.startsWith('--id=')) || '').split('=')[1]) || null;
 
 if (isMockMode()) {
@@ -44,7 +45,16 @@ const same = (a, b, col) => {
   return String(a) === String(b);
 };
 
-await ensureSchema();
+await ensureSchema(); // also verifies APP_ENV against the database's label
+
+// Writing to production needs saying so explicitly; dry runs never do.
+if (APPLY || REDACT || BACKUP) {
+  const { rows } = await getPool().query('SELECT env FROM app_environment');
+  if (rows[0]?.env === 'production' && !PRODUCTION_OK) {
+    console.error('This is the PRODUCTION database. Re-run with --production as well to write to it.');
+    process.exit(1);
+  }
+}
 
 if (BACKUP) {
   const stamp = new Date().toISOString().slice(0, 10).replace(/-/g, '');

@@ -18,6 +18,10 @@ services:
     envVars:
       - key: NODE_ENV
         value: production
+      # Must match the label stored in the production database. The app
+      # refuses to start if they disagree. Never set this anywhere else.
+      - key: APP_ENV
+        value: production
       # Render terminates TLS, so the session cookie must be marked Secure.
       - key: COOKIE_SECURE
         value: "true"

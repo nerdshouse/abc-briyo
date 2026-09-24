@@ -694,31 +694,47 @@ on `/readyz`, and replayable once the cause is fixed.
 
 ## Database
 
-Create a free project at [neon.tech](https://neon.tech), copy the **pooled** connection string
-(the host contains `-pooler`), and set it as `DATABASE_URL`:
+Three databases, and each process may only talk to its own:
 
-```
-DATABASE_URL=postgresql://user:pass@ep-xxx.ap-southeast-1.aws.neon.tech/neondb?sslmode=require
-```
+| Environment | Where | Who connects | Contents |
+|---|---|---|---|
+| **production** | existing Neon project, `neondb` | Render only | real carts, orders, members |
+| **development** | Neon project **briyo-dev**, database `briyo_dev` | your machine (`DATABASE_URL`) | fake data from `npm run db:seed-dev` |
+| **test** | same **briyo-dev** project, database `briyo_test` | `npm run db:check` only (`TEST_DATABASE_URL`) | created and cleaned by the tests |
 
-Use the pooled string because Render may run more than one instance, each with its own
-connection pool; Neon's pooler keeps that within the connection limit.
+Production data is never copied into development or test.
 
-Two tables are created automatically on first use — `abandoned_carts` and `otp_state`. There's
-no migration step.
+**How the separation is enforced.** Every database carries a one-row
+`app_environment` table naming what it is, and every process declares
+`APP_ENV`. They must agree or nothing runs:
 
-**Verify the wiring in one command** once `DATABASE_URL` is set:
+- The server refuses to start on a mismatch, so a laptop pointed at production
+  stops before serving a single request.
+- An unlabelled database is labelled on first use: `production` only from
+  Render (or `NODE_ENV=production`); `development`/`test` only if it holds no
+  carts or orders, so an old copy of real data can never be adopted.
+- `npm run db:check` reads `TEST_DATABASE_URL` only, refuses on Render,
+  with `NODE_ENV=production`, with `APP_ENV` set to anything but `test` in the
+  shell, or if the URL equals `DATABASE_URL`; it then requires the label `test`.
+  Its cleanup re-reads the label inside the same transaction as the deletes.
+- `npm run db:seed-dev` requires `APP_ENV=development` and the label
+  `development`, and refuses on Render or with `NODE_ENV=production`.
+- Test-order purging refuses on any database not labelled test/development.
+- `npm run db:renormalize -- --apply` on production also needs `--production`.
 
-```bash
-npm run db:check
-```
+**Setting up locally**
 
-It exercises every database path against the real database — insert, dedupe-on-retry,
-status update, retry-preserves-status, and the full OTP create/verify/replay/cooldown cycle —
-then deletes its own test rows. Run this before pointing GoKwik at the URL.
-With `DATABASE_URL` unset the app runs in **mock mode** on in-memory sample data, so the UI,
-login and webhook are all testable before Neon exists.
----
+1. In Neon, create the project **briyo-dev** with databases `briyo_dev` and
+   `briyo_test` (both empty). Copy their pooled connection strings.
+2. In `.env`: `APP_ENV=development`, `DATABASE_URL=<briyo_dev>`,
+   `TEST_DATABASE_URL=<briyo_test>`. Do not keep the production string here.
+3. `npm run dev` — creates the tables and labels `briyo_dev` "development".
+4. `npm run db:seed-dev` — optional sample carts and orders (all fake:
+   "Sample Customer", 90000 00xxx phones, `.invalid` emails, `DEV-` numbers).
+5. `npm run db:check` — labels `briyo_test` "test" on first run, then tests.
+
+With `DATABASE_URL` unset the app runs in **mock mode** on in-memory sample
+data, and none of the above applies.
 
 ## How it works
 
@@ -781,7 +797,7 @@ every push to `main`. Config is in [`render.yaml`](render.yaml).
    `DATABASE_URL`, `WEBHOOK_SECRET`, `SESSION_SECRET`, `ELEVENZA_AUTH_TOKEN`, `ALLOWED_PHONES`.
 3. **Settings → Custom Domains** → add `abc.briyo.xyz`, then create the `CNAME` Render shows
    you. TLS is issued automatically.
-4. Run `npm run db:check` locally against the same `DATABASE_URL` before going live.
+4. Set `APP_ENV=production` on Render. Run `npm run db:check` locally (it uses the test database, never production).
 
 ### The one real catch: sleeping
 

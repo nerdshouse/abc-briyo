@@ -14,6 +14,8 @@ import {
   actionQueue, cartsForBucket, cartsByStatus, ACTION_BUCKETS, dailySnapshot,
   cartEvents, recentEvents, callbackAtOf,
 } from './lib/db.js';
+import { getPool } from './lib/db.js';
+import { assertDatabaseEnvironment } from './lib/env-guard.js';
 import {
   mockInsertCart, mockListCarts, mockUpdateStatus, mockMatchOrder,
   mockReasonSummary, mockStatsByCaller, mockStaleCarts, mockSearchCarts,
@@ -1002,6 +1004,19 @@ app.get('/api/stats/by-caller', requireAdmin, async (req, res) => {
 });
 
 const port = process.env.PORT || 3000;
+// Refuse to serve at all — not even a health check — if this process and its
+// database disagree about which environment they are. On Render a failed
+// health check keeps the previous deploy live.
+if (!MOCK) {
+  try {
+    const env = await assertDatabaseEnvironment(getPool());
+    console.log(`Environment: ${env} (APP_ENV and database label agree)`);
+  } catch (err) {
+    console.error(`\n  REFUSING TO START: ${err.message}\n`);
+    process.exit(1);
+  }
+}
+
 app.listen(port, async () => {
   console.log(`Recovery Board on http://localhost:${port}`);
   if (process.env.BOARD_TZ && !process.env.BOARD_TIMEZONE) {

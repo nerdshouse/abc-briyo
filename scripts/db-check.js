@@ -1,4 +1,4 @@
-import 'dotenv/config';
+import dotenv from 'dotenv';
 import {
   ensureSchema, getPool, isMockMode, insertCart, listCarts, updateStatus, ping,
   matchOrderToCarts, reasonSummary, statsByCaller, staleCarts,
@@ -31,16 +31,36 @@ import {
 } from '../lib/sla-alert.js';
 import { issueSession, verifySession } from '../lib/session.js';
 import { rateLimit, _reset as resetRateLimit } from '../lib/rate-limit.js';
+import { assertDatabaseEnvironment, assertMarkerIn } from '../lib/env-guard.js';
+
+// ---- where this may run ---------------------------------------------------
+// db:check writes and deletes rows, so it runs only against the test database:
+// TEST_DATABASE_URL, labelled "test". Never DATABASE_URL, never production.
+const refuse = (why) => { console.error(`\n  db:check REFUSED: ${why}\n`); process.exit(1); };
+const productionHost = () => Boolean(process.env.RENDER) || process.env.NODE_ENV === 'production';
+if (productionHost()) refuse('this is a production host (Render / NODE_ENV=production).');
+// Checked before .env loads: a shell that says production means it.
+if (process.env.APP_ENV && process.env.APP_ENV !== 'test') refuse(`APP_ENV=${process.env.APP_ENV} is set in this shell.`);
+dotenv.config();
+if (productionHost()) refuse('.env sets NODE_ENV=production.');
+if (!process.env.TEST_DATABASE_URL) refuse('TEST_DATABASE_URL is not set. See README → Databases.');
+if (process.env.TEST_DATABASE_URL === process.env.DATABASE_URL) refuse('TEST_DATABASE_URL is the same as DATABASE_URL.');
+process.env.DATABASE_URL = process.env.TEST_DATABASE_URL;
+process.env.APP_ENV = 'test';
 
 /**
- * Exercises every database code path against the real DATABASE_URL and cleans up
- * after itself. Run once after setting DATABASE_URL:  npm run db:check
+ * Exercises every database code path against TEST_DATABASE_URL (a database
+ * labelled "test") and cleans up after itself:  npm run db:check
  */
 
 if (isMockMode()) {
   console.error('DATABASE_URL is not set — nothing to check. Set it in .env first.');
   process.exit(1);
 }
+
+// The database itself must say "test" (or be empty, and get labelled so) before
+// the first write. Anything else — above all "production" — stops here.
+try { await assertDatabaseEnvironment(getPool(), 'test'); } catch (err) { refuse(err.message); }
 
 const TEST_CART = 'DBCHECK-DELETE-ME';
 const TEST_PHONE = normalisePhone('9000000000');
@@ -1380,16 +1400,55 @@ await step('orders cleanup (sequence left as is)', async () => {
   return `${orders} orders removed`;
 });
 
+// ---- environment guard ------------------------------------------------------
+await step('environment guard: labels and APP_ENV must agree; production is never touched', async () => {
+  const { appEnv, EnvironmentError: EnvErr } = await import('../lib/env-guard.js');
+  const fake = (env) => ({ async query(q) {
+    if (/to_regclass/.test(q)) return { rows: [{ t: env === undefined ? null : 'app_environment' }] };
+    return { rows: env ? [{ env }] : [] };
+  } });
+  const refused = async (fn) => { try { await fn(); return false; } catch (e) { if (e instanceof EnvErr) return true; throw e; } };
+  if (!(await refused(() => assertMarkerIn(fake('production'), ['test', 'development'], 'purge')))) throw new Error('purge allowed on production');
+  if (!(await refused(() => assertMarkerIn(fake(undefined), ['test'], 'cleanup')))) throw new Error('cleanup allowed on unlabelled db');
+  if (await refused(() => assertMarkerIn(fake('test'), ['test'], 'cleanup'))) throw new Error('cleanup refused on test');
+  // The real test database says "test".
+  const c = await getPool().connect();
+  try { await assertMarkerIn(c, ['test'], 'check'); } finally { c.release(); }
+  const saved = { APP_ENV: process.env.APP_ENV, RENDER: process.env.RENDER };
+  try {
+    delete process.env.APP_ENV; if (!(await refused(() => appEnv()))) throw new Error('missing APP_ENV accepted');
+    process.env.APP_ENV = 'staging'; if (!(await refused(() => appEnv()))) throw new Error('unknown APP_ENV accepted');
+    process.env.APP_ENV = 'development'; process.env.RENDER = 'true';
+    if (!(await refused(() => appEnv()))) throw new Error('development accepted on Render');
+  } finally {
+    process.env.APP_ENV = saved.APP_ENV;
+    if (saved.RENDER === undefined) delete process.env.RENDER; else process.env.RENDER = saved.RENDER;
+  }
+  return 'production/unlabelled refused, test allowed, APP_ENV validated';
+});
+
 // ---- cleanup ---------------------------------------------------------------
 await step('cleanup', async () => {
-  await getPool().query('DELETE FROM login_log WHERE phone = $1', [TEST_PHONE]);
-  await getPool().query('DELETE FROM member_log WHERE target_phone = $1', [TEST_MEMBER]);
-  await deleteMember(TEST_MEMBER);
-  await getPool().query('DELETE FROM system_state WHERE key = $1', [TEST_STATE_KEY]);
-  await getPool().query('DELETE FROM webhook_failures WHERE kind = $1', [TEST_FAILURE_KIND]);
-  await getPool().query('DELETE FROM auto_recovery_log WHERE cart_id = $1', [TEST_CART]);
-  await getPool().query('DELETE FROM abandoned_carts WHERE cart_id = $1', [TEST_CART]);
-  await getPool().query('DELETE FROM otp_state WHERE phone = $1', [TEST_PHONE]);
+  // One transaction, and the label is re-read inside it before any DELETE.
+  const client = await getPool().connect();
+  try {
+    await client.query('BEGIN');
+    await assertMarkerIn(client, ['test'], 'db:check cleanup');
+    await client.query('DELETE FROM login_log WHERE phone = $1', [TEST_PHONE]);
+    await client.query('DELETE FROM member_log WHERE target_phone = $1', [TEST_MEMBER]);
+    await client.query('DELETE FROM allowed_users WHERE phone = $1', [TEST_MEMBER]);
+    await client.query('DELETE FROM system_state WHERE key = $1', [TEST_STATE_KEY]);
+    await client.query('DELETE FROM webhook_failures WHERE kind = $1', [TEST_FAILURE_KIND]);
+    await client.query('DELETE FROM auto_recovery_log WHERE cart_id = $1', [TEST_CART]);
+    await client.query('DELETE FROM abandoned_carts WHERE cart_id = $1', [TEST_CART]);
+    await client.query('DELETE FROM otp_state WHERE phone = $1', [TEST_PHONE]);
+    await client.query('COMMIT');
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw err;
+  } finally {
+    client.release();
+  }
   return 'test rows removed';
 });
 
