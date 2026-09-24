@@ -3,111 +3,234 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Abandoned Cart Recovery Board — Briyo Supplements</title>
-  <link rel="stylesheet" href="/styles.css" />
+  <title>Call board — Briyo Recovery</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/ui.css" />
+  <script src="https://cdn.jsdelivr.net/npm/lucide@0.469.0/dist/umd/lucide.min.js" defer></script>
 </head>
 <body>
-  <div class="wrap">
-    <header class="page">
+<div class="app">
+
+  <!-- ============================== sidebar ============================== -->
+  <aside class="sidebar" id="sidebar" aria-label="Main navigation">
+    <div class="brand">
+      <span class="brand-mark"><i data-lucide="shopping-cart"></i></span>
       <div>
-        <h1>Abandoned Cart Recovery Board</h1>
-        <p class="sub">
-          Work top to bottom. Call status and notes are shared — everyone sees the same
-          queue on every device.
-        </p>
+        <div class="brand-name">Briyo Recovery</div>
+        <div class="brand-sub">Abandoned carts</div>
       </div>
-      <div class="session">
-        <span id="sessionPhone"></span>
-        <a id="dashLink" class="btnlink" href="/dashboard" hidden>Dashboard</a>
-        <a id="importLink" class="btnlink" href="/import" hidden>Import</a>
-        <a id="adminLink" class="btnlink" href="/admin" hidden>Members</a>
-        <a id="exportCsv" class="btnlink" href="/api/carts.csv?days=7" download>Export CSV</a>
-        <button id="refresh" type="button">Refresh</button>
-        <button id="logout" type="button">Sign out</button>
+    </div>
+
+    <form class="side-search" id="sideSearchForm" role="search">
+      <i data-lucide="search"></i>
+      <input id="sideSearch" type="search" placeholder="Find a customer" autocomplete="off"
+             aria-label="Search every cart by name, phone or email" />
+      <kbd>⌘ K</kbd>
+    </form>
+
+    <nav>
+      <div class="nav-group" data-admin hidden>
+        <div class="nav-caption">Overview</div>
+        <a class="nav-item" href="/dashboard"><i data-lucide="layout-grid"></i>Dashboard</a>
       </div>
+
+      <div class="nav-group">
+        <div class="nav-caption">Carts</div>
+        <a class="nav-item active" href="/?mode=all" data-view-link="board"><i data-lucide="shopping-bag"></i>Call board</a>
+        <div class="nav-tree">
+          <a class="nav-item" href="/?mode=tocall" data-view-link="tocall">To call<span class="nav-count" id="countToCall" hidden></span></a>
+          <a class="nav-item" href="/?mode=callbacks" data-view-link="callbacks">Callbacks<span class="nav-count" id="countCallbacks" hidden></span></a>
+          <a class="nav-item" href="/?mode=mine" data-view-link="mine">My queue</a>
+          <a class="nav-item" href="/?mode=all" data-view-link="all">All carts</a>
+        </div>
+      </div>
+
+      <div class="nav-group" data-admin hidden>
+        <div class="nav-caption">Team</div>
+        <a class="nav-item" href="/admin"><i data-lucide="users"></i>Members</a>
+      </div>
+
+      <div class="nav-group" data-admin hidden>
+        <div class="nav-caption">Data</div>
+        <a class="nav-item" href="/import"><i data-lucide="upload"></i>Import carts</a>
+      </div>
+    </nav>
+
+    <div class="sidebar-foot">
+      <div class="user-card">
+        <span class="avatar" id="userAvatar">·<span class="live"></span></span>
+        <div style="min-width:0">
+          <div class="user-name" id="userName">Signed in</div>
+          <div class="user-role" id="userRole"></div>
+        </div>
+        <button class="icon-btn bare" id="signOut" type="button" title="Sign out" aria-label="Sign out"><i data-lucide="log-out"></i></button>
+      </div>
+    </div>
+  </aside>
+  <div class="scrim" id="scrim"></div>
+
+  <!-- ============================== main ============================== -->
+  <div class="main">
+    <header class="topbar">
+      <button class="icon-btn" id="navOpen" type="button" aria-label="Open navigation"><i data-lucide="menu"></i></button>
+      <span class="topbar-title">Call board</span>
     </header>
 
-    <div id="mockBanner" class="banner mock" hidden>
-      <strong>Mock mode.</strong> No database configured, so this is sample data held in
-      memory and lost on restart. Set <code>DATABASE_URL</code> to go live.
-    </div>
-
-    <div id="errorBanner" class="banner error" hidden></div>
-
-    <p class="sub" id="rangeSummary"></p>
-
-    <div id="staleBanner" class="banner" hidden></div>
-
-    <!--
-      One filter surface, not three. The queue modes carry their own counts, so
-      the numbers and the filters are the same control — the old board had
-      clickable stat cards, two toggles and four dropdowns all driving the same
-      state, and they could disagree with each other on screen.
-    -->
-    <div class="controls controls-primary">
-      <div class="group" id="modeGroup" role="group" aria-label="Queue">
-        <button type="button" data-mode="tocall" class="active">To call</button>
-        <button type="button" data-mode="callbacks">Callbacks</button>
-        <button type="button" data-mode="mine">Mine</button>
-        <button type="button" data-mode="all">All</button>
+    <main class="page">
+      <div class="crumbs">
+        <i data-lucide="shopping-bag"></i><span>Carts</span><span class="sep">/</span><span class="here" id="crumbView">To call</span>
       </div>
-      <input type="search" id="search" autocomplete="off" spellcheck="false"
-             placeholder="Search all history — name, phone, email…" aria-label="Search all carts" />
-    </div>
 
-    <div class="controls controls-filters">
-      <div class="group" id="rangeGroup" role="group" aria-label="Date range">
-        <button type="button" data-days="1">Today</button>
-        <button type="button" data-days="3">3 days</button>
-        <button type="button" data-days="7" class="active">7 days</button>
-        <button type="button" data-days="0">All</button>
+      <div class="page-head">
+        <div>
+          <h1 class="page-title">Call board</h1>
+          <p class="page-sub" id="rangeSummary">Loading carts…</p>
+        </div>
+        <div class="page-actions">
+          <label class="range-pick" id="rangePick">
+            <i data-lucide="calendar"></i>
+            <select id="range" class="select" aria-label="Date range">
+              <option value="1">Today</option>
+              <option value="3">Last 3 days</option>
+              <option value="7" selected>Last 7 days</option>
+              <option value="0">All time</option>
+            </select>
+          </label>
+          <button class="icon-btn" id="refresh" type="button" title="Refresh" aria-label="Refresh"><i data-lucide="refresh-cw"></i></button>
+          <details class="menu">
+            <summary class="icon-btn" aria-label="More"><i data-lucide="ellipsis-vertical"></i></summary>
+            <div class="menu-list">
+              <a id="exportCsv" href="/api/carts.csv?days=7" download><i data-lucide="download"></i>Export this range (CSV)</a>
+            </div>
+          </details>
+        </div>
       </div>
-      <select id="sort" aria-label="Sort">
-        <option value="value">Biggest carts first</option>
-        <option value="risk">Riskiest first</option>
-        <option value="recent">Newest first</option>
-        <option value="callback">Callback due soonest</option>
-      </select>
-    </div>
 
-    <p id="resultNote" class="result-note" hidden></p>
+      <div id="alerts"></div>
 
-    <div id="queue" class="queue">
-      <div class="callcard skeleton">
-        <span class="sk w40"></span><span class="sk w80"></span><span class="sk w60"></span>
-      </div>
-    </div>
-
-    <section class="insights">
-      <div class="panel insight">
-        <header>
-          <h2>Why they abandoned</h2>
-          <span class="muted" id="reasonMeta"></span>
+      <section class="card" id="boardCard">
+        <header class="card-head board-head">
+          <div class="tabs" id="viewTabs" role="tablist" aria-label="Queue"></div>
         </header>
-        <div id="reasonList"><p class="muted">Loading…</p></div>
-      </div>
-      <div class="panel insight" id="callerPanel">
-        <header><h2>By caller</h2></header>
-        <table class="mini">
-          <thead>
-            <tr>
-              <th>Caller</th><th class="right">Touched</th><th class="right">Recovered</th>
-              <th class="right">Rate</th><th class="right">Value</th>
-            </tr>
-          </thead>
-          <tbody id="callerRows"><tr><td colspan="5" class="empty">Loading…</td></tr></tbody>
-        </table>
-      </div>
-    </section>
+        <div class="pane">
+          <div class="board-filters">
+            <label class="search">
+              <i data-lucide="search"></i>
+              <input class="input" id="search" type="search" autocomplete="off" spellcheck="false"
+                     placeholder="Search all history — name, phone, email" aria-label="Search all carts" />
+            </label>
+            <select class="select" id="fstatus" aria-label="Status"><option value="">Status</option></select>
+            <select class="select" id="fowner" aria-label="Owner"><option value="">Owner</option></select>
+            <select class="select" id="ffollow" aria-label="Follow-up">
+              <option value="">Follow-up</option>
+              <option value="overdue">Overdue</option>
+              <option value="today">Due today</option>
+              <option value="upcoming">Upcoming</option>
+              <option value="missing">No time set</option>
+              <option value="none">No callback</option>
+            </select>
+            <select class="select" id="freason" aria-label="Reason"><option value="">Reason</option></select>
+            <select class="select" id="fvalue" aria-label="Cart value">
+              <option value="">Cart value</option>
+              <option value="0-500">Under ₹500</option>
+              <option value="500-1000">₹500 – ₹1,000</option>
+              <option value="1000-2000">₹1,000 – ₹2,000</option>
+              <option value="2000-">₹2,000 and above</option>
+            </select>
+            <button type="button" class="linkish" id="fclear" hidden>Clear</button>
+            <span class="spacer"></span>
+            <label class="sort-pick" title="Order">
+              <i data-lucide="arrow-down-up"></i>
+              <select class="select" id="sort" aria-label="Sort">
+                <option value="value">Biggest carts first</option>
+                <option value="risk">Riskiest first</option>
+                <option value="recent">Newest first</option>
+                <option value="callback">Callback due soonest</option>
+              </select>
+            </label>
+          </div>
+          <div class="board-meta" id="resultNote" aria-live="polite"></div>
 
-    <p class="note">
-      Carts are received from GoKwik's webhook and stored with their full original payload,
-      so nothing is lost even if a field isn't shown here. Outcome edits save immediately;
-      if someone else changed the same cart while you were typing, the board says so rather
-      than overwriting them.
-    </p>
+          <div class="table-wrap">
+            <table class="table board-table" id="cartTable">
+              <colgroup>
+                <col class="c-flag" /><col class="c-cust" /><col class="c-items" /><col class="c-val" />
+                <col class="c-status" /><col class="c-owner" /><col class="c-last" /><col class="c-follow" />
+                <col class="c-reason" /><col class="c-age" /><col class="c-act" />
+              </colgroup>
+              <thead><tr>
+                <th class="col-flag"><span class="sr-only">Needs attention</span></th>
+                <th class="sortable" data-sort="customer">Customer<span class="sort"></span></th>
+                <th class="col-items">Items</th>
+                <th class="sortable r" data-sort="value">Cart value<span class="sort"></span></th>
+                <th class="sortable" data-sort="status">Status<span class="sort"></span></th>
+                <th class="sortable" data-sort="owner">Owner<span class="sort"></span></th>
+                <th class="sortable col-last" data-sort="updated" title="The last time anyone saved a change to this cart">Last update<span class="sort"></span></th>
+                <th class="sortable" data-sort="callback">Follow-up<span class="sort"></span></th>
+                <th class="col-reason" title="The reason the caller recorded — or, if none yet, where GoKwik says they dropped off">Reason</th>
+                <th class="sortable r" data-sort="recent" title="Time since the cart reached the board">Age<span class="sort"></span></th>
+                <th class="r"><span class="sr-only">Actions</span></th>
+              </tr></thead>
+              <tbody id="rows"></tbody>
+            </table>
+          </div>
+
+          <!-- Phones get a list, not a squeezed table. -->
+          <ul class="clist" id="clist" aria-label="Carts"></ul>
+        </div>
+      </section>
+
+      <div class="grid grid-2" style="margin-top:16px">
+        <section class="card">
+          <header class="card-head"><h2 class="card-title"><i data-lucide="message-square-text"></i>Why they abandoned <span class="card-meta" id="reasonMeta"></span></h2></header>
+          <div class="pane pad" id="reasonList"></div>
+        </section>
+        <section class="card" id="callerPanel">
+          <header class="card-head"><h2 class="card-title"><i data-lucide="users"></i>By caller <span class="card-meta">in range</span></h2></header>
+          <div class="pane">
+            <div class="table-wrap"><table class="table compact">
+              <thead><tr>
+                <th>Caller</th><th class="r" title="Carts where this person saved the last change">Touched</th>
+                <th class="r">Recovered</th><th class="r" title="Recovered ÷ touched">Rate</th>
+                <th class="r" title="Recovered cart value — not verified order revenue">Recovered cart value</th>
+              </tr></thead>
+              <tbody id="callerRows"></tbody>
+            </table></div>
+          </div>
+        </section>
+      </div>
+
+      <p class="footnote">Carts arrive live from GoKwik and keep their full original payload. Changes save immediately; if someone else changed the same cart while you were typing, the board says so rather than overwriting them.</p>
+    </main>
   </div>
+</div>
 
-  <script src="/app.js"></script>
+<!-- Status quick-change menu, positioned beside whichever row opened it. -->
+<div class="popover" id="statusMenu" role="menu" hidden></div>
+
+<!-- Cart detail — the same outcome workflow as before, in one place. -->
+<div class="drawer-scrim" id="drawerScrim" hidden></div>
+<aside class="drawer drawer-wide" id="drawer" hidden aria-label="Cart detail">
+  <div class="drawer-head">
+    <div style="min-width:0">
+      <h2 class="drawer-title" id="dTitle"></h2>
+      <div class="drawer-sub" id="dSub"></div>
+    </div>
+    <div class="drawer-nav">
+      <button class="icon-btn" id="dPrev" type="button" title="Previous cart" aria-label="Previous cart"><i data-lucide="chevron-up"></i></button>
+      <button class="icon-btn" id="dNext" type="button" title="Next cart" aria-label="Next cart"><i data-lucide="chevron-down"></i></button>
+      <button class="icon-btn" id="dClose" type="button" title="Close" aria-label="Close"><i data-lucide="x"></i></button>
+    </div>
+  </div>
+  <div class="drawer-body" id="dBody"></div>
+  <div class="drawer-foot">
+    <span class="saved" id="dSaved"></span>
+    <button class="btn" id="dNextBtn" type="button">Next cart<i data-lucide="arrow-right"></i></button>
+  </div>
+</aside>
+
+<script type="module" src="/app.js"></script>
 </body>
 </html>

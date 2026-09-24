@@ -1,4 +1,16 @@
-'use strict';
+/**
+ * Call board (v2 shell).
+ *
+ * The same caller workflow as before — the same endpoints, the same save
+ * payloads, the same conflict guard and callback-time rule — laid out as a dense
+ * table with the outcome controls in a drawer, so a row can be scanned in one
+ * glance and worked without leaving the list.
+ */
+import {
+  $, $$, esc, money, count, icon, renderIcons, setTimezone, dayKey, dateTime,
+  relative, span, statusOf, statusIndicator, followUp, hbars, initials, initShell,
+  setNavCount, STATUS_LABELS,
+} from './ui/components.js';
 
 const STATUSES = [
   'Not called',
@@ -9,148 +21,82 @@ const STATUSES = [
 ];
 
 /** Call-priority ranking for the risk sort. Anything unrecognised sorts last. */
-const RISK_ORDER = {
-  'high risk': 3,
-  'medium risk': 2,
-  'low risk': 1,
-  control: 0,
-};
+const RISK_ORDER = { 'high risk': 3, 'medium risk': 2, 'low risk': 1, control: 0 };
 
 let REASON_TAGS = [];
 let SLA_HOURS = 6;
-/** The team's timezone, from the server. A laptop set to UTC must still read
- *  the same "today 6:30 pm" the SLA, the reports and the digest all mean. */
-let BOARD_TZ = 'Asia/Kolkata';
-
 let TEAM = [];
 let ME = null;
 
+const st = (c) => c.status || 'Not called';
+
 /**
- * Queue modes, in the order a caller works.
- *
- * These replace the old status/stage/assignee/mine/overdue filters. Those were
- * five independent switches that could combine into states nobody wanted and
- * that the controls could not always display back accurately; these four are
- * mutually exclusive and each answers "what am I working on right now".
+ * Views, in the order a caller works. The first four are the board's original
+ * queues and keep their URL names; the rest are narrower lenses on the same
+ * loaded carts, filtered in the browser — no new query, no new rule.
  */
-const MODES = {
-  tocall:    { label: 'To call',   sort: 'value',    match: (c) => (c.status || 'Not called') === 'Not called' },
-  callbacks: { label: 'Callbacks', sort: 'callback', match: (c) => c.status === 'Callback scheduled' },
-  mine:      { label: 'Mine',      sort: 'value',    match: (c) => c.assigned_to === ME },
-  all:       { label: 'All',       sort: 'recent',   match: () => true },
+const VIEWS = {
+  tocall:     { label: 'To call',         sort: 'value',    match: (c) => st(c) === 'Not called' },
+  attention:  { label: 'Needs attention', sort: 'recent',   match: (c) => Boolean(attentionOf(c)) },
+  callbacks:  { label: 'Callbacks',       sort: 'callback', match: (c) => st(c) === 'Callback scheduled' },
+  mine:       { label: 'My queue',        sort: 'value',    match: (c) => Boolean(ME) && c.assigned_to === ME },
+  unassigned: { label: 'Unassigned',      sort: 'value',    match: (c) => !c.assigned_to },
+  recovered:  { label: 'Recovered',       sort: 'recent',   match: (c) => st(c) === 'Called – Recovered' },
+  lost:       { label: 'Lost',            sort: 'recent',   match: (c) => st(c) === 'Called – Declined' },
+  all:        { label: 'All',             sort: 'recent',   match: () => true },
 };
 
 const state = {
   carts: [],
   query: '',
-  days: 7,       // default range: last 7 days
-  mode: 'tocall',
+  days: 7,
+  view: 'tocall',
   sort: 'value',
-  sortTouched: false,   // once set by hand, stop re-picking it per mode
+  dir: -1,
+  sortTouched: false,     // once chosen by hand, stop re-picking it per view
+  f: { status: '', owner: '', follow: '', reason: '', value: '' },
+  stale: null,
+  total: 0,
+  callbackTotal: null,
+  truncated: false,
+  mock: false,
+  done: new Set(),        // saved rows that no longer belong in the view — dimmed, not removed
+  openId: null,
 };
 
 const cartById = (id) => state.carts.find((c) => String(c.id) === String(id));
 
-const $ = (sel) => document.querySelector(sel);
+/* ------------------------------------------------------------------ helpers */
 
-/** Attach a listener only if the element exists — a missing control should
- *  never throw and take the whole board down with it. */
-function on(sel, event, handler) {
-  const el = $(sel);
-  if (el) el.addEventListener(event, handler);
-  else console.warn(`No element matches ${sel}; skipping ${event} handler.`);
-}
-const queueEl = $('#queue');
-const errorEl = $('#errorBanner');
-
-// ---------- formatting helpers ----------
-
-const inr = new Intl.NumberFormat('en-IN', {
-  style: 'currency', currency: 'INR', maximumFractionDigits: 0,
-});
-
-function money(amount, currency) {
-  if (amount == null) return '—';
-  if (!currency || currency === 'INR') return inr.format(amount);
-  try {
-    return new Intl.NumberFormat('en-IN', { style: 'currency', currency }).format(amount);
-  } catch {
-    return `${currency} ${amount}`;
-  }
-}
-
-/**
- * The wall-clock time a thing happened, in the caller's own timezone.
- *
- * "15m ago" is fine for scanning but useless for "when exactly did you ring
- * them?" — which is the question an outcome record has to answer.
- */
-function exactTime(iso) {
-  const d = new Date(iso);
-  if (Number.isNaN(d.getTime())) return '';
-  return d.toLocaleString('en-IN', {
-    day: 'numeric', month: 'short', hour: 'numeric', minute: '2-digit', hour12: true,
-  });
-}
-
-/** Calendar day in the board's timezone, as YYYY-MM-DD. */
-function boardDay(d) {
-  return new Intl.DateTimeFormat('en-CA', {
-    timeZone: BOARD_TZ, year: 'numeric', month: '2-digit', day: '2-digit',
-  }).format(d);
-}
-
-/** "6:30 pm" in the board's timezone. */
-function boardClock(d) {
-  return new Intl.DateTimeFormat('en-IN', {
-    timeZone: BOARD_TZ, hour: 'numeric', minute: '2-digit', hour12: true,
-  }).format(d).toLowerCase();
-}
-
-/** "18 min" / "4h 10m" / "2d 3h" — a duration, not a point in time. */
-function spanText(ms) {
-  const mins = Math.round(Math.abs(ms) / 60000);
-  if (mins < 60) return `${mins} min`;
+/** "18m" / "4h" / "3d" — age at a glance; the exact time is in the tooltip. */
+function ageShort(iso) {
+  const mins = Math.max(0, Math.round((Date.now() - new Date(iso).getTime()) / 60000));
+  if (mins < 60) return `${mins}m`;
   const h = Math.floor(mins / 60);
-  if (h < 24) return `${h}h ${mins % 60}m`;
-  return `${Math.floor(h / 24)}d ${h % 24}h`;
+  return h < 48 ? `${h}h` : `${Math.floor(h / 24)}d`;
 }
 
-function relativeTime(iso) {
-  const then = new Date(iso).getTime();
-  if (Number.isNaN(then)) return '—';
-  const mins = Math.round((Date.now() - then) / 60000);
-  if (mins < 1) return 'just now';
-  if (mins < 60) return `${mins}m ago`;
-  const hrs = Math.round(mins / 60);
-  if (hrs < 24) return `${hrs}h ago`;
-  const days = Math.round(hrs / 24);
-  return days === 1 ? 'yesterday' : `${days}d ago`;
-}
-
-/**
- * Convert an Indian number to wa.me's 91XXXXXXXXXX form.
- * Returns null when it doesn't look like a usable number.
- */
+/** Convert an Indian number to wa.me's 91XXXXXXXXXX form; null if unusable. */
 function waNumber(phone) {
   if (!phone) return null;
   const digits = String(phone).replace(/\D/g, '');
-  if (/^[6-9]\d{9}$/.test(digits)) return `91${digits}`;          // bare 10-digit mobile
-  if (/^91[6-9]\d{9}$/.test(digits)) return digits;               // already country-coded
-  if (/^0[6-9]\d{9}$/.test(digits)) return `91${digits.slice(1)}`; // leading trunk 0
-  return digits.length >= 10 ? digits : null;                     // non-IN, pass through
+  if (/^[6-9]\d{9}$/.test(digits)) return `91${digits}`;
+  if (/^91[6-9]\d{9}$/.test(digits)) return digits;
+  if (/^0[6-9]\d{9}$/.test(digits)) return `91${digits.slice(1)}`;
+  return digits.length >= 10 ? digits : null;
 }
 
 function waMessage(cart) {
   const name = cart.customer_name ? cart.customer_name.split(' ')[0] : 'there';
-  return `Hi ${name}! This is Briyo Supplements. We noticed you left a few items in your cart — ` +
-         `can we help you complete your order? Here's your cart: ${cart.checkout_url || ''}`;
+  return `Hi ${name}! This is Briyo Supplements. We noticed you left a few items in your cart — `
+    + `can we help you complete your order? Here's your cart: ${cart.checkout_url || ''}`;
 }
+const waLink = (c) => { const n = waNumber(c.phone); return n ? `https://wa.me/${n}?text=${encodeURIComponent(waMessage(c))}` : null; };
+const telLink = (c) => (c.phone ? `tel:${String(c.phone).replace(/\s/g, '')}` : null);
 
 /**
- * Line items stay in raw_payload rather than becoming columns, because GoKwik
- * sends them either as an array or as a "#Name(Variant)*1" string. The server
- * exposes the parsed form on each cart; fall back to the raw shapes if absent.
+ * Line items live in the payload; GoKwik sends them as an array or a string.
+ * The server exposes the parsed form; fall back to the raw shapes if absent.
  */
 function itemsOf(cart) {
   if (Array.isArray(cart.items) && cart.items.length) return cart.items;
@@ -163,113 +109,45 @@ function itemsOf(cart) {
   }));
 }
 
-const riskClass = (flag) => 'risk-' + String(flag || '').toLowerCase().split(' ')[0];
-/** "Medium Risk" -> "Medium". The column header and colour already say risk. */
-const shortRisk = (flag) => String(flag || '').replace(/\s*risk\s*/i, '').trim() || flag;
+/** Pull the pack size off the end of a long product name so it survives truncation. */
+function splitPack(title) {
+  const m = String(title).match(/^(.*?)\s*[-–|]\s*((?:Pack of|Box of)\s*\d+|\d+\s*Box(?:es)?)\s*$/i);
+  return m ? { name: m[1].trim(), pack: m[2].trim() } : { name: String(title), pack: null };
+}
+
+const isHighRisk = (c) => /^high/i.test(String(c.risk_flag || ''));
+
+/** Callback timing in the board's timezone — the buckets the Follow-up filter uses. */
+function callbackKind(c) {
+  if (st(c) !== 'Callback scheduled') return 'none';
+  if (!c.callback_at) return 'missing';
+  const diff = new Date(c.callback_at) - Date.now();
+  if (diff < -60000) return 'overdue';
+  if (dayKey(new Date(c.callback_at)) === dayKey(new Date()) || diff <= 60 * 60000) return 'today';
+  return 'upcoming';
+}
 
 /**
- * Product names here run long ("Daily Wellness Starter Bundle – Vitamin D3 +
- * Fish Oil + B12"), and stacking three of them in full made a single row fill
- * the screen. A caller needs to recognise the order at a glance, not read the
- * catalogue: show a count, the first two names on one line each, and hide the
- * rest behind a disclosure. Full text stays in the title attribute.
+ * Why a row deserves a second look, or null. Only facts already on the cart:
+ * a promised callback that has passed or has no time, or a new cart past the
+ * SLA the server already enforces for the stale alarm.
  */
-function itemsCell(cart) {
-  const items = itemsOf(cart);
-  if (!items.length) {
-    return cart.item_count
-      ? `<span class="muted">${cart.item_count} item${cart.item_count === 1 ? '' : 's'}</span>`
-      : '<span class="muted">—</span>';
+function attentionOf(c) {
+  const s = st(c);
+  if (s === 'Callback scheduled') {
+    if (!c.callback_at) return { kind: 'warn', text: 'Callback has no time set' };
+    const diff = new Date(c.callback_at) - Date.now();
+    if (diff < -60000) return { kind: 'bad', text: `Callback overdue by ${span(diff)}` };
+    return null;
   }
-
-  // The pack size is the part a caller needs and the part truncation eats, since
-  // it sits at the end of the name. Pull it out so it always stays visible.
-  const splitPack = (title) => {
-    const m = String(title).match(/^(.*?)\s*[-–]\s*((?:Pack of|Box of)\s*\d+|\d+\s*Box(?:es)?)\s*$/i);
-    return m ? { name: m[1].trim(), pack: m[2].trim() } : { name: title, pack: null };
-  };
-
-  const line = (i) => {
-    const { name, pack } = splitPack(i.title);
-    return `<div class="item" title="${esc(i.title)}">`
-      + `<span class="iname">${esc(name)}</span>`
-      + `${pack ? ` <span class="pack">${esc(pack)}</span>` : ''}`
-      + `${i.quantity > 1 ? ` <span class="qty">×${i.quantity}</span>` : ''}</div>`;
-  };
-
-  const units = items.reduce((n, i) => n + (i.quantity || 1), 0);
-  const head = items.slice(0, 3).map(line).join('');
-  const rest = items.slice(3);
-
-  return (items.length > 1
-      ? `<div class="itemcount">${items.length} products · ${units} unit${units === 1 ? '' : 's'}</div>`
-      : '')
-    + head
-    + (rest.length
-      // The label has to change when it opens, or expanding looks like nothing
-      // happened — the extra rows appear but the toggle still says "+1 more".
-      ? `<details class="moreitems">
-           <summary><span class="lbl-more">+${rest.length} more</span><span class="lbl-less">Show less</span></summary>
-           ${rest.map(line).join('')}
-         </details>`
-      : '');
+  if (s === 'Not called') {
+    const age = Date.now() - new Date(c.received_at).getTime();
+    if (age > SLA_HOURS * 3600000) return { kind: 'warn', text: `Not called for ${span(age)} — past the ${SLA_HOURS}h target` };
+  }
+  return null;
 }
 
-/**
- * GoKwik runs its own recovery email/messaging. Showing that lets a caller open
- * with the right line instead of repeating a message the customer already got —
- * and is why this board deliberately sends nothing automatically.
- */
-function gokwikTouch(cart) {
-  const bits = [];
-  if (cart.gokwik_message_queued) bits.push('msg sent');
-  if (cart.gokwik_email_sent) bits.push('email sent');
-  const already = bits.length
-    ? `<div class="touched" title="GoKwik already contacted this customer — ${bits.join(' + ')}">Nudged</div>`
-    : '';
-  const repeat = cart.brand_order_count > 0
-    ? `<div class="repeat" title="Has ordered ${cart.brand_order_count} time(s) before">Repeat ×${cart.brand_order_count}</div>`
-    : '';
-  return already + repeat;
-}
-
-/** Overdue / due-today state for a scheduled callback. */
-/**
- * What a caller needs to know about a promised callback, at a glance.
- *
- * "Today" and "tomorrow" are the board's calendar days, not the browser's, so
- * this agrees with the SLA, the reports and the evening digest.
- */
-function callbackState(cart) {
-  if (cart.status !== 'Callback scheduled') return null;
-  // Carts that reached this status before a time was required.
-  if (!cart.callback_at) return { kind: 'missing', label: 'No time set', due: null };
-
-  const due = new Date(cart.callback_at);
-  if (Number.isNaN(due.getTime())) return { kind: 'missing', label: 'No time set', due: null };
-
-  const now = new Date();
-  const diff = due - now;
-
-  if (diff < -60000) return { kind: 'overdue', label: `Overdue ${spanText(diff)}`, due };
-  if (diff <= 5 * 60000) return { kind: 'due-now', label: 'Due now', due };
-  if (diff <= 60 * 60000) return { kind: 'due-now', label: `In ${spanText(diff)}`, due };
-
-  const today = boardDay(now);
-  const tomorrow = boardDay(new Date(now.getTime() + 86400000));
-  const day = boardDay(due);
-  if (day === today) return { kind: 'due-today', label: `Today ${boardClock(due)}`, due };
-  if (day === tomorrow) return { kind: 'scheduled', label: `Tomorrow ${boardClock(due)}`, due };
-
-  const date = new Intl.DateTimeFormat('en-IN', {
-    timeZone: BOARD_TZ, day: 'numeric', month: 'short',
-  }).format(due);
-  return { kind: 'scheduled', label: `${date} ${boardClock(due)}`, due };
-}
-
-const isOverdue = (c) => callbackState(c)?.kind === 'overdue';
-
-/** <input type="datetime-local"> needs local wall-clock, not an ISO UTC string. */
+/** <input type="datetime-local"> wants local wall-clock, not an ISO UTC string. */
 function toLocalInput(iso) {
   if (!iso) return '';
   const d = new Date(iso);
@@ -278,169 +156,467 @@ function toLocalInput(iso) {
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
 }
 
-const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => (
-  { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]
-));
-
-// ---------- data ----------
-
-function showError(msg) {
-  errorEl.textContent = msg;
-  errorEl.hidden = false;
-}
-function clearError() {
-  errorEl.hidden = true;
+/** Who, and exactly when — attribution without asking anyone to type it. */
+function savedLabel(cart) {
+  if (!cart?.status_updated_at) return '';
+  return `${cart.updated_by ? `${esc(cart.updated_by)} · ` : ''}${esc(dateTime(cart.status_updated_at))}`;
 }
 
-/**
- * The free Render instance sleeps after 15 minutes and takes up to a minute to
- * wake, so the first request after a quiet spell can fail outright at the
- * network level ("Failed to fetch"). Retry a couple of times before giving up,
- * and say what's happening rather than showing a bare error.
- */
-/**
- * Filters can arrive in the URL so other pages can link to a filtered board —
- * "which ones?" from the dashboard lands here already narrowed.
- *
- * Applied from inside loadAll rather than at module top level: this is the code
- * path that definitely runs before the first render, and it cannot race the
- * DOM being ready.
- */
-let urlFiltersApplied = false;
-function applyUrlFilters() {
-  if (urlFiltersApplied) return;
-  urlFiltersApplied = true;
+/* ------------------------------------------------------------------ alerts */
 
-  const p = new URLSearchParams(window.location.search);
-  if (p.has('days')) {
-    state.days = Number(p.get('days'));
-    $('#rangeGroup')?.querySelectorAll('button').forEach((b) =>
-      b.classList.toggle('active', Number(b.dataset.days) === state.days));
+const alertsEl = $('#alerts');
+let errorText = '';
+function showError(msg) { errorText = msg; renderAlerts(); }
+function clearError() { if (errorText) { errorText = ''; renderAlerts(); } }
+
+/** The error, the mock banner, and the stale alarm — which no filter can hide. */
+function renderAlerts() {
+  const parts = [];
+  if (errorText) parts.push(`<div class="alert" role="alert">${icon('triangle-alert')}<p>${esc(errorText)}</p></div>`);
+  if (state.mock) {
+    parts.push(`<div class="alert warn">${icon('info')}<p><b>Mock mode.</b> No database is configured, so this is sample data held in memory and lost on restart.</p></div>`);
   }
-  if (p.has('q')) { state.query = p.get('q'); if ($('#search')) $('#search').value = state.query; }
+  const stale = Number(state.stale?.count ?? 0);
+  if (stale) {
+    parts.push(`<div class="alert warn">${icon('clock')}<p>${count(stale)} cart${stale === 1 ? '' : 's'} still not called after ${SLA_HOURS}h`
+      + `${state.stale?.value ? ` (${esc(money(state.stale.value))})` : ''}.</p>`
+      + '<button type="button" class="alert-link" data-goto="attention">Show them</button></div>');
+  }
+  alertsEl.innerHTML = parts.join('');
+  renderIcons();
+}
 
-  // Old links carried status/mine/overdue params. Map the ones that have an
-  // obvious home so a bookmark still lands somewhere sensible, rather than
-  // silently ignoring them and showing an unexpected list.
+/* ------------------------------------------------------------------ URL */
+
+const time = (iso) => (iso ? new Date(iso).getTime() : null);
+const SORTS = {
+  value:    { dir: -1, val: (c) => Number(c.total_price || 0) },
+  recent:   { dir: -1, val: (c) => time(c.received_at) },
+  // Ascending by callback time gives overdue, then due now, then upcoming.
+  // Carts with no time set go to the bottom: a promise already broken outranks
+  // a data-entry gap. Non-callbacks after those.
+  callback: { dir: 1, val: (c) => (st(c) !== 'Callback scheduled' ? Number.MAX_VALUE : c.callback_at ? time(c.callback_at) : Number.MAX_SAFE_INTEGER) },
+  customer: { dir: 1, val: (c) => String(c.customer_name || '').toLowerCase() },
+  status:   { dir: 1, val: (c) => STATUSES.indexOf(st(c)) },
+  owner:    { dir: 1, val: (c) => (c.assigned_to_name ? c.assigned_to_name.toLowerCase() : null) },
+  updated:  { dir: -1, val: (c) => time(c.status_updated_at) },
+  risk:     { dir: -1, val: (c) => RISK_ORDER[String(c.risk_flag || '').toLowerCase()] ?? -1 },
+};
+
+let urlApplied = false;
+/**
+ * Other pages link here already narrowed (?mode=, ?q=, ?days=). Old bookmarks
+ * carried status/mine/overdue — mapped to the nearest view so they still land
+ * somewhere sensible.
+ */
+function applyUrl() {
+  if (urlApplied) return;
+  urlApplied = true;
+  const p = new URLSearchParams(window.location.search);
+  if (p.has('days')) { state.days = Number(p.get('days')); $('#range').value = String(state.days); }
+  if (p.has('q')) { state.query = p.get('q'); $('#search').value = state.query; }
   const legacy = p.get('status') === 'Not called' ? 'tocall'
     : p.get('status') === 'Callback scheduled' || p.get('overdue') === '1' ? 'callbacks'
     : p.get('mine') === '1' ? 'mine'
-    : p.has('status') ? 'all'
-    : null;
-  if (p.has('mode') && MODES[p.get('mode')]) state.mode = p.get('mode');
-  else if (legacy) state.mode = legacy;
-
-  state.sort = MODES[state.mode].sort;
-  if ($('#sort')) $('#sort').value = state.sort;
+    : p.has('status') ? 'all' : null;
+  if (p.has('mode') && VIEWS[p.get('mode')]) state.view = p.get('mode');
+  else if (legacy) state.view = legacy;
+  state.sort = VIEWS[state.view].sort;
+  state.dir = SORTS[state.sort].dir;
 }
 
+/* ------------------------------------------------------------------ load */
+
 async function loadAll(attempt = 1) {
-  applyUrlFilters();
+  applyUrl();
   const MAX_ATTEMPTS = 3;
+  $('#refresh').classList.add('spin');
   try {
-    // The date range is now applied server-side, so the array stays small and
-    // every other filter and sort can stay client-side over it.
-    const params = state.query
-      ? `q=${encodeURIComponent(state.query)}`
-      : `days=${state.days}`;
-    const [cfgRes, cartsRes] = await Promise.all([
-      fetch('/api/config'), fetch(`/api/carts?${params}`),
-    ]);
-    if ([cfgRes, cartsRes].some((r) => r.status === 401)) {
-      window.location.href = '/login';
-      return;
-    }
+    // The range is applied server-side; search deliberately ignores it.
+    const params = state.query ? `q=${encodeURIComponent(state.query)}` : `days=${state.days}`;
+    const [cfgRes, cartsRes] = await Promise.all([fetch('/api/config'), fetch(`/api/carts?${params}`)]);
+    if ([cfgRes, cartsRes].some((r) => r.status === 401)) { window.location.href = '/login'; return; }
     const cfg = await cfgRes.json();
     const carts = await cartsRes.json();
     if (Array.isArray(cfg.reasonTags)) REASON_TAGS = cfg.reasonTags;
     if (cfg.slaHours) SLA_HOURS = cfg.slaHours;
-    if (cfg.boardTimezone) BOARD_TZ = cfg.boardTimezone;
+    if (cfg.boardTimezone) setTimezone(cfg.boardTimezone);
     if (Array.isArray(cfg.team)) TEAM = cfg.team;
     ME = cfg.me ?? ME;
-
-    if (cfg.mock) $('#mockBanner').hidden = false;
+    state.mock = Boolean(cfg.mock);
     if (!carts.ok) throw new Error(carts.error || 'Could not load carts');
 
     state.carts = carts.carts;
+    state.loadedFor = state.query;
     state.stale = carts.stale || null;
     state.total = carts.total ?? carts.carts.length;
     state.callbackTotal = carts.callbackTotal ?? null;
     state.truncated = Boolean(carts.truncated);
-    renderResultNote();
-    syncExportLink();
+    state.done.clear();
 
-    clearError();
+    errorText = '';
+    syncFilterOptions();
     render();
-    renderInsights();   // range may have changed; this is the only place it can
+    renderInsights();   // the range may have changed; this is the only place it can
   } catch (err) {
-    // A TypeError from fetch means the request never completed — server asleep,
-    // restarting, or the network dropped. An HTTP error would not land here.
+    // A TypeError from fetch means the request never completed — the free
+    // instance asleep or restarting. An HTTP error would not land here.
     const networkLevel = err instanceof TypeError;
     if (networkLevel && attempt < MAX_ATTEMPTS) {
       showError(`Server isn't responding — it may be waking up. Retrying (${attempt}/${MAX_ATTEMPTS - 1})…`);
-      queueEl.innerHTML = skeletonCards(3);
+      skeleton();
       await new Promise((r) => setTimeout(r, attempt * 4000));
       return loadAll(attempt + 1);
     }
     showError(networkLevel
       ? "Couldn't reach the server after several tries — it may still be starting up. Press Refresh in a moment."
       : `Could not load the board: ${err.message}`);
-    queueEl.innerHTML = '<div class="empty-state"><h3>Failed to load</h3></div>';
+    $('#rows').innerHTML = '<tr><td colspan="11"><div class="empty-note"><b>Failed to load</b></div></td></tr>';
+    $('#clist').innerHTML = '';
+  } finally {
+    $('#refresh').classList.remove('spin');
   }
+}
+
+function skeleton() {
+  const cell = (w) => `<td><span class="sk ${w}"></span></td>`;
+  $('#rows').innerHTML = Array.from({ length: 8 }, () => `<tr>${cell('')}${cell('w70')}${cell('w70')}${cell('w50')}${cell('w50')}${cell('w50')}${cell('w50')}${cell('w50')}${cell('w50')}${cell('w30')}${cell('')}</tr>`).join('');
+  $('#clist').innerHTML = Array.from({ length: 4 }, () => '<li class="citem"><span class="sk w50"></span><span class="sk w70" style="margin-top:10px"></span><span class="sk w90" style="margin-top:10px"></span></li>').join('');
+}
+
+/* ------------------------------------------------------------------ sort + filter */
+
+function compare(a, b) {
+  const s = SORTS[state.sort];
+  const x = s.val(a);
+  const y = s.val(b);
+  // Empty values sort last whichever way the column is ordered.
+  if (x === null && y === null) return 0;
+  if (x === null) return 1;
+  if (y === null) return -1;
+  const d = (x < y ? -1 : x > y ? 1 : 0) * state.dir;
+  // Within the same risk band, bigger carts first — that is the call order.
+  if (d === 0 && state.sort === 'risk') return Number(b.total_price || 0) - Number(a.total_price || 0);
+  return d;
+}
+
+function passesFilters(c) {
+  const { status, owner, follow, reason, value } = state.f;
+  if (status && statusOf(c.status).label !== status) return false;
+  if (owner === '__none' ? c.assigned_to : owner && c.assigned_to !== owner) return false;
+  if (follow && callbackKind(c) !== follow) return false;
+  const tags = c.reason_tags || [];
+  if (reason === '__none' ? tags.length : reason && !tags.includes(reason)) return false;
+  if (value) {
+    const [lo, hi] = value.split('-').map((v) => (v === '' ? null : Number(v)));
+    const v = Number(c.total_price || 0);
+    if (v < lo || (hi !== null && v >= hi)) return false;
+  }
+  return true;
 }
 
 /**
- * Ask for the callback time, next to the field that needs it.
- *
- * The alternative — a banner at the top of a long queue — makes the caller hunt
- * for which card it meant. Returns nothing; it is pure UI.
+ * What is on screen, in order. A search is already the filter — narrowing it by
+ * view as well would hide the customer who just rang back, the only reason to
+ * search — so the view is bypassed; the column filters still apply.
  */
-function flagCallbackNeeded(id, message) {
-  const card = document.querySelector(`[data-row="${CSS.escape(id)}"]`);
-  const input = card?.querySelector('.js-callback');
-  if (!input) return;
-  input.hidden = false;
-  input.classList.add('needed');
-  let hint = card.querySelector('.cb-hint');
-  if (!hint) {
-    hint = document.createElement('div');
-    hint.className = 'cb-hint';
-    input.insertAdjacentElement('afterend', hint);
-  }
-  hint.textContent = message || 'Pick the date and time you promised to call back.';
-  input.focus();
+function visibleCarts() {
+  const base = state.query
+    ? state.carts.slice()
+    : state.carts.filter((c) => VIEWS[state.view].match(c) || state.done.has(String(c.id)));
+  return base.filter(passesFilters).sort(compare);
 }
 
-/** Save one row. Never re-renders the row being edited, so in-progress text survives. */
-async function saveRow(id, patch, noteEl) {
-  const cell = document.querySelector(`[data-row="${CSS.escape(id)}"] .saved`);
-  if (cell) { cell.textContent = 'Saving…'; cell.className = 'saved pending'; }
+function syncFilterOptions() {
+  const keep = (sel, html) => { const el = $(sel); const v = el.value; el.innerHTML = html; el.value = v; };
+  keep('#fstatus', '<option value="">Status</option>' + STATUS_LABELS.map((s) => `<option>${esc(s)}</option>`).join(''));
+  keep('#fowner', '<option value="">Owner</option>'
+    + TEAM.map((t) => `<option value="${esc(t.phone)}">${esc(t.name)}${t.phone === ME ? ' (me)' : ''}</option>`).join('')
+    + '<option value="__none">Unassigned</option>');
+  const tags = [...new Set([...REASON_TAGS, ...state.carts.flatMap((c) => c.reason_tags || [])])];
+  keep('#freason', '<option value="">Reason</option>' + tags.map((t) => `<option>${esc(t)}</option>`).join('')
+    + '<option value="__none">None recorded</option>');
+}
 
+/* ------------------------------------------------------------------ render */
+
+function render() {
+  renderTabs();
+  renderSummary();
+  renderMeta();
+  renderRows();
+  renderSortMarks();
+  syncRange();
+  syncExport();
+  renderAlerts();
+  syncSidebar();
+}
+
+function renderTabs() {
+  $('#viewTabs').innerHTML = Object.entries(VIEWS).map(([key, v]) => {
+    const n = state.carts.filter(v.match).length;
+    const tone = key === 'attention' && n ? ' is-alert' : '';
+    return `<button type="button" role="tab" class="tab${key === state.view ? ' active' : ''}" data-view="${key}" aria-selected="${key === state.view}">`
+      + `${esc(v.label)}<span class="tab-count${tone}">${count(n)}</span></button>`;
+  }).join('');
+  $('#viewTabs').classList.toggle('searching', Boolean(state.query));
+  $('#crumbView').textContent = state.query ? 'Search' : VIEWS[state.view].label;
+}
+
+function renderSummary() {
+  const value = state.carts.reduce((sum, c) => sum + Number(c.total_price || 0), 0);
+  $('#rangeSummary').textContent = state.query
+    ? `Searching all history for “${state.query}”`
+    : `${count(state.total)} cart${state.total === 1 ? '' : 's'} · ${money(value)} in play`;
+}
+
+const RANGE_LABEL = { 1: 'today', 3: 'the last 3 days', 7: 'the last 7 days', 0: 'all time' };
+
+/** Always says what is on screen versus what exists. */
+function renderMeta() {
+  const shown = visibleCarts().length;
+  const filtered = Object.values(state.f).some(Boolean);
+  const el = $('#resultNote');
+  $('#fclear').hidden = !filtered;
+  for (const [id, key] of [['#fstatus', 'status'], ['#fowner', 'owner'], ['#ffollow', 'follow'], ['#freason', 'reason'], ['#fvalue', 'value']]) {
+    $(id).classList.toggle('on', Boolean(state.f[key]));
+  }
+
+  if (state.query) {
+    el.textContent = `${count(shown)} result${shown === 1 ? '' : 's'} for “${state.query}” across all history`
+      + (filtered ? ', filtered' : '') + (state.truncated ? ' — showing the first 50; narrow the search.' : '.');
+    return;
+  }
+  if (state.view === 'callbacks') {
+    const cbs = state.carts.filter(VIEWS.callbacks.match);
+    const n = (k) => cbs.filter((c) => callbackKind(c) === k).length;
+    const parts = [n('overdue') && `${n('overdue')} overdue`, n('today') && `${n('today')} due today`,
+      n('upcoming') && `${n('upcoming')} upcoming`, n('missing') && `${n('missing')} with no time set`].filter(Boolean);
+    el.textContent = `${cbs.length} callback${cbs.length === 1 ? '' : 's'}, all time${parts.length ? ` — ${parts.join(' · ')}` : ''}. The date range does not apply here.`;
+    return;
+  }
+  const label = RANGE_LABEL[state.days] ?? `the last ${state.days} days`;
+  el.textContent = state.truncated
+    ? `Showing ${count(state.carts.length)} of ${count(state.total)} carts from ${label} — narrow the range to see the rest.`
+    : `${count(shown)} in ${VIEWS[state.view].label.toLowerCase()}${filtered ? ' (filtered)' : ''}, of ${count(state.total)} cart${state.total === 1 ? '' : 's'} from ${label}.`;
+}
+
+const flagIcon = (a) => `<span class="flag ${a.kind}" title="${esc(a.text)}">${icon(a.kind === 'bad' ? 'alarm-clock' : 'circle-alert')}</span>`;
+const tagsHtml = (c) => (c.brand_order_count > 0 ? `<span class="mini-tag" title="Has ordered ${c.brand_order_count} time(s) before">Repeat</span>` : '')
+  + (isHighRisk(c) ? `<span class="mini-tag warn" title="${esc(c.risk_flag)} of return-to-origin">High RTO</span>` : '');
+
+function rowHtml(c) {
+  const a = attentionOf(c);
+  const items = itemsOf(c);
+  const first = items[0] ? splitPack(items[0].title) : null;
+  const units = items.reduce((n, i) => n + (i.quantity || 1), 0);
+  const tel = telLink(c);
+  const wa = waLink(c);
+  const cls = ['brow', a && `attn attn-${a.kind}`, ME && c.assigned_to === ME && 'mine',
+    state.done.has(String(c.id)) && 'done', state.openId === String(c.id) && 'open'].filter(Boolean).join(' ');
+  const tags = c.reason_tags || [];
+
+  return `<tr class="${cls}" data-id="${esc(c.id)}" data-mine="${ME && c.assigned_to === ME ? 'true' : 'false'}" tabindex="0">
+    <td class="col-flag">${a ? flagIcon(a) : ''}</td>
+    <td>
+      <div class="cell-main">${esc(c.customer_name || 'Guest')}${tagsHtml(c)}</div>
+      <div class="cell-sub num">${esc(c.phone || 'No phone number')}</div>
+    </td>
+    <td class="col-items">${first
+      ? `<div class="cell-item" title="${esc(items.map((i) => `${i.title} ×${i.quantity || 1}`).join('\n'))}">${esc(first.name)}${items[0].quantity > 1 ? ` <span class="soft">×${items[0].quantity}</span>` : ''}</div>`
+        + `<div class="cell-sub">${items.length > 1 ? `+${items.length - 1} more · ` : ''}${units} unit${units === 1 ? '' : 's'}${first.pack ? ` · ${esc(first.pack)}` : ''}</div>`
+      : `<span class="muted">${c.item_count ? `${c.item_count} items` : '—'}</span>`}</td>
+    <td class="r"><div class="cell-main num">${money(c.total_price)}</div>${c.discount_total ? `<div class="cell-sub num">${money(c.discount_total)} off</div>` : ''}</td>
+    <td><button type="button" class="status-btn" data-act="status" aria-haspopup="menu" title="Change outcome">${statusIndicator(c.status)}${icon('chevron-down', 'caret')}</button></td>
+    <td>${c.assigned_to_name
+      ? `<span class="owner">${esc(c.assigned_to_name)}</span>`
+      : `<span class="muted unassigned">Unassigned</span>${ME ? '<button type="button" class="take" data-act="take" title="Assign this cart to me">Take</button>' : ''}`}</td>
+    <td class="col-last">${c.status_updated_at
+      ? `<div class="cell-text">${esc(c.updated_by || '—')}</div><div class="cell-sub" title="${esc(dateTime(c.status_updated_at))}">${esc(relative(c.status_updated_at))}</div>`
+      : '<span class="muted">—</span>'}</td>
+    <td>${followUp(c)}</td>
+    <td class="col-reason">${tags.length
+      ? `<span class="cell-text" title="${esc(tags.join(', '))}">${esc(tags.join(', '))}</span>`
+      : c.drop_stage ? `<span class="muted cell-text" title="No reason recorded yet. GoKwik says they dropped off at the ${esc(c.drop_stage)}.">${esc(c.drop_stage)}</span>` : '<span class="muted">—</span>'}</td>
+    <td class="r num soft" title="${esc(dateTime(c.received_at))}">${esc(ageShort(c.received_at))}</td>
+    <td><div class="row-actions">
+      ${tel ? `<a class="icon-btn bare" href="${esc(tel)}" title="Call ${esc(c.phone)}" aria-label="Call">${icon('phone')}</a>` : `<span class="icon-btn bare off" title="No phone number">${icon('phone-off')}</span>`}
+      ${wa ? `<a class="icon-btn bare" href="${esc(wa)}" target="_blank" rel="noopener" title="WhatsApp with a ready opener" aria-label="WhatsApp">${icon('message-circle')}</a>` : ''}
+      <button type="button" class="icon-btn bare" data-act="open" title="Open cart" aria-label="Open cart">${icon('panel-right-open')}</button>
+    </div></td>
+  </tr>`;
+}
+
+function cardHtml(c) {
+  const a = attentionOf(c);
+  const items = itemsOf(c);
+  const first = items[0] ? splitPack(items[0].title) : null;
+  const tel = telLink(c);
+  const wa = waLink(c);
+  const cls = ['citem', a && `attn attn-${a.kind}`, ME && c.assigned_to === ME && 'mine',
+    state.done.has(String(c.id)) && 'done'].filter(Boolean).join(' ');
+  return `<li class="${cls}" data-id="${esc(c.id)}" tabindex="0">
+    <div class="ci-top">
+      <span class="ci-val num">${money(c.total_price)}</span>
+      <span class="ci-age num" title="${esc(dateTime(c.received_at))}">${esc(ageShort(c.received_at))} ago</span>
+      ${a ? flagIcon(a) : ''}
+      <button type="button" class="status-btn" data-act="status" aria-haspopup="menu">${statusIndicator(c.status)}${icon('chevron-down', 'caret')}</button>
+    </div>
+    <div class="ci-name">${esc(c.customer_name || 'Guest')}${tagsHtml(c)}</div>
+    ${first ? `<div class="ci-items">${esc(first.name)}${items[0].quantity > 1 ? ` ×${items[0].quantity}` : ''}${items.length > 1 ? ` <span class="muted">+${items.length - 1} more</span>` : ''}</div>` : ''}
+    ${st(c) === 'Callback scheduled' ? `<div class="ci-follow">${icon('calendar-clock')}${followUp(c)}</div>` : ''}
+    ${a ? `<div class="ci-attn ${a.kind}">${esc(a.text)}</div>` : ''}
+    <div class="ci-actions">
+      ${tel ? `<a class="btn primary" href="${esc(tel)}">${icon('phone')}Call</a>` : '<span class="btn off">No phone</span>'}
+      ${wa ? `<a class="btn" href="${esc(wa)}" target="_blank" rel="noopener">${icon('message-circle')}WhatsApp</a>` : ''}
+      <button type="button" class="btn" data-act="open">Open</button>
+    </div>
+  </li>`;
+}
+
+function renderRows() {
+  const list = visibleCarts();
+  if (!list.length) {
+    const filtered = Object.values(state.f).some(Boolean);
+    const [title, hint] = state.query
+      ? ['Nothing matches that search.', 'Try a phone number, or part of a name or email.']
+      : filtered ? ['No carts match these filters.', 'Try adjusting the filters or the date range.']
+      : state.view === 'tocall' ? ['Nothing left to call.', 'Every cart in this range has been worked. Check Callbacks next.']
+      : state.view === 'attention' ? ['Nothing needs attention.', 'No overdue callbacks and nothing past the call target.']
+      : [`Nothing in ${VIEWS[state.view].label.toLowerCase()}.`, 'Switch view, or widen the date range.'];
+    const empty = `<div class="empty-note"><b>${esc(title)}</b>${esc(hint)}${filtered ? ' <button type="button" class="linkish" data-clear>Clear filters</button>' : ''}</div>`;
+    $('#rows').innerHTML = `<tr><td colspan="11">${empty}</td></tr>`;
+    $('#clist').innerHTML = `<li class="citem empty">${empty}</li>`;
+    return;
+  }
+  $('#rows').innerHTML = list.map(rowHtml).join('');
+  $('#clist').innerHTML = list.map(cardHtml).join('');
+  renderIcons();
+}
+
+/** Update one cart in place after a save — the rest of the list is untouched. */
+function rerenderCart(id) {
+  const c = cartById(id);
+  if (!c) return;
+  const tr = $(`#rows tr[data-id="${CSS.escape(String(id))}"]`);
+  if (tr) tr.outerHTML = rowHtml(c);
+  const li = $(`#clist li[data-id="${CSS.escape(String(id))}"]`);
+  if (li) li.outerHTML = cardHtml(c);
+  renderIcons();
+}
+
+function renderSortMarks() {
+  $$('#cartTable th.sortable').forEach((th) => {
+    const on = th.dataset.sort === state.sort;
+    th.querySelector('.sort').textContent = on ? (state.dir > 0 ? '↑' : '↓') : '↕';
+    th.classList.toggle('sorted', on);
+  });
+  $('#sort').value = ['value', 'risk', 'recent', 'callback'].includes(state.sort) ? state.sort : '';
+}
+
+/**
+ * The date range is a browsing control. Callbacks outlive it, so inside that
+ * view it is visibly off rather than live-looking and silently ignored.
+ */
+function syncRange() {
+  const off = state.view === 'callbacks' && !state.query;
+  $('#range').disabled = off;
+  $('#rangePick').classList.toggle('disabled', off);
+  $('#rangePick').title = off ? 'Callbacks are shown whatever the date range' : '';
+}
+
+function syncExport() {
+  $('#exportCsv').href = state.query
+    ? `/api/carts.csv?q=${encodeURIComponent(state.query)}`
+    : `/api/carts.csv?days=${state.days}`;
+}
+
+function syncSidebar() {
+  setNavCount('countToCall', state.carts.filter(VIEWS.tocall.match).length);
+  const overdue = state.carts.some((c) => callbackKind(c) === 'overdue');
+  setNavCount('countCallbacks', state.callbackTotal ?? state.carts.filter(VIEWS.callbacks.match).length, { alert: overdue });
+  $$('[data-view-link]').forEach((a) => {
+    const v = a.dataset.viewLink;
+    a.classList.toggle('active', v === 'board' || (!state.query && v === state.view));
+  });
+}
+
+/* ------------------------------------------------------------------ insights */
+
+let byCallerForbidden = false;
+let insightsTimer = null;
+/** The panels are secondary; after a save a trailing refresh is plenty. */
+function scheduleInsights() { clearTimeout(insightsTimer); insightsTimer = setTimeout(renderInsights, 3000); }
+
+async function renderInsights() {
+  try {
+    const [rRes, cRes] = await Promise.all([
+      fetch(`/api/reasons/summary?days=${state.days}`),
+      // By-caller is admin-only; a caller gets 403 by design, so do not keep asking.
+      byCallerForbidden ? Promise.resolve(null) : fetch(`/api/stats/by-caller?days=${state.days}`),
+    ]);
+    if (cRes?.status === 403) byCallerForbidden = true;
+    if (cRes?.ok) {
+      const d = await cRes.json();
+      $('#callerRows').innerHTML = d.callers.length
+        ? d.callers.map((c) => `<tr>
+            <td><span style="display:inline-flex;align-items:center;gap:8px"><span class="avatar" style="width:24px;height:24px;font-size:10px">${esc(initials(c.caller))}</span>${esc(c.caller)}</span></td>
+            <td class="r num">${count(c.touched)}</td><td class="r num">${count(c.recovered)}</td>
+            <td class="r num">${c.recovery_rate}%</td><td class="r num">${money(c.recovered_value)}</td></tr>`).join('')
+        : '<tr><td colspan="5"><div class="empty-note">Nobody has worked a cart in this range yet.</div></td></tr>';
+    } else if (byCallerForbidden) {
+      $('#callerPanel').hidden = true;   // not an error: this panel simply is not theirs
+    }
+    if (!rRes.ok) return;
+    const r = await rRes.json();
+    $('#reasonList').innerHTML = r.reasons.length
+      ? hbars(r.reasons.map((x) => ({ label: x.tag, n: x.count })))
+      : '<div class="empty-note"><b>No reasons recorded yet</b>Add them from a cart as you call.</div>';
+    $('#reasonMeta').textContent = r.taggedCarts ? `${r.taggedCarts} tagged` : '';
+  } catch { /* secondary — never let them break the call list */ }
+}
+
+/* ------------------------------------------------------------------ save */
+
+function setSaved(id, html, tone = '') {
+  if (state.openId !== String(id)) return;
+  const el = $('#dSaved');
+  el.innerHTML = html;
+  el.className = `saved ${tone}`;
+}
+
+/**
+ * Save one change. The payloads are exactly the ones the board has always sent,
+ * including `seenAt`, so the server's conflict guard still stops one caller's
+ * notes silently replacing another's.
+ */
+async function saveRow(id, patch) {
+  id = String(id);
+  setSaved(id, 'Saving…', 'pending');
   try {
     const res = await fetch('/api/status', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      // Sent so the server can tell if someone else saved since we last read.
       body: JSON.stringify({ id, seenAt: cartById(id)?.status_updated_at ?? null, ...patch }),
     });
     const data = await res.json();
 
     if (res.status === 409 && data.conflict) {
       showError(`${data.error} Your text is still here — reload to see theirs, or save again to overwrite.`);
-      if (cell) { cell.textContent = 'Not saved — conflict'; cell.className = 'saved failed'; }
+      setSaved(id, 'Not saved — conflict', 'failed');
       // Adopt their timestamp so a deliberate second save goes through.
       const cart = cartById(id);
       if (cart && data.current) cart.status_updated_at = data.current.status_updated_at;
-      return;
+      return false;
     }
     if (data.needsCallbackTime) {
-      flagCallbackNeeded(id, data.error);
-      if (cell) { cell.textContent = 'Not saved'; cell.className = 'saved failed'; }
-      return;
+      if (state.openId !== id) openDrawer(id);
+      flagCallbackNeeded(data.error);
+      setSaved(id, 'Not saved', 'failed');
+      return false;
     }
     if (!res.ok || !data.ok) throw new Error(data.error || `HTTP ${res.status}`);
 
-    // Update the row in place; never re-render it, so an in-progress edit survives.
     const cart = cartById(id);
     if (cart) {
       cart.status = data.entry.status;
@@ -453,640 +629,531 @@ async function saveRow(id, patch, noteEl) {
         cart.assigned_to = data.entry.assigned_to;
         cart.assigned_to_name = data.entry.assigned_to_name;
       }
+      // The row stays put rather than vanishing — losing it under your cursor
+      // is worse than seeing it a moment longer — but dims once it has left the view.
+      if (!state.query && !VIEWS[state.view].match(cart)) state.done.add(id);
+      else state.done.delete(id);
     }
     clearError();
-    if (cell) { cell.innerHTML = savedLabel(cart || data.entry); cell.className = 'saved'; }
-
-    // Chips and the callback badge reflect the just-saved values without a
-    // full re-render, which would discard any in-progress edit on other rows.
-    const tr = document.querySelector(`[data-row="${CSS.escape(id)}"]`);
-    if (tr && cart) {
-      const chips = tr.querySelector('.chips');
-      if (chips) {
-        chips.innerHTML = (cart.reason_tags || []).map((t) => `<span class="chip">${esc(t)}</span>`).join('');
-      }
-      // Name the reason rather than saying a reason exists — the whole point of
-      // a collapsed section is that you can read it without opening it.
-      const summary = tr.querySelector('.tagpick summary');
-      if (summary) {
-        summary.textContent = (cart.reason_tags || []).length
-          ? `Reason: ${(cart.reason_tags || []).join(', ')}`
-          : 'Why did they not buy?';
-      }
-
-      // Owner cell: keep the select, the "mine" marker and the Take it button
-      // in step without a full re-render, which would discard other rows' edits.
-      const assignSel = tr.querySelector('.js-assign');
-      if (assignSel) assignSel.value = cart.assigned_to || '';
-      tr.dataset.mine = String(cart.assigned_to === ME);
-      const takeIt = tr.querySelector('.js-takeit');
-      if (cart.assigned_to && takeIt) takeIt.remove();
-      if (!cart.assigned_to && !takeIt && ME && assignSel) {
-        assignSel.insertAdjacentHTML('afterend',
-          `<button type="button" class="linky js-takeit" data-id="${esc(cart.id)}">Take it</button>`);
-      }
-    }
-    if (tr) {
-      tr.dataset.status = data.entry.status;
-      // The card stays put rather than vanishing mid-edit — losing the row
-      // under your cursor is worse than seeing it a moment longer — but it
-      // dims once it no longer belongs in the queue you are working.
-      tr.classList.toggle('cc-done', !MODES[state.mode].match(cartById(id) || {}));
-    }
-    // Counts move with every save, so they cannot be left to the next reload.
-    renderModes();
+    setSaved(id, savedLabel(cart || data.entry));
+    rerenderCart(id);
+    if (state.openId === id) refreshDrawer();
+    // Counts move with every save, so they cannot wait for the next reload.
+    renderTabs();
     renderSummary();
+    renderMeta();
+    syncSidebar();
     scheduleInsights();
+    return true;
   } catch (err) {
-    // Keep the user's edit on screen; just tell them it isn't saved.
     showError(`Couldn't save that change: ${err.message} — your edit is still here, try again.`);
-    if (cell) { cell.textContent = 'Not saved'; cell.className = 'saved failed'; }
-    if (noteEl) noteEl.focus();
+    setSaved(id, 'Not saved', 'failed');
+    return false;
   }
-}
-
-// ---------- rendering ----------
-
-function visibleCarts() {
-  // No date filter here on purpose. The server already applied the range in
-  // listCarts, using a calendar-day boundary; this used to re-apply a *rolling*
-  // days*24h cutoff over the same rows, so "Today" hid rows the server had sent
-  // and the board disagreed with the dashboard. Worse, searchCarts deliberately
-  // ignores the range — "that customer from three weeks ago just rang back" —
-  // and this line threw those hits away before they could ever be shown.
-  // A search is already the filter — narrowing it by queue mode as well would
-  // hide the customer who just rang back, which is the only reason to search.
-  const list = state.query
-    ? state.carts.slice()
-    : state.carts.filter(MODES[state.mode].match);
-
-  return list.sort((a, b) => {
-    if (state.sort === 'value') return (b.total_price ?? 0) - (a.total_price ?? 0);
-    if (state.sort === 'callback') {
-      // Ascending by callback time, which naturally gives overdue first, then
-      // due now, then upcoming.
-      //
-      // Carts whose time was never set sort to the *bottom*, not the top. They
-      // need fixing, but a promise already broken outranks a data-entry gap —
-      // putting eleven of them above a genuinely overdue call buries the work.
-      const due = (c) => {
-        if (c.status !== 'Callback scheduled') return Infinity;
-        if (!c.callback_at) return Number.MAX_SAFE_INTEGER;
-        return new Date(c.callback_at).getTime();
-      };
-      return due(a) - due(b);
-    }
-    if (state.sort === 'risk') {
-      const rank = (c) => RISK_ORDER[String(c.risk_flag || '').toLowerCase()] ?? -1;
-      // Within the same risk band, bigger carts first — that's the call order.
-      return (rank(b) - rank(a)) || ((b.total_price ?? 0) - (a.total_price ?? 0));
-    }
-    return new Date(b.received_at) - new Date(a.received_at);
-  });
-}
-
-/** Counts live on the mode buttons, so the filter and the number are one control. */
-function renderModes() {
-  for (const btn of $('#modeGroup').querySelectorAll('button')) {
-    const mode = btn.dataset.mode;
-    const n = state.carts.filter(MODES[mode].match).length;
-    btn.textContent = `${MODES[mode].label} ${n}`;
-    btn.classList.toggle('active', mode === state.mode);
-  }
-}
-
-/** The money line, and the one alarm worth interrupting a caller for. */
-function renderSummary() {
-  const inRange = state.total ?? state.carts.length;
-  const value = state.carts.reduce((sum, c) => sum + (c.total_price ?? 0), 0);
-  const el = $('#rangeSummary');
-  if (el) el.textContent = `${inRange} cart${inRange === 1 ? '' : 's'} · ${money(value, 'INR')} in play`;
-
-  // Stale is a whole-table figure from the server, deliberately not filtered:
-  // it is an alarm, and an alarm you can filter away is not an alarm.
-  const stale = Number(state.stale?.count ?? 0);
-  const banner = $('#staleBanner');
-  if (!banner) return;
-  banner.hidden = stale === 0;
-  banner.className = 'banner error';
-  banner.textContent = stale
-    ? `${stale} cart${stale === 1 ? '' : 's'} still not called after ${SLA_HOURS}h`
-      + `${state.stale?.value ? ` (${money(state.stale.value, 'INR')})` : ''}. They are at the top of "To call".`
-    : '';
-}
-
-/** Who, and exactly when — attribution without asking anyone to type it. */
-function savedLabel(cart) {
-  if (!cart.status_updated_at) return '';
-  const exact = exactTime(cart.status_updated_at);
-  const rel = relativeTime(cart.status_updated_at);
-  const who = cart.updated_by ? `${esc(cart.updated_by)} · ` : '';
-  return `<span title="${esc(rel)}">${who}${esc(exact)}</span>`;
-}
-
-/** Shape-of-the-content placeholder — less jarring than the word "Loading". */
-function skeletonCards(n = 4) {
-  return Array.from({ length: n }, () => `<div class="callcard skeleton">
-    <span class="sk w40"></span><span class="sk w80"></span><span class="sk w60"></span>
-  </div>`).join('');
 }
 
 /**
- * One card per cart, in call order.
- *
- * Three zones, always in the same place: who and why, then the act of calling,
- * then recording what happened. The old table put the outcome form in an eighth
- * column, which meant a caller read a dropdown per row to see where a cart
- * stood instead of scanning down the list.
+ * Changing the outcome. "Callback scheduled" needs a time, so it opens the
+ * cart with the picker waiting rather than attempting a save the server refuses.
  */
-function renderQueue() {
+function changeStatus(id, status) {
+  const cart = cartById(id);
+  if (!cart || st(cart) === status) return;
+  if (status === 'Callback scheduled') {
+    openDrawer(id);
+    showCallback(true);
+    const input = $('#dBody .js-callback');
+    if (!input.value) { flagCallbackNeeded(); return; }
+    saveRow(id, { status, callbackAt: new Date(input.value).toISOString() });
+    return;
+  }
+  const notes = state.openId === String(id) ? ($('#dBody .js-notes')?.value ?? cart.notes ?? '') : (cart.notes ?? '');
+  saveRow(id, { status, notes, callbackAt: null });
+}
+
+/* ------------------------------------------------------------------ status menu */
+
+const menu = $('#statusMenu');
+let menuFor = null;
+
+function openStatusMenu(btn, id) {
+  const cart = cartById(id);
+  menuFor = String(id);
+  menu.innerHTML = STATUSES.map((s) => `<button type="button" role="menuitem" data-status="${esc(s)}" class="${st(cart) === s ? 'on' : ''}" title="${esc(s)}">`
+    + `${statusIndicator(s)}${st(cart) === s ? icon('check', 'tick') : ''}</button>`).join('');
+  menu.hidden = false;
+  const r = btn.getBoundingClientRect();
+  const w = menu.offsetWidth;
+  menu.style.left = `${Math.min(window.innerWidth - w - 8, Math.max(8, r.left)) + window.scrollX}px`;
+  menu.style.top = `${r.bottom + window.scrollY + 4}px`;
+  renderIcons();
+  menu.querySelector('button')?.focus();
+}
+function closeStatusMenu() { menu.hidden = true; menuFor = null; }
+
+menu.addEventListener('click', (e) => {
+  const b = e.target.closest('[data-status]');
+  if (!b || !menuFor) return;
+  const id = menuFor;
+  closeStatusMenu();
+  changeStatus(id, b.dataset.status);
+});
+
+/* ------------------------------------------------------------------ drawer */
+
+const drawer = $('#drawer');
+const SOURCE_NAME = { gokwik: 'GoKwik', shopify: 'Shopify', 'shopify-csv': 'Shopify CSV' };
+
+function openDrawer(id) {
+  id = String(id);
+  const cart = cartById(id);
+  if (!cart) return;
+  const switching = state.openId !== id;
+  state.openId = id;
+  $$('#rows tr.open').forEach((tr) => tr.classList.remove('open'));
+  $(`#rows tr[data-id="${CSS.escape(id)}"]`)?.classList.add('open');
+  if (switching) {
+    renderDrawer(cart);
+    loadEvents(id);
+  }
+  drawer.hidden = false;
+  $('#drawerScrim').hidden = false;
+  syncDrawerNav();
+}
+
+function closeDrawer() {
+  drawer.hidden = true;
+  $('#drawerScrim').hidden = true;
+  $$('#rows tr.open').forEach((tr) => tr.classList.remove('open'));
+  const id = state.openId;
+  state.openId = null;
+  // Focus returns to the row, so keyboard work can carry on from the list.
+  if (id) $(`#rows tr[data-id="${CSS.escape(id)}"]`)?.focus({ preventScroll: true });
+}
+
+function syncDrawerNav() {
   const list = visibleCarts();
-
-  if (!list.length) {
-    const mode = MODES[state.mode].label.toLowerCase();
-    queueEl.innerHTML = `<div class="empty-state">
-      <h3>${state.query ? 'Nothing matches that search'
-        : state.mode === 'tocall' ? 'Nothing left to call'
-        : `Nothing in ${mode}`}</h3>
-      <p>${state.query ? 'Try a phone number, or part of a name or email.'
-        : state.mode === 'tocall' ? 'Every cart in this range has been worked. Check Callbacks next.'
-        : 'Switch queue above, or widen the date range.'}</p>
-    </div>`;
-    return;
-  }
-
-  queueEl.innerHTML = list.map((c) => {
-    const status = c.status || 'Not called';
-    const cb = callbackState(c);
-    const wa = waNumber(c.phone);
-
-    // Call is the job, so it is the only filled button.
-    const links = [];
-    if (c.phone) links.push(`<a class="call" href="tel:${esc(String(c.phone).replace(/\s/g, ''))}">Call</a>`);
-    if (wa) links.push(`<a href="https://wa.me/${wa}?text=${encodeURIComponent(waMessage(c))}" target="_blank" rel="noopener">WhatsApp</a>`);
-    if (c.checkout_url) links.push(`<a href="${esc(c.checkout_url)}" target="_blank" rel="noopener">Cart</a>`);
-    if (!c.phone) links.push('<span class="muted">No phone number</span>');
-
-    // Why this cart, in chips: the three things callers said they use.
-    const chips = [
-      c.risk_flag ? `<span class="tag ${riskClass(c.risk_flag)}" title="${esc(c.risk_flag)} of return-to-origin">${esc(shortRisk(c.risk_flag))} risk</span>` : '',
-      c.drop_stage ? `<span class="tag tag-stage" title="Left at the ${esc(c.drop_stage)}">${esc(c.drop_stage)}</span>` : '',
-      gokwikTouch(c),
-    ].filter(Boolean).join('');
-
-    return `
-      <article class="callcard" data-row="${esc(c.id)}" data-status="${esc(status)}" data-mine="${c.assigned_to === ME}">
-        <div class="cc-who">
-          <div class="cc-top">
-            <span class="cc-value">${money(c.total_price, c.currency)}</span>
-            <span class="cc-name" title="${esc(c.customer_name || 'Guest')}">${esc(c.customer_name || 'Guest')}</span>
-            ${cb ? `<span class="cb cb-${cb.kind}">${esc(cb.label)}</span>` : ''}
-          </div>
-          <div class="cc-meta">
-            ${relativeTime(c.received_at)}
-            ${c.phone ? ` · ${esc(c.phone)}` : ''}
-            ${c.discount_total ? ` · ${money(c.discount_total, c.currency)} off` : ''}
-          </div>
-          <div class="cc-chips">${chips}</div>
-          <div class="cc-items">${itemsCell(c)}</div>
-        </div>
-
-        <div class="cc-act"><div class="links">${links.join('')}</div></div>
-
-        <div class="cc-record">
-          <div class="cc-outcome">
-            <select data-id="${esc(c.id)}" class="js-status" autocomplete="off" aria-label="Outcome">
-              ${STATUSES.map((st) => `<option ${st === status ? 'selected' : ''}>${st}</option>`).join('')}
-            </select>
-            <input type="datetime-local" class="js-callback" data-id="${esc(c.id)}" autocomplete="off"
-                   aria-label="Callback time" value="${toLocalInput(c.callback_at)}"
-                   ${status === 'Callback scheduled' ? '' : 'hidden'} />
-          </div>
-          ${cb?.kind === 'missing' ? '<div class="cb-hint">No time was ever set for this callback — pick one.</div>' : ''}
-          <textarea class="js-notes" data-id="${esc(c.id)}" rows="2" autocomplete="off"
-                    placeholder="What happened on the call…" aria-label="Call notes">${esc(c.notes || '')}</textarea>
-          <details class="tagpick" data-id="${esc(c.id)}">
-            <summary>${(c.reason_tags || []).length
-              ? `Reason: ${esc((c.reason_tags || []).join(', '))}`
-              : 'Why did they not buy?'}</summary>
-            <div class="tagmenu">
-              ${REASON_TAGS.map((t) => `
-                <label class="rtag${(c.reason_tags || []).includes(t) ? ' on' : ''}">
-                  <input type="checkbox" class="js-tag" data-id="${esc(c.id)}" value="${esc(t)}"
-                    ${(c.reason_tags || []).includes(t) ? 'checked' : ''} />${esc(t)}</label>`).join('')}
-            </div>
-          </details>
-          <div class="chips">${(c.reason_tags || []).map((t) => `<span class="chip">${esc(t)}</span>`).join('')}</div>
-          <details class="history" data-id="${esc(c.id)}">
-            <summary>History</summary>
-            <div class="hist"><span class="muted">Loading…</span></div>
-          </details>
-          <div class="cc-foot">
-            <select class="js-assign" data-id="${esc(c.id)}" autocomplete="off" aria-label="Owner">
-              <option value="">Unassigned</option>
-              ${TEAM.map((t) => `<option value="${esc(t.phone)}" ${t.phone === c.assigned_to ? 'selected' : ''}>${esc(t.name)}${t.phone === ME ? ' (me)' : ''}</option>`).join('')}
-            </select>
-            ${!c.assigned_to && ME ? `<button type="button" class="linky js-takeit" data-id="${esc(c.id)}">Take it</button>` : ''}
-            <span class="saved">${savedLabel(c)}</span>
-          </div>
-        </div>
-      </article>`;
-  }).join('');
-
-  // Browsers restore form-control values across reloads, which would both show
-  // the wrong status and fire a change event that saves it. Re-assert every
-  // control from server state after inserting the markup.
-  for (const sel of queueEl.querySelectorAll('.js-status')) {
-    const cart = cartById(sel.dataset.id);
-    if (cart) sel.value = cart.status || 'Not called';
-  }
-  for (const sel of queueEl.querySelectorAll('.js-assign')) {
-    const cart = cartById(sel.dataset.id);
-    if (cart) sel.value = cart.assigned_to || '';
-  }
-  for (const input of queueEl.querySelectorAll('.js-notes')) {
-    const cart = cartById(input.dataset.id);
-    if (cart) input.value = cart.notes || '';
-  }
-  // Keep the picker visible on the carts whose callback time was never set,
-  // so the thing that needs fixing is the thing on screen.
-  for (const card of queueEl.querySelectorAll('.callcard')) {
-    const cart = cartById(card.dataset.row);
-    if (cart?.status === 'Callback scheduled' && !cart.callback_at) {
-      const input = card.querySelector('.js-callback');
-      if (input) { input.hidden = false; input.classList.add('needed'); }
-    }
-  }
+  const i = list.findIndex((c) => String(c.id) === state.openId);
+  $('#dPrev').disabled = i <= 0;
+  $('#dNext').disabled = i < 0 || i >= list.length - 1;
+  $('#dNextBtn').disabled = $('#dNext').disabled;
 }
 
-let insightsTimer = null;
-/** Two network requests per save adds up across three callers on a free
- *  instance; the panels are secondary so a trailing debounce is fine. */
-function scheduleInsights() {
-  clearTimeout(insightsTimer);
-  insightsTimer = setTimeout(renderInsights, 3000);
+function step(delta) {
+  const list = visibleCarts();
+  const i = list.findIndex((c) => String(c.id) === state.openId);
+  const next = list[i + delta];
+  if (next) openDrawer(next.id);
 }
 
-/** A caller gets 403 from by-caller by design; asking again every time just
- *  fills their console with errors for a panel they will never see. */
-let byCallerForbidden = false;
+/**
+ * Cart detail, in the order a caller needs it: who, what they wanted, what has
+ * already happened, then the outcome and what comes next. Every control saves
+ * with the same payload the old card sent.
+ */
+function renderDrawer(c) {
+  const items = itemsOf(c);
+  const tel = telLink(c);
+  const wa = waLink(c);
+  const tags = c.reason_tags || [];
+  const s = st(c);
 
-async function renderInsights() {
-  const days = state.days;
+  $('#dTitle').textContent = c.customer_name || 'Guest';
+  $('#dSub').innerHTML = `<span class="num">${esc(money(c.total_price))}</span> · abandoned ${esc(relative(c.abandoned_at || c.received_at))} · ${esc(SOURCE_NAME[c.source] || c.source || 'GoKwik')}`;
+  $('#dSaved').innerHTML = savedLabel(c);
+  $('#dSaved').className = 'saved';
+
+  $('#dBody').innerHTML = `
+    <div class="d-actions">
+      ${tel ? `<a class="btn primary" href="${esc(tel)}">${icon('phone')}Call ${esc(c.phone)}</a>` : '<span class="btn off">No phone number</span>'}
+      ${wa ? `<a class="btn" href="${esc(wa)}" target="_blank" rel="noopener">${icon('message-circle')}WhatsApp</a>` : ''}
+      ${c.checkout_url ? `<a class="btn" href="${esc(c.checkout_url)}" target="_blank" rel="noopener">${icon('external-link')}Open cart</a>` : ''}
+    </div>
+
+    <section class="dsec">
+      <h3 class="dsec-title">Customer</h3>
+      <dl class="kv">
+        <dt>Phone</dt><dd class="num">${esc(c.phone || '—')}</dd>
+        <dt>Email</dt><dd>${esc(c.email || '—')}</dd>
+        ${c.brand_order_count > 0 ? `<dt>History</dt><dd>Ordered ${count(c.brand_order_count)} time${c.brand_order_count === 1 ? '' : 's'} before</dd>` : ''}
+        ${c.risk_flag ? `<dt>RTO risk</dt><dd>${esc(c.risk_flag)}</dd>` : ''}
+        ${c.gokwik_message_queued || c.gokwik_email_sent ? `<dt>GoKwik</dt><dd class="soft">Already sent this customer a ${[c.gokwik_message_queued && 'message', c.gokwik_email_sent && 'email'].filter(Boolean).join(' and ')}</dd>` : ''}
+      </dl>
+    </section>
+
+    <section class="dsec">
+      <h3 class="dsec-title">Cart <span class="dsec-meta num">${esc(money(c.total_price))}${c.discount_total ? ` · ${esc(money(c.discount_total))} off` : ''}</span></h3>
+      ${items.length ? `<ul class="d-items">${items.map((i) => {
+        const p = splitPack(i.title);
+        return `<li><span class="d-item-name" title="${esc(i.title)}">${esc(p.name)}</span>${p.pack ? `<span class="mini-tag">${esc(p.pack)}</span>` : ''}<span class="d-qty num">×${i.quantity || 1}</span></li>`;
+      }).join('')}</ul>` : `<p class="soft" style="margin:0">${c.item_count ? `${c.item_count} items` : 'No items recorded.'}</p>`}
+      <dl class="kv" style="margin-top:10px">
+        ${c.drop_stage ? `<dt>Dropped off at</dt><dd>${esc(c.drop_stage)}</dd>` : ''}
+        <dt>Abandoned</dt><dd class="num">${esc(dateTime(c.abandoned_at || c.received_at))}</dd>
+      </dl>
+    </section>
+
+    <section class="dsec">
+      <h3 class="dsec-title">Contact history</h3>
+      <div id="dHistory"><span class="sk w70"></span></div>
+    </section>
+
+    <section class="dsec">
+      <h3 class="dsec-title">Outcome</h3>
+      <div class="outcomes" role="radiogroup" aria-label="Outcome">
+        ${STATUSES.map((x) => `<button type="button" role="radio" class="oc${x === s ? ' on' : ''}" data-status="${esc(x)}" aria-checked="${x === s}" title="${esc(x)}">${statusIndicator(x)}</button>`).join('')}
+      </div>
+      <div class="d-callback" ${s === 'Callback scheduled' ? '' : 'hidden'}>
+        <label class="d-label" for="dCallback">Call back at</label>
+        <input id="dCallback" class="input js-callback" type="datetime-local" value="${esc(toLocalInput(c.callback_at))}" />
+        <div class="cb-hint" hidden></div>
+      </div>
+    </section>
+
+    <section class="dsec">
+      <h3 class="dsec-title">Next action</h3>
+      <div class="d-row">
+        <label class="d-label" for="dOwner">Owner</label>
+        <div class="d-owner">
+          <select id="dOwner" class="select js-assign" aria-label="Owner">
+            <option value="">Unassigned</option>
+            ${TEAM.map((t) => `<option value="${esc(t.phone)}"${t.phone === c.assigned_to ? ' selected' : ''}>${esc(t.name)}${t.phone === ME ? ' (me)' : ''}</option>`).join('')}
+          </select>
+          <button type="button" class="btn js-takeit"${c.assigned_to || !ME ? ' hidden' : ''}>Take it</button>
+        </div>
+      </div>
+      <div class="d-row"><span class="d-label">Follow-up</span><span id="dFollow">${followUp(c)}</span></div>
+    </section>
+
+    <section class="dsec">
+      <h3 class="dsec-title">Notes</h3>
+      <textarea class="input js-notes" rows="3" placeholder="What happened on the call…" aria-label="Call notes">${esc(c.notes || '')}</textarea>
+      <div class="hint" style="margin-top:6px">Saves when you leave the box or press Enter · Shift+Enter for a new line</div>
+      <div class="d-label" style="margin-top:14px">Why didn't they buy?</div>
+      <div class="pills">
+        ${REASON_TAGS.map((t) => `<label class="pill${tags.includes(t) ? ' on' : ''}"><input type="checkbox" class="js-tag" value="${esc(t)}"${tags.includes(t) ? ' checked' : ''} />${esc(t)}</label>`).join('')}
+      </div>
+    </section>
+
+    <section class="dsec">
+      <h3 class="dsec-title">Timeline</h3>
+      <div id="dTimeline"><span class="sk w70"></span></div>
+    </section>`;
+  $('#dBody').scrollTop = 0;
+  renderIcons();
+}
+
+/** After a save: update what changed, never the note someone may be typing. */
+function refreshDrawer() {
+  const c = cartById(state.openId);
+  if (!c) return;
+  const s = st(c);
+  $$('#dBody .oc').forEach((b) => { const on = b.dataset.status === s; b.classList.toggle('on', on); b.setAttribute('aria-checked', String(on)); });
+  showCallback(s === 'Callback scheduled');
+  if (s === 'Callback scheduled' && c.callback_at) {
+    const input = $('#dBody .js-callback');
+    if (document.activeElement !== input) input.value = toLocalInput(c.callback_at);
+    input.classList.remove('needed');
+    $('#dBody .cb-hint').hidden = true;
+  }
+  $('#dOwner').value = c.assigned_to || '';
+  $('#dBody .js-takeit').hidden = Boolean(c.assigned_to) || !ME;
+  $('#dFollow').innerHTML = followUp(c);
+  const tags = c.reason_tags || [];
+  $$('#dBody .js-tag').forEach((b) => { b.checked = tags.includes(b.value); b.closest('.pill').classList.toggle('on', b.checked); });
+  loadEvents(state.openId);
+  syncDrawerNav();
+}
+
+function showCallback(on) {
+  const box = $('#dBody .d-callback');
+  if (box) box.hidden = !on;
+}
+
+/** Ask for the callback time next to the field that needs it, not in a banner. */
+function flagCallbackNeeded(message) {
+  showCallback(true);
+  const input = $('#dBody .js-callback');
+  const hint = $('#dBody .cb-hint');
+  if (!input) return;
+  input.classList.add('needed');
+  hint.textContent = message || 'Pick the date and time you promised to call back.';
+  hint.hidden = false;
+  input.focus();
+}
+
+const EVENT_TEXT = {
+  status: (e) => `${esc(statusOf(e.to_status).label)}${e.from_status ? ` <span class="muted">from ${esc(statusOf(e.from_status).label)}</span>` : ''}`,
+  note: (e) => (e.detail ? `Note: “${esc(e.detail)}”` : 'Note cleared'),
+  callback: (e) => (e.detail === 'cleared' ? 'Callback cleared' : `Callback set for ${esc(e.detail)}`),
+  reason: (e) => (e.detail === 'cleared' ? 'Reasons cleared' : `Reason: ${esc(e.detail)}`),
+  assign: (e) => (e.detail === 'unassigned' ? 'Unassigned' : `Assigned to ${esc(e.detail)}`),
+};
+const EVENT_ICON = { status: 'phone-call', note: 'sticky-note', callback: 'alarm-clock', reason: 'tag', assign: 'user-plus' };
+
+/**
+ * Contact history is the outcomes; the timeline is everything. Both read the
+ * same cart_events rows — nothing inferred or back-filled — plus the
+ * abandonment itself, which the cart records.
+ */
+async function loadEvents(id) {
   try {
-    // Fetched and rendered independently: by-caller is admin-only, so for a
-    // caller it comes back 403 — and when the two shared a failure check, that
-    // 403 silently blanked the reasons panel they are allowed to see.
-    const [rRes, cRes] = await Promise.all([
-      fetch(`/api/reasons/summary?days=${days}`),
-      byCallerForbidden ? Promise.resolve(null) : fetch(`/api/stats/by-caller?days=${days}`),
-    ]);
+    const res = await fetch(`/api/carts/${encodeURIComponent(id)}/events`);
+    const d = await res.json();
+    if (!d.ok) throw new Error(d.error || 'Could not load the history');
+    if (state.openId !== String(id)) return;   // the drawer moved on meanwhile
+    const cart = cartById(id);
+    const events = d.events;
+    const statusEvents = events.filter((e) => (e.kind || 'status') === 'status').slice().reverse();
 
-    if (cRes?.status === 403) byCallerForbidden = true;
+    $('#dHistory').innerHTML = statusEvents.length
+      ? `<ul class="d-history">${statusEvents.map((e) => `<li>
+          ${statusIndicator(e.to_status)}<span class="soft">${esc(e.actor || 'System')}</span>
+          <span class="d-when num">${esc(dateTime(e.at))}</span></li>`).join('')}</ul>`
+      : '<p class="soft" style="margin:0">No calls recorded yet. Call history is kept from 23 Sep 2026.</p>';
 
-    if (cRes?.ok) {
-      const callers = await cRes.json();
-      $('#callerRows').innerHTML = callers.callers.length
-        ? callers.callers.map((c) => `
-            <tr>
-              <td>${esc(c.caller)}</td>
-              <td class="right">${c.touched}</td>
-              <td class="right">${c.recovered}</td>
-              <td class="right">${c.recovery_rate}%</td>
-              <td class="right">${money(c.recovered_value, 'INR')}</td>
-            </tr>`).join('')
-        : '<tr><td colspan="5" class="empty">Nobody has worked a cart in this range yet.</td></tr>';
-    } else if (byCallerForbidden) {
-      // Not an error to show anyone: this panel simply isn't theirs.
-      $('#callerPanel')?.setAttribute('hidden', '');
-    }
-
-    if (!rRes.ok) return;
-    const reasons = await rRes.json();
-
-    const max = Math.max(1, ...reasons.reasons.map((r) => r.count));
-    $('#reasonList').innerHTML = reasons.reasons.length
-      ? reasons.reasons.map((r) => `
-          <div class="bar-row">
-            <span class="bar-label">${esc(r.tag)}</span>
-            <span class="bar"><span class="bar-fill" style="width:${(r.count / max) * 100}%"></span></span>
-            <span class="bar-count">${r.count}</span>
-          </div>`).join('')
-      : '<p class="muted">No reasons tagged yet. Add them from the table as you call.</p>';
-    $('#reasonMeta').textContent = reasons.taggedCarts
-      ? `${reasons.taggedCarts} cart${reasons.taggedCarts === 1 ? '' : 's'} tagged`
-      : '';
-
-  } catch {
-    // Insights are secondary; never let them break the call list.
+    const rows = [
+      ...events.map((e) => {
+        const kind = e.kind || 'status';
+        return { at: e.at, ico: EVENT_ICON[kind] || 'activity', text: (EVENT_TEXT[kind] || (() => esc(e.detail || kind)))(e), who: e.actor };
+      }),
+      { at: cart.abandoned_at || cart.received_at, ico: 'shopping-cart', text: 'Cart abandoned', who: SOURCE_NAME[cart.source] || 'GoKwik' },
+    ].sort((a, b) => new Date(b.at) - new Date(a.at));
+    $('#dTimeline').innerHTML = `<div class="timeline">${rows.map((r) => `<div class="act">
+      <span class="act-ico">${icon(r.ico)}</span>
+      <div style="min-width:0"><div class="act-title">${r.text}</div><div class="act-meta">${esc(r.who || 'System')}</div></div>
+      <span class="act-time">${esc(dateTime(r.at))}</span></div>`).join('')}</div>`;
+    renderIcons();
+  } catch (err) {
+    if ($('#dHistory')) $('#dHistory').innerHTML = `<p class="soft" style="margin:0">${esc(err.message)}</p>`;
+    if ($('#dTimeline')) $('#dTimeline').innerHTML = '';
   }
 }
 
-/** Says what is on screen versus what exists — the old code silently dropped
- *  everything past the 500th row with no indication. */
-const RANGE_LABEL = { 1: 'today', 3: 'the last 3 days', 7: 'the last 7 days', 0: 'all time' };
+/* ------------------------------------------------------------------ drawer events */
 
-/**
- * Always says what is on screen. Previously it only appeared when results were
- * truncated, so switching between ranges that happen to hold the same carts
- * looked like the button had done nothing.
- */
-function renderResultNote() {
-  const el = $('#resultNote');
-  if (!el) return;
-  el.hidden = false;
+const dBody = $('#dBody');
 
-  if (state.query) {
-    el.textContent = `${state.carts.length} result${state.carts.length === 1 ? '' : 's'} for "${state.query}" — searching all history.`
-      + (state.truncated ? ' Showing the first 50; narrow the search.' : '');
-    return;
-  }
-
-  const shown = visibleCarts().length;
-  const inRange = state.total ?? state.carts.length;
-  const label = RANGE_LABEL[state.days] ?? `the last ${state.days} days`;
-
-  if (state.truncated) {
-    el.textContent = `Showing ${state.carts.length} of ${inRange} carts from ${label} — narrow the date range to see the rest.`;
-    return;
-  }
-  if (state.mode === 'callbacks') {
-    // "5 callbacks" does not say whether anything has been missed, which is the
-    // only part of it that needs acting on today.
-    const cbs = state.carts.filter(MODES.callbacks.match);
-    const kinds = cbs.map((c) => callbackState(c)?.kind);
-    const n = (k) => kinds.filter((x) => x === k).length;
-    const parts = [
-      n('overdue') && `${n('overdue')} overdue`,
-      n('due-now') && `${n('due-now')} due now`,
-      n('due-today') && `${n('due-today')} later today`,
-      n('scheduled') && `${n('scheduled')} upcoming`,
-      n('missing') && `${n('missing')} with no time set`,
-    ].filter(Boolean);
-    el.textContent = `${cbs.length} callback${cbs.length === 1 ? '' : 's'}, all time`
-      + (parts.length ? ` — ${parts.join(' · ')}.` : '.')
-      + ' The date range does not apply here.';
-    return;
-  }
-  el.textContent = `${shown} in ${MODES[state.mode].label.toLowerCase()}, of ${inRange} cart${inRange === 1 ? '' : 's'} from ${label}.`;
-}
-
-function syncExportLink() {
-  const a = $('#exportCsv');
-  if (!a) return;
-  a.href = state.query
-    ? `/api/carts.csv?q=${encodeURIComponent(state.query)}`
-    : `/api/carts.csv?days=${state.days}`;
-}
-
-/**
- * The date range is a browsing control. It has never applied to callbacks and
- * now visibly does not: leaving it live while it changes nothing is how the
- * original bug hid — the count moved, so it looked like it was working.
- */
-function syncRangeAvailability() {
-  const group = $('#rangeGroup');
-  if (!group) return;
-  const off = state.mode === 'callbacks' && !state.query;
-  group.classList.toggle('disabled', off);
-  group.title = off ? 'Callbacks are shown whatever the date range' : '';
-  for (const b of group.querySelectorAll('button')) b.disabled = off;
-}
-
-function render() {
-  syncRangeAvailability();
-  renderModes();
-  renderSummary();
-  renderResultNote();
-  renderQueue();
-  // Insights are NOT refreshed here. They depend only on the date range, and
-  // render() runs on every queue switch and sort change — refetching both
-  // panels each time was two requests per click for data that had not changed.
-}
-
-// ---------- events ----------
-
-// Delegated so re-renders never orphan a listener.
-queueEl.addEventListener('change', (e) => {
-  const id = e.target.dataset?.id;
-
-  if (e.target.classList.contains('js-status')) {
-    // Ignore no-op changes (e.g. browser form restoration re-firing on load).
-    if ((cartById(id)?.status || 'Not called') === e.target.value) return;
-    const status = e.target.value;
-
-    // Reveal the picker immediately so the caller can set a time without waiting
-    // for the save round-trip.
-    const cbInput = document.querySelector(`.js-callback[data-id="${CSS.escape(id)}"]`);
-    if (cbInput) {
-      cbInput.hidden = status !== 'Callback scheduled';
-      if (status !== 'Callback scheduled') cbInput.value = '';
-    }
-
-    const notes = document.querySelector(`.js-notes[data-id="${CSS.escape(id)}"]`)?.value ?? '';
-    const payload = { status, notes };
+dBody.addEventListener('click', (e) => {
+  const oc = e.target.closest('.oc');
+  if (oc) {
+    const status = oc.dataset.status;
     if (status === 'Callback scheduled') {
-      // Nothing is saved until there is a time. The js-callback handler below
-      // completes the save the moment one is picked, so the caller does one
-      // thing rather than choosing the status twice.
-      if (!cbInput?.value) {
-        flagCallbackNeeded(id);
-        return;
-      }
-      payload.callbackAt = new Date(cbInput.value).toISOString();
-    } else {
-      payload.callbackAt = null;
-      cbInput?.classList.remove('needed');
-      document.querySelector(`[data-row="${CSS.escape(id)}"] .cb-hint`)?.remove();
+      // Nothing is saved until there is a time; picking one completes the save.
+      showCallback(true);
+      const input = $('#dBody .js-callback');
+      if (!input.value) { flagCallbackNeeded(); return; }
+      saveRow(state.openId, { status, callbackAt: new Date(input.value).toISOString() });
+      return;
     }
-    saveRow(id, payload);
+    showCallback(false);
+    changeStatus(state.openId, status);
     return;
   }
+  if (e.target.closest('.js-takeit')) saveRow(state.openId, { assignedTo: ME });
+});
 
+dBody.addEventListener('change', (e) => {
+  const id = state.openId;
+  const cart = cartById(id);
+  if (!cart) return;
   if (e.target.classList.contains('js-callback')) {
-    if (!e.target.value) { flagCallbackNeeded(id); return; }
+    if (!e.target.value) { flagCallbackNeeded(); return; }
     e.target.classList.remove('needed');
-    document.querySelector(`[data-row="${CSS.escape(id)}"] .cb-hint`)?.remove();
-    saveRow(id, {
-      status: 'Callback scheduled',
-      callbackAt: new Date(e.target.value).toISOString(),
-    });
+    $('#dBody .cb-hint').hidden = true;
+    saveRow(id, { status: 'Callback scheduled', callbackAt: new Date(e.target.value).toISOString() });
     return;
   }
-
   if (e.target.classList.contains('js-assign')) {
-    if ((cartById(id)?.assigned_to || '') === e.target.value) return;
+    if ((cart.assigned_to || '') === e.target.value) return;
     saveRow(id, { assignedTo: e.target.value || null });
     return;
   }
-
   if (e.target.classList.contains('js-tag')) {
-    const boxes = [...document.querySelectorAll(`.js-tag[data-id="${CSS.escape(id)}"]`)];
-    const reasonTags = boxes.filter((b) => b.checked).map((b) => b.value);
-    // Reflect the choice immediately; the save round-trip should not be what
-    // tells you whether your tap registered.
-    for (const b of boxes) b.closest('.rtag')?.classList.toggle('on', b.checked);
-    const summary = document.querySelector(`.tagpick[data-id="${CSS.escape(id)}"] > summary`);
-    if (summary) {
-      summary.textContent = reasonTags.length
-        ? `Reason: ${reasonTags.join(', ')}` : 'Why did they not buy?';
-    }
-    saveRow(id, { reasonTags });
+    const boxes = $$('#dBody .js-tag');
+    for (const b of boxes) b.closest('.pill').classList.toggle('on', b.checked);
+    saveRow(id, { reasonTags: boxes.filter((b) => b.checked).map((b) => b.value) });
   }
 });
 
-// Notes save on blur and on Enter — not per keystroke, which would hammer the metafield.
-queueEl.addEventListener('blur', (e) => {
-  if (e.target.classList.contains('js-notes')) {
-    const id = e.target.dataset.id;
-    if ((cartById(id)?.notes || '') === e.target.value) return;
-    const status = document.querySelector(`.js-status[data-id="${CSS.escape(id)}"]`)?.value;
-    saveRow(id, { status, notes: e.target.value }, e.target);
-  }
+/**
+ * Notes save on blur and on Enter — never per keystroke.
+ *
+ * Enter saves directly rather than relying on the blur it causes: a blur event
+ * is not delivered when the page itself lacks focus, which would drop the note
+ * silently. The in-flight guard stops the blur that follows from sending the
+ * same text a second time.
+ */
+let notesInFlight = null;
+function saveNotes(el) {
+  const cart = cartById(state.openId);
+  if (!cart) return;
+  const value = el.value;
+  if ((cart.notes || '') === value || notesInFlight === value) return;
+  notesInFlight = value;
+  saveRow(state.openId, { status: st(cart), notes: value }).finally(() => { notesInFlight = null; });
+}
+dBody.addEventListener('blur', (e) => {
+  if (e.target.classList?.contains('js-notes')) saveNotes(e.target);
 }, true);
-
-queueEl.addEventListener('keydown', (e) => {
-  // Enter saves, Shift+Enter starts a new line — a textarea has to allow both.
+dBody.addEventListener('keydown', (e) => {
   if (e.key === 'Enter' && !e.shiftKey && e.target.classList.contains('js-notes')) {
     e.preventDefault();
+    saveNotes(e.target);
     e.target.blur();
   }
 });
 
-const HISTORY_VERB = {
-  status: (e) => `${e.from_status || 'new'} → ${e.to_status}`,
-  note: (e) => (e.detail ? `note: "${e.detail}"` : 'note cleared'),
-  callback: (e) => (e.detail === 'cleared' ? 'callback cleared' : `callback set for ${e.detail}`),
-  reason: (e) => (e.detail === 'cleared' ? 'reasons cleared' : `reason: ${e.detail}`),
-  assign: (e) => (e.detail === 'unassigned' ? 'unassigned' : `assigned to ${e.detail}`),
-};
+$('#dClose').addEventListener('click', closeDrawer);
+$('#drawerScrim').addEventListener('click', closeDrawer);
+$('#dPrev').addEventListener('click', () => step(-1));
+$('#dNext').addEventListener('click', () => step(1));
+$('#dNextBtn').addEventListener('click', () => step(1));
 
-/** Falls back on the fields themselves, so an unknown kind still reads as
- *  something rather than as a blank line in an audit trail. */
-function describeEvent(ev) {
-  const fn = HISTORY_VERB[ev.kind];
-  if (fn) return fn(ev);
-  if (ev.to_status) return `${ev.from_status || 'new'} → ${ev.to_status}`;
-  return ev.detail || ev.kind || 'changed';
+/* ------------------------------------------------------------------ list events */
+
+/** One handler for both layouts: actions act, everything else opens the cart. */
+function onListClick(e) {
+  if (e.target.closest('[data-clear]')) { clearFilters(); return; }
+  const host = e.target.closest('[data-id]');
+  if (!host) return;
+  const id = host.dataset.id;
+  const actEl = e.target.closest('[data-act]');
+  const act = actEl?.dataset.act;
+  if (act === 'status') { e.stopPropagation(); openStatusMenu(actEl, id); return; }
+  if (act === 'take') { saveRow(id, { assignedTo: ME }); return; }
+  if (act === 'open') { openDrawer(id); return; }
+  if (e.target.closest('a')) return;             // Call / WhatsApp links do their own thing
+  openDrawer(id);
+}
+$('#rows').addEventListener('click', onListClick);
+$('#clist').addEventListener('click', onListClick);
+for (const el of [$('#rows'), $('#clist')]) {
+  // A focused row opens with Enter, as any focusable control does.
+  el.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && e.target.matches('[data-id]')) { e.preventDefault(); openDrawer(e.target.dataset.id); }
+  });
 }
 
-/** Fetched on open, not on render — most cards are never expanded. */
-queueEl.addEventListener('toggle', async (e) => {
-  const d = e.target;
-  if (!d.classList?.contains('history') || !d.open || d.dataset.loaded) return;
-  d.dataset.loaded = '1';
-  const box = d.querySelector('.hist');
-  try {
-    const res = await fetch(`/api/carts/${encodeURIComponent(d.dataset.id)}/events`);
-    const data = await res.json();
-    if (!data.ok) throw new Error(data.error || 'Could not load the history');
-    box.innerHTML = data.events.length
-      ? data.events.map((ev) => `
-          <div class="hist-row">
-            <span class="hist-when">${esc(exactTime(ev.at))}</span>
-            <span class="hist-what">${esc(describeEvent(ev))}</span>
-            <span class="hist-who">${esc(ev.actor || 'system')}</span>
-          </div>`).join('')
-      : '<span class="muted">Nothing recorded yet. History starts from the first change after 23 Sep 2026.</span>';
-  } catch (err) {
-    box.innerHTML = `<span class="muted">${esc(err.message)}</span>`;
-    d.dataset.loaded = '';
-  }
-}, true);
-
-// One-tap self-assign — the common case, and the whole point of this feature is
-// stopping two people ringing the same customer.
-queueEl.addEventListener('click', (e) => {
-  const btn = e.target.closest('.js-takeit');
-  if (btn) saveRow(btn.dataset.id, { assignedTo: ME });
+$('#viewTabs').addEventListener('click', (e) => {
+  const b = e.target.closest('[data-view]');
+  if (b) setView(b.dataset.view);
 });
 
-on('#rangeGroup', 'click', (e) => {
-  const btn = e.target.closest('button');
-  if (!btn) return;
-  state.days = Number(btn.dataset.days);
-  $('#rangeGroup').querySelectorAll('button').forEach((b) => b.classList.toggle('active', b === btn));
+alertsEl.addEventListener('click', (e) => {
+  const b = e.target.closest('[data-goto]');
+  if (b) setView(b.dataset.goto);
+});
+
+function setView(view) {
+  if (!VIEWS[view]) return;
+  // Leaving a search means going back to the range's carts, which needs a load.
+  const wasSearch = Boolean(state.loadedFor);
+  if (state.query) { state.query = ''; $('#search').value = ''; }
+  state.view = view;
+  state.done.clear();
+  // Each view has an obvious order until someone chooses one by hand.
+  if (!state.sortTouched) { state.sort = VIEWS[view].sort; state.dir = SORTS[state.sort].dir; }
+  const url = new URL(window.location.href);
+  url.searchParams.set('mode', view);
+  url.searchParams.delete('q');
+  window.history.replaceState(null, '', url);
+  if (!drawer.hidden) closeDrawer();
+  if (wasSearch) loadAll(); else render();
+}
+
+// Sidebar queue links switch the view in place rather than reloading the page.
+document.addEventListener('click', (e) => {
+  const a = e.target.closest('a[data-view-link]');
+  if (!a) return;
+  e.preventDefault();
+  setView(a.dataset.viewLink === 'board' ? 'tocall' : a.dataset.viewLink);
+  $('.app').classList.remove('nav-open');
+});
+
+$('#cartTable thead').addEventListener('click', (e) => {
+  const th = e.target.closest('th.sortable');
+  if (!th) return;
+  const key = th.dataset.sort;
+  state.dir = state.sort === key ? -state.dir : SORTS[key].dir;
+  state.sort = key;
+  state.sortTouched = true;
+  render();
+});
+
+$('#sort').addEventListener('change', (e) => {
+  if (!e.target.value) return;
+  state.sort = e.target.value;
+  state.dir = SORTS[state.sort].dir;
+  state.sortTouched = true;
+  render();
+});
+
+for (const [id, key] of [['#fstatus', 'status'], ['#fowner', 'owner'], ['#ffollow', 'follow'], ['#freason', 'reason'], ['#fvalue', 'value']]) {
+  $(id).addEventListener('change', (e) => { state.f[key] = e.target.value; render(); });
+}
+function clearFilters() {
+  state.f = { status: '', owner: '', follow: '', reason: '', value: '' };
+  for (const id of ['#fstatus', '#fowner', '#ffollow', '#freason', '#fvalue']) $(id).value = '';
+  render();
+}
+$('#fclear').addEventListener('click', clearFilters);
+
+$('#range').addEventListener('change', (e) => {
+  state.days = Number(e.target.value);
   loadAll();   // the range is a server-side query, not a local filter
 });
 
-/**
- * Poll so a teammate's change shows up without a manual refresh. Skipped while
- * a field is focused — reloading under someone's cursor would discard what they
- * are typing, which is exactly what the conflict guard exists to prevent.
- *
- * This used to sit inside the range handler, so it never started until someone
- * clicked a range button — and then started another timer on every click.
- */
-const REFRESH_MS = 60_000;
-setInterval(() => {
-  if (document.hidden) return;
-  const active = document.activeElement;
-  if (active && active.closest?.('#queue')) return;
-  if (state.query) return;   // don't yank a search result set away
-  loadAll();
-}, REFRESH_MS);
-
 let searchTimer = null;
-on('#search', 'input', (e) => {
+$('#search').addEventListener('input', (e) => {
   const value = e.target.value.trim();
   clearTimeout(searchTimer);
-  // Search hits the whole history, so don't fire on every keystroke.
+  // Search reaches the whole history, so it waits for a pause in typing.
   searchTimer = setTimeout(() => {
     if (value === state.query) return;
     state.query = value;
     loadAll();
   }, 350);
 });
-on('#search', 'keydown', (e) => {
+$('#search').addEventListener('keydown', (e) => {
   if (e.key === 'Escape') { e.target.value = ''; state.query = ''; loadAll(); }
 });
 
-on('#modeGroup', 'click', (e) => {
-  const btn = e.target.closest('button');
-  if (!btn) return;
-  state.mode = btn.dataset.mode;
-  // Each queue has an obvious order — callbacks by due time, everything else by
-  // size — so switching queue picks it, until someone chooses one by hand.
-  if (!state.sortTouched) {
-    state.sort = MODES[state.mode].sort;
-    if ($('#sort')) $('#sort').value = state.sort;
-  }
-  render();
+$('#refresh').addEventListener('click', () => loadAll());
+
+document.addEventListener('keydown', (e) => {
+  if (e.key !== 'Escape') return;
+  if (!menu.hidden) { closeStatusMenu(); return; }
+  if (!drawer.hidden) closeDrawer();
 });
-
-on('#sort', 'change', (e) => {
-  state.sort = e.target.value;
-  state.sortTouched = true;
-  render();
+document.addEventListener('click', (e) => {
+  if (!menu.hidden && !menu.contains(e.target)) closeStatusMenu();
+  for (const d of $$('details.menu[open]')) if (!d.contains(e.target)) d.removeAttribute('open');
 });
-on('#refresh', 'click', loadAll);
+window.addEventListener('scroll', () => { if (!menu.hidden) closeStatusMenu(); }, { passive: true });
 
-on('#logout', 'click', async () => {
-  await fetch('/auth/logout', { method: 'POST' });
-  window.location.href = '/login';
-});
+/**
+ * Poll so a teammate's change shows up without a manual refresh — but never
+ * under someone's cursor: skipped while the tab is hidden, a cart is open, the
+ * status menu is up, or a search is showing.
+ */
+setInterval(() => {
+  if (document.hidden || !drawer.hidden || !menu.hidden || state.query) return;
+  loadAll();
+}, 60_000);
 
-// Show who is signed in; bounce to login if the session expired mid-session.
-/** "Good morning, Axit" reads better than a phone number, and confirms at a
- *  glance which account you are signed in as. */
-function greeting(name) {
-  const hour = Number(new Intl.DateTimeFormat('en-GB', {
-    hour: 'numeric', hour12: false, timeZone: 'Asia/Kolkata',
-  }).format(new Date()));
-  const part = hour < 12 ? 'Good morning' : hour < 17 ? 'Good afternoon' : 'Good evening';
-  return name ? `${part}, ${name}` : part;
-}
+/* ------------------------------------------------------------------ boot */
 
-fetch('/auth/me').then((r) => r.json()).then((me) => {
-  if (!me.authenticated) { window.location.href = '/login'; return; }
-  $('#sessionPhone').textContent = greeting(me.name);
-  $('#sessionPhone').title = `+${me.phone}`;
-  // Admin-only pages: don't advertise links that 403.
-  if (me.isAdmin) {
-    $('#adminLink').hidden = false;
-    if ($('#dashLink')) $('#dashLink').hidden = false;
-    if ($('#importLink')) $('#importLink').hidden = false;
-  }
-}).catch(() => {});
-
-loadAll();
+(async () => {
+  skeleton();
+  try {
+    const me = await (await fetch('/auth/me')).json();
+    if (!me.authenticated) { window.location.href = '/login'; return; }
+    initShell(me, {
+      // The sidebar search is the board's own search here, not a page change.
+      onSearch: (q) => { $('#search').value = q; state.query = q; loadAll(); },
+    });
+  } catch { /* the board still works on its defaults */ }
+  renderIcons();
+  loadAll();
+})();

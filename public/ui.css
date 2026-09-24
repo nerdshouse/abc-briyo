@@ -649,3 +649,250 @@ button { font: inherit; color: inherit; }
   .metric .pane { flex-direction: column; align-items: stretch; }
   .metric .spark { width: 100%; }
 }
+
+/* ==========================================================================
+   Call board
+   Built only from the tokens above — the same frame, pane, controls, status
+   dots and table density as the dashboard. Nothing here is a second language.
+   ========================================================================== */
+
+.btn.primary { background: var(--ink); border-color: var(--ink); color: #fff; }
+.btn.primary:hover { background: var(--ink-hover); }
+.btn .lucide { width: 14px; height: 14px; }
+.btn.off { color: var(--text-3); cursor: default; }
+.btn:disabled { opacity: .45; cursor: default; }
+
+/* queue views: lightweight tabs, the sidebar's selected treatment */
+.board-head { min-height: 44px; padding: 5px 6px 5px 6px; }
+.tabs { display: flex; gap: 2px; overflow-x: auto; scrollbar-width: none; }
+.tabs::-webkit-scrollbar { display: none; }
+.tab {
+  display: inline-flex; align-items: center; gap: 7px; flex: none;
+  height: 30px; padding: 0 10px; cursor: pointer;
+  border: 1px solid transparent; border-radius: 7px; background: none;
+  font-size: 13px; font-weight: 500; color: var(--text-2); white-space: nowrap;
+}
+.tab:hover { color: var(--text); background: rgba(255, 255, 255, .6); }
+.tab.active { background: var(--surface); border-color: var(--border-frame); color: var(--text); box-shadow: 0 1px 2px rgba(16, 24, 40, .04); }
+.tab-count { font-size: 11px; font-weight: 500; color: var(--text-3); font-variant-numeric: tabular-nums; }
+.tab.active .tab-count { color: var(--text-2); }
+.tab-count.is-alert { color: var(--warning-text); }
+.tabs.searching .tab { opacity: .55; }
+
+/* filters row, inside the pane */
+.board-filters { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; padding: 12px 14px; border-bottom: 1px solid var(--border-soft); }
+.board-filters .search .input { width: 220px; }
+/* selects size to their longest option otherwise, and push the row onto two lines */
+.board-filters .select { max-width: 124px; }
+.board-filters .sort-pick .select { max-width: 172px; }
+.board-filters .spacer { flex: 1; }
+.sort-pick, .range-pick { position: relative; display: inline-flex; align-items: center; }
+.sort-pick .lucide { position: absolute; left: 10px; width: 14px; height: 14px; color: var(--text-3); pointer-events: none; }
+.sort-pick .select { padding-left: 30px; }
+.range-pick.disabled { opacity: .5; }
+.board-meta { padding: 8px 16px; font-size: 12px; color: var(--text-3); border-bottom: 1px solid var(--border-soft); background: #FCFCFD; }
+
+/* the table: fixed layout so a long name never pushes the actions off-screen */
+.board-table { table-layout: fixed; min-width: 1040px; }
+.board-table col.c-flag { width: 30px; }
+.board-table col.c-cust { width: 17%; }
+.board-table col.c-items { width: 16%; }
+.board-table col.c-val { width: 86px; }
+.board-table col.c-status { width: 128px; }
+.board-table col.c-owner { width: 104px; }
+.board-table col.c-last { width: 104px; }
+.board-table col.c-follow { width: 124px; }
+.board-table col.c-reason { width: 11%; }
+.board-table col.c-age { width: 62px; }
+.board-table col.c-act { width: 100px; }
+.board-table th.col-flag, .board-table td.col-flag { padding-left: 10px !important; padding-right: 0; }
+.board-table td { overflow: hidden; text-overflow: ellipsis; }
+.board-table .cell-main, .board-table .cell-sub, .board-table .cell-item, .board-table .cell-text {
+  display: block; max-width: none; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.cell-item { font-size: 13px; }
+.cell-text { font-size: 13px; }
+.board-table th.sorted { color: var(--text); }
+.board-table th.sorted .sort { color: var(--text-2); }
+
+.brow { cursor: pointer; }
+.brow:focus-visible { outline: 2px solid rgba(32, 43, 60, .25); outline-offset: -2px; }
+.brow.open td { background: #F7F8FA !important; }
+/* a cart that needs a second look: one quiet tint and a small mark, not a red row */
+.brow.attn td { background: #FFFDF7; }
+.brow.attn:hover td { background: #FFFBF0; }
+/* yours: the thin stripe the old board meant to show and had stopped drawing */
+.brow.mine td:first-child { box-shadow: inset 2px 0 0 #98A2B3; }
+.brow.done td { opacity: .45; }
+
+.flag { display: inline-grid; place-items: center; width: 18px; height: 18px; border-radius: 5px; }
+.flag .lucide { width: 13px; height: 13px; }
+.flag.warn { color: var(--warning); }
+.flag.bad { color: var(--error); }
+
+.mini-tag {
+  display: inline-block; margin-left: 6px; padding: 0 5px; vertical-align: 1px;
+  font-size: 10.5px; font-weight: 500; line-height: 16px; color: var(--text-2);
+  border: 1px solid var(--border); border-radius: 5px; background: var(--surface);
+}
+.mini-tag.warn { color: var(--warning-text); border-color: #FEDF89; background: var(--warning-soft); }
+
+.status-btn {
+  display: inline-flex; align-items: center; gap: 4px; max-width: 100%;
+  margin-left: -6px; padding: 3px 6px; border: 1px solid transparent; border-radius: 6px;
+  background: none; cursor: pointer;
+}
+.status-btn .caret { width: 12px; height: 12px; color: var(--text-3); opacity: 0; transition: opacity .1s; }
+.status-btn:hover, .status-btn:focus-visible { border-color: var(--border); background: var(--surface); }
+.status-btn:hover .caret, .status-btn:focus-visible .caret, .brow:hover .status-btn .caret { opacity: 1; }
+.status .dot + * { margin-left: 0; }
+
+/* Take shows on hover, so a column of unowned carts reads as a column, not a row of buttons */
+.take { display: none; }
+.brow:hover .take, .brow:focus-within .take { display: inline-block; }
+.brow:hover .unassigned, .brow:focus-within .unassigned { display: none; }
+.take {
+  height: 24px; padding: 0 9px; cursor: pointer; font-size: 12px; font-weight: 500;
+  color: var(--text); background: var(--surface); border: 1px solid var(--border); border-radius: 6px;
+}
+.take:hover { background: var(--surface-2); }
+.owner { font-size: 13px; }
+
+.row-actions { display: flex; gap: 2px; justify-content: flex-end; }
+.row-actions .icon-btn { color: var(--text-3); }
+.brow:hover .row-actions .icon-btn { color: var(--text-2); }
+.row-actions .icon-btn:hover { color: var(--text) !important; background: var(--surface-2); }
+.icon-btn.off { opacity: .4; cursor: default; }
+
+/* status quick-change menu */
+.popover {
+  position: absolute; z-index: 60; min-width: 176px; padding: 4px;
+  background: var(--surface); border: 1px solid var(--border); border-radius: 10px;
+  box-shadow: 0 8px 24px rgba(16, 24, 40, .08);
+}
+.popover button {
+  display: flex; align-items: center; justify-content: space-between; width: 100%;
+  height: 32px; padding: 0 9px; border: 0; background: none; border-radius: 6px; cursor: pointer;
+}
+.popover button:hover, .popover button:focus-visible { background: var(--surface-2); outline: none; }
+.popover .tick { width: 14px; height: 14px; color: var(--text-2); }
+
+/* phones get a list, not a squeezed table */
+.clist { display: none; list-style: none; margin: 0; padding: 0; }
+
+/* ---------------- drawer ---------------- */
+.drawer-wide { width: min(520px, 100vw); }
+.drawer-nav { display: flex; gap: 6px; flex: none; }
+.drawer-foot {
+  display: flex; align-items: center; justify-content: space-between; gap: 10px;
+  padding: 10px 16px; border-top: 1px solid var(--border);
+}
+.saved { font-size: 12px; color: var(--text-3); }
+.saved.pending { color: var(--text-2); }
+.saved.failed { color: var(--error-text); }
+
+.d-actions { display: flex; gap: 8px; flex-wrap: wrap; padding: 14px 16px; border-bottom: 1px solid var(--border-soft); }
+.d-actions .btn { height: 34px; }
+.dsec { padding: 14px 16px; border-bottom: 1px solid var(--border-soft); }
+.dsec:last-child { border-bottom: 0; }
+.dsec-title {
+  display: flex; align-items: baseline; justify-content: space-between; gap: 8px;
+  margin: 0 0 10px; font-size: 11px; font-weight: 500; letter-spacing: .03em; text-transform: uppercase; color: var(--text-3);
+}
+.dsec-meta { font-size: 12.5px; font-weight: 500; letter-spacing: 0; text-transform: none; color: var(--text); }
+.kv { display: grid; grid-template-columns: 112px minmax(0, 1fr); gap: 7px 12px; margin: 0; font-size: 13px; }
+.kv dt { color: var(--text-2); }
+.kv dd { margin: 0; overflow-wrap: anywhere; }
+.d-items { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
+.d-items li { display: flex; align-items: center; gap: 6px; font-size: 13px; }
+.d-item-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.d-items .mini-tag { margin-left: 0; flex: none; }
+.d-qty { margin-left: auto; color: var(--text-2); flex: none; }
+.d-history { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
+.d-history li { display: flex; align-items: center; gap: 10px; font-size: 12.5px; }
+.d-when { margin-left: auto; font-size: 12px; color: var(--text-3); }
+.d-label { display: block; font-size: 12px; color: var(--text-2); margin-bottom: 6px; }
+.d-row { display: grid; grid-template-columns: 112px minmax(0, 1fr); align-items: center; gap: 12px; }
+.d-row + .d-row { margin-top: 10px; }
+.d-row .d-label { margin: 0; }
+.d-owner { display: flex; gap: 8px; }
+.d-owner .select { flex: 1; min-width: 0; }
+
+.outcomes { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 6px; }
+.oc {
+  display: flex; align-items: center; height: 36px; padding: 0 11px; cursor: pointer;
+  background: var(--surface); border: 1px solid var(--border); border-radius: 8px; text-align: left;
+}
+.oc:hover { background: var(--surface-2); }
+.oc.on { border-color: var(--ink); box-shadow: inset 0 0 0 1px var(--ink); }
+.d-callback { margin-top: 12px; }
+.d-callback .input { width: 100%; padding-left: 10px; }
+.js-callback.needed { border-color: #FEC84B; background: var(--warning-soft); }
+.cb-hint { font-size: 12px; color: var(--warning-text); margin-top: 6px; }
+
+.dsec textarea.input {
+  width: 100%; height: auto; min-height: 72px; padding: 8px 10px; resize: vertical; line-height: 1.45; font-size: 13px;
+}
+.pills { display: flex; flex-wrap: wrap; gap: 6px; }
+.pill {
+  display: inline-flex; align-items: center; gap: 6px; height: 28px; padding: 0 10px; cursor: pointer;
+  font-size: 12.5px; color: var(--text-2); background: var(--surface);
+  border: 1px solid var(--border); border-radius: 7px; user-select: none;
+}
+.pill input { position: absolute; opacity: 0; pointer-events: none; }
+.pill:hover { background: var(--surface-2); }
+.pill.on { color: var(--text); border-color: var(--ink); box-shadow: inset 0 0 0 1px var(--ink); }
+.timeline .act { padding: 8px 0; }
+.timeline .act:not(:last-child)::before { top: 36px; bottom: -6px; }
+
+.alert { align-items: center; }
+.alert-link { margin-left: auto; flex: none; background: none; border: 0; cursor: pointer; font: inherit; font-weight: 500; color: inherit; text-decoration: underline; text-underline-offset: 2px; }
+
+/* ---------------- responsive ---------------- */
+@media (max-width: 1360px) {
+  /* first to go: who touched it last and the recorded reason — both in the drawer */
+  .board-table .col-last, .board-table .col-reason { display: none; }
+  /* the <col>s must go too — hiding only the cells shifts every later cell one column left */
+  .board-table col.c-last, .board-table col.c-reason { display: none; }
+  .board-table { min-width: 860px; }
+}
+@media (max-width: 1100px) {
+  .board-table .col-items { display: none; }
+  .board-table col.c-items { display: none; }
+  .board-table { min-width: 720px; }
+  .board-filters .search .input { width: 220px; }
+}
+@media (max-width: 760px) {
+  .table-wrap:has(.board-table) { display: none; }
+  .clist { display: block; }
+  .board-filters { padding: 10px 12px; }
+  .board-filters .search { flex: 1 1 100%; }
+  .board-filters .search .input { width: 100%; }
+  .board-filters .select { flex: 1 1 30%; min-width: 0; }
+  .board-filters .spacer { display: none; }
+  .sort-pick { flex: 1 1 100%; }
+  .sort-pick .select { width: 100%; }
+  .citem { display: block; padding: 14px; border-bottom: 1px solid var(--border-soft); cursor: pointer; }
+  .citem:last-child { border-bottom: 0; }
+  .citem.attn { background: #FFFDF7; }
+  .citem.mine { box-shadow: inset 2px 0 0 #98A2B3; }
+  .citem.done { opacity: .45; }
+  .citem.empty { cursor: default; }
+  .ci-top { display: flex; align-items: center; gap: 8px; }
+  .ci-val { font-size: 16px; font-weight: 500; }
+  .ci-age { font-size: 12px; color: var(--text-3); }
+  .ci-top .status-btn { margin-left: auto; }
+  .ci-top .status-btn .caret { opacity: 1; }
+  .ci-name { font-size: 14px; font-weight: 500; margin-top: 6px; }
+  .ci-items { font-size: 12.5px; color: var(--text-2); margin-top: 2px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .ci-follow { display: flex; align-items: center; gap: 6px; margin-top: 6px; }
+  .ci-follow .lucide { width: 13px; height: 13px; color: var(--text-3); }
+  .ci-attn { font-size: 12px; margin-top: 4px; }
+  .ci-attn.warn { color: var(--warning-text); }
+  .ci-attn.bad { color: var(--error-text); }
+  .ci-actions { display: flex; gap: 8px; margin-top: 12px; }
+  .ci-actions .btn { flex: 1; justify-content: center; height: 40px; }
+  .drawer-wide { width: 100vw; }
+  .d-row { grid-template-columns: 1fr; gap: 6px; }
+  .kv { grid-template-columns: 96px minmax(0, 1fr); }
+}

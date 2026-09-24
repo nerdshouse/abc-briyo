@@ -349,9 +349,10 @@ export const initials = (name) => String(name || '?').split(/\s+/).filter(Boolea
 /**
  * Sidebar behaviour shared by every page on the new shell: the off-canvas toggle
  * below 1024px, the ⌘K search (which hands off to the board's global search —
- * the only search in the app), the signed-in user card, and sign-out.
+ * the only search in the app — or, given `onSearch`, runs it in place), the
+ * signed-in user card, admin-only links, and sign-out.
  */
-export function initShell(me) {
+export function initShell(me, { onSearch } = {}) {
   const app = $('.app');
   const open = () => app.classList.add('nav-open');
   const close = () => app.classList.remove('nav-open');
@@ -368,11 +369,17 @@ export function initShell(me) {
   $('#sideSearchForm')?.addEventListener('submit', (e) => {
     e.preventDefault();
     const q = $('#sideSearch').value.trim();
-    if (q) window.location.href = `/?q=${encodeURIComponent(q)}`;
+    if (!q) return;
+    // On the board the sidebar search is the board's own search; elsewhere it
+    // hands off to the board, the only page that searches every cart.
+    if (onSearch) { onSearch(q); close(); } else window.location.href = `/?q=${encodeURIComponent(q)}`;
   });
   if (/Mac|iPhone|iPad/.test(navigator.platform) === false) {
     const k = $('.side-search kbd'); if (k) k.textContent = 'Ctrl K';
   }
+
+  // Admin-only destinations are hidden, not disabled: a link that 403s is noise.
+  for (const el of document.querySelectorAll('[data-admin]')) el.hidden = !me?.isAdmin;
 
   if (me?.name) {
     $('#userName').textContent = me.name;
