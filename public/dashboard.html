@@ -3,188 +3,322 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Owner view — Cart Recovery Board</title>
-  <link rel="stylesheet" href="/styles.css" />
+  <title>Dashboard — Briyo Recovery</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/ui.css" />
+  <script src="https://cdn.jsdelivr.net/npm/lucide@0.469.0/dist/umd/lucide.min.js" defer></script>
 </head>
 <body>
-  <div class="wrap">
-    <header class="page">
+<div class="app">
+
+  <!-- ============================== sidebar ============================== -->
+  <aside class="sidebar" id="sidebar" aria-label="Main navigation">
+    <div class="brand">
+      <span class="brand-mark"><i data-lucide="shopping-cart"></i></span>
       <div>
-        <h1 id="hello">Owner view</h1>
-        <p class="sub">What is happening with the carts, and what needs doing. Admins only.</p>
+        <div class="brand-name">Briyo Recovery</div>
+        <div class="brand-sub">Abandoned carts</div>
       </div>
-      <div class="session">
-        <div class="group" id="dashRange" role="group" aria-label="Range">
-          <button type="button" data-days="1">Today</button>
-          <button type="button" data-days="7" class="active">7 days</button>
-          <button type="button" data-days="30">30 days</button>
-          <button type="button" data-days="0">All</button>
+    </div>
+
+    <form class="side-search" id="sideSearchForm" role="search">
+      <i data-lucide="search"></i>
+      <input id="sideSearch" type="search" placeholder="Find a customer" autocomplete="off"
+             aria-label="Search every cart by name, phone or email" />
+      <kbd>⌘ K</kbd>
+    </form>
+
+    <nav>
+      <div class="nav-group">
+        <div class="nav-caption">Overview</div>
+        <a class="nav-item active" href="/dashboard" aria-current="page"><i data-lucide="layout-grid"></i>Dashboard</a>
+      </div>
+
+      <div class="nav-group">
+        <div class="nav-caption">Carts</div>
+        <a class="nav-item" href="/?mode=all"><i data-lucide="shopping-bag"></i>Call board</a>
+        <div class="nav-tree">
+          <a class="nav-item" href="/?mode=tocall">To call<span class="nav-count" id="countToCall" hidden></span></a>
+          <a class="nav-item" href="/?mode=callbacks">Callbacks<span class="nav-count" id="countCallbacks" hidden></span></a>
+          <a class="nav-item" href="/?mode=mine">My queue</a>
+          <a class="nav-item" href="/?mode=all">All carts</a>
         </div>
-        <a class="btnlink" href="/admin">Members</a>
-        <a class="btnlink" href="/">← Board</a>
       </div>
+
+      <div class="nav-group">
+        <div class="nav-caption">Team</div>
+        <a class="nav-item" href="/admin"><i data-lucide="users"></i>Members</a>
+      </div>
+
+      <div class="nav-group">
+        <div class="nav-caption">Data</div>
+        <a class="nav-item" href="/import"><i data-lucide="upload"></i>Import carts</a>
+        <a class="nav-item" href="/api/admin/report.csv?period=day" download><i data-lucide="download"></i>Export report</a>
+      </div>
+    </nav>
+
+    <div class="sidebar-foot">
+      <div class="user-card">
+        <span class="avatar" id="userAvatar">·<span class="live"></span></span>
+        <div style="min-width:0">
+          <div class="user-name" id="userName">Signed in</div>
+          <div class="user-role" id="userRole"></div>
+        </div>
+        <button class="icon-btn bare" id="signOut" type="button" title="Sign out" aria-label="Sign out"><i data-lucide="log-out"></i></button>
+      </div>
+    </div>
+  </aside>
+  <div class="scrim" id="scrim"></div>
+
+  <!-- ============================== main ============================== -->
+  <div class="main">
+    <header class="topbar">
+      <button class="icon-btn" id="navOpen" type="button" aria-label="Open navigation"><i data-lucide="menu"></i></button>
+      <span class="topbar-title">Dashboard</span>
     </header>
 
-    <div id="banner" class="banner error" hidden></div>
-    <div id="health" class="banner" hidden></div>
-
-    <!-- 1. Work first. Anything that needs a call is more urgent than any number. -->
-    <section class="panel insight" style="margin-bottom:18px">
-      <header>
-        <h2>Needs doing now</h2>
-        <span class="muted">all time — the range above does not apply here</span>
-      </header>
-      <div class="stats" id="queue"></div>
-      <div id="drawer"></div>
-      <p class="hint">
-        A callback overdue since last month is the most urgent thing on this page, so these
-        four counts deliberately ignore the date range — filtering them by “last 7 days” would
-        hide exactly the work that has been ignored longest. Click any number to see the carts.
-      </p>
-    </section>
-
-    <!-- 2. Today, which is the question the page gets opened to answer. -->
-    <section class="panel insight" style="margin-bottom:18px">
-      <header><h2>Today</h2><span class="muted" id="todayMeta">vs yesterday</span></header>
-      <div class="stats" id="today"></div>
-    </section>
-
-    <!-- 3. Money. Everything below here follows the range selector. -->
-    <section class="panel insight" style="margin-bottom:18px">
-      <header><h2>Money</h2><span class="muted" id="moneyMeta"></span></header>
-      <div class="stats" id="money"></div>
-      <p class="hint">
-        These are <strong>cart</strong> values — what the customer had in the basket when they
-        left. <strong>Recovered cart value is the abandoned cart value at the time of
-        abandonment. It is not verified order revenue.</strong> Recovery is recorded by hand
-        and nothing yet checks it against a real order. A cart nobody has called yet is
-        <strong>still open</strong>, not lost; only a customer who actually said no counts as lost.
-      </p>
-    </section>
-
-    <section class="insights">
-      <div class="panel insight">
-        <header><h2>Pipeline</h2><span class="muted">in range</span></header>
-        <div id="funnel"><p class="muted">Loading…</p></div>
+    <main class="page">
+      <div class="crumbs">
+        <i data-lucide="layout-grid"></i><span>Overview</span><span class="sep">/</span><span class="here">Dashboard</span>
       </div>
-      <div class="panel insight">
-        <header><h2>Carts per day</h2><span class="muted">recovered shaded</span></header>
-        <div id="byDay"><p class="muted">Loading…</p></div>
-      </div>
-    </section>
 
-    <!-- 4. Team. -->
-    <section class="insights">
-      <div class="panel insight">
-        <header><h2>By caller</h2><span class="muted">in range</span></header>
-        <table class="mini">
-          <thead><tr>
-            <th>Caller</th>
-            <th class="right" title="Carts where this person saved the last change">Touched</th>
-            <th class="right">Recovered</th>
-            <th class="right" title="Recovered ÷ touched">Rate</th>
-            <th class="right" title="Recovered cart value, not verified order revenue">Cart value</th>
-          </tr></thead>
-          <tbody id="callers"><tr><td colspan="5" class="empty">Loading…</td></tr></tbody>
-        </table>
-        <p class="hint">
-          “Touched” is who saved the <strong>last</strong> change, not who called first — the
-          board records one owner per cart, not an attempt log. With three callers that is close
-          enough to read as activity; it is not a call count.
-        </p>
+      <div class="page-head">
+        <div>
+          <h1 class="page-title" id="hello">Recovery dashboard</h1>
+          <p class="page-sub" id="helloSub">What needs doing, and how recovery is going.</p>
+        </div>
+        <div class="page-actions">
+          <label class="range-pick">
+            <i data-lucide="calendar"></i>
+            <select id="range" class="select" aria-label="Date range">
+              <option value="1">Today</option>
+              <option value="7" selected>Last 7 days</option>
+              <option value="30">Last 30 days</option>
+              <option value="0">All time</option>
+            </select>
+          </label>
+          <button class="icon-btn" id="refresh" type="button" title="Refresh" aria-label="Refresh"><i data-lucide="refresh-cw"></i></button>
+          <details class="menu">
+            <summary class="icon-btn" aria-label="More"><i data-lucide="ellipsis-vertical"></i></summary>
+            <div class="menu-list">
+              <a href="/api/admin/report.csv?period=day" download><i data-lucide="download"></i>Daily report (CSV)</a>
+              <a href="/api/admin/report.csv?period=week" download><i data-lucide="download"></i>Weekly report (CSV)</a>
+              <div class="menu-sep"></div>
+              <a href="/import"><i data-lucide="upload"></i>Import carts</a>
+              <a href="/admin"><i data-lucide="users"></i>Members</a>
+            </div>
+          </details>
+        </div>
       </div>
-      <div class="panel insight">
-        <header><h2>Who's online</h2><span class="muted" id="onlineMeta"></span></header>
-        <div id="online"><p class="muted">Loading…</p></div>
-      </div>
-    </section>
 
-    <!-- 5. Where carts come from, and what each source can actually tell us. -->
-    <section class="insights">
-      <div class="panel insight">
-        <header><h2>Where carts come from</h2><span class="muted">in range</span></header>
-        <div id="sources"><p class="muted">Loading…</p></div>
-      </div>
-      <div class="panel insight">
-        <header><h2>Why they abandoned</h2><span class="muted" id="reasonMeta"></span></header>
-        <div id="reasons"><p class="muted">Loading…</p></div>
-      </div>
-    </section>
+      <div id="alerts"></div>
 
-    <section class="insights">
-      <div class="panel insight">
-        <header><h2>Where they drop</h2><span class="muted" id="stageMeta"></span></header>
-        <div id="stages"><p class="muted">Loading…</p></div>
+      <!-- Work first: anything that needs a call outranks any number below. -->
+      <section class="card" style="margin-bottom:16px">
+        <header class="card-head">
+          <h2 class="card-title"><i data-lucide="siren"></i>Needs attention <span class="card-meta" title="These counts deliberately ignore the date range: a callback missed last month is the most urgent thing on the page.">all time</span></h2>
+        </header>
+        <div class="pane"><div class="attention" id="attention">
+          <div class="att"><span class="sk w50"></span><span class="sk lg"></span></div>
+          <div class="att"><span class="sk w50"></span><span class="sk lg"></span></div>
+          <div class="att"><span class="sk w50"></span><span class="sk lg"></span></div>
+          <div class="att"><span class="sk w50"></span><span class="sk lg"></span></div>
+        </div></div>
+      </section>
+
+      <div class="grid grid-kpi" id="kpis">
+        <section class="card metric"><header class="card-head"><span class="sk w50"></span></header><div class="pane"><div style="width:100%"><span class="sk lg"></span><span class="sk w70" style="margin-top:12px"></span></div></div></section>
+        <section class="card metric"><header class="card-head"><span class="sk w50"></span></header><div class="pane"><div style="width:100%"><span class="sk lg"></span><span class="sk w70" style="margin-top:12px"></span></div></div></section>
+        <section class="card metric"><header class="card-head"><span class="sk w50"></span></header><div class="pane"><div style="width:100%"><span class="sk lg"></span><span class="sk w70" style="margin-top:12px"></span></div></div></section>
+        <section class="card metric"><header class="card-head"><span class="sk w50"></span></header><div class="pane"><div style="width:100%"><span class="sk lg"></span><span class="sk w70" style="margin-top:12px"></span></div></div></section>
       </div>
-      <div class="panel insight">
-        <header><h2>Risk mix</h2><span class="muted">split by source</span></header>
-        <div id="risk"><p class="muted">Loading…</p></div>
-        <p class="hint">
-          GoKwik's RTO flag and Shopify's risk level are different scores that happen to share
-          the words High and Low, so they are listed separately rather than added together.
-        </p>
+
+      <section class="card" style="margin-bottom:16px">
+        <header class="card-head">
+          <h2 class="card-title"><i data-lucide="gauge"></i>Operations <span class="card-meta" id="opsMeta"></span></h2>
+        </header>
+        <div class="pane"><div class="ops" id="ops"></div></div>
+      </section>
+
+      <div class="grid grid-main">
+        <section class="card">
+          <header class="card-head">
+            <h2 class="card-title"><i data-lucide="chart-column"></i>Recovery trend <span class="card-meta" id="chartMeta"></span></h2>
+            <div class="card-tools">
+              <select id="chartMetric" class="select" aria-label="Chart metric">
+                <option value="carts">Carts received</option>
+                <option value="worked">Carts called</option>
+                <option value="recovered">Carts recovered</option>
+                <option value="recovered_value">Recovered cart value</option>
+              </select>
+            </div>
+          </header>
+          <div class="pane">
+            <div class="chart-head">
+              <span class="chart-total" id="chartTotal">—</span>
+              <span class="delta" id="chartDelta"></span>
+            </div>
+            <div class="chart" id="chart"></div>
+          </div>
+        </section>
+
+        <section class="card">
+          <header class="card-head">
+            <h2 class="card-title">Latest activity</h2>
+            <i data-lucide="history"></i>
+          </header>
+          <div class="pane">
+            <div class="act-tabs" id="actTabs" role="tablist">
+              <button type="button" data-tab="today" class="active" role="tab">Today</button>
+              <button type="button" data-tab="yesterday" role="tab">Yesterday</button>
+              <button type="button" data-tab="week" role="tab">This week</button>
+            </div>
+            <div class="act-search search">
+              <i data-lucide="search"></i>
+              <input class="input" id="actSearch" type="search" placeholder="Search activity" autocomplete="off" aria-label="Search activity" />
+            </div>
+            <div class="act-count" id="actCount"><span class="sk w50"></span></div>
+            <div class="activity" id="activity"></div>
+          </div>
+        </section>
       </div>
-    </section>
 
-    <section class="panel insight" style="margin-bottom:18px">
-      <header><h2>Marketing source</h2><span class="muted" id="utmMeta"></span></header>
-      <div id="utm"><p class="muted">Loading…</p></div>
-    </section>
+      <section class="card" style="margin-bottom:16px">
+        <header class="card-head">
+          <h2 class="card-title"><i data-lucide="list-checks"></i>Carts <span class="card-meta" id="tableMeta"></span></h2>
+          <div class="card-tools filters">
+            <label class="search">
+              <i data-lucide="search"></i>
+              <input class="input" id="fq" type="search" placeholder="Customer, phone or email" autocomplete="off" aria-label="Filter carts" />
+            </label>
+            <select class="select" id="fstatus" aria-label="Status"><option value="">Status</option></select>
+            <select class="select" id="fowner" aria-label="Assigned to"><option value="">Owner</option></select>
+            <select class="select" id="freason" aria-label="Reason"><option value="">Reason</option></select>
+            <button type="button" class="linky linkish" id="fclear" hidden>Clear</button>
+          </div>
+        </header>
+        <div class="pane">
+          <div class="table-wrap">
+            <table class="table" id="cartTable">
+              <thead><tr>
+                <th class="sortable" data-sort="customer_name">Customer<span class="sort"></span></th>
+                <th class="sortable r" data-sort="total_price">Cart value<span class="sort"></span></th>
+                <th>Phone</th>
+                <th class="sortable" data-sort="status">Status<span class="sort"></span></th>
+                <th class="sortable" data-sort="assigned_to_name">Assigned to<span class="sort"></span></th>
+                <th class="sortable" data-sort="status_updated_at">Last update<span class="sort"></span></th>
+                <th class="sortable" data-sort="callback_at">Follow-up<span class="sort"></span></th>
+                <th>Reason</th>
+                <th class="sortable" data-sort="received_at">Created<span class="sort"></span></th>
+                <th class="r"><span class="sr-only">Actions</span></th>
+              </tr></thead>
+              <tbody id="cartRows"></tbody>
+            </table>
+          </div>
+          <div class="table-more" id="tableMore" hidden><button class="btn" id="showMore" type="button">Show more</button></div>
+        </div>
+      </section>
 
-    <!-- Everything anyone changed, newest first. -->
-    <section class="panel insight" style="margin-bottom:18px">
-      <header>
-        <h2>Activity log</h2>
-        <span class="muted" id="activityMeta">every change, newest first</span>
-      </header>
-      <div id="activity"><p class="muted">Loading…</p></div>
-      <p class="hint">
-        Recorded from 23 Sep 2026, when logging was added — anything before that was
-        overwritten in place and cannot be recovered.
-      </p>
-    </section>
+      <div class="grid grid-team">
+        <section class="card">
+          <header class="card-head"><h2 class="card-title"><i data-lucide="filter"></i>Pipeline <span class="card-meta">in range</span></h2></header>
+          <div class="pane pad" id="funnel"></div>
+        </section>
+        <section class="card">
+          <header class="card-head"><h2 class="card-title"><i data-lucide="users"></i>By caller <span class="card-meta">in range</span></h2></header>
+          <div class="pane">
+            <div class="table-wrap"><table class="table compact">
+              <thead><tr>
+                <th title="Carts where this person saved the last change">Caller</th>
+                <th class="r" title="Carts where this person saved the last change">Touched</th>
+                <th class="r">Recovered</th>
+                <th class="r" title="Recovered ÷ touched">Rate</th>
+                <th class="r" title="Recovered cart value — not verified order revenue">Recovered cart value</th>
+              </tr></thead>
+              <tbody id="callers"></tbody>
+            </table></div>
+            <div class="pane-foot">“Touched” is whoever saved the last change, not who called first — it reads as activity, not a call count.</div>
+          </div>
+        </section>
+        <section class="card">
+          <header class="card-head"><h2 class="card-title"><i data-lucide="radio"></i>Who's online</h2><span class="card-meta" id="onlineMeta"></span></header>
+          <div class="pane pad"><div class="presence" id="online"></div></div>
+        </section>
+      </div>
 
-    <!-- 6. The long view. -->
-    <section class="panel insight" style="margin-bottom:18px">
-      <header>
-        <h2>Report</h2>
-        <span class="session" style="gap:8px">
-          <span class="muted">last 14 periods, independent of the range above</span>
-          <span class="group" id="periodGroup" role="group" aria-label="Report period">
-            <button type="button" data-period="day" class="active">Daily</button>
-            <button type="button" data-period="week">Weekly</button>
-            <button type="button" data-period="month">Monthly</button>
-          </span>
-          <a class="btnlink" id="reportCsv" href="/api/admin/report.csv?period=day" download>Download CSV</a>
-        </span>
-      </header>
-      <div class="panel" style="overflow-x:auto;box-shadow:none;border:none">
-        <table class="mini" id="reportTable">
-          <thead>
-            <tr>
+      <div class="grid grid-3">
+        <section class="card">
+          <header class="card-head"><h2 class="card-title"><i data-lucide="message-square-text"></i>Why they abandoned <span class="card-meta" id="reasonMeta"></span></h2></header>
+          <div class="pane pad" id="reasons"></div>
+        </section>
+        <section class="card">
+          <header class="card-head"><h2 class="card-title"><i data-lucide="git-merge"></i>Where carts come from</h2></header>
+          <div class="pane pad" id="sources"></div>
+        </section>
+        <section class="card">
+          <header class="card-head"><h2 class="card-title"><i data-lucide="log-out"></i>Where they drop <span class="card-meta" id="stageMeta"></span></h2></header>
+          <div class="pane pad" id="stages"></div>
+        </section>
+      </div>
+
+      <div class="grid grid-2">
+        <section class="card">
+          <header class="card-head"><h2 class="card-title"><i data-lucide="shield-alert"></i>Risk mix <span class="card-meta">split by source</span></h2></header>
+          <div class="pane pad">
+            <div id="risk"></div>
+            <p class="hint">GoKwik's RTO flag and Shopify's risk level are different scores that happen to share the words High and Low, so they are listed separately rather than added together.</p>
+          </div>
+        </section>
+        <section class="card">
+          <header class="card-head"><h2 class="card-title"><i data-lucide="megaphone"></i>Marketing source <span class="card-meta" id="utmMeta"></span></h2></header>
+          <div class="pane pad" id="utm"></div>
+        </section>
+      </div>
+
+      <section class="card">
+        <header class="card-head">
+          <h2 class="card-title"><i data-lucide="table-2"></i>Report <span class="card-meta">last 14 periods, independent of the range above</span></h2>
+          <div class="card-tools">
+            <div class="seg seg-quiet" id="periodGroup" role="group" aria-label="Report period">
+              <button type="button" data-period="day" class="active">Daily</button>
+              <button type="button" data-period="week">Weekly</button>
+              <button type="button" data-period="month">Monthly</button>
+            </div>
+            <a class="btn" id="reportCsv" href="/api/admin/report.csv?period=day" download><i data-lucide="download"></i>CSV</a>
+          </div>
+        </header>
+        <div class="pane">
+          <div class="table-wrap"><table class="table compact">
+            <thead><tr>
               <th id="periodHead">Date</th>
-              <th class="right">Carts</th>
-              <th class="right">Cart value</th>
-              <th class="right">Called</th>
-              <th class="right">Contact</th>
-              <th class="right">Recovered</th>
-              <th class="right">Rate</th>
-              <th class="right" title="Recovered cart value, not verified order revenue">Recovered cart value</th>
-            </tr>
-          </thead>
-          <tbody id="reportRows"><tr><td colspan="8" class="empty">Loading…</td></tr></tbody>
-        </table>
-      </div>
-      <p class="hint">
-        Recovery rate is measured against carts <strong>called</strong>, not carts received —
-        you cannot recover a cart nobody rang, and mixing the two hides whether calling works.
-        The board uses this same definition.
-      </p>
-    </section>
+              <th class="r">Carts</th><th class="r">Cart value</th><th class="r">Called</th>
+              <th class="r">Contact rate</th><th class="r">Recovered</th>
+              <th class="r" title="Recovered ÷ called">Recovery rate</th>
+              <th class="r" title="Not verified order revenue">Recovered cart value</th>
+            </tr></thead>
+            <tbody id="reportRows"></tbody>
+          </table></div>
+          <div class="pane-foot">Recovery rate is recovered ÷ carts <b>called</b>, the same definition the board uses. Recovered cart value is the cart's value at abandonment — not verified order revenue; recovery is recorded by hand and nothing yet checks it against a real order.</div>
+        </div>
+      </section>
 
-    <p class="note" id="footnote"></p>
+      <p class="footnote" id="footnote"></p>
+    </main>
   </div>
+</div>
 
-  <script src="/dashboard.js"></script>
+<!-- The rows behind a Needs-attention number. -->
+<div class="drawer-scrim" id="drawerScrim" hidden></div>
+<aside class="drawer" id="drawer" hidden aria-label="Carts behind this number">
+  <div class="drawer-head">
+    <div><h2 class="drawer-title" id="drawerTitle"></h2><div class="drawer-sub" id="drawerSub"></div></div>
+    <button class="icon-btn" id="drawerClose" type="button" aria-label="Close"><i data-lucide="x"></i></button>
+  </div>
+  <div class="drawer-body" id="drawerBody"></div>
+</aside>
+
+<script type="module" src="/dashboard.js"></script>
 </body>
 </html>
