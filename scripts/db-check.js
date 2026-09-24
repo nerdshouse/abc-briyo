@@ -17,6 +17,12 @@ import { GOKWIK_REAL_PAYLOAD } from './fixtures/gokwik-real.js';
 import { mapShopifyCsv } from '../lib/shopify-csv.js';
 import { csvCell, toCsv } from '../lib/csv.js';
 import {
+  ensureOrdersSchema, createOrder, updateOrder, getOrder, listOrders, orderEvents, addOrderNote,
+  addDocument, removeDocument, orderDocuments, listCouriers, trackingUrlFor, purgeTestOrders,
+} from '../lib/orders.js';
+import { validateDocument, storage, newStorageKey } from '../lib/storage.js';
+import { canUseOrders, canUseRecovery, roleFor } from '../lib/otp.js';
+import {
   isIngestSilent, buildDailySummary, shouldSendSummary, boardDay,
 } from '../lib/sla-alert.js';
 import { issueSession, verifySession } from '../lib/session.js';
@@ -1053,6 +1059,179 @@ await step('CSV export neutralises formulas without mangling numbers', async () 
   if (!csv.includes("'=danger")) throw new Error('toCsv did not guard a formula');
   if (csv.includes("'-5")) throw new Error('toCsv mangled a negative number');
   return `${cases.length} cases, formulas guarded, negatives intact`;
+});
+
+
+// ---- orders & logistics ----------------------------------------------------
+const TEST_ORDER = 'DBCHECK-ORDER-DELETE-ME';
+const ACTOR = 'db-check';
+let orderId = null;
+await step('orders schema (channels, couriers, orders, documents, events)', async () => {
+  await ensureOrdersSchema();
+  await purgeTestOrders(TEST_ORDER); // leftovers from an interrupted run
+  const couriers = await listCouriers();
+  if (!couriers.some((c) => c.name === 'Delhivery')) throw new Error('courier seed missing');
+  return `${couriers.length} couriers`;
+});
+await step('create order (required fields only)', async () => {
+  orderId = await createOrder({ channel: 'amazon', source_order_id: `${TEST_ORDER}-1`,
+    order_date: new Date().toISOString(), order_value: '1,299.50' }, { actor: ACTOR });
+  const o = await getOrder(orderId);
+  if (!/^ORD-\d{6}$/.test(o.internal_order_id)) throw new Error(`bad internal id ${o.internal_order_id}`);
+  if (o.order_value !== 1299.5 || o.order_status !== 'new' || o.shipment_status !== 'not_ready') throw new Error('defaults wrong');
+  return o.internal_order_id;
+});
+await step('create rejects missing required fields and unknown channel', async () => {
+  for (const bad of [{}, { channel: 'amazon' }, { channel: 'nope', source_order_id: 'x', order_date: new Date().toISOString(), order_value: 1 },
+    { channel: 'amazon', source_order_id: `${TEST_ORDER}-x`, order_date: new Date().toISOString(), order_value: -1 }]) {
+    try { await createOrder(bad, { actor: ACTOR }); throw new Error(`accepted ${JSON.stringify(bad)}`); }
+    catch (err) { if (err.status !== 400) throw err; }
+  }
+  return 'refused with 400';
+});
+await step('duplicate channel + source order ID is refused and points at the original', async () => {
+  try {
+    await createOrder({ channel: 'amazon', source_order_id: `${TEST_ORDER}-1`, order_date: new Date().toISOString(), order_value: 1 }, { actor: ACTOR });
+    throw new Error('duplicate accepted');
+  } catch (err) {
+    if (err.status !== 409 || err.existingId !== orderId) throw err;
+  }
+  // Same source ID on another channel is a different order.
+  await createOrder({ channel: 'blinkit', source_order_id: `${TEST_ORDER}-1`, order_date: new Date().toISOString(), order_value: 10 }, { actor: ACTOR });
+  return '409 with existing id; other channel allowed';
+});
+await step('channel filtering and tab counts', async () => {
+  const r = await listOrders({ channel: 'amazon', q: TEST_ORDER });
+  if (r.orders.some((o) => o.channel !== 'amazon')) throw new Error('filter leaked');
+  if (r.channelCounts.amazon !== 1 || r.channelCounts.blinkit !== 1) throw new Error(`counts ${JSON.stringify(r.channelCounts)}`);
+  return 'amazon 1, blinkit 1';
+});
+await step('edit order details writes an order_edited event', async () => {
+  const o = await getOrder(orderId);
+  await updateOrder(orderId, { customer_name: 'DB Check', order_value: 1400 }, { actor: ACTOR, version: o.version });
+  const ev = (await orderEvents(orderId)).find((e) => e.event_type === 'order_edited');
+  if (!ev || ev.metadata.changes.order_value.to !== 1400) throw new Error('edit not logged');
+  return 'logged with from/to';
+});
+await step('stale version is refused (concurrent edit)', async () => {
+  const o = await getOrder(orderId);
+  await updateOrder(orderId, { payment_method: 'UPI' }, { actor: 'tab-a', version: o.version });
+  try {
+    await updateOrder(orderId, { payment_method: 'COD' }, { actor: 'tab-b', version: o.version });
+    throw new Error('stale write accepted');
+  } catch (err) { if (err.status !== 409) throw err; }
+  if ((await getOrder(orderId)).payment_method !== 'UPI') throw new Error('first write lost');
+  return 'second writer got 409, first write kept';
+});
+await step('order status and shipment status move independently', async () => {
+  let o = await getOrder(orderId);
+  await updateOrder(orderId, { order_status: 'confirmed' }, { actor: ACTOR, version: o.version });
+  o = await getOrder(orderId);
+  if (o.shipment_status !== 'not_ready') throw new Error('order status touched shipment');
+  await updateOrder(orderId, { shipment_status: 'packed' }, { actor: ACTOR, version: o.version });
+  o = await getOrder(orderId);
+  if (o.order_status !== 'confirmed') throw new Error('shipment touched order status');
+  return 'confirmed / packed';
+});
+await step('dispatch needs courier and AWB', async () => {
+  const o = await getOrder(orderId);
+  try { await updateOrder(orderId, { shipment_status: 'dispatched' }, { actor: ACTOR, version: o.version }); throw new Error('dispatched without AWB'); }
+  catch (err) { if (err.status !== 400) throw err; }
+  return 'refused';
+});
+await step('courier + AWB generate the tracking URL', async () => {
+  const delhivery = (await listCouriers()).find((c) => c.name === 'Delhivery');
+  let o = await getOrder(orderId);
+  await updateOrder(orderId, { courier_partner_id: delhivery.id, tracking_id: 'AWB 123/9', shipment_status: 'dispatched' },
+    { actor: ACTOR, version: o.version });
+  o = await getOrder(orderId);
+  const want = trackingUrlFor(delhivery.tracking_url_template, 'AWB 123/9');
+  if (o.tracking_url !== want || !want.endsWith('AWB%20123%2F9')) throw new Error(`url ${o.tracking_url}`);
+  if (!o.dispatch_date) throw new Error('dispatch_date not stamped');
+  // A courier with no template clears the generated link rather than keep a wrong one.
+  const porter = (await listCouriers()).find((c) => c.name === 'Porter');
+  await updateOrder(orderId, { courier_partner_id: porter.id }, { actor: ACTOR, version: o.version });
+  o = await getOrder(orderId);
+  if (o.tracking_url && o.tracking_url.includes('delhivery')) throw new Error('stale Delhivery link kept');
+  await updateOrder(orderId, { courier_partner_id: delhivery.id }, { actor: ACTOR, version: o.version });
+  return 'encoded AWB, dispatch stamped';
+});
+await step('delivered stamps delivered_at; logistics views follow shipment status', async () => {
+  let o = await getOrder(orderId);
+  let r = await listOrders({ view: 'in_transit', q: `${TEST_ORDER}-1`, channel: 'amazon' });
+  if (r.total !== 1) throw new Error('not in In transit');
+  await updateOrder(orderId, { shipment_status: 'delivered' }, { actor: ACTOR, version: o.version });
+  o = await getOrder(orderId);
+  if (!o.delivered_at) throw new Error('delivered_at missing');
+  r = await listOrders({ view: 'delivered', q: `${TEST_ORDER}-1`, channel: 'amazon' });
+  if (r.total !== 1) throw new Error('not in Delivered');
+  return 'in transit → delivered';
+});
+await step('document validation (type, signature, size)', async () => {
+  const pdf = Buffer.from('%PDF-1.4\n%test\n');
+  const png = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0]);
+  const cases = [
+    [validateDocument('a.pdf', pdf).ok, true], [validateDocument('a.PNG', png).ok, true],
+    [validateDocument('a.jpg', Buffer.from([0xff, 0xd8, 0xff, 0xe0])).ok, true],
+    [validateDocument('a.exe', pdf).ok, false], [validateDocument('a.pdf', png).ok, false],
+    [validateDocument('a.pdf', Buffer.alloc(0)).ok, false],
+    [validateDocument('a.pdf', Buffer.concat([pdf, Buffer.alloc(10 * 1024 * 1024)])).ok, false],
+  ];
+  cases.forEach(([got, want], i) => { if (got !== want) throw new Error(`case ${i}`); });
+  return `${cases.length} cases`;
+});
+await step('multiple documents stored outside the database, removal is soft and logged', async () => {
+  const store = storage();
+  for (const [type, name] of [['tax_invoice', 'invoice.pdf'], ['courier_receipt', 'receipt.pdf']]) {
+    const key = newStorageKey(orderId, 'pdf');
+    await store.put(key, Buffer.from('%PDF-1.4 dbcheck'));
+    await addDocument(orderId, { document_type: type, original_filename: name, storage_path: key, mime_type: 'application/pdf', file_size: 16 }, { actor: ACTOR });
+  }
+  let docs = await orderDocuments(orderId);
+  if (docs.length !== 2) throw new Error(`${docs.length} docs`);
+  if (!(await getOrder(orderId)).has_invoice) throw new Error('has_invoice false');
+  const inv = docs.find((d) => d.document_type === 'tax_invoice');
+  await removeDocument(orderId, inv.id, { actor: ACTOR });
+  docs = await orderDocuments(orderId);
+  if (docs.length !== 2 || !docs.find((d) => d.id === inv.id).removed_at) throw new Error('removal was not soft');
+  if ((await getOrder(orderId)).has_invoice) throw new Error('removed invoice still counted');
+  return '2 files, invoice flag follows removal';
+});
+await step('audit log is complete and append-only', async () => {
+  await addOrderNote(orderId, 'db-check note', { actor: ACTOR });
+  const types = new Set((await orderEvents(orderId)).map((e) => e.event_type));
+  for (const t of ['order_created', 'order_edited', 'order_status_changed', 'shipment_status_changed',
+    'courier_changed', 'tracking_changed', 'document_uploaded', 'document_removed', 'note_added']) {
+    if (!types.has(t)) throw new Error(`missing ${t}`);
+  }
+  for (const sql of ['UPDATE order_events SET actor = $2 WHERE order_id = $1', 'DELETE FROM order_events WHERE order_id = $1']) {
+    try {
+      await getPool().query(sql, sql.startsWith('UPDATE') ? [orderId, 'tamper'] : [orderId]);
+      throw new Error(`allowed: ${sql.split(' ')[0]}`);
+    } catch (err) { if (!/append-only/.test(err.message)) throw err; }
+  }
+  try { await getPool().query('DELETE FROM orders WHERE id = $1', [orderId]); throw new Error('order with history deleted'); }
+  catch (err) { if (err.code !== '23503') throw err; }
+  return `${types.size} event types; UPDATE/DELETE refused`;
+});
+await step('permissions: roles map to areas; existing callers unchanged', async () => {
+  const table = [['admin', true, true], ['caller', false, true], ['logistics', true, false], [undefined, false, false]];
+  for (const [role, orders, recovery] of table) {
+    if (canUseOrders(role) !== orders || canUseRecovery(role) !== recovery) throw new Error(`role ${role}`);
+  }
+  await upsertMember({ phone: TEST_MEMBER, name: 'DB Check', isAdmin: false, addedBy: 'db-check' });
+  if (await roleFor(TEST_MEMBER) !== 'caller') throw new Error('new member not a caller by default');
+  await getPool().query(`UPDATE allowed_users SET role = 'logistics' WHERE phone = $1`, [TEST_MEMBER]);
+  if (await roleFor(TEST_MEMBER) !== 'logistics') throw new Error('logistics role not read');
+  const { rows } = await getPool().query(`SELECT count(*)::int AS n FROM allowed_users WHERE role IS NOT NULL AND phone <> $1`, [TEST_MEMBER]);
+  return `matrix ok; ${rows[0].n} real members have a role set`;
+});
+await step('orders cleanup', async () => {
+  const { orders, paths } = await purgeTestOrders(TEST_ORDER);
+  for (const p of paths) await storage().remove(p);
+  const left = await getPool().query('SELECT count(*)::int AS n FROM orders WHERE source_order_id LIKE $1', [`${TEST_ORDER}%`]);
+  if (left.rows[0].n) throw new Error('orders left behind');
+  return `${orders} orders, ${paths.length} files removed`;
 });
 
 // ---- cleanup ---------------------------------------------------------------

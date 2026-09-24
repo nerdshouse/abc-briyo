@@ -1,0 +1,204 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Orders — Briyo</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/ui.css" />
+  <link rel="stylesheet" href="/orders.css" />
+  <script src="https://cdn.jsdelivr.net/npm/lucide@0.469.0/dist/umd/lucide.min.js" defer></script>
+</head>
+<body>
+<div class="app">
+
+  <aside class="sidebar" id="sidebar" aria-label="Main navigation">
+    <div class="brand">
+      <span class="brand-mark"><i data-lucide="package"></i></span>
+      <div>
+        <div class="brand-name">Briyo Operations</div>
+        <div class="brand-sub">Orders &amp; logistics</div>
+      </div>
+    </div>
+
+    <nav>
+      <div class="nav-group" data-admin hidden>
+        <div class="nav-caption">Overview</div>
+        <a class="nav-item" href="/dashboard"><i data-lucide="layout-grid"></i>Dashboard</a>
+      </div>
+
+      <div class="nav-group" data-recovery hidden>
+        <div class="nav-caption">Carts</div>
+        <a class="nav-item" href="/?mode=all"><i data-lucide="shopping-bag"></i>Call board</a>
+        <div class="nav-tree">
+          <a class="nav-item" href="/?mode=tocall">To call</a>
+          <a class="nav-item" href="/?mode=callbacks">Callbacks</a>
+          <a class="nav-item" href="/?mode=mine">My queue</a>
+          <a class="nav-item" href="/?mode=all">All carts</a>
+        </div>
+      </div>
+
+      <div id="ordersNav"></div>
+
+      <div class="nav-group" data-admin hidden>
+        <div class="nav-caption">Team</div>
+        <a class="nav-item" href="/admin"><i data-lucide="users"></i>Members</a>
+      </div>
+    </nav>
+
+    <div class="sidebar-foot">
+      <div class="user-card">
+        <span class="avatar" id="userAvatar">·<span class="live"></span></span>
+        <div style="min-width:0">
+          <div class="user-name" id="userName">Signed in</div>
+          <div class="user-role" id="userRole"></div>
+        </div>
+        <button class="icon-btn bare" id="signOut" type="button" title="Sign out" aria-label="Sign out"><i data-lucide="log-out"></i></button>
+      </div>
+    </div>
+  </aside>
+  <div class="scrim" id="scrim"></div>
+
+  <div class="main">
+    <header class="topbar">
+      <button class="icon-btn" id="navOpen" type="button" aria-label="Open navigation"><i data-lucide="menu"></i></button>
+      <span class="topbar-title" id="topTitle">Orders</span>
+    </header>
+
+    <main class="page">
+      <div class="crumbs">
+        <i data-lucide="package"></i><span id="crumbGroup">Orders</span><span class="sep">/</span><span class="here" id="crumbHere">All orders</span>
+      </div>
+
+      <div class="page-head">
+        <div>
+          <h1 class="page-title" id="pageTitle">All orders</h1>
+          <p class="page-sub" id="pageSub">Loading orders…</p>
+        </div>
+        <div class="page-actions">
+          <button class="icon-btn" id="refresh" type="button" title="Refresh" aria-label="Refresh"><i data-lucide="refresh-cw"></i></button>
+          <button class="btn primary" id="newOrder" type="button"><i data-lucide="plus"></i>New order</button>
+        </div>
+      </div>
+
+      <div id="alerts"></div>
+
+      <section class="card">
+        <header class="card-head board-head">
+          <div class="tabs" id="channelTabs" role="tablist" aria-label="Channel"></div>
+        </header>
+        <div class="pane">
+          <div class="board-filters">
+            <label class="search">
+              <i data-lucide="search"></i>
+              <input class="input" id="q" type="search" autocomplete="off" spellcheck="false"
+                     placeholder="Order ID, AWB, customer" aria-label="Search orders" />
+            </label>
+            <select class="select" id="fstatus" aria-label="Order status"><option value="">Order status</option></select>
+            <select class="select" id="fshipment" aria-label="Shipment"><option value="">Shipment</option></select>
+            <select class="select" id="fcourier" aria-label="Courier"><option value="">Courier</option></select>
+            <select class="select" id="finvoice" aria-label="Invoice">
+              <option value="">Invoice</option>
+              <option value="yes">Invoice uploaded</option>
+              <option value="no">No invoice</option>
+            </select>
+            <select class="select" id="ftracking" aria-label="Tracking">
+              <option value="">Tracking</option>
+              <option value="yes">AWB added</option>
+              <option value="no">No AWB</option>
+            </select>
+            <span class="date-range"><label class="date-pick" title="Order date from"><span>From</span><input class="input" id="ffrom" type="date" aria-label="Order date from" /></label>
+            <label class="date-pick" title="Order date to"><span>To</span><input class="input" id="fto" type="date" aria-label="Order date to" /></label></span>
+            <button type="button" class="linkish" id="fclear" hidden>Clear</button>
+          </div>
+          <div class="board-meta" id="resultNote" aria-live="polite"></div>
+
+          <div class="table-wrap">
+            <table class="table ord-table">
+              <colgroup>
+                <col class="c-order" /><col class="c-chan" /><col class="c-cust" /><col class="c-amt" />
+                <col class="c-ostat" /><col class="c-ship" /><col class="c-courier" /><col class="c-track" />
+                <col class="c-inv" /><col class="c-date" /><col class="c-act" />
+              </colgroup>
+              <thead><tr>
+                <th>Order</th><th>Channel</th><th>Customer</th><th class="r">Amount</th>
+                <th>Order status</th><th>Shipment</th><th class="col-courier">Courier</th>
+                <th class="col-track">Tracking</th><th>Invoice</th><th>Order date</th>
+                <th class="r"><span class="sr-only">Actions</span></th>
+              </tr></thead>
+              <tbody id="rows"></tbody>
+            </table>
+          </div>
+          <ul class="clist" id="clist" aria-label="Orders"></ul>
+          <div class="table-more" id="more" hidden><button class="btn" type="button" id="moreBtn">Show more</button></div>
+        </div>
+      </section>
+
+      <p class="footnote" id="footnote">Orders are entered by hand in this version. Every change is recorded in the order's activity timeline and cannot be edited afterwards.</p>
+    </main>
+  </div>
+</div>
+
+<!-- Order detail -->
+<div class="drawer-scrim" id="drawerScrim" hidden></div>
+<aside class="drawer drawer-wide" id="drawer" hidden aria-label="Order detail">
+  <div class="drawer-head">
+    <div style="min-width:0">
+      <h2 class="drawer-title" id="dTitle"></h2>
+      <div class="drawer-sub" id="dSub"></div>
+    </div>
+    <div class="drawer-nav">
+      <button class="icon-btn" id="dClose" type="button" title="Close" aria-label="Close"><i data-lucide="x"></i></button>
+    </div>
+  </div>
+  <div class="drawer-body" id="dBody"></div>
+  <div class="drawer-foot"><span class="saved" id="dSaved"></span></div>
+</aside>
+
+<!-- Create / edit order -->
+<aside class="drawer drawer-wide" id="formDrawer" hidden aria-label="Order form">
+  <div class="drawer-head">
+    <div><h2 class="drawer-title" id="fTitle">New order</h2><div class="drawer-sub" id="fSub">Logistics details are added after the order exists.</div></div>
+    <div class="drawer-nav"><button class="icon-btn" id="fClose" type="button" title="Close" aria-label="Close"><i data-lucide="x"></i></button></div>
+  </div>
+  <form class="drawer-body" id="orderForm" novalidate>
+    <div class="form-error" id="formError" role="alert" hidden></div>
+    <section class="dsec">
+      <h3 class="dsec-title">Order</h3>
+      <div class="form-grid">
+        <label class="fld"><span>Channel <em>*</em></span><select class="select" name="channel" required></select></label>
+        <label class="fld"><span>Source order ID <em>*</em></span><input class="input" name="source_order_id" required maxlength="100" autocomplete="off" /></label>
+        <label class="fld"><span>Order date <em>*</em></span><input class="input" name="order_date" type="datetime-local" required /></label>
+        <label class="fld"><span>Order value (₹) <em>*</em></span><input class="input" name="order_value" inputmode="decimal" required autocomplete="off" /></label>
+      </div>
+    </section>
+    <section class="dsec">
+      <h3 class="dsec-title">Customer <span class="dsec-meta soft">optional</span></h3>
+      <div class="form-grid">
+        <label class="fld"><span>Name</span><input class="input" name="customer_name" maxlength="120" autocomplete="off" /></label>
+        <label class="fld"><span>Phone</span><input class="input" name="customer_phone" maxlength="20" inputmode="tel" autocomplete="off" /></label>
+        <label class="fld wide"><span>Email</span><input class="input" name="customer_email" maxlength="160" type="email" autocomplete="off" /></label>
+      </div>
+    </section>
+    <section class="dsec">
+      <h3 class="dsec-title">Payment <span class="dsec-meta soft">optional</span></h3>
+      <div class="form-grid">
+        <label class="fld"><span>Method</span><input class="input" name="payment_method" maxlength="40" placeholder="UPI, COD, card…" autocomplete="off" /></label>
+        <label class="fld"><span>Status</span><select class="select" name="payment_status"><option value="">—</option></select></label>
+      </div>
+    </section>
+  </form>
+  <div class="drawer-foot">
+    <span class="saved" id="fSaved"></span>
+    <div style="display:flex;gap:8px">
+      <button class="btn" type="button" id="fCancel">Cancel</button>
+      <button class="btn primary" type="submit" form="orderForm" id="fSubmit">Create order</button>
+    </div>
+  </div>
+</aside>
+
+<script type="module" src="/orders.js"></script>
+</body>
+</html>

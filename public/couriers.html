@@ -1,0 +1,99 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Courier partners — Briyo</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/ui.css" />
+  <link rel="stylesheet" href="/orders.css" />
+  <script src="https://cdn.jsdelivr.net/npm/lucide@0.469.0/dist/umd/lucide.min.js" defer></script>
+</head>
+<body>
+<div class="app">
+
+  <aside class="sidebar" id="sidebar" aria-label="Main navigation">
+    <div class="brand">
+      <span class="brand-mark"><i data-lucide="package"></i></span>
+      <div>
+        <div class="brand-name">Briyo Operations</div>
+        <div class="brand-sub">Orders &amp; logistics</div>
+      </div>
+    </div>
+
+    <nav>
+      <div class="nav-group" data-admin hidden>
+        <div class="nav-caption">Overview</div>
+        <a class="nav-item" href="/dashboard"><i data-lucide="layout-grid"></i>Dashboard</a>
+      </div>
+
+      <div class="nav-group" data-recovery hidden>
+        <div class="nav-caption">Carts</div>
+        <a class="nav-item" href="/?mode=all"><i data-lucide="shopping-bag"></i>Call board</a>
+        <div class="nav-tree">
+          <a class="nav-item" href="/?mode=tocall">To call</a>
+          <a class="nav-item" href="/?mode=callbacks">Callbacks</a>
+          <a class="nav-item" href="/?mode=mine">My queue</a>
+          <a class="nav-item" href="/?mode=all">All carts</a>
+        </div>
+      </div>
+
+      <div id="ordersNav"></div>
+
+      <div class="nav-group" data-admin hidden>
+        <div class="nav-caption">Team</div>
+        <a class="nav-item" href="/admin"><i data-lucide="users"></i>Members</a>
+      </div>
+    </nav>
+
+    <div class="sidebar-foot">
+      <div class="user-card">
+        <span class="avatar" id="userAvatar">·<span class="live"></span></span>
+        <div style="min-width:0">
+          <div class="user-name" id="userName">Signed in</div>
+          <div class="user-role" id="userRole"></div>
+        </div>
+        <button class="icon-btn bare" id="signOut" type="button" title="Sign out" aria-label="Sign out"><i data-lucide="log-out"></i></button>
+      </div>
+    </div>
+  </aside>
+  <div class="scrim" id="scrim"></div>
+
+  <div class="main">
+    <header class="topbar">
+      <button class="icon-btn" id="navOpen" type="button" aria-label="Open navigation"><i data-lucide="menu"></i></button>
+      <span class="topbar-title" id="topTitle">Courier partners</span>
+    </header>
+
+    <main class="page">
+      <div class="crumbs">
+        <i data-lucide="truck"></i><span>Logistics</span><span class="sep">/</span><span class="here">Courier partners</span>
+      </div>
+      <div class="page-head">
+        <div>
+          <h1 class="page-title">Courier partners</h1>
+          <p class="page-sub" id="pageSub">The couriers staff can pick on an order, and how each one's tracking link is built.</p>
+        </div>
+      </div>
+      <div id="alerts"></div>
+      <section class="card">
+        <header class="card-head"><h2 class="card-title"><i data-lucide="building-2"></i>Couriers <span class="card-meta" id="cpMeta"></span></h2></header>
+        <div class="pane">
+          <div class="table-wrap">
+            <table class="table cp-table">
+              <colgroup><col style="width:22%" /><col /><col style="width:96px" /><col style="width:96px" /></colgroup>
+              <thead><tr><th>Name</th><th>Tracking link pattern</th><th>Status</th><th class="r"><span class="sr-only">Save</span></th></tr></thead>
+              <tbody id="cpRows"></tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+      <p class="footnote">A pattern is a web address containing <span class="mono">{awb}</span>, which is replaced with the AWB when an order is saved. Leave it blank for couriers without a per-parcel tracking page. Couriers are switched off rather than deleted, so past orders keep their name.</p>
+    </main>
+  </div>
+</div>
+<script type="module" src="/couriers.js"></script>
+</body>
+</html>

@@ -23,7 +23,9 @@ import {
 } from './lib/normalize.js';
 import {
   router as authRouter, requireAuth, requireAdmin, currentUserName, invalidateMembership,
+  requireOrders, requireRecovery,
 } from './lib/auth-routes.js';
+import { router as ordersRouter, courierRouter } from './lib/orders-routes.js';
 import { activeUsers, seedAllowedUsers, normalisePhone, bootstrapAdmins, nameFor } from './lib/otp.js';
 import { mapShopifyCsv } from './lib/shopify-csv.js';
 import { toCsv } from './lib/csv.js';
@@ -387,6 +389,16 @@ app.use('/auth', authRouter);
 
 // --- everything below requires a session ------------------------------------
 app.use(requireAuth);
+
+// Roles: logistics staff reach orders only; the recovery board and its APIs
+// stay with callers and admins, exactly as before roles existed.
+app.get(['/', '/index.html'], requireRecovery);
+app.use(['/api/carts', '/api/status', '/api/reasons'], requireRecovery);
+app.get(['/orders', '/orders.html', '/couriers', '/couriers.html'], requireOrders, (req, res) =>
+  res.sendFile(path.join(PUBLIC, req.path.startsWith('/couriers') ? 'couriers.html' : 'orders.html')));
+app.use('/api/orders', requireOrders, ordersRouter);
+app.use('/api/couriers', requireOrders, courierRouter);
+
 app.use(express.static(PUBLIC));
 
 function fail(res, err, code = 500) {
@@ -859,7 +871,10 @@ app.patch('/api/members/:phone', requireAdmin, async (req, res) => {
     if (!phone) return res.status(400).json({ ok: false, error: 'Invalid number.' });
 
     const actor = await currentUserName(req);
-    const { name, active, isAdmin } = req.body ?? {};
+    const { name, active, isAdmin, role } = req.body ?? {};
+    if (role !== undefined && !['caller', 'logistics'].includes(role)) {
+      return res.status(400).json({ ok: false, error: 'Role must be caller or logistics.' });
+    }
     const losingAdmin = active === false || isAdmin === false;
 
     // A number in ADMIN_PHONES keeps admin rights no matter what this table
@@ -919,6 +934,7 @@ app.patch('/api/members/:phone', requireAdmin, async (req, res) => {
       name: name === undefined ? null : String(name).trim().slice(0, 60),
       active: active === undefined ? null : Boolean(active),
       isAdmin: isAdmin === undefined ? null : Boolean(isAdmin),
+      role: role ?? null,
     });
     if (!member) return res.status(404).json({ ok: false, error: 'No such member.' });
 
@@ -927,6 +943,7 @@ app.patch('/api/members/:phone', requireAdmin, async (req, res) => {
       name !== undefined ? `name="${member.name}"` : null,
       active !== undefined ? (active ? 'reactivated' : 'deactivated') : null,
       isAdmin !== undefined ? (isAdmin ? 'promoted to admin' : 'demoted') : null,
+      role !== undefined ? `role=${role}` : null,
     ].filter(Boolean).join(', ');
     await recordMemberChange({ actor, action: 'update', targetPhone: phone, detail: what });
     console.log(`Member updated by ${actor}: +${phone} — ${what}`);

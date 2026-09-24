@@ -63,7 +63,8 @@ function renderMembers(members) {
           ${locked ? '' : `<button class="linky" data-act="phone" data-phone="${esc(m.phone)}">Change</button>`}
         </td>
         <td>
-          ${m.is_admin ? '<span class="chip">Admin</span>' : '<span class="muted">Caller</span>'}
+          ${m.is_admin ? '<span class="chip">Admin</span>'
+            : `<span class="muted">${m.role === 'logistics' ? 'Logistics' : 'Caller'}</span>`}
           ${m.active ? '' : '<div class="muted">deactivated</div>'}
         </td>
         <td class="muted">${when(m.last_login)}</td>
@@ -74,6 +75,11 @@ function renderMembers(members) {
               ${lastAdmin ? 'disabled title="The last admin cannot be demoted"' : ''}>
               ${m.is_admin ? 'Make caller' : 'Make admin'}
             </button>
+            ${m.is_admin ? '' : `<button data-act="role" data-phone="${esc(m.phone)}"
+              data-to="${m.role === 'logistics' ? 'caller' : 'logistics'}"
+              title="Logistics staff see Orders and Logistics only; callers see the recovery board only">
+              ${m.role === 'logistics' ? 'Make caller' : 'Make logistics'}
+            </button>`}
             <button data-act="active" data-phone="${esc(m.phone)}" data-to="${m.active ? 'false' : 'true'}"
               ${lastAdmin ? 'disabled title="The last admin cannot be deactivated"' : ''}>
               ${m.active ? 'Deactivate' : 'Reactivate'}
@@ -150,7 +156,8 @@ $('#memberRows').addEventListener('click', async (e) => {
       await api(`/api/members/${phone}`, { method: 'DELETE' });
       showOk(`+${phone} removed.`);
     } else {
-      const body = act === 'admin' ? { isAdmin: to === 'true' } : { active: to === 'true' };
+      const body = act === 'admin' ? { isAdmin: to === 'true' }
+        : act === 'role' ? { role: to } : { active: to === 'true' };
       await api(`/api/members/${phone}`, { method: 'PATCH', body: JSON.stringify(body) });
       showOk('Updated.');
     }

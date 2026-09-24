@@ -380,16 +380,56 @@ export function initShell(me, { onSearch } = {}) {
 
   // Admin-only destinations are hidden, not disabled: a link that 403s is noise.
   for (const el of document.querySelectorAll('[data-admin]')) el.hidden = !me?.isAdmin;
+  // Same rule by role. Pages without these attributes are unaffected.
+  for (const el of document.querySelectorAll('[data-recovery]')) el.hidden = me?.canRecovery === false;
+  if (me?.canOrders) renderOrdersNav().catch(() => {});
 
   if (me?.name) {
     $('#userName').textContent = me.name;
-    $('#userRole').textContent = me.isAdmin ? 'Admin' : 'Caller';
+    $('#userRole').textContent = me.isAdmin ? 'Admin' : me.role === 'logistics' ? 'Logistics' : 'Caller';
     $('#userAvatar').firstChild.textContent = initials(me.name);
   }
   $('#signOut')?.addEventListener('click', async () => {
     await fetch('/auth/logout', { method: 'POST' });
     window.location.href = '/login';
   });
+}
+
+/**
+ * Orders + Logistics sidebar groups, built from the server's channel list so a
+ * new channel appears here without touching any page. Needs an empty
+ * <div id="ordersNav"></div> in the sidebar; pages without one are untouched.
+ */
+async function renderOrdersNav() {
+  const host = document.getElementById('ordersNav');
+  if (!host) return;
+  const meta = await (await fetch('/api/orders/meta')).json();
+  if (!meta.ok) return;
+  const here = window.location.pathname + window.location.search;
+  const link = (href, label, ico, n) => `<a class="nav-item${href === here ? ' active' : ''}" href="${href}">`
+    + `${ico ? `<i data-lucide="${ico}"></i>` : ''}${esc(label)}`
+    + `${n ? `<span class="nav-count">${count(n)}</span>` : ''}</a>`;
+  host.innerHTML = `
+    <div class="nav-group">
+      <div class="nav-caption">Orders</div>
+      ${link('/orders', 'All orders', 'package')}
+      <div class="nav-tree">${meta.channels.filter((c) => c.active)
+        .map((c) => link(`/orders?channel=${encodeURIComponent(c.key)}`, c.label)).join('')}</div>
+    </div>
+    <div class="nav-group">
+      <div class="nav-caption">Logistics</div>
+      ${Object.entries(meta.views).map(([k, label]) => link(`/orders?view=${k}`, label,
+        { pending_dispatch: 'package-open', in_transit: 'truck', delivered: 'package-check', failed: 'undo-2' }[k],
+        meta.viewCounts?.[k])).join('')}
+      ${link('/couriers', 'Courier partners', 'building-2')}
+    </div>`;
+  // The recovery pages mark their own item active; don't leave two lit.
+  if (host.querySelector('.nav-item.active')) {
+    for (const a of document.querySelectorAll('.sidebar nav > .nav-group .nav-item.active')) {
+      if (!host.contains(a)) a.classList.remove('active');
+    }
+  }
+  renderIcons();
 }
 
 /** Set a sidebar count badge; `alert` turns it red for work that is overdue. */
