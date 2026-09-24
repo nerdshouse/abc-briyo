@@ -1096,6 +1096,23 @@ await step('create order: one empty shipment, numbering continues', async () => 
   if ((await orderShipments(orderId)).length !== 1) throw new Error('no shipment created');
   return o.internal_order_id;
 });
+await step('manual entry: only channel + order number required; value/date optional; note saved', async () => {
+  const id = await createOrder({ channel: 'instamart', source_order_id: `${TEST_ORDER}-min`, note: 'Box damaged at pickup' }, { actor: ACTOR });
+  const o = await getOrder(id);
+  if (o.order_value !== null || o.order_date !== null || o.currency !== 'INR') throw new Error('optional fields not empty');
+  const ev = await orderEvents(id);
+  if (!ev.some((e) => e.event_type === 'note_added' && e.metadata.note === 'Box damaged at pickup')) throw new Error('note not logged');
+  // Undated orders sort and filter by when they were entered (today, IST).
+  const today = new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Kolkata' }).format(new Date());
+  const r = await listOrders({ q: `${TEST_ORDER}-min`, from: today, to: today });
+  if (r.total !== 1 || r.withoutValue !== 1) throw new Error(`filter total=${r.total} withoutValue=${r.withoutValue}`);
+  // Value can be added later, then cleared again.
+  await updateOrder(id, { order_value: '850' }, { actor: ACTOR, version: o.version });
+  const o2 = await getOrder(id);
+  await updateOrder(id, { order_value: '' }, { actor: ACTOR, version: o2.version });
+  if ((await getOrder(id)).order_value !== null) throw new Error('value not cleared');
+  return 'value/date null, note on timeline, undated order filed under entry day';
+});
 await step('create rejects missing required fields and unknown channel', async () => {
   for (const bad of [{}, { channel: 'amazon' }, { channel: 'nope', source_order_id: 'x', order_date: NOW(), order_value: 1 },
     { channel: 'amazon', source_order_id: `${TEST_ORDER}-x`, order_date: NOW(), order_value: -1 },

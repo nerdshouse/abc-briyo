@@ -7,7 +7,11 @@ import {
   $, $$, esc, money, count, icon, renderIcons, setTimezone, dateShort, dateTime, initShell,
 } from './ui/components.js';
 
-const LABEL_OVERRIDES = { rto: 'RTO', not_ready: 'Not ready', cod: 'COD', third_party: 'Third party' };
+const LABEL_OVERRIDES = {
+  rto: 'RTO', not_ready: 'Not ready', cod: 'COD', third_party: 'Third party',
+  tax_invoice: 'Tax Invoice', courier_receipt: 'Courier Receipt', marketplace_invoice: 'Marketplace Invoice',
+  credit_note: 'Credit Note', other: 'Other',
+};
 const label = (v) => (v ? LABEL_OVERRIDES[v] || (v[0].toUpperCase() + v.slice(1)).replaceAll('_', ' ') : '—');
 
 // Dot colours reuse the board's status palette: grey waiting, amber in hand,
@@ -58,6 +62,10 @@ const api = async (url, opts = {}) => {
   if (!res.ok || data.ok === false) throw Object.assign(new Error(data.error || `HTTP ${res.status}`), { status: res.status, data });
   return data;
 };
+
+// Value and date are optional on an order: unknown shows as a dash, never ₹0.
+const amount = (v) => (v === null || v === undefined ? '—' : money(v));
+const day = (iso) => (iso ? dateShort(iso) : '—');
 
 const channelLabel = (key) => state.meta.channels.find((c) => c.key === key)?.label || key;
 const courierById = (id) => state.meta.couriers.find((c) => c.id === Number(id));
@@ -115,7 +123,11 @@ function renderHead(data) {
   $('#crumbHere').textContent = view || (state.channel ? channelLabel(state.channel) : 'All orders');
   $('#topTitle').textContent = title;
   document.title = `${title} — Briyo`;
-  $('#pageSub').textContent = `${count(data.total)} ${data.total === 1 ? 'order' : 'orders'} · ${money(data.totalValue)} order value`;
+  // Only entered values are summed; say how many have none rather than imply ₹0.
+  const valued = data.total - data.withoutValue;
+  $('#pageSub').textContent = `${count(data.total)} ${data.total === 1 ? 'order' : 'orders'}`
+    + (valued ? ` · ${money(data.totalValue)} order value` : '')
+    + (data.withoutValue && data.total ? ` · ${count(data.withoutValue)} without a value` : '');
   $('#resultNote').textContent = anyFilter()
     ? `Showing ${count(state.orders.length)} of ${count(data.total)} matching the filters`
     : `Showing ${count(state.orders.length)} of ${count(data.total)}, newest order date first`;
@@ -154,24 +166,24 @@ function renderRows() {
   $('#rows').innerHTML = state.orders.map((o) => `
     <tr class="orow${o.id === state.openId ? ' open' : ''}" data-id="${o.id}" tabindex="0">
       <td><span class="cell-main" style="font-weight:500">${esc(o.internal_order_id)}</span>
-          <span class="cell-sub muted mono" title="Source order ID">${esc(o.source_order_id)}</span></td>
+          <span class="cell-sub muted mono" title="Order number">${esc(o.source_order_id)}</span></td>
       <td><span class="chan">${esc(o.channel_label)}</span></td>
       <td><span class="cell-main">${o.customer_name ? esc(o.customer_name) : '<span class="muted-cell">—</span>'}</span>
           ${o.customer_phone ? `<span class="cell-sub muted">${esc(o.customer_phone)}</span>` : ''}</td>
-      <td class="r num">${esc(money(o.order_value))}</td>
+      <td class="r num">${esc(amount(o.order_value))}</td>
       <td>${indicator(o.order_status)}</td>
       <td>${indicator(o.shipment_status)}</td>
       <td class="col-courier">${o.courier_name ? esc(o.courier_name) : '<span class="muted-cell">—</span>'}</td>
       <td class="col-track">${trackingCell(o)}</td>
       <td>${o.has_invoice ? `<span class="yes">${icon('check')}Yes</span>` : '<span class="muted-cell">No</span>'}</td>
-      <td class="num">${esc(dateShort(o.order_date))}</td>
+      <td class="num"${o.order_date ? '' : ' title="No order date — shown by when it was entered"'}>${esc(day(o.order_date))}</td>
       <td class="r"><button class="icon-btn bare" type="button" data-open="${o.id}" title="Open order" aria-label="Open ${esc(o.internal_order_id)}">${icon('chevron-right')}</button></td>
     </tr>`).join('');
   $('#clist').innerHTML = state.orders.map((o) => `
     <li class="oitem" data-id="${o.id}" tabindex="0">
       <div class="oi-top"><span class="oi-id">${esc(o.internal_order_id)}</span><span class="chan">${esc(o.channel_label)}</span>
-        <span class="oi-val">${esc(money(o.order_value))}</span></div>
-      <div class="oi-sub">${esc(o.customer_name || 'No customer name')} · ${esc(dateShort(o.order_date))} · <span class="mono">${esc(o.source_order_id)}</span></div>
+        <span class="oi-val">${esc(amount(o.order_value))}</span></div>
+      <div class="oi-sub"><span class="mono">${esc(o.source_order_id)}</span> · ${esc(o.customer_name || 'No customer name')} · ${esc(day(o.order_date))}</div>
       <div class="oi-stat">${indicator(o.order_status)}${indicator(o.shipment_status)}
         ${o.tracking_id ? `<span class="soft" style="font-size:12.5px">${esc(o.courier_name || '')} ${esc(o.tracking_id)}</span>` : ''}
         ${o.has_invoice ? `<span class="yes">${icon('check')}Invoice</span>` : ''}</div>
@@ -231,15 +243,16 @@ function renderDrawer() {
   const notes = events.filter((e) => e.event_type === 'note_added');
 
   $('#dTitle').textContent = o.internal_order_id;
-  $('#dSub').textContent = `${o.channel_label} · ${o.source_order_id} · ${dateTime(o.order_date)}`;
+  $('#dSub').textContent = [o.channel_label, o.source_order_id, o.order_date && dateTime(o.order_date)].filter(Boolean).join(' · ');
 
   $('#dBody').innerHTML = `
     <section class="dsec">
-      <h3 class="dsec-title">Order <span class="dsec-meta num">${esc(money(o.order_value))}</span></h3>
+      <h3 class="dsec-title">Order <span class="dsec-meta num">${esc(amount(o.order_value))}</span></h3>
       <dl class="kv">
         <dt>Channel</dt><dd>${esc(o.channel_label)}</dd>
-        <dt>Source order ID</dt><dd class="mono">${esc(o.source_order_id)}</dd>
-        <dt>Order date</dt><dd>${esc(dateTime(o.order_date))}</dd>
+        <dt>Order Number</dt><dd class="mono">${esc(o.source_order_id)}</dd>
+        <dt>Order Date</dt><dd>${o.order_date ? esc(dateTime(o.order_date)) : '<span class="muted">Not entered</span>'}</dd>
+        <dt>Order Value</dt><dd>${o.order_value === null ? '<span class="muted">Not entered</span>' : esc(`${money(o.order_value)}${o.currency && o.currency !== 'INR' ? ` ${o.currency}` : ''}`)}</dd>
         <dt>Payment</dt><dd>${esc([o.payment_method && label(o.payment_method), o.payment_status && label(o.payment_status)].filter(Boolean).join(' · ') || 'Not known')}</dd>
         <dt>Fulfillment</dt><dd>${esc(o.fulfillment_type ? label(o.fulfillment_type) : 'Not set')}</dd>
         <dt>Entered</dt><dd>${esc(o.created_by || 'System')}, ${esc(dateTime(o.created_at))}${o.source !== 'manual' ? ` · via ${esc(o.source)}` : ''}</dd>
@@ -267,14 +280,14 @@ function renderDrawer() {
           <select class="select" name="courier_partner_id">${opt('', 'Choose courier', !ship.courier_partner_id)}
             ${m.couriers.filter((c) => c.active || c.id === ship.courier_partner_id).map((c) => opt(c.id, c.name, c.id === ship.courier_partner_id)).join('')}
           </select></label>
-        <label class="fld"><span>AWB / tracking ID</span><input class="input mono" name="tracking_id" value="${esc(ship.tracking_id || '')}" maxlength="80" autocomplete="off" /></label>
-        <label class="fld wide"><span>Tracking link</span>
+        <label class="fld"><span>Tracking ID / AWB</span><input class="input mono" name="tracking_id" value="${esc(ship.tracking_id || '')}" maxlength="80" autocomplete="off" /></label>
+        <label class="fld wide"><span>Tracking URL</span>
           <input class="input" name="tracking_url" value="${esc(ship.tracking_url || '')}" ${autoLink ? 'readonly' : ''}
                  placeholder="${autoLink ? 'Filled from the courier and AWB' : 'Paste a link, if the courier gives one'}" maxlength="500" autocomplete="off" />
           <span class="help" id="trackHelp">${trackHelp(courier)}</span>
           ${ship.tracking_url ? `<span class="help"><a class="track-link" href="${esc(ship.tracking_url)}" target="_blank" rel="noopener noreferrer">Open tracking</a></span>` : ''}</label>
-        <label class="fld"><span>Expected delivery</span><input class="input" type="date" name="expected_delivery_date" value="${esc(ship.expected_delivery_date || '')}" /></label>
-        <label class="fld"><span>Shipment status</span>
+        <label class="fld"><span>Expected Delivery</span><input class="input" type="date" name="expected_delivery_date" value="${esc(ship.expected_delivery_date || '')}" /></label>
+        <label class="fld"><span>Shipment Status</span>
           <select class="select" name="shipment_status">${m.shipmentStatuses.map((s) => opt(s, label(s), s === ship.shipment_status)).join('')}</select></label>
       </form>
       <div class="form-actions"><button class="btn primary" type="button" id="dShipSave">Save shipment</button></div>
@@ -339,7 +352,7 @@ const fmtVal = (k, v) => {
   return String(v);
 };
 const FIELD_NAME = {
-  order_value: 'value', source_order_id: 'source ID', customer_name: 'name', customer_phone: 'phone',
+  order_value: 'value', source_order_id: 'order number', customer_name: 'name', customer_phone: 'phone',
   customer_email: 'email', payment_method: 'payment method', payment_status: 'payment status',
   order_date: 'order date', courier_partner_id: 'courier', tracking_id: 'AWB', tracking_url: 'tracking link',
   expected_delivery_date: 'expected delivery', dispatch_date: 'dispatched', delivered_at: 'delivered',
@@ -352,7 +365,7 @@ function describeEvent(e) {
   const md = e.metadata || {};
   const ch = md.changes || {};
   switch (e.event_type) {
-    case 'order_created': return ['plus', 'info', `Order created · ${esc(channelLabel(md.channel))} ${esc(md.source_order_id)} · ${esc(money(md.order_value))}`];
+    case 'order_created': return ['plus', 'info', `Order created · ${esc(channelLabel(md.channel))} ${esc(md.source_order_id)}${md.order_value === null || md.order_value === undefined ? '' : ` · ${esc(money(md.order_value))}`}`];
     case 'order_status_changed': return ['circle-dot', ch.order_status?.to === 'cancelled' ? 'bad' : '', `Order ${esc(label(ch.order_status?.from))} → <b>${esc(label(ch.order_status?.to))}</b>`];
     case 'shipment_status_changed': {
       const to = ch.shipment_status?.to;
@@ -525,14 +538,18 @@ function openForm(order = null) {
     + state.meta.fulfillmentTypes.map((s) => opt(s, label(s), s === order?.fulfillment_type)).join('');
   if (order) {
     for (const k of ['source_order_id', 'customer_name', 'customer_phone', 'customer_email']) form[k].value = order[k] || '';
-    form.order_value.value = order.order_value;
+    form.order_value.value = order.order_value ?? '';
     form.order_date.value = toTeamInput(order.order_date);
-  } else {
-    form.order_date.value = toTeamInput(new Date().toISOString());
+    form.currency.value = order.currency && order.currency !== 'INR' ? order.currency : '';
   }
-  $('#fTitle').textContent = order ? `Edit ${order.internal_order_id}` : 'New order';
-  $('#fSub').textContent = order ? 'Every change is recorded in the timeline.' : 'Logistics details are added after the order exists.';
-  $('#fSubmit').textContent = order ? 'Save changes' : 'Create order';
+  // Editing opens the extra fields when any are filled; a new order starts folded.
+  $('#moreDetails').open = Boolean(order && ['customer_name', 'customer_phone', 'customer_email', 'payment_method',
+    'payment_status', 'fulfillment_type'].some((k) => order[k]));
+  $('#noteSection').hidden = Boolean(order); // notes on an existing order go in its drawer
+  $('#fTitle').textContent = order ? `Edit ${order.internal_order_id}` : 'New Order';
+  $('#fSub').textContent = order ? 'Every change is recorded in the timeline.'
+    : 'Only channel and order number are needed. Add the rest when you have it.';
+  $('#fSubmit').textContent = order ? 'Save Changes' : 'Create Order';
   $('#formDrawer').hidden = false;
   $('#drawerScrim').hidden = false;
   form.source_order_id.focus();
@@ -550,10 +567,11 @@ $('#orderForm').addEventListener('submit', async (e) => {
   const err = $('#formError');
   err.hidden = true;
   const body = Object.fromEntries(new FormData(form));
-  const missing = [['channel', 'channel'], ['source_order_id', 'source order ID'], ['order_date', 'order date'], ['order_value', 'order value']]
+  const missing = [['channel', 'channel'], ['source_order_id', 'order number']]
     .filter(([k]) => !String(body[k] || '').trim()).map(([, l]) => l);
   if (missing.length) { err.textContent = `Enter the ${missing.join(', ')}.`; err.hidden = false; return; }
-  // Sent as wall-clock time; the server reads it in the team's timezone.
+  // Order date is sent as wall-clock time; the server reads it in the team's timezone.
+  if (state.editing) delete body.note;
   const btn = $('#fSubmit');
   btn.disabled = true;
   try {
@@ -567,7 +585,11 @@ $('#orderForm').addEventListener('submit', async (e) => {
       const data = await api('/api/orders', { method: 'POST', body: JSON.stringify(body) });
       closeForm();
       await load();
-      openOrder(data.order.id);
+      // Straight into logistics: courier first.
+      await openOrder(data.order.id);
+      $('#dSaved').className = 'saved';
+      $('#dSaved').textContent = `${data.order.internal_order_id} created`;
+      $('#shipForm [name=courier_partner_id]')?.focus();
     }
     load();
   } catch (ex) {

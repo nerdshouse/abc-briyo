@@ -79,7 +79,7 @@
         </div>
         <div class="page-actions">
           <button class="icon-btn" id="refresh" type="button" title="Refresh" aria-label="Refresh"><i data-lucide="refresh-cw"></i></button>
-          <button class="btn primary" id="newOrder" type="button"><i data-lucide="plus"></i>New order</button>
+          <button class="btn primary" id="newOrder" type="button"><i data-lucide="plus"></i>New Order</button>
         </div>
       </div>
 
@@ -94,7 +94,7 @@
             <label class="search">
               <i data-lucide="search"></i>
               <input class="input" id="q" type="search" autocomplete="off" spellcheck="false"
-                     placeholder="Order ID, AWB, customer" aria-label="Search orders" />
+                     placeholder="Order number, AWB, customer" aria-label="Search orders" />
             </label>
             <select class="select" id="fstatus" aria-label="Order status"><option value="">Order status</option></select>
             <select class="select" id="fshipment" aria-label="Shipment"><option value="">Shipment</option></select>
@@ -136,7 +136,7 @@
         </div>
       </section>
 
-      <p class="footnote" id="footnote">Orders are entered by hand in this version. Every change is recorded in the order's activity timeline and cannot be edited afterwards.</p>
+      <p class="footnote" id="footnote">Orders are entered by the team. Every change is recorded in the order's activity timeline and cannot be edited afterwards.</p>
     </main>
   </div>
 </div>
@@ -157,46 +157,52 @@
   <div class="drawer-foot"><span class="saved" id="dSaved"></span></div>
 </aside>
 
-<!-- Create / edit order -->
+<!-- New order / edit order -->
 <aside class="drawer drawer-wide" id="formDrawer" hidden aria-label="Order form">
   <div class="drawer-head">
-    <div><h2 class="drawer-title" id="fTitle">New order</h2><div class="drawer-sub" id="fSub">Logistics details are added after the order exists.</div></div>
+    <div><h2 class="drawer-title" id="fTitle">New Order</h2><div class="drawer-sub" id="fSub">Only channel and order number are needed. Add the rest when you have it.</div></div>
     <div class="drawer-nav"><button class="icon-btn" id="fClose" type="button" title="Close" aria-label="Close"><i data-lucide="x"></i></button></div>
   </div>
   <form class="drawer-body" id="orderForm" novalidate>
     <div class="form-error" id="formError" role="alert" hidden></div>
     <section class="dsec">
-      <h3 class="dsec-title">Order</h3>
       <div class="form-grid">
         <label class="fld"><span>Channel <em>*</em></span><select class="select" name="channel" required></select></label>
-        <label class="fld"><span>Source order ID <em>*</em></span><input class="input" name="source_order_id" required maxlength="100" autocomplete="off" /></label>
-        <label class="fld"><span>Order date <em>*</em> <span class="soft" id="tzNote"></span></span><input class="input" name="order_date" type="datetime-local" required /></label>
-        <label class="fld"><span>Order value (₹) <em>*</em></span><input class="input" name="order_value" inputmode="decimal" required autocomplete="off" /></label>
+        <label class="fld"><span>Order Number <em>*</em></span><input class="input" name="source_order_id" required maxlength="100" autocomplete="off" placeholder="e.g. #1524" /></label>
+        <label class="fld"><span>Order Date <span class="soft" id="tzNote"></span></span><input class="input" name="order_date" type="datetime-local" /></label>
+        <label class="fld"><span>Order Value (₹)</span><input class="input" name="order_value" inputmode="decimal" autocomplete="off" placeholder="Leave blank if unknown" /></label>
       </div>
     </section>
-    <section class="dsec">
-      <h3 class="dsec-title">Customer <span class="dsec-meta soft">optional</span></h3>
-      <div class="form-grid">
-        <label class="fld"><span>Name</span><input class="input" name="customer_name" maxlength="120" autocomplete="off" /></label>
-        <label class="fld"><span>Phone</span><input class="input" name="customer_phone" maxlength="20" inputmode="tel" autocomplete="off" /></label>
-        <label class="fld wide"><span>Email</span><input class="input" name="customer_email" maxlength="160" type="email" autocomplete="off" /></label>
-      </div>
-    </section>
-    <section class="dsec">
-      <h3 class="dsec-title">Payment &amp; fulfillment <span class="dsec-meta soft">optional</span></h3>
-      <div class="form-grid">
-        <label class="fld"><span>Method</span><select class="select" name="payment_method"></select></label>
-        <label class="fld"><span>Status</span><select class="select" name="payment_status"></select></label>
-        <label class="fld wide"><span>Fulfillment</span><select class="select" name="fulfillment_type"></select>
-          <span class="help">Who ships it — independent of the channel.</span></label>
-      </div>
-    </section>
+    <details class="more" id="moreDetails">
+      <summary><i data-lucide="chevron-right"></i>More details <span class="soft">customer, payment, fulfillment, note</span></summary>
+      <section class="dsec">
+        <h3 class="dsec-title">Customer</h3>
+        <div class="form-grid">
+          <label class="fld"><span>Name</span><input class="input" name="customer_name" maxlength="120" autocomplete="off" /></label>
+          <label class="fld"><span>Phone</span><input class="input" name="customer_phone" maxlength="20" inputmode="tel" autocomplete="off" /></label>
+          <label class="fld wide"><span>Email</span><input class="input" name="customer_email" maxlength="160" type="email" autocomplete="off" /></label>
+        </div>
+      </section>
+      <section class="dsec">
+        <h3 class="dsec-title">Payment &amp; fulfillment</h3>
+        <div class="form-grid">
+          <label class="fld"><span>Payment Method</span><select class="select" name="payment_method"></select></label>
+          <label class="fld"><span>Payment Status</span><select class="select" name="payment_status"></select></label>
+          <label class="fld"><span>Currency</span><input class="input" name="currency" maxlength="3" autocomplete="off" placeholder="INR" /></label>
+          <label class="fld"><span>Fulfillment</span><select class="select" name="fulfillment_type"></select></label>
+        </div>
+      </section>
+      <section class="dsec" id="noteSection">
+        <h3 class="dsec-title">Note</h3>
+        <textarea class="input" name="note" maxlength="2000" placeholder="Saved to the order's timeline"></textarea>
+      </section>
+    </details>
   </form>
   <div class="drawer-foot">
     <span class="saved" id="fSaved"></span>
     <div style="display:flex;gap:8px">
       <button class="btn" type="button" id="fCancel">Cancel</button>
-      <button class="btn primary" type="submit" form="orderForm" id="fSubmit">Create order</button>
+      <button class="btn primary" type="submit" form="orderForm" id="fSubmit">Create Order</button>
     </div>
   </div>
 </aside>

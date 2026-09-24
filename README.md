@@ -623,6 +623,38 @@ This is not row locking, and deliberately so: for a three-person team the cost o
 model (claims, expiry, release, "why can't I edit this") outweighs the occasional duplicate
 call. The 409 only guards the genuinely destructive case — silently overwriting someone's notes.
 
+## Orders & Logistics
+
+A separate, fully manual module at **/orders** for tracking every sales order and
+its shipment, whatever the channel: Website, Amazon, Blinkit, Instamart, Zepto.
+Nothing is pulled from Shopify or a marketplace; the team enters orders. The
+Shopify code described under *Getting carts in* is for abandoned carts only.
+
+**Who sees it.** Admins, and members given the *Logistics* role on the Members
+page. Callers keep the recovery board only; logistics staff see orders only.
+
+**Entering an order.** *New Order* needs just the channel and the order number.
+Order date, value, customer, payment, fulfillment and a note are optional and
+can be added later. The same order number on two channels is two orders; the
+same number twice on one channel opens the existing order instead. Once
+created, the order's drawer opens so logistics can add the courier, the
+tracking ID / AWB, the tax invoice and courier receipt, and move the shipment
+status along (Packed → Dispatched → In transit → Out for delivery → Delivered,
+or Delivery failed / RTO). An order can't be marked dispatched without a
+courier and AWB. Cancelling an order never changes its shipment.
+
+**Tracking links** are built from each courier's pattern on the *Courier
+partners* page (admins edit them). The seeded patterns are unverified until
+someone opens a generated link for a real AWB and ticks *Verified*.
+
+**Documents** (PDF, PNG, JPG, up to 10 MB) are stored in Cloudflare R2 in
+production and on local disk in development; the database keeps only the key.
+Set the `R2_*` variables in `.env.example`. Downloads need an orders login.
+
+**History.** Every change, upload and note is written to the order's activity
+timeline, which the database refuses to edit or delete. Times are stored in
+UTC and shown, entered and filtered in IST.
+
 ## Is the board broken?
 
 ```bash
