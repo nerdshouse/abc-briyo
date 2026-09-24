@@ -55,9 +55,10 @@
       <div class="stats" id="money"></div>
       <p class="hint">
         These are <strong>cart</strong> values — what the customer had in the basket when they
-        left. Recovered is not the value of the order that eventually landed, which we never
-        fetch from Shopify. A cart nobody has called yet is <strong>still open</strong>, not
-        lost; only a customer who actually said no counts as lost.
+        left. <strong>Recovered cart value is the abandoned cart value at the time of
+        abandonment. It is not verified order revenue.</strong> Recovery is recorded by hand
+        and nothing yet checks it against a real order. A cart nobody has called yet is
+        <strong>still open</strong>, not lost; only a customer who actually said no counts as lost.
       </p>
     </section>
 
@@ -82,7 +83,7 @@
             <th class="right" title="Carts where this person saved the last change">Touched</th>
             <th class="right">Recovered</th>
             <th class="right" title="Recovered ÷ touched">Rate</th>
-            <th class="right">Value</th>
+            <th class="right" title="Recovered cart value, not verified order revenue">Cart value</th>
           </tr></thead>
           <tbody id="callers"><tr><td colspan="5" class="empty">Loading…</td></tr></tbody>
         </table>
@@ -168,7 +169,7 @@
               <th class="right">Contact</th>
               <th class="right">Recovered</th>
               <th class="right">Rate</th>
-              <th class="right">Recovered value</th>
+              <th class="right" title="Recovered cart value, not verified order revenue">Recovered cart value</th>
             </tr>
           </thead>
           <tbody id="reportRows"><tr><td colspan="8" class="empty">Loading…</td></tr></tbody>

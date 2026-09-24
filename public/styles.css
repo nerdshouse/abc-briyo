@@ -93,8 +93,8 @@ tbody tr:hover { background: #fafbfc; }
 td.right { font-variant-numeric: tabular-nums; white-space: nowrap; }
 td.empty { color: var(--muted); font-style: italic; text-align: center; padding: 26px; }
 
-.cust-name { font-weight: 500; }
-.cust-email, .muted { color: var(--muted); font-size: 12.5px; }
+.muted { color: var(--muted); font-size: 12.5px; }
+
 /* One line per product, ellipsised — full name is in the title attribute.
    Stacking long names in full made a single row fill the screen. */
 .items { font-size: 12.5px; color: var(--muted); max-width: 26ch; }
@@ -120,15 +120,7 @@ td.empty { color: var(--muted); font-style: italic; text-align: center; padding:
 .links a { color: var(--accent); text-decoration: none; }
 .links a:hover { text-decoration: underline; }
 
-.status-cell { min-width: 260px; }
-.status-cell select { width: 100%; margin-bottom: 5px; }
-.status-cell input { width: 100%; }
-.status-cell .saved { font-size: 11.5px; color: var(--muted); margin-top: 3px; min-height: 15px; }
-.status-cell .saved.pending { color: var(--accent); }
-.status-cell .saved.failed { color: var(--danger); }
 
-tr[data-status="Called – Recovered"] { background: #f4fbf7; }
-tr[data-status="Called – Declined"] { opacity: 0.72; }
 
 .note { margin-top: 22px; color: var(--muted); font-size: 12.5px; line-height: 1.6; }
 code { background: #eef0f3; padding: 1px 5px; border-radius: 4px; font-size: 12px; }
@@ -166,7 +158,6 @@ button.link:disabled { color: var(--muted); cursor: default; text-decoration: no
 .session { display: flex; align-items: center; gap: 10px; font-size: 12.5px; color: var(--muted); }
 
 /* ---------- drop stage / risk ---------- */
-td.stage { font-size: 12.5px; max-width: 18ch; white-space: normal; }
 .risk { display: inline-block; margin-top: 3px; padding: 1px 7px; border-radius: 999px; font-size: 11px; font-weight: 500; }
 .risk-high { background: #fee4e2; color: #b42318; }
 .risk-medium { background: #fef0c7; color: #b54708; }
@@ -188,7 +179,6 @@ button.toggle.active:hover { background: #1a5c3e; }
 .cb-due-today { background: #fef0c7; color: #b54708; }
 .cb-scheduled { background: #eef0f3; color: var(--muted); font-weight: 400; }
 
-.status-cell input[type="datetime-local"] { width: 100%; margin-bottom: 5px; font-size: 12.5px; }
 
 .tagpick { margin-top: 4px; }
 .tagpick summary { cursor: pointer; font-size: 12px; color: var(--accent); list-style: none; }
@@ -218,11 +208,12 @@ table.mini th, table.mini td { padding: 7px 10px; font-size: 12.5px; }
 table.mini th { position: static; }
 
 /* ---------- mobile ----------
-   Callers work this list on a phone as much as a desktop. Below 760px the
-   table becomes a stack of cards: the header row is dropped and each cell
-   labels itself from its data-label attribute, so renderRows() needs no
-   separate mobile template. Call and WhatsApp come first and large — on a
-   phone that is the entire job. */
+   NOTE: this block still contains rules for the retired table board
+   (td::before, td[data-label], .status-cell, tbody tr) sitting alongside live
+   ones (.links a is the 44px Call target, .insights, .bar-row, table.mini).
+   They are deliberately left entangled rather than untangled during a
+   correctness phase — separating them needs visual verification at three
+   widths and belongs with the P4 mobile work. */
 @media (max-width: 760px) {
   .wrap { padding: 16px 12px 48px; }
   header.page h1 { font-size: 18px; }
@@ -267,9 +258,7 @@ table.mini th { position: static; }
   }
   /* The customer name is the card's heading; it needs no label above it. */
   td[data-label="Customer"]::before { display: none; }
-  td[data-label="Customer"] .cust-name { font-size: 16px; }
   td.right, td.right::before { text-align: left; }
-  td.items { max-width: none; }
   .items .item { white-space: normal; overflow: visible; text-overflow: clip; }
   td.empty::before { display: none; }
 
@@ -291,10 +280,8 @@ table.mini th { position: static; }
   .links a:hover { background: var(--accent-soft); text-decoration: none; }
   .links .muted { align-self: center; }
 
-  .status-cell { min-width: 0; }
   .status-cell select,
   .status-cell input[type="text"],
-  .status-cell input[type="datetime-local"] { min-height: 40px; font-size: 15px; }
   .tagmenu label { min-height: 32px; white-space: normal; }
 
   .insights { grid-template-columns: 1fr; }
@@ -373,10 +360,7 @@ button.linky {
 button.linky:hover { background: none; text-decoration: underline; }
 
 /* ---------- assignment ---------- */
-td.owner { min-width: 130px; }
-td.owner select { width: 100%; font-size: 12.5px; padding: 5px 8px; }
-td.owner .js-takeit { margin: 3px 0 0; padding: 2px 0; }
-tr[data-mine="true"] { box-shadow: inset 3px 0 0 var(--accent); }
+.callcard[data-mine="true"] { box-shadow: inset 3px 0 0 var(--accent); }
 
 /* Header actions shouldn't break mid-label ("Export / CSV", "Sign / out"). */
 .session > * { white-space: nowrap; }
@@ -404,32 +388,14 @@ tr[data-mine="true"] { box-shadow: inset 3px 0 0 var(--accent); }
    Auto layout gave Customer 448px of mostly-empty space and pushed the table to
    1450px inside a 1240px panel, so "Status & notes" — the column callers
    actually use — fell off the right edge. Fixed layout, widths by importance. */
-table.board { table-layout: fixed; width: 100%; }
-table.board th:nth-child(1), table.board td:nth-child(1) { width: 8%; }   /* Abandoned */
-table.board th:nth-child(2), table.board td:nth-child(2) { width: 13%; }  /* Customer */
-table.board th:nth-child(3), table.board td:nth-child(3) { width: 19%; }  /* Items — names are long */
-table.board th:nth-child(4), table.board td:nth-child(4) { width: 8%; }   /* Value */
-table.board th:nth-child(5), table.board td:nth-child(5) { width: 11%; }  /* Dropped at — chips must not wrap */
-table.board th:nth-child(6), table.board td:nth-child(6) { width: 12%; }  /* Owner — "Unassigned" must fit */
-table.board th:nth-child(7), table.board td:nth-child(7) { width: 8%; }   /* Contact */
-table.board th:nth-child(8), table.board td:nth-child(8) { width: 21%; }  /* Status & notes */
 
 /* Long values must ellipsise rather than force the column wider. */
-table.board .cust-name, table.board .cust-email {
-  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-}
-table.board td.items { max-width: none; }
-table.board td.stage { max-width: none; white-space: normal; }
-table.board .status-cell { min-width: 0; }
 
 /* The disclosure was picking up a focus ring that made it look like an input. */
 .moreitems summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 4px; }
 
 @media (max-width: 760px) {
   /* Cards, not columns — widths must not apply. */
-  table.board { table-layout: auto; }
-  table.board th, table.board td { width: auto !important; }
-  table.board .cust-name, table.board .cust-email { white-space: normal; overflow: visible; }
 }
 
 #sessionPhone { font-weight: 500; color: var(--text); }
@@ -463,29 +429,15 @@ table.board .status-cell { min-width: 0; }
    ========================================================================== */
 
 /* The column headers must stay visible; this list gets long. */
-table.board thead th {
-  position: sticky; top: 0; z-index: 2;
-  background: var(--panel);
-  box-shadow: inset 0 -1px 0 var(--border);
-  padding-top: var(--s3); padding-bottom: var(--s3);
-}
 
-table.board tbody tr { transition: background 90ms ease; }
-table.board tbody tr:hover { background: #fbfcfd; }
-table.board td { padding: var(--s3) var(--s4); vertical-align: top; }
 
 /* --- what the eye should land on first: who, how much, how urgent --- */
-.cust-name { font-size: 14.5px; font-weight: 600; color: var(--text); letter-spacing: -0.01em; }
-.cust-email { font-size: 12px; color: var(--muted); }
 
 td.right .amount { font-size: 15px; font-weight: 600; letter-spacing: -0.015em; font-variant-numeric: tabular-nums; }
 td.right .disc { font-size: 11.5px; color: var(--muted); }
 
 /* --- "Dropped at" was four stacked lines of unequal worth.
        Risk is the signal; the stage is near-constant, so it recedes. --- */
-td.stage { font-size: 12px; line-height: 1.5; }
-td.stage .meta { color: var(--muted); }
-td.stage .meta + .meta { margin-top: 1px; }
 .touched, .repeat, .risk { margin-bottom: var(--s1); }
 
 /* --- contact: these are the actions, so they look like actions --- */
@@ -504,13 +456,8 @@ td.stage .meta + .meta { margin-top: 1px; }
 .links .muted { font-size: 12px; text-align: center; padding: var(--s1) 0; }
 
 /* --- status cell: group the controls so it reads as one unit --- */
-.status-cell select, .status-cell input[type="text"], .status-cell input[type="datetime-local"] {
-  border-radius: var(--r-sm);
-}
-.status-cell .saved { margin-top: var(--s1); }
 
 /* --- skeleton rows beat the word "Loading" --- */
-.skeleton td { padding: var(--s4); }
 .sk {
   display: block; height: 10px; border-radius: 999px;
   background: linear-gradient(90deg, #eef0f3 25%, #e4e7ec 37%, #eef0f3 63%);
@@ -535,23 +482,13 @@ td.stage .meta + .meta { margin-top: 1px; }
 /* Chips wrapping to two lines was most of the visual noise in this column. */
 .risk, .touched, .repeat, .chip { white-space: nowrap; }
 .risk { padding: 1px 8px; font-size: 11px; }
-td.stage .meta { font-size: 11.5px; line-height: 1.4; }
 
 /* Two lines is enough for a timestamp; three was noise. */
-td:first-child .when-abs { font-size: 11.5px; color: var(--muted); line-height: 1.35; }
-td:first-child .when-rel { font-weight: 500; }
 
 /* A relative time reading "3d / ago" over two lines is just noise. */
-td:first-child .when-rel, td:first-child .when-abs { white-space: nowrap; }
 
 /* Tighten the status cell without turning the <td> into a flex container —
    doing that broke table cell sizing and pushed rows from 150px to 270px. */
-.status-cell select { margin-bottom: 4px; }
-.status-cell input[type="text"], .status-cell input[type="datetime-local"] { margin-bottom: 4px; }
-.status-cell .tagpick { margin-top: 2px; }
-.status-cell .chips { margin-top: 4px; }
-.status-cell .saved { margin-top: 3px; min-height: 0; line-height: 1.3; }
-table.board td { padding-top: 10px; padding-bottom: 10px; }
 
 @media (max-width: 760px) {
   /* On a phone the carts are the job; everything above them is overhead.
@@ -593,15 +530,10 @@ table.board td { padding-top: 10px; padding-bottom: 10px; }
   td[data-label="Value"] .amount { font-size: 17px; }
 
   td[data-label="Abandoned"] { margin-bottom: 2px; }
-  td[data-label="Abandoned"] .when-rel { display: inline; }
-  td[data-label="Abandoned"] .when-abs { display: inline; margin-left: 6px; }
   td[data-label="Abandoned"] .cb { margin-left: 6px; }
 
-  td.stage .meta { display: inline; }
-  td.stage .meta + .meta::before { content: ' · '; }
 
   .items .item { line-height: 1.35; }
-  .status-cell select, .status-cell input[type="text"] { min-height: 40px; }
 }
 
 /* Stat cards are the "which ones?" control, so they look pressable. */
@@ -610,8 +542,6 @@ button.stat {
   border: 1px solid var(--border); background: var(--panel);
 }
 button.stat:hover { border-color: var(--accent); background: #fbfdfc; }
-button.stat.stat-on { border-color: var(--accent); background: var(--accent-soft); }
-button.stat.stat-on .label { color: var(--accent); }
 button.stat.stat-alarm:hover, button.stat.stat-alarm.stat-on { border-color: #fda29b; background: var(--danger-soft); }
 button.stat.stat-warn:hover, button.stat.stat-warn.stat-on { border-color: var(--warn-border); background: var(--warn-soft); }
 
@@ -740,3 +670,9 @@ a.stat.stat-click:hover { border-color: var(--accent); background: #fbfdfc; }
   .hist-row { grid-template-columns: 1fr; gap: 0; padding-bottom: 4px; }
   .hist-who::before { content: '— '; }
 }
+
+/* The range group is inert inside the Callbacks queue — callbacks are shown
+   whatever the range, and a live-looking control that changes nothing is
+   exactly how that bug stayed hidden. */
+.group.disabled { opacity: .45; pointer-events: none; }
+.cb.cb-due-now { background: var(--danger-soft); border-color: #fda29b; color: var(--danger); font-weight: 600; }

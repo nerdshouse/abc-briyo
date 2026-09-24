@@ -18,6 +18,9 @@ const RISK_ORDER = {
 
 let REASON_TAGS = [];
 let SLA_HOURS = 6;
+/** The team's timezone, from the server. A laptop set to UTC must still read
+ *  the same "today 6:30 pm" the SLA, the reports and the digest all mean. */
+let BOARD_TZ = 'Asia/Kolkata';
 
 let TEAM = [];
 let ME = null;
@@ -88,6 +91,29 @@ function exactTime(iso) {
   return d.toLocaleString('en-IN', {
     day: 'numeric', month: 'short', hour: 'numeric', minute: '2-digit', hour12: true,
   });
+}
+
+/** Calendar day in the board's timezone, as YYYY-MM-DD. */
+function boardDay(d) {
+  return new Intl.DateTimeFormat('en-CA', {
+    timeZone: BOARD_TZ, year: 'numeric', month: '2-digit', day: '2-digit',
+  }).format(d);
+}
+
+/** "6:30 pm" in the board's timezone. */
+function boardClock(d) {
+  return new Intl.DateTimeFormat('en-IN', {
+    timeZone: BOARD_TZ, hour: 'numeric', minute: '2-digit', hour12: true,
+  }).format(d).toLowerCase();
+}
+
+/** "18 min" / "4h 10m" / "2d 3h" — a duration, not a point in time. */
+function spanText(ms) {
+  const mins = Math.round(Math.abs(ms) / 60000);
+  if (mins < 60) return `${mins} min`;
+  const h = Math.floor(mins / 60);
+  if (h < 24) return `${h}h ${mins % 60}m`;
+  return `${Math.floor(h / 24)}d ${h % 24}h`;
 }
 
 function relativeTime(iso) {
@@ -208,21 +234,39 @@ function gokwikTouch(cart) {
 }
 
 /** Overdue / due-today state for a scheduled callback. */
+/**
+ * What a caller needs to know about a promised callback, at a glance.
+ *
+ * "Today" and "tomorrow" are the board's calendar days, not the browser's, so
+ * this agrees with the SLA, the reports and the evening digest.
+ */
 function callbackState(cart) {
   if (cart.status !== 'Callback scheduled') return null;
-  // Ten carts reached this status before a time was required. They are not
-  // scheduled anything — say so rather than showing a blank chip.
+  // Carts that reached this status before a time was required.
   if (!cart.callback_at) return { kind: 'missing', label: 'No time set', due: null };
+
   const due = new Date(cart.callback_at);
-  if (Number.isNaN(due.getTime())) return null;
+  if (Number.isNaN(due.getTime())) return { kind: 'missing', label: 'No time set', due: null };
+
   const now = new Date();
-  if (due < now) return { kind: 'overdue', label: `Overdue · ${exactTime(cart.callback_at)}`, due };
-  const endOfDay = new Date(now); endOfDay.setHours(23, 59, 59, 999);
-  if (due <= endOfDay) return { kind: 'due-today', label: `Due today, ${exactTime(cart.callback_at)}`, due };
-  return { kind: 'scheduled', label: exactTime(cart.callback_at), due };
+  const diff = due - now;
+
+  if (diff < -60000) return { kind: 'overdue', label: `Overdue ${spanText(diff)}`, due };
+  if (diff <= 5 * 60000) return { kind: 'due-now', label: 'Due now', due };
+  if (diff <= 60 * 60000) return { kind: 'due-now', label: `In ${spanText(diff)}`, due };
+
+  const today = boardDay(now);
+  const tomorrow = boardDay(new Date(now.getTime() + 86400000));
+  const day = boardDay(due);
+  if (day === today) return { kind: 'due-today', label: `Today ${boardClock(due)}`, due };
+  if (day === tomorrow) return { kind: 'scheduled', label: `Tomorrow ${boardClock(due)}`, due };
+
+  const date = new Intl.DateTimeFormat('en-IN', {
+    timeZone: BOARD_TZ, day: 'numeric', month: 'short',
+  }).format(due);
+  return { kind: 'scheduled', label: `${date} ${boardClock(due)}`, due };
 }
 
-/** Used by the Callbacks queue's sort tie-break and by the overdue chip. */
 const isOverdue = (c) => callbackState(c)?.kind === 'overdue';
 
 /** <input type="datetime-local"> needs local wall-clock, not an ISO UTC string. */
@@ -310,6 +354,7 @@ async function loadAll(attempt = 1) {
     const carts = await cartsRes.json();
     if (Array.isArray(cfg.reasonTags)) REASON_TAGS = cfg.reasonTags;
     if (cfg.slaHours) SLA_HOURS = cfg.slaHours;
+    if (cfg.boardTimezone) BOARD_TZ = cfg.boardTimezone;
     if (Array.isArray(cfg.team)) TEAM = cfg.team;
     ME = cfg.me ?? ME;
 
@@ -319,6 +364,7 @@ async function loadAll(attempt = 1) {
     state.carts = carts.carts;
     state.stale = carts.stale || null;
     state.total = carts.total ?? carts.carts.length;
+    state.callbackTotal = carts.callbackTotal ?? null;
     state.truncated = Boolean(carts.truncated);
     renderResultNote();
     syncExportLink();
@@ -477,11 +523,15 @@ function visibleCarts() {
   return list.sort((a, b) => {
     if (state.sort === 'value') return (b.total_price ?? 0) - (a.total_price ?? 0);
     if (state.sort === 'callback') {
-      // Soonest due at the top — and carts whose time was never set above even
-      // those, because they cannot be worked until somebody fixes them.
+      // Ascending by callback time, which naturally gives overdue first, then
+      // due now, then upcoming.
+      //
+      // Carts whose time was never set sort to the *bottom*, not the top. They
+      // need fixing, but a promise already broken outranks a data-entry gap —
+      // putting eleven of them above a genuinely overdue call buries the work.
       const due = (c) => {
         if (c.status !== 'Callback scheduled') return Infinity;
-        if (!c.callback_at) return -Infinity;
+        if (!c.callback_at) return Number.MAX_SAFE_INTEGER;
         return new Date(c.callback_at).getTime();
       };
       return due(a) - due(b);
@@ -590,7 +640,7 @@ function renderQueue() {
           <div class="cc-top">
             <span class="cc-value">${money(c.total_price, c.currency)}</span>
             <span class="cc-name" title="${esc(c.customer_name || 'Guest')}">${esc(c.customer_name || 'Guest')}</span>
-            ${cb ? `<span class="cb cb-${cb.kind}">${cb.kind === 'scheduled' ? 'Callback ' : ''}${esc(cb.label)}</span>` : ''}
+            ${cb ? `<span class="cb cb-${cb.kind}">${esc(cb.label)}</span>` : ''}
           </div>
           <div class="cc-meta">
             ${relativeTime(c.received_at)}
@@ -767,13 +817,15 @@ function renderResultNote() {
     const kinds = cbs.map((c) => callbackState(c)?.kind);
     const n = (k) => kinds.filter((x) => x === k).length;
     const parts = [
-      n('overdue') && `${n('overdue')} missed`,
-      n('due-today') && `${n('due-today')} due today`,
-      n('scheduled') && `${n('scheduled')} later`,
+      n('overdue') && `${n('overdue')} overdue`,
+      n('due-now') && `${n('due-now')} due now`,
+      n('due-today') && `${n('due-today')} later today`,
+      n('scheduled') && `${n('scheduled')} upcoming`,
       n('missing') && `${n('missing')} with no time set`,
     ].filter(Boolean);
-    el.textContent = `${cbs.length} callback${cbs.length === 1 ? '' : 's'}`
-      + (parts.length ? ` — ${parts.join(' · ')}.` : '.');
+    el.textContent = `${cbs.length} callback${cbs.length === 1 ? '' : 's'}, all time`
+      + (parts.length ? ` — ${parts.join(' · ')}.` : '.')
+      + ' The date range does not apply here.';
     return;
   }
   el.textContent = `${shown} in ${MODES[state.mode].label.toLowerCase()}, of ${inRange} cart${inRange === 1 ? '' : 's'} from ${label}.`;
@@ -787,7 +839,22 @@ function syncExportLink() {
     : `/api/carts.csv?days=${state.days}`;
 }
 
+/**
+ * The date range is a browsing control. It has never applied to callbacks and
+ * now visibly does not: leaving it live while it changes nothing is how the
+ * original bug hid — the count moved, so it looked like it was working.
+ */
+function syncRangeAvailability() {
+  const group = $('#rangeGroup');
+  if (!group) return;
+  const off = state.mode === 'callbacks' && !state.query;
+  group.classList.toggle('disabled', off);
+  group.title = off ? 'Callbacks are shown whatever the date range' : '';
+  for (const b of group.querySelectorAll('button')) b.disabled = off;
+}
+
 function render() {
+  syncRangeAvailability();
   renderModes();
   renderSummary();
   renderResultNote();

@@ -26,6 +26,7 @@ import {
 } from './lib/auth-routes.js';
 import { activeUsers, seedAllowedUsers, normalisePhone, bootstrapAdmins, nameFor } from './lib/otp.js';
 import { mapShopifyCsv } from './lib/shopify-csv.js';
+import { toCsv } from './lib/csv.js';
 import { driver } from './lib/whatsapp.js';
 import { startKeepAlive } from './lib/keepalive.js';
 import { startSlaAlerts, isIngestSilent } from './lib/sla-alert.js';
@@ -409,6 +410,10 @@ app.get('/api/config', async (req, res) => {
     slaHours: SLA_HOURS,
     team,
     importDefaultCaller: normalisePhone(process.env.IMPORT_DEFAULT_CALLER || '') || null,
+    // The board formats callback times in the team's timezone, not the
+    // browser's, so a caller travelling or a laptop set to UTC still reads the
+    // same "today 6:30 pm" the SLA and the reports mean.
+    boardTimezone: process.env.BOARD_TIMEZONE || process.env.BOARD_TZ || 'Asia/Kolkata',
     // Two distinct states: credentials present, and the store actually authorised.
     shopifyConnected: shopifyConfigured(),
     shopifyAuthorized: shopifyConfigured()
@@ -595,19 +600,7 @@ app.get('/api/carts.csv', async (req, res) => {
       ['Checkout URL', (c) => c.checkout_url],
     ];
 
-    // Excel treats a leading =, +, - or @ as a formula; prefix those so an
-    // exported note can never execute in someone's spreadsheet.
-    const cell = (v) => {
-      if (v === null || v === undefined) return '';
-      let out = v instanceof Date ? v.toISOString() : String(v);
-      if (/^[=+\-@]/.test(out)) out = `'${out}`;
-      return `"${out.replace(/"/g, '""')}"`;
-    };
-
-    const body = [
-      COLUMNS.map(([h]) => cell(h)).join(','),
-      ...result.carts.map((c) => COLUMNS.map(([, get]) => cell(get(c))).join(',')),
-    ].join('\r\n');
+    const body = toCsv(COLUMNS, result.carts);
 
     const stamp = new Date().toISOString().slice(0, 10);
     res.setHeader('Content-Type', 'text/csv; charset=utf-8');
@@ -816,11 +809,7 @@ app.get('/api/admin/report.csv', requireAdmin, async (req, res) => {
       ['Declined', (r) => r.declined],
       ['Never called', (r) => r.never_called],
     ];
-    const cell = (v) => `"${String(v ?? '').replace(/"/g, '""')}"`;
-    const body = [
-      cols.map(([h]) => cell(h)).join(','),
-      ...rows.map((r) => cols.map(([, get]) => cell(get(r))).join(',')),
-    ].join('\r\n');
+    const body = toCsv(cols, rows);
 
     console.log(`Report CSV (${period}) exported by ${await currentUserName(req)}`);
     res.setHeader('Content-Type', 'text/csv; charset=utf-8');
@@ -998,6 +987,10 @@ app.get('/api/stats/by-caller', requireAdmin, async (req, res) => {
 const port = process.env.PORT || 3000;
 app.listen(port, async () => {
   console.log(`Recovery Board on http://localhost:${port}`);
+  if (process.env.BOARD_TZ && !process.env.BOARD_TIMEZONE) {
+    console.warn('BOARD_TZ is deprecated — rename it to BOARD_TIMEZONE. '
+      + 'It is still honoured, but only BOARD_TIMEZONE is documented.');
+  }
   console.log(`Storage: ${MOCK ? 'MOCK (in-memory, resets on restart)' : 'Postgres'}`);
   console.log(`OTP delivery: ${driver() === 'console' ? 'CONSOLE (codes printed here)' : '11za WhatsApp'}`);
 

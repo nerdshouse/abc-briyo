@@ -15,6 +15,7 @@ import { createOtp, verifyOtp, checkRateLimit, normalisePhone } from '../lib/otp
 import { normalizePayload, redactPayload, REDACTED_KEYS } from '../lib/normalize.js';
 import { GOKWIK_REAL_PAYLOAD } from './fixtures/gokwik-real.js';
 import { mapShopifyCsv } from '../lib/shopify-csv.js';
+import { csvCell, toCsv } from '../lib/csv.js';
 import {
   isIngestSilent, buildDailySummary, shouldSendSummary, boardDay,
 } from '../lib/sla-alert.js';
@@ -331,9 +332,15 @@ await step('ranges are calendar days, not rolling hours', async () => {
   const id = rows[0].id;
 
   // Yesterday, late enough that a rolling 24h window would still include it.
+  // The status is pinned too: a cart in "Callback scheduled" is deliberately
+  // exempt from the date window, so leaving it there would test the callback
+  // rule rather than the calendar-day boundary this step exists for.
   await getPool().query(
-    `UPDATE abandoned_carts SET received_at =
-       (date_trunc('day', (now() AT TIME ZONE 'Asia/Kolkata')) - interval '2 hours') AT TIME ZONE 'Asia/Kolkata'
+    `UPDATE abandoned_carts SET
+       status = 'Called – No answer',
+       callback_at = NULL,
+       received_at =
+         (date_trunc('day', (now() AT TIME ZONE 'Asia/Kolkata')) - interval '2 hours') AT TIME ZONE 'Asia/Kolkata'
      WHERE id = $1`, [id]);
 
   const today = await listCarts({ sinceDays: 1 });
@@ -352,7 +359,11 @@ await step('ranges are calendar days, not rolling hours', async () => {
 await step('date window is applied server-side', async () => {
   // The old code took an unconditional LIMIT 500 and silently dropped the rest.
   const { rows } = await getPool().query('SELECT id FROM abandoned_carts WHERE cart_id = $1', [TEST_CART]);
-  await getPool().query("UPDATE abandoned_carts SET received_at = now() - interval '30 days' WHERE id = $1", [rows[0].id]);
+  // Status pinned for the same reason as the calendar-day check above.
+  await getPool().query(
+    `UPDATE abandoned_carts
+     SET received_at = now() - interval '30 days', status = 'Called – No answer', callback_at = NULL
+     WHERE id = $1`, [rows[0].id]);
 
   const recent = await listCarts({ sinceDays: 7 });
   const all = await listCarts({ sinceDays: 0 });
@@ -980,6 +991,68 @@ await step('a callback time can be read back for validation', async () => {
   const missing = await callbackAtOf(-1);
   if (missing !== undefined) throw new Error('a non-existent cart should report undefined');
   return 'present for a real cart, undefined for a missing one';
+});
+
+/**
+ * P0: a promised callback outlives any date window.
+ *
+ * This is the regression that matters most here — 14 callbacks existed while
+ * the seven-day default showed 9 and "Today" showed 5, so a caller changing
+ * the range watched promised callbacks disappear.
+ */
+await step('callbacks survive every date range', async () => {
+  const { rows } = await getPool().query('SELECT id FROM abandoned_carts WHERE cart_id = $1', [TEST_CART]);
+  const id = rows[0].id;
+  // A callback promised for today on a cart that arrived 20 days ago: outside
+  // every window the board offers, and overdue.
+  await getPool().query(
+    `UPDATE abandoned_carts
+     SET received_at = now() - interval '20 days',
+         status = 'Callback scheduled',
+         callback_at = now() - interval '18 minutes'
+     WHERE id = $1`, [id]);
+
+  const seen = {};
+  for (const days of [1, 3, 7, 0]) {
+    const r = await listCarts({ sinceDays: days });
+    seen[days] = r.carts.some((c) => String(c.id) === String(id));
+    if (r.callbackTotal === undefined) throw new Error('listCarts no longer reports callbackTotal');
+  }
+  const missing = Object.entries(seen).filter(([, v]) => !v).map(([d]) => d);
+  if (missing.length) {
+    throw new Error(`a 20-day-old callback vanished at days=${missing.join(',')}`);
+  }
+
+  // And a cart that is merely old, with no callback, must still be excluded —
+  // otherwise the "fix" is just disabling the window.
+  await getPool().query(
+    `UPDATE abandoned_carts SET status = 'Called – No answer', callback_at = NULL WHERE id = $1`, [id]);
+  const narrow = await listCarts({ sinceDays: 1 });
+  if (narrow.carts.some((c) => String(c.id) === String(id))) {
+    throw new Error('the date window stopped applying to ordinary carts');
+  }
+  return 'visible at 1/3/7/all days; still excluded once it is not a callback';
+});
+
+await step('CSV export neutralises formulas without mangling numbers', async () => {
+  const cases = [
+    ['=cmd|/c calc', "\"'=cmd|/c calc\""],
+    ['+1+1', "\"'+1+1\""],
+    ['@SUM(A1)', "\"'@SUM(A1)\""],
+    ['-100', '"-100"'],        // a negative number must survive intact
+    ['-12.5', '"-12.5"'],
+    ['0', '"0"'],
+    ['plain note', '"plain note"'],
+    ['say "hi"', '"say ""hi"""'],
+  ];
+  for (const [input, want] of cases) {
+    const got = csvCell(input);
+    if (got !== want) throw new Error(`csvCell(${JSON.stringify(input)}) = ${got}, expected ${want}`);
+  }
+  const csv = toCsv([['Head', (r) => r.v]], [{ v: '=danger' }, { v: -5 }]);
+  if (!csv.includes("'=danger")) throw new Error('toCsv did not guard a formula');
+  if (csv.includes("'-5")) throw new Error('toCsv mangled a negative number');
+  return `${cases.length} cases, formulas guarded, negatives intact`;
 });
 
 // ---- cleanup ---------------------------------------------------------------

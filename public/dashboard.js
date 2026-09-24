@@ -145,8 +145,8 @@ function render(d) {
       `Yesterday: ${yesterday.called}. Anything other than "Not called".`),
     card('Recovered', today.recovered, today.recovered ? 'stat-good' : '',
       `Yesterday: ${yesterday.recovered}`),
-    card('Recovered value', money(today.recovered_value), today.recovered ? 'stat-good' : '',
-      `Yesterday: ${money(yesterday.recovered_value)}`),
+    card('Recovered cart value', money(today.recovered_value), today.recovered ? 'stat-good' : '',
+      `Yesterday: ${money(yesterday.recovered_value)}. Cart value at abandonment, not verified order revenue.`),
   ].join('');
   $('#todayMeta').textContent = `${yesterday.carts} cart${yesterday.carts === 1 ? '' : 's'} yesterday`
     + delta(today.carts, yesterday.carts);
@@ -154,8 +154,9 @@ function render(d) {
   // --- money -------------------------------------------------------------
   $('#money').innerHTML = [
     card('Came in', money(t.value), '', 'Cart value of everything received in this range.'),
-    card('Recovered', money(t.recovered_value), t.recovered ? 'stat-good' : '',
-      'Cart value of carts marked Recovered. Not the value of the order that followed.'),
+    card('Recovered cart value', money(t.recovered_value), t.recovered ? 'stat-good' : '',
+      'Cart value at the time of abandonment for carts marked recovered. '
+      + 'It is not verified order revenue — no order is fetched to confirm it.'),
     card('Still open', money(t.open_value), '',
       'Neither recovered nor declined — including carts nobody has called yet.'),
     card('Lost', money(t.declined_value), '',
