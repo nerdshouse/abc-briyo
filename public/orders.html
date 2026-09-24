@@ -79,7 +79,7 @@
         </div>
         <div class="page-actions">
           <button class="icon-btn" id="refresh" type="button" title="Refresh" aria-label="Refresh"><i data-lucide="refresh-cw"></i></button>
-          <button class="btn primary" id="newOrder" type="button"><i data-lucide="plus"></i>New Order</button>
+          <button class="btn primary" id="newShipment" type="button"><i data-lucide="plus"></i>New Shipment</button>
         </div>
       </div>
 
@@ -118,14 +118,14 @@
           <div class="table-wrap">
             <table class="table ord-table">
               <colgroup>
-                <col class="c-order" /><col class="c-chan" /><col class="c-cust" /><col class="c-amt" />
-                <col class="c-ostat" /><col class="c-ship" /><col class="c-courier" /><col class="c-track" />
-                <col class="c-inv" /><col class="c-date" /><col class="c-act" />
+                <col class="c-order" /><col class="c-chan" /><col class="c-courier" /><col class="c-track" />
+                <col class="c-ship" /><col class="c-inv" /><col class="c-date" /><col class="c-cust" />
+                <col class="c-amt" /><col class="c-act" />
               </colgroup>
               <thead><tr>
-                <th>Order</th><th>Channel</th><th>Customer</th><th class="r">Amount</th>
-                <th>Order status</th><th>Shipment</th><th class="col-courier">Courier</th>
-                <th class="col-track">Tracking</th><th>Invoice</th><th>Order date</th>
+                <th>Order</th><th>Channel</th><th>Courier</th><th>AWB / Tracking</th>
+                <th>Shipment Status</th><th>Invoice</th><th>Order Date</th>
+                <th class="col-cust">Customer</th><th class="r col-amt">Amount</th>
                 <th class="r"><span class="sr-only">Actions</span></th>
               </tr></thead>
               <tbody id="rows"></tbody>
@@ -157,10 +157,10 @@
   <div class="drawer-foot"><span class="saved" id="dSaved"></span></div>
 </aside>
 
-<!-- New order / edit order -->
+<!-- Edit order details -->
 <aside class="drawer drawer-wide" id="formDrawer" hidden aria-label="Order form">
   <div class="drawer-head">
-    <div><h2 class="drawer-title" id="fTitle">New Order</h2><div class="drawer-sub" id="fSub">Only channel and order number are needed. Add the rest when you have it.</div></div>
+    <div><h2 class="drawer-title" id="fTitle">Edit order</h2><div class="drawer-sub" id="fSub">Every change is recorded in the activity.</div></div>
     <div class="drawer-nav"><button class="icon-btn" id="fClose" type="button" title="Close" aria-label="Close"><i data-lucide="x"></i></button></div>
   </div>
   <form class="drawer-body" id="orderForm" novalidate>
@@ -169,12 +169,12 @@
       <div class="form-grid">
         <label class="fld"><span>Channel <em>*</em></span><select class="select" name="channel" required></select></label>
         <label class="fld"><span>Order Number <em>*</em></span><input class="input" name="source_order_id" required maxlength="100" autocomplete="off" placeholder="e.g. #1524" /></label>
-        <label class="fld"><span>Order Date <span class="soft" id="tzNote"></span></span><input class="input" name="order_date" type="datetime-local" /></label>
+        <label class="fld"><span>Order Date <span class="soft tz-note" id="tzNote"></span></span><input class="input" name="order_date" type="datetime-local" /></label>
         <label class="fld"><span>Order Value (₹)</span><input class="input" name="order_value" inputmode="decimal" autocomplete="off" placeholder="Leave blank if unknown" /></label>
       </div>
     </section>
     <details class="more" id="moreDetails">
-      <summary><i data-lucide="chevron-right"></i>More details <span class="soft">customer, payment, fulfillment, note</span></summary>
+      <summary><i data-lucide="chevron-right"></i>More details <span class="soft">customer, payment, fulfillment</span></summary>
       <section class="dsec">
         <h3 class="dsec-title">Customer</h3>
         <div class="form-grid">
@@ -192,10 +192,6 @@
           <label class="fld"><span>Fulfillment</span><select class="select" name="fulfillment_type"></select></label>
         </div>
       </section>
-      <section class="dsec" id="noteSection">
-        <h3 class="dsec-title">Note</h3>
-        <textarea class="input" name="note" maxlength="2000" placeholder="Saved to the order's timeline"></textarea>
-      </section>
     </details>
   </form>
   <div class="drawer-foot">
@@ -203,6 +199,67 @@
     <div style="display:flex;gap:8px">
       <button class="btn" type="button" id="fCancel">Cancel</button>
       <button class="btn primary" type="submit" form="orderForm" id="fSubmit">Create Order</button>
+    </div>
+  </div>
+</aside>
+
+
+<!-- New Shipment: creates the order and its shipment in one step -->
+<aside class="drawer drawer-wide" id="createDrawer" hidden aria-label="Create shipment">
+  <div class="drawer-head">
+    <div><h2 class="drawer-title">Create Shipment</h2><div class="drawer-sub">Channel, order number, courier and AWB. Everything else is optional.</div></div>
+    <div class="drawer-nav"><button class="icon-btn" id="cClose" type="button" title="Close" aria-label="Close"><i data-lucide="x"></i></button></div>
+  </div>
+  <form class="drawer-body" id="createForm" novalidate>
+    <div class="form-error" id="cError" role="alert" hidden></div>
+    <div class="exists" id="cExists" hidden>
+      <div id="cExistsText"></div>
+      <div class="form-actions">
+        <button class="btn primary" type="button" id="cAddExisting">Add as another shipment</button>
+        <button class="btn" type="button" id="cOpenExisting" data-goto="">Open the order</button>
+      </div>
+    </div>
+    <section class="dsec">
+      <div class="form-grid">
+        <label class="fld"><span>Channel <em>*</em></span><select class="select" name="channel" required></select></label>
+        <label class="fld"><span>Order Number <em>*</em></span><input class="input" name="source_order_id" required maxlength="100" autocomplete="off" placeholder="e.g. #1524" /></label>
+        <label class="fld"><span>Courier Partner <em>*</em></span><select class="select" name="courier_partner_id" required></select></label>
+        <label class="fld"><span>Tracking ID / AWB <em>*</em></span><input class="input mono" name="tracking_id" required maxlength="80" autocomplete="off" /></label>
+      </div>
+    </section>
+    <section class="dsec">
+      <h3 class="dsec-title">Optional</h3>
+      <div class="form-grid">
+        <label class="fld"><span>Shipment Status</span><select class="select" name="shipment_status"></select></label>
+        <label class="fld"><span>Expected Delivery</span><input class="input" type="date" name="expected_delivery_date" /></label>
+        <label class="fld"><span>Order Date <span class="soft tz-note"></span></span><input class="input" name="order_date" type="datetime-local" /></label>
+        <label class="fld"><span>Order Value (₹)</span><input class="input" name="order_value" inputmode="decimal" autocomplete="off" placeholder="Leave blank if unknown" /></label>
+        <label class="fld"><span>Tax Invoice</span><input class="file" type="file" name="invoice_file" accept=".pdf,.png,.jpg,.jpeg,application/pdf,image/png,image/jpeg" /></label>
+        <label class="fld"><span>Courier Receipt</span><input class="file" type="file" name="receipt_file" accept=".pdf,.png,.jpg,.jpeg,application/pdf,image/png,image/jpeg" /></label>
+        <span class="help wide" id="cDocsNote"></span>
+        <label class="fld wide"><span>Notes</span><textarea class="input" name="note" maxlength="2000" placeholder="Saved to the shipment's activity"></textarea></label>
+      </div>
+    </section>
+    <details class="more">
+      <summary><i data-lucide="chevron-right"></i>More details <span class="soft">customer, payment, fulfillment</span></summary>
+      <section class="dsec">
+        <div class="form-grid">
+          <label class="fld"><span>Customer Name</span><input class="input" name="customer_name" maxlength="120" autocomplete="off" /></label>
+          <label class="fld"><span>Phone</span><input class="input" name="customer_phone" maxlength="20" inputmode="tel" autocomplete="off" /></label>
+          <label class="fld wide"><span>Email</span><input class="input" name="customer_email" maxlength="160" type="email" autocomplete="off" /></label>
+          <label class="fld"><span>Payment Method</span><select class="select" name="payment_method"></select></label>
+          <label class="fld"><span>Payment Status</span><select class="select" name="payment_status"></select></label>
+          <label class="fld"><span>Currency</span><input class="input" name="currency" maxlength="3" autocomplete="off" placeholder="INR" /></label>
+          <label class="fld"><span>Fulfillment</span><select class="select" name="fulfillment_type"></select></label>
+        </div>
+      </section>
+    </details>
+  </form>
+  <div class="drawer-foot">
+    <span class="saved" id="cSaved"></span>
+    <div style="display:flex;gap:8px">
+      <button class="btn" type="button" id="cCancel">Cancel</button>
+      <button class="btn primary" type="submit" form="createForm" id="cSubmit">Create Shipment</button>
     </div>
   </div>
 </aside>

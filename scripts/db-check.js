@@ -17,7 +17,7 @@ import { GOKWIK_REAL_PAYLOAD } from './fixtures/gokwik-real.js';
 import { mapShopifyCsv } from '../lib/shopify-csv.js';
 import { csvCell, toCsv } from '../lib/csv.js';
 import {
-  ensureOrdersSchema, createOrder, updateOrder, updateShipment, getOrder, listOrders, orderEvents,
+  ensureOrdersSchema, createOrder, createShipment, updateOrder, updateShipment, getOrder, listOrders, orderEvents,
   orderShipments, addOrderNote, removeDocument, orderDocuments, listCouriers, saveCourier,
   trackingUrlFor, purgeTestOrders, zonedToUtc,
 } from '../lib/orders.js';
@@ -63,6 +63,11 @@ if (isMockMode()) {
 try { await assertDatabaseEnvironment(getPool(), 'test'); } catch (err) { refuse(err.message); }
 
 const TEST_CART = 'DBCHECK-DELETE-ME';
+// The tests bring their own members and a second cart rather than borrowing
+// whatever a real database happens to hold.
+const FIX_CART = 'DBCHECK-DELETE-ME-2';
+const FIX_A = '919000000091';   // active caller
+const FIX_B = '919000000092';   // active admin
 const TEST_PHONE = normalisePhone('9000000000');
 const TEST_STATE_KEY = 'dbcheck_marker';
 const TEST_FAILURE_KIND = 'dbcheck-simulated';
@@ -406,6 +411,15 @@ await step('date window is applied server-side', async () => {
   return `7d excluded it, all included it (${all.total} total)`;
 });
 
+await step('fixtures: two test members and a second test cart', async () => {
+  await upsertMember({ phone: FIX_A, name: 'DBCheck Member A', isAdmin: false, addedBy: 'db-check' });
+  await upsertMember({ phone: FIX_B, name: 'DBCheck Member B', isAdmin: true, addedBy: 'db-check' });
+  const payload = { request_id: FIX_CART, created_at: new Date().toISOString(),
+    customer: { first_name: 'DB', last_name: 'Check Two', phone: '9000000002' }, totals: { total: 10 }, currency: 'INR' };
+  await insertCart(normalizePayload(payload), payload);
+  return 'ready';
+});
+
 await step('truncation is reported, not silent', async () => {
   const capped = await listCarts({ sinceDays: 0, limit: 1 });
   if (capped.carts.length !== 1) throw new Error('limit not applied');
@@ -515,8 +529,8 @@ const TEST_MEMBER = '919000000099';
 await step('assignment: set, reassign, clear, and survive a status change', async () => {
   const { rows } = await getPool().query('SELECT id FROM abandoned_carts WHERE cart_id = $1', [TEST_CART]);
   const id = rows[0].id;
-  const members = (await listMembers()).filter((m) => m.active);
-  if (members.length < 2) throw new Error('need at least two active members to test reassignment');
+  const members = (await listMembers()).filter((m) => m.active && [FIX_A, FIX_B].includes(m.phone));
+  if (members.length < 2) throw new Error('fixture members missing');
   const [a, b] = members;
 
   let row = await updateStatus(id, { assignedTo: a.phone, updatedBy: 'db-check' });
@@ -541,7 +555,7 @@ await step('a rename follows through to assigned carts', async () => {
   // assigned_to stores the phone and the name is resolved at read time, so a
   // rename must not leave stale copies scattered across carts.
   const { rows } = await getPool().query('SELECT id FROM abandoned_carts WHERE cart_id = $1', [TEST_CART]);
-  const me = (await listMembers()).find((m) => m.active);
+  const me = (await listMembers()).find((m) => m.phone === FIX_A);
 
   await updateStatus(rows[0].id, { assignedTo: me.phone, updatedBy: 'db-check' });
   await updateMember(me.phone, { name: 'Renamed For Check' });
@@ -1400,6 +1414,118 @@ await step('orders cleanup (sequence left as is)', async () => {
   return `${orders} orders removed`;
 });
 
+// ---- new shipment (shipment-first entry) -------------------------------------
+await step('new shipment: creates order + shipment in one step; Packed by default, never Dispatched', async () => {
+  const dl = (await listCouriers()).find((c) => c.name === 'Delhivery');
+  const r = await createShipment({ channel: 'blinkit', source_order_id: `${TEST_ORDER}-S1`, courier_partner_id: dl.id,
+    tracking_id: 'AWB-S1-a', note: 'first box' }, { actor: ACTOR });
+  if (!r.createdOrder) throw new Error('order not created');
+  const o = await getOrder(r.orderId);
+  const ships = await orderShipments(r.orderId);
+  if (ships.length !== 1 || ships[0].id !== r.shipmentId) throw new Error(`${ships.length} shipments`);
+  if (o.shipment_status !== 'packed' || o.dispatch_date) throw new Error(`status ${o.shipment_status}, dispatched ${o.dispatch_date}`);
+  if (o.tracking_url !== trackingUrlFor(dl.tracking_url_template, 'AWB-S1-a')) throw new Error(`url ${o.tracking_url}`);
+  const types = (await orderEvents(r.orderId)).map((e) => e.event_type);
+  for (const t of ['order_created', 'courier_changed', 'tracking_changed', 'shipment_status_changed', 'note_added']) {
+    if (!types.includes(t)) throw new Error(`missing ${t}`);
+  }
+  return `1 order, 1 shipment, packed, link built, ${types.length} events`;
+});
+await step('new shipment: required fields; explicit Dispatched is honoured and stamped', async () => {
+  const dl = (await listCouriers()).find((c) => c.name === 'Delhivery');
+  for (const bad of [{ channel: 'zepto', source_order_id: `${TEST_ORDER}-S2`, tracking_id: 'X' },
+    { channel: 'zepto', source_order_id: `${TEST_ORDER}-S2`, courier_partner_id: dl.id },
+    { channel: 'zepto', courier_partner_id: dl.id, tracking_id: 'X' }]) {
+    try { await createShipment(bad, { actor: ACTOR }); throw new Error(`accepted ${JSON.stringify(bad)}`); }
+    catch (err) { if (err.status !== 400) throw err; }
+  }
+  if ((await listOrders({ q: `${TEST_ORDER}-S2` })).total !== 0) throw new Error('a refused shipment left an order behind');
+  const r = await createShipment({ channel: 'zepto', source_order_id: `${TEST_ORDER}-S2`, courier_partner_id: dl.id,
+    tracking_id: 'AWB-S2', shipment_status: 'dispatched' }, { actor: ACTOR });
+  const o = await getOrder(r.orderId);
+  if (o.shipment_status !== 'dispatched' || !o.dispatch_date) throw new Error('dispatch not stamped');
+  return 'missing courier/AWB/number refused with nothing written; dispatched stamped';
+});
+await step('new shipment on an existing order: no duplicate order; offers the order instead', async () => {
+  const bd = (await listCouriers()).find((c) => c.name === 'Blue Dart');
+  try {
+    await createShipment({ channel: 'blinkit', source_order_id: `${TEST_ORDER}-S1`, courier_partner_id: bd.id, tracking_id: 'AWB-S1-b' }, { actor: ACTOR });
+    throw new Error('second order accepted');
+  } catch (err) {
+    if (err.status !== 409 || !err.orderExists || err.shipments?.length !== 1 || err.shipments[0].awb !== 'AWB-S1-a') throw err;
+  }
+  const n = (await listOrders({ q: `${TEST_ORDER}-S1`, channel: 'blinkit' })).total;
+  if (n !== 1) throw new Error(`${n} orders`);
+  // Same number on another channel is a different order.
+  const other = await createShipment({ channel: 'amazon', source_order_id: `${TEST_ORDER}-S1`, courier_partner_id: bd.id, tracking_id: 'AWB-S1-a' }, { actor: ACTOR });
+  if (!other.createdOrder) throw new Error('other channel treated as the same order');
+  return '409 with the existing shipment listed; still one Blinkit order';
+});
+await step('new shipment: add another shipment to an existing order; duplicate AWB refused', async () => {
+  const bd = (await listCouriers()).find((c) => c.name === 'Blue Dart');
+  const r = await createShipment({ channel: 'blinkit', source_order_id: `${TEST_ORDER}-S1`, courier_partner_id: bd.id,
+    tracking_id: 'AWB-S1-b' }, { actor: ACTOR, addToExisting: true });
+  if (r.createdOrder) throw new Error('made a new order');
+  const ships = await orderShipments(r.orderId);
+  if (ships.length !== 2 || ships[1].tracking_id !== 'AWB-S1-b') throw new Error(`${ships.length} shipments`);
+  if (!(await orderEvents(r.orderId)).some((e) => e.event_type === 'shipment_added' && e.metadata.shipment_id === r.shipmentId)) {
+    throw new Error('shipment_added not logged');
+  }
+  // The list still shows the first shipment; the second is counted.
+  const o = await getOrder(r.orderId);
+  if (o.tracking_id !== 'AWB-S1-a' || o.shipment_count !== 2) throw new Error('list row changed');
+  for (const awb of ['AWB-S1-b', ' awb-s1-A ']) {
+    try { await createShipment({ channel: 'blinkit', source_order_id: `${TEST_ORDER}-S1`, courier_partner_id: bd.id, tracking_id: awb }, { actor: ACTOR, addToExisting: true }); throw new Error(`duplicate ${awb} accepted`); }
+    catch (err) { if (err.status !== 409 || !err.duplicateAwb) throw err; }
+  }
+  if ((await orderShipments(r.orderId)).length !== 2) throw new Error('duplicate created a shipment');
+  return '2 shipments; repeated AWB (any case/spacing) refused';
+});
+await step('new shipment fills an order\'s untouched shipment instead of adding an empty one', async () => {
+  const id = await createOrder({ channel: 'instamart', source_order_id: `${TEST_ORDER}-S3` }, { actor: ACTOR });
+  const dl = (await listCouriers()).find((c) => c.name === 'Delhivery');
+  try { await createShipment({ channel: 'instamart', source_order_id: `${TEST_ORDER}-S3`, courier_partner_id: dl.id, tracking_id: 'AWB-S3' }, { actor: ACTOR }); throw new Error('no confirmation asked'); }
+  catch (err) { if (err.status !== 409 || !err.canFillShipment || err.shipments.length !== 0) throw err; }
+  const r = await createShipment({ channel: 'instamart', source_order_id: `${TEST_ORDER}-S3`, courier_partner_id: dl.id,
+    tracking_id: 'AWB-S3' }, { actor: ACTOR, addToExisting: true });
+  const ships = await orderShipments(id);
+  if (ships.length !== 1 || ships[0].tracking_id !== 'AWB-S3' || r.orderId !== id) throw new Error('did not fill the blank shipment');
+  return 'blank shipment filled, still one';
+});
+await step('new shipment: concurrent entries cannot duplicate an order or an AWB', async () => {
+  const dl = (await listCouriers()).find((c) => c.name === 'Delhivery');
+  const base = { channel: 'website', source_order_id: `${TEST_ORDER}-S4`, courier_partner_id: dl.id };
+  const race = await Promise.allSettled([1, 2, 3].map((i) => createShipment({ ...base, tracking_id: `AWB-S4-${i}` }, { actor: `tab-${i}` })));
+  const won = race.filter((x) => x.status === 'fulfilled');
+  const lost = race.filter((x) => x.status === 'rejected');
+  if (won.length !== 1 || lost.some((x) => !x.reason.orderExists)) throw new Error(`won ${won.length}; ${lost.map((x) => x.reason.message)}`);
+  if ((await listOrders({ q: `${TEST_ORDER}-S4` })).total !== 1) throw new Error('duplicate order');
+  const id = won[0].value.orderId;
+  const race2 = await Promise.allSettled([1, 2].map((i) => createShipment({ ...base, tracking_id: 'AWB-S4-SAME' }, { actor: `tab-${i}`, addToExisting: true })));
+  const won2 = race2.filter((x) => x.status === 'fulfilled').length;
+  if (won2 !== 1 || !race2.find((x) => x.status === 'rejected')?.reason.duplicateAwb) throw new Error(`won ${won2}`);
+  if ((await orderShipments(id)).filter((x) => x.tracking_id === 'AWB-S4-SAME').length !== 1) throw new Error('AWB duplicated');
+  return '3 simultaneous creates → 1 order; 2 simultaneous same-AWB adds → 1 shipment';
+});
+await step('new shipment: invoice and receipt attach to the order', async () => {
+  const id = (await listOrders({ q: `${TEST_ORDER}-S1`, channel: 'blinkit' })).orders[0].id;
+  const objects = new Map();
+  const fake = { async put(k, b) { objects.set(k, b); }, async remove(k) { objects.delete(k); } };
+  await saveUploadedDocument({ orderId: id, filename: 'inv.pdf', buffer: Buffer.from('%PDF-1.4 i'), documentType: 'tax_invoice', actor: ACTOR, store: fake });
+  await saveUploadedDocument({ orderId: id, filename: 'rcpt.png', buffer: Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1]), documentType: 'courier_receipt', actor: ACTOR, store: fake });
+  const docs = await orderDocuments(id);
+  if (!docs.some((d) => d.document_type === 'tax_invoice') || !docs.some((d) => d.document_type === 'courier_receipt')) throw new Error('missing a document');
+  if (!(await getOrder(id)).has_invoice || objects.size !== 2) throw new Error('invoice flag / storage');
+  return 'tax invoice + courier receipt stored';
+});
+
+await step('new shipment cleanup', async () => {
+  const { orders } = await purgeTestOrders(TEST_ORDER);
+  const left = await getPool().query('SELECT count(*)::int AS n FROM orders WHERE source_order_id LIKE $1', [`${TEST_ORDER}%`]);
+  if (left.rows[0].n) throw new Error('orders left behind');
+  return `${orders} orders removed`;
+});
+
 // ---- environment guard ------------------------------------------------------
 await step('environment guard: labels and APP_ENV must agree; production is never touched', async () => {
   const { appEnv, EnvironmentError: EnvErr } = await import('../lib/env-guard.js');
@@ -1435,6 +1561,8 @@ await step('cleanup', async () => {
     await client.query('BEGIN');
     await assertMarkerIn(client, ['test'], 'db:check cleanup');
     await client.query('DELETE FROM login_log WHERE phone = $1', [TEST_PHONE]);
+    await client.query('DELETE FROM allowed_users WHERE phone = ANY($1)', [[FIX_A, FIX_B]]);
+    await client.query('DELETE FROM abandoned_carts WHERE cart_id = $1', [FIX_CART]);
     await client.query('DELETE FROM member_log WHERE target_phone = $1', [TEST_MEMBER]);
     await client.query('DELETE FROM allowed_users WHERE phone = $1', [TEST_MEMBER]);
     await client.query('DELETE FROM system_state WHERE key = $1', [TEST_STATE_KEY]);
