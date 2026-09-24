@@ -10,7 +10,11 @@ import {
   $, $$, esc, money, count, pct, icon, renderIcons, setTimezone, dayKey, lastDays,
   clock, dateShort, dateTime, relative, duration, delta, metricCard, barChart,
   statusOf, statusIndicator, followUp, hbars, initials, initShell, setNavCount, STATUS_LABELS,
+  pageSignal, onLeave, pageFetch,
 } from './ui/components.js';
+
+// Requests belong to this page: cancelled, and never rendered, once it is left.
+const fetch = pageFetch();
 
 const state = {
   days: 7,
@@ -559,7 +563,7 @@ $('#attention').addEventListener('click', (e) => {
 });
 $('#drawerClose').addEventListener('click', closeDrawer);
 $('#drawerScrim').addEventListener('click', closeDrawer);
-document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeDrawer(); });
+document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeDrawer(); }, { signal: pageSignal() });
 
 $('#actTabs').addEventListener('click', (e) => {
   const b = e.target.closest('button');
@@ -603,9 +607,14 @@ $('#periodGroup').addEventListener('click', (e) => {
 // Close the "more" menu when clicking elsewhere — <details> does not on its own.
 document.addEventListener('click', (e) => {
   for (const d of $$('details.menu[open]')) if (!d.contains(e.target)) d.removeAttribute('open');
-});
+}, { signal: pageSignal() });
 
 /* ------------------------------------------------------------------ boot */
+
+// Same cadence as before. Skipped while hidden, and quiet, so an open filter
+// or a scrolled table is not reset under the reader. Stops when the page is left.
+const poll = setInterval(() => { if (!document.hidden) loadAll({ quiet: true }); }, 60_000);
+onLeave(() => { clearInterval(poll); clearTimeout(qTimer); });
 
 (async () => {
   try {
@@ -619,7 +628,4 @@ document.addEventListener('click', (e) => {
   loadAll();
   loadReasons();
   loadReport();
-  // Same cadence as before. Skipped while hidden, and quiet, so an open filter
-  // or a scrolled table is not reset under the reader.
-  setInterval(() => { if (!document.hidden) loadAll({ quiet: true }); }, 60_000);
 })();

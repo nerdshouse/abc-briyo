@@ -896,3 +896,14 @@ button { font: inherit; color: inherit; }
   .d-row { grid-template-columns: 1fr; gap: 6px; }
   .kv { grid-template-columns: 96px minmax(0, 1fr); }
 }
+
+/* ---------------- client-side navigation ---------------- */
+/* A thin bar at the top while the next page loads; the shell stays put. */
+.nav-progress {
+  position: fixed; top: 0; left: 0; right: 0; height: 2px; z-index: 60; pointer-events: none;
+  background: var(--ink); transform: scaleX(0); transform-origin: left; opacity: 0;
+  transition: transform 1.2s cubic-bezier(.2, .7, .3, 1), opacity .2s;
+}
+.nav-progress.on { transform: scaleX(.85); opacity: 1; }
+main.page[aria-busy="true"] { opacity: .6; transition: opacity .15s .1s; }
+@media (prefers-reduced-motion: reduce) { .nav-progress { transition: none; } }

@@ -22,6 +22,9 @@ export const pct = (n, d) => (d ? Math.round((n / d) * 100) : 0);
 /** A Lucide placeholder; renderIcons() swaps it for the SVG. */
 export const icon = (name, cls = '') => `<i data-lucide="${esc(name)}"${cls ? ` class="${esc(cls)}"` : ''}></i>`;
 
+import { navigate, startRouter, syncSidebarActive } from './nav.js';
+export { navigate, pageSignal, onLeave, onQueryChange, pageFetch } from './nav.js';
+
 /** Lucide scans the whole document, so this is cheap to call after any render. */
 export function renderIcons() {
   if (window.lucide?.createIcons) window.lucide.createIcons({ attrs: { 'stroke-width': 1.75 } });
@@ -352,30 +355,44 @@ export const initials = (name) => String(name || '?').split(/\s+/).filter(Boolea
  * the only search in the app — or, given `onSearch`, runs it in place), the
  * signed-in user card, admin-only links, and sign-out.
  */
+let shellBound = false;
+let shellSearch = null;
+
 export function initShell(me, { onSearch } = {}) {
-  const app = $('.app');
-  const open = () => app.classList.add('nav-open');
-  const close = () => app.classList.remove('nav-open');
-  $('#navOpen')?.addEventListener('click', open);
-  $('#scrim')?.addEventListener('click', close);
-  document.addEventListener('keydown', (e) => {
-    if (e.key === 'Escape') close();
-    if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') {
+  // The shell survives client-side navigation, so its listeners are bound once;
+  // each page only swaps in its own search behaviour.
+  shellSearch = onSearch || null;
+  if (!shellBound) {
+    shellBound = true;
+    const app = $('.app');
+    const open = () => app.classList.add('nav-open');
+    const close = () => app.classList.remove('nav-open');
+    $('#navOpen')?.addEventListener('click', open);
+    $('#scrim')?.addEventListener('click', close);
+    document.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape') close();
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') {
+        e.preventDefault();
+        open();
+        $('#sideSearch')?.focus();
+      }
+    });
+    $('#sideSearchForm')?.addEventListener('submit', (e) => {
       e.preventDefault();
-      open();
-      $('#sideSearch')?.focus();
+      const q = $('#sideSearch').value.trim();
+      if (!q) return;
+      // On the board the sidebar search is the board's own search; elsewhere it
+      // hands off to the board, the only page that searches every cart.
+      if (shellSearch) { shellSearch(q); close(); } else navigate(`/?q=${encodeURIComponent(q)}`);
+    });
+    if (/Mac|iPhone|iPad/.test(navigator.platform) === false) {
+      const k = $('.side-search kbd'); if (k) k.textContent = 'Ctrl K';
     }
-  });
-  $('#sideSearchForm')?.addEventListener('submit', (e) => {
-    e.preventDefault();
-    const q = $('#sideSearch').value.trim();
-    if (!q) return;
-    // On the board the sidebar search is the board's own search; elsewhere it
-    // hands off to the board, the only page that searches every cart.
-    if (onSearch) { onSearch(q); close(); } else window.location.href = `/?q=${encodeURIComponent(q)}`;
-  });
-  if (/Mac|iPhone|iPad/.test(navigator.platform) === false) {
-    const k = $('.side-search kbd'); if (k) k.textContent = 'Ctrl K';
+    $('#signOut')?.addEventListener('click', async () => {
+      await fetch('/auth/logout', { method: 'POST' });
+      window.location.href = '/login';
+    });
+    startRouter();
   }
 
   // Admin-only destinations are hidden, not disabled: a link that 403s is noise.
@@ -389,10 +406,7 @@ export function initShell(me, { onSearch } = {}) {
     $('#userRole').textContent = me.isAdmin ? 'Admin' : me.role === 'logistics' ? 'Logistics' : 'Caller';
     $('#userAvatar').firstChild.textContent = initials(me.name);
   }
-  $('#signOut')?.addEventListener('click', async () => {
-    await fetch('/auth/logout', { method: 'POST' });
-    window.location.href = '/login';
-  });
+  syncSidebarActive();
 }
 
 /**
@@ -405,11 +419,10 @@ async function renderOrdersNav() {
   if (!host) return;
   const meta = await (await fetch('/api/orders/meta')).json();
   if (!meta.ok) return;
-  const here = window.location.pathname + window.location.search;
-  const link = (href, label, ico, n) => `<a class="nav-item${href === here ? ' active' : ''}" href="${href}">`
+  const link = (href, label, ico, n) => `<a class="nav-item" href="${href}">`
     + `${ico ? `<i data-lucide="${ico}"></i>` : ''}${esc(label)}`
     + `${n ? `<span class="nav-count">${count(n)}</span>` : ''}</a>`;
-  host.innerHTML = `
+  const html = `
     <div class="nav-group">
       <div class="nav-caption">Orders</div>
       ${link('/orders', 'All orders', 'package')}
@@ -423,12 +436,11 @@ async function renderOrdersNav() {
         meta.viewCounts?.[k])).join('')}
       ${link('/couriers', 'Courier partners', 'building-2')}
     </div>`;
-  // The recovery pages mark their own item active; don't leave two lit.
-  if (host.querySelector('.nav-item.active')) {
-    for (const a of document.querySelectorAll('.sidebar nav > .nav-group .nav-item.active')) {
-      if (!host.contains(a)) a.classList.remove('active');
-    }
-  }
+  // Re-rendered on every page; replaced only if something (a count) changed.
+  if (host.dataset.html === html) return;
+  host.dataset.html = html;
+  host.innerHTML = html;
+  syncSidebarActive();
   renderIcons();
 }
 

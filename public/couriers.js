@@ -1,5 +1,8 @@
 /** Courier partners: everyone with orders access can read; admins edit. */
-import { $, esc, icon, renderIcons, initShell } from './ui/components.js';
+import { $, esc, icon, renderIcons, initShell, pageFetch } from './ui/components.js';
+
+// Requests belong to this page: cancelled, and never rendered, once it is left.
+const fetch = pageFetch();
 
 let isAdmin = false;
 

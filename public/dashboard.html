@@ -23,7 +23,7 @@
       </div>
     </div>
 
-    <form class="side-search" id="sideSearchForm" role="search">
+    <form class="side-search" id="sideSearchForm" role="search" data-recovery>
       <i data-lucide="search"></i>
       <input id="sideSearch" type="search" placeholder="Find a customer" autocomplete="off"
              aria-label="Search every cart by name, phone or email" />
@@ -31,30 +31,30 @@
     </form>
 
     <nav>
-      <div class="nav-group">
+      <div class="nav-group" data-admin hidden>
         <div class="nav-caption">Overview</div>
-        <a class="nav-item active" href="/dashboard" aria-current="page"><i data-lucide="layout-grid"></i>Dashboard</a>
+        <a class="nav-item" href="/dashboard"><i data-lucide="layout-grid"></i>Dashboard</a>
       </div>
 
-      <div class="nav-group">
+      <div class="nav-group" data-recovery>
         <div class="nav-caption">Carts</div>
-        <a class="nav-item" href="/?mode=all"><i data-lucide="shopping-bag"></i>Call board</a>
+        <a class="nav-item" href="/?mode=all" data-view-link="board"><i data-lucide="shopping-bag"></i>Call board</a>
         <div class="nav-tree">
-          <a class="nav-item" href="/?mode=tocall">To call<span class="nav-count" id="countToCall" hidden></span></a>
-          <a class="nav-item" href="/?mode=callbacks">Callbacks<span class="nav-count" id="countCallbacks" hidden></span></a>
-          <a class="nav-item" href="/?mode=mine">My queue</a>
-          <a class="nav-item" href="/?mode=all">All carts</a>
+          <a class="nav-item" href="/?mode=tocall" data-view-link="tocall">To call<span class="nav-count" id="countToCall" hidden></span></a>
+          <a class="nav-item" href="/?mode=callbacks" data-view-link="callbacks">Callbacks<span class="nav-count" id="countCallbacks" hidden></span></a>
+          <a class="nav-item" href="/?mode=mine" data-view-link="mine">My queue</a>
+          <a class="nav-item" href="/?mode=all" data-view-link="all">All carts</a>
         </div>
       </div>
 
       <div id="ordersNav"></div>
 
-      <div class="nav-group">
+      <div class="nav-group" data-admin hidden>
         <div class="nav-caption">Team</div>
         <a class="nav-item" href="/admin"><i data-lucide="users"></i>Members</a>
       </div>
 
-      <div class="nav-group">
+      <div class="nav-group" data-admin hidden>
         <div class="nav-caption">Data</div>
         <a class="nav-item" href="/import"><i data-lucide="upload"></i>Import carts</a>
         <a class="nav-item" href="/api/admin/report.csv?period=day" download><i data-lucide="download"></i>Export report</a>
@@ -78,7 +78,7 @@
   <div class="main">
     <header class="topbar">
       <button class="icon-btn" id="navOpen" type="button" aria-label="Open navigation"><i data-lucide="menu"></i></button>
-      <span class="topbar-title">Dashboard</span>
+      <span class="topbar-title" id="topTitle">Dashboard</span>
     </header>
 
     <main class="page">

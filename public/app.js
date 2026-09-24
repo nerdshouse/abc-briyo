@@ -9,8 +9,11 @@
 import {
   $, $$, esc, money, count, icon, renderIcons, setTimezone, dayKey, dateTime,
   relative, span, statusOf, statusIndicator, followUp, hbars, initials, initShell,
-  setNavCount, STATUS_LABELS,
+  setNavCount, STATUS_LABELS, pageSignal, onLeave, onQueryChange, pageFetch,
 } from './ui/components.js';
+
+// Requests belong to this page: cancelled, and never rendered, once it is left.
+const fetch = pageFetch();
 
 const STATUSES = [
   'Not called',
@@ -1062,13 +1065,16 @@ function setView(view) {
   if (wasSearch) loadAll(); else render();
 }
 
-// Sidebar queue links switch the view in place rather than reloading the page.
-document.addEventListener('click', (e) => {
-  const a = e.target.closest('a[data-view-link]');
-  if (!a) return;
-  e.preventDefault();
-  setView(a.dataset.viewLink === 'board' ? 'tocall' : a.dataset.viewLink);
-  $('.app').classList.remove('nav-open');
+// Sidebar queue links (/?mode=…) and Back/Forward between them switch the
+// view in place; the shell router hands the new URL here instead of reloading.
+onQueryChange((url) => {
+  const p = url.searchParams;
+  if (p.get('q')) {
+    $('#search').value = p.get('q');
+    state.query = p.get('q');
+    return loadAll();
+  }
+  setView(VIEWS[p.get('mode')] ? p.get('mode') : 'tocall');
 });
 
 $('#cartTable thead').addEventListener('click', (e) => {
@@ -1121,26 +1127,29 @@ $('#search').addEventListener('keydown', (e) => {
 
 $('#refresh').addEventListener('click', () => loadAll());
 
+// Page-wide listeners end with the page (pageSignal), so moving away and back
+// never stacks a second copy.
 document.addEventListener('keydown', (e) => {
   if (e.key !== 'Escape') return;
   if (!menu.hidden) { closeStatusMenu(); return; }
   if (!drawer.hidden) closeDrawer();
-});
+}, { signal: pageSignal() });
 document.addEventListener('click', (e) => {
   if (!menu.hidden && !menu.contains(e.target)) closeStatusMenu();
   for (const d of $$('details.menu[open]')) if (!d.contains(e.target)) d.removeAttribute('open');
-});
-window.addEventListener('scroll', () => { if (!menu.hidden) closeStatusMenu(); }, { passive: true });
+}, { signal: pageSignal() });
+window.addEventListener('scroll', () => { if (!menu.hidden) closeStatusMenu(); }, { passive: true, signal: pageSignal() });
 
 /**
  * Poll so a teammate's change shows up without a manual refresh — but never
  * under someone's cursor: skipped while the tab is hidden, a cart is open, the
  * status menu is up, or a search is showing.
  */
-setInterval(() => {
+const poll = setInterval(() => {
   if (document.hidden || !drawer.hidden || !menu.hidden || state.query) return;
   loadAll();
 }, 60_000);
+onLeave(() => { clearInterval(poll); clearTimeout(searchTimer); clearTimeout(insightsTimer); });
 
 /* ------------------------------------------------------------------ boot */
 

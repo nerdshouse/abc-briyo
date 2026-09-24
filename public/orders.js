@@ -4,8 +4,12 @@
  * couriers and statuses come from /api/orders/meta, never from this file.
  */
 import {
-  $, $$, esc, money, count, icon, renderIcons, setTimezone, dateShort, dateTime, initShell,
+  $, $$, esc, money, count, icon, renderIcons, setTimezone, dateShort, dateTime, initShell, pageFetch,
+  navigate, pageSignal, onLeave, onQueryChange,
 } from './ui/components.js';
+
+// Requests belong to this page: cancelled, and never rendered, once it is left.
+const fetch = pageFetch();
 
 const LABEL_OVERRIDES = {
   rto: 'RTO', not_ready: 'Not ready', cod: 'COD', third_party: 'Third party',
@@ -88,7 +92,17 @@ function writeUrl() {
   for (const k of FILTER_KEYS) if (state.f[k]) u.set(k, state.f[k]);
   if (state.openId) u.set('open', state.openId);
   const qs = u.toString();
-  history.replaceState(null, '', qs ? `/orders?${qs}` : '/orders');
+  // Filters and the open order refine the current entry; history.state carries
+  // the scroll position for Back, so it is kept.
+  history.replaceState(history.state, '', qs ? `/orders?${qs}` : '/orders');
+}
+
+/** The URL for this list with a different channel, keeping the other filters. */
+function channelUrl(channel) {
+  const u = new URL(window.location.href);
+  if (channel) u.searchParams.set('channel', channel); else u.searchParams.delete('channel');
+  u.searchParams.delete('open');
+  return u.pathname + u.search;
 }
 
 /* ------------------------------------------------------------------ list */
@@ -765,11 +779,11 @@ function bind() {
     for (const k of FILTER_KEYS) state.f[k] = '';
     fillFilters(); writeUrl(); load();
   });
+  // A channel is a place you can go Back to, so it is a history entry.
   $('#channelTabs').addEventListener('click', (e) => {
     const b = e.target.closest('[data-channel]');
-    if (!b) return;
-    state.channel = b.dataset.channel;
-    writeUrl(); load();
+    if (!b || b.dataset.channel === state.channel) return;
+    navigate(channelUrl(b.dataset.channel));
   });
   const rowOpen = (e) => {
     if (e.target.closest('a')) return;
@@ -795,7 +809,19 @@ function bind() {
     else if (!$('#drawer').hidden) closeDrawer();
   };
   $('#drawerScrim').addEventListener('click', closeTop);
-  document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeTop(); });
+  document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeTop(); }, { signal: pageSignal() });
+  onLeave(() => clearTimeout(t));
+  // Same page, new query (a sidebar channel or queue link, Back/Forward):
+  // refresh the list in place, keeping scroll, instead of reloading the page.
+  onQueryChange(async () => {
+    const wasOpen = state.openId;
+    readUrl();
+    fillFilters();
+    const loading = load();
+    if (state.openId && state.openId !== wasOpen) openOrder(state.openId);
+    else if (!state.openId && !$('#drawer').hidden) closeDrawer();
+    await loading;
+  });
 }
 
 (async function init() {
