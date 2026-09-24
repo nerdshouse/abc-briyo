@@ -907,3 +907,8 @@ button { font: inherit; color: inherit; }
 .nav-progress.on { transform: scaleX(.85); opacity: 1; }
 main.page[aria-busy="true"] { opacity: .6; transition: opacity .15s .1s; }
 @media (prefers-reduced-motion: reduce) { .nav-progress { transition: none; } }
+
+/* Sidebar tools that only make sense for cart recovery (customer search,
+   cart import/export) step aside on the Orders pages. The shell is shared;
+   the page says which section it belongs to. Role visibility is separate. */
+.app:has(main.page[data-section="orders"]) .sidebar [data-context="recovery"] { display: none; }

@@ -371,10 +371,12 @@ export function initShell(me, { onSearch } = {}) {
     $('#scrim')?.addEventListener('click', close);
     document.addEventListener('keydown', (e) => {
       if (e.key === 'Escape') close();
-      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') {
+      // ⌘K only where the customer search is actually shown.
+      const search = $('#sideSearch');
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k' && search?.offsetParent) {
         e.preventDefault();
         open();
-        $('#sideSearch')?.focus();
+        search.focus();
       }
     });
     $('#sideSearchForm')?.addEventListener('submit', (e) => {

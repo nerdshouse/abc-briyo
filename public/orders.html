@@ -23,7 +23,7 @@
       </div>
     </div>
 
-    <form class="side-search" id="sideSearchForm" role="search" data-recovery>
+    <form class="side-search" id="sideSearchForm" role="search" data-recovery data-context="recovery">
       <i data-lucide="search"></i>
       <input id="sideSearch" type="search" placeholder="Find a customer" autocomplete="off"
              aria-label="Search every cart by name, phone or email" />
@@ -54,7 +54,7 @@
         <a class="nav-item" href="/admin"><i data-lucide="users"></i>Members</a>
       </div>
 
-      <div class="nav-group" data-admin hidden>
+      <div class="nav-group" data-admin data-context="recovery" hidden>
         <div class="nav-caption">Data</div>
         <a class="nav-item" href="/import"><i data-lucide="upload"></i>Import carts</a>
         <a class="nav-item" href="/api/admin/report.csv?period=day" download><i data-lucide="download"></i>Export report</a>
@@ -80,7 +80,7 @@
       <span class="topbar-title" id="topTitle">Orders</span>
     </header>
 
-    <main class="page">
+    <main class="page" data-section="orders">
       <div class="crumbs">
         <i data-lucide="package"></i><span id="crumbGroup">Orders</span><span class="sep">/</span><span class="here" id="crumbHere">All orders</span>
       </div>
