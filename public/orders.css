@@ -69,8 +69,19 @@
 /* order details fold under the shipment */
 .more-sec > summary { cursor: pointer; list-style: none; margin: 0; }
 .more-sec > summary::-webkit-details-marker { display: none; }
-.more-sec > summary::before { content: '▸'; margin-right: 6px; color: var(--text-3); }
-.more-sec[open] > summary::before { content: '▾'; }
+/* Same header as the other drawer sections: arrow and title together on the
+   left, the summary text pushed right. (.dsec-title spreads its children,
+   which put the arrow, title and summary in three separate places.) */
+.more-sec > summary.dsec-title { justify-content: flex-start; align-items: center; gap: 6px; }
+.more-sec > summary.dsec-title .dsec-meta { margin-left: auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.more-sec > summary::before {
+  content: ''; flex: none; width: 6px; height: 6px; margin: 0 2px 1px 1px;
+  border-right: 1.5px solid var(--text-3); border-bottom: 1.5px solid var(--text-3);
+  transform: rotate(-45deg); transition: transform .12s;
+}
+.more-sec[open] > summary::before { transform: rotate(45deg); margin-bottom: 3px; }
+.more-sec[open] > summary { margin-bottom: 10px; }
+.more-sec > summary:hover { color: var(--text-2); }
 
 /* shipment steps: the next move is one click, anything else via the select */
 .steps { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 12px; }
@@ -148,3 +159,5 @@
 .proof-n .lucide { width: 13px; height: 13px; color: var(--text-2); }
 .proof .yes { gap: 2px; }
 @media (max-width: 760px) { .thumb { width: 68px; height: 68px; } }
+/* Long tracking links in the activity timeline wrap instead of widening the drawer on phones. */
+#dBody .act-title { overflow-wrap: anywhere; }
