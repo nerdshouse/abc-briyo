@@ -7,7 +7,7 @@
 .ord-table col.c-courier { width: 118px; }
 .ord-table col.c-track { width: 16%; }
 .ord-table col.c-ship { width: 136px; }
-.ord-table col.c-inv { width: 74px; }
+.ord-table col.c-inv { width: 98px; }
 .ord-table col.c-date { width: 92px; }
 .ord-table col.c-cust { width: 13%; }
 .ord-table col.c-amt { width: 88px; }
@@ -119,3 +119,32 @@
   .upload { grid-template-columns: 1fr; }
   .page-actions .btn.primary { padding: 0 10px; }
 }
+
+/* dispatch proof: photos first, then the paper trail */
+.proof-group { margin-top: 12px; }
+.proof-group:first-of-type { margin-top: 0; }
+.proof-h { display: flex; gap: 8px; align-items: baseline; font-size: 12.5px; font-weight: 500; margin-bottom: 6px; }
+.proof-h .soft { font-weight: 400; font-size: 12px; }
+.proof-none { margin: 0; font-size: 12.5px; }
+.thumbs { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.thumb { position: relative; margin: 0; width: 76px; height: 76px; border-radius: 8px; overflow: hidden;
+  border: 1px solid var(--border); background: var(--surface-2); flex: none; }
+.thumb a, .thumb img { display: block; width: 100%; height: 100%; }
+.thumb img { object-fit: cover; }
+.thumb-x { position: absolute; top: 3px; right: 3px; width: 20px; height: 20px; border-radius: 6px; border: 0; cursor: pointer;
+  display: grid; place-items: center; background: rgba(16, 24, 40, .6); color: #fff; opacity: .85; }
+.thumb-x .lucide { width: 12px; height: 12px; }
+.thumb-x:hover { opacity: 1; }
+.thumbs-n { font-size: 12px; }
+#cThumbs { margin-top: 10px; }
+.add-photos { margin: 10px 8px 0 0; height: 32px; cursor: pointer; }
+.proof-field .file { font-size: 12.5px; }
+.retry { margin-bottom: 12px; padding: 10px 12px; border: 1px solid #FECDCA; border-radius: 8px; background: var(--error-soft); font-size: 12.5px; color: var(--error-text); }
+.retry ul { margin: 6px 0 0; padding-left: 18px; }
+.retry .form-actions { margin-top: 8px; }
+/* list: compact proof summary, no taller rows */
+.proof { display: inline-flex; gap: 8px; align-items: center; font-size: 12.5px; }
+.proof-n { display: inline-flex; gap: 3px; align-items: center; color: var(--text); font-variant-numeric: tabular-nums; }
+.proof-n .lucide { width: 13px; height: 13px; color: var(--text-2); }
+.proof .yes { gap: 2px; }
+@media (max-width: 760px) { .thumb { width: 68px; height: 68px; } }

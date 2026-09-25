@@ -137,7 +137,7 @@
               </colgroup>
               <thead><tr>
                 <th>Order</th><th>Channel</th><th>Courier</th><th>AWB / Tracking</th>
-                <th>Shipment Status</th><th>Invoice</th><th>Order Date</th>
+                <th>Shipment Status</th><th title="Dispatch photos and tax invoice">Proof</th><th>Order Date</th>
                 <th class="col-cust">Customer</th><th class="r col-amt">Amount</th>
                 <th class="r"><span class="sr-only">Actions</span></th>
               </tr></thead>
@@ -241,15 +241,25 @@
       </div>
     </section>
     <section class="dsec">
+      <h3 class="dsec-title">Dispatch Proof &amp; Documents <span class="dsec-meta soft">optional</span></h3>
+      <label class="fld proof-field"><span>Dispatch Product Image</span>
+        <input class="file" type="file" name="dispatch_files" multiple
+               accept=".jpg,.jpeg,.png,.webp,image/jpeg,image/png,image/webp" />
+        <span class="help">Photos of the packed cartons, the label or AWB, the final package. Add as many as needed.</span></label>
+      <div class="thumbs" id="cThumbs" hidden></div>
+      <div class="form-grid" style="margin-top:12px">
+        <label class="fld"><span>Tax Invoice</span><input class="file" type="file" name="invoice_file" accept=".pdf,.png,.jpg,.jpeg,application/pdf,image/png,image/jpeg" /></label>
+        <label class="fld"><span>Courier Receipt <span class="soft">(optional)</span></span><input class="file" type="file" name="receipt_file" accept=".pdf,.png,.jpg,.jpeg,application/pdf,image/png,image/jpeg" /></label>
+        <span class="help wide" id="cDocsNote"></span>
+      </div>
+    </section>
+    <section class="dsec">
       <h3 class="dsec-title">Optional</h3>
       <div class="form-grid">
         <label class="fld"><span>Shipment Status</span><select class="select" name="shipment_status"></select></label>
         <label class="fld"><span>Expected Delivery</span><input class="input" type="date" name="expected_delivery_date" /></label>
         <label class="fld"><span>Order Date <span class="soft tz-note"></span></span><input class="input" name="order_date" type="datetime-local" /></label>
         <label class="fld"><span>Order Value (₹)</span><input class="input" name="order_value" inputmode="decimal" autocomplete="off" placeholder="Leave blank if unknown" /></label>
-        <label class="fld"><span>Tax Invoice</span><input class="file" type="file" name="invoice_file" accept=".pdf,.png,.jpg,.jpeg,application/pdf,image/png,image/jpeg" /></label>
-        <label class="fld"><span>Courier Receipt</span><input class="file" type="file" name="receipt_file" accept=".pdf,.png,.jpg,.jpeg,application/pdf,image/png,image/jpeg" /></label>
-        <span class="help wide" id="cDocsNote"></span>
         <label class="fld wide"><span>Notes</span><textarea class="input" name="note" maxlength="2000" placeholder="Saved to the shipment's activity"></textarea></label>
       </div>
     </section>

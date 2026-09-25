@@ -13,6 +13,7 @@ const fetch = pageFetch();
 
 const LABEL_OVERRIDES = {
   rto: 'RTO', not_ready: 'Not ready', cod: 'COD', third_party: 'Third party',
+  dispatch_product_image: 'Dispatch Product Image',
   tax_invoice: 'Tax Invoice', courier_receipt: 'Courier Receipt', marketplace_invoice: 'Marketplace Invoice',
   credit_note: 'Credit Note', other: 'Other',
 };
@@ -55,6 +56,7 @@ const state = {
   openId: null,
   detail: null,
   editing: null,
+  retry: null,       // uploads that failed, kept (with their files) for Retry
 };
 
 const api = async (url, opts = {}) => {
@@ -167,6 +169,14 @@ function trackingCell(o) {
     : `<span class="mono">${esc(o.tracking_id)}</span>`) + more;
 }
 
+/** Compact proof summary: dispatch photo count and whether the tax invoice is in. */
+function proofCell(o) {
+  const photos = o.dispatch_image_count
+    ? `<span class="proof-n" title="${o.dispatch_image_count} dispatch photo${o.dispatch_image_count === 1 ? '' : 's'}">${icon('camera')}${o.dispatch_image_count}</span>` : '';
+  const inv = o.has_invoice ? `<span class="yes" title="Tax invoice uploaded">Inv${icon('check')}</span>` : '';
+  return photos || inv ? `<span class="proof">${photos}${inv}</span>` : '<span class="muted-cell">—</span>';
+}
+
 // A cancelled order is flagged next to its number rather than in a column of its own.
 const cancelledTag = (o) => (o.order_status === 'cancelled' ? '<span class="mini-tag warn">Cancelled</span>' : '');
 
@@ -188,7 +198,7 @@ function renderRows() {
       <td>${o.courier_name ? esc(o.courier_name) : '<span class="muted-cell">—</span>'}</td>
       <td>${trackingCell(o)}</td>
       <td>${indicator(o.shipment_status)}</td>
-      <td>${o.has_invoice ? `<span class="yes">${icon('check')}Yes</span>` : '<span class="muted-cell">No</span>'}</td>
+      <td>${proofCell(o)}</td>
       <td class="num"${o.order_date ? '' : ' title="No order date — shown by when it was entered"'}>${esc(day(o.order_date))}</td>
       <td class="col-cust"><span class="cell-main">${o.customer_name ? esc(o.customer_name) : '<span class="muted-cell">—</span>'}</span></td>
       <td class="r num col-amt">${esc(amount(o.order_value))}</td>
@@ -200,7 +210,7 @@ function renderRows() {
         <span class="oi-val">${indicator(o.shipment_status)}</span></div>
       <div class="oi-sub">${o.tracking_id ? `${esc(o.courier_name || '')} · <span class="mono">${esc(o.tracking_id)}</span>` : 'No courier / AWB yet'}</div>
       <div class="oi-stat"><span class="soft" style="font-size:12.5px">${esc(day(o.order_date))}</span>
-        ${o.has_invoice ? `<span class="yes">${icon('check')}Invoice</span>` : '<span class="muted" style="font-size:12.5px">No invoice</span>'}
+        ${proofCell(o)}
         ${o.order_value !== null ? `<span class="soft" style="font-size:12.5px">${esc(amount(o.order_value))}</span>` : ''}</div>
     </li>`).join('');
   renderIcons();
@@ -253,6 +263,107 @@ const toTeamInput = (iso) => {
 };
 const bytes = (n) => (n >= 1048576 ? `${(n / 1048576).toFixed(1)} MB` : `${Math.max(1, Math.round(n / 1024))} KB`);
 
+/* ------------------------------------------------------------------ documents */
+
+const formatsFor = (type) => state.meta.documentFormats?.[type] || ['pdf', 'png', 'jpg', 'jpeg'];
+const MIME = { pdf: 'application/pdf', png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', webp: 'image/webp' };
+const acceptFor = (type) => [...formatsFor(type).map((e) => `.${e}`), ...new Set(formatsFor(type).map((e) => MIME[e]))].join(',');
+const formatNames = (type) => [...new Set(formatsFor(type).map((e) => (e === 'jpeg' ? 'JPG' : e.toUpperCase())))].join(', ');
+
+/** Quick check before sending; the server checks again, including the bytes. */
+function fileProblem(file, type) {
+  const ext = file.name.toLowerCase().split('.').pop();
+  if (!formatsFor(type).includes(ext)) return `${file.name}: only ${formatNames(type)} can be uploaded as ${label(type)}.`;
+  if (file.size > state.meta.maxDocumentBytes) return `${file.name}: files must be ${bytes(state.meta.maxDocumentBytes)} or smaller.`;
+  return null;
+}
+
+async function uploadFile(orderId, file, type) {
+  return api(`/api/orders/${orderId}/documents?type=${encodeURIComponent(type)}`, {
+    method: 'POST', body: file,
+    headers: { 'Content-Type': file.type || 'application/octet-stream', 'X-Filename': encodeURIComponent(file.name) },
+  });
+}
+
+/**
+ * Uploads one by one, reporting progress. Files that fail are kept (with the
+ * reason) for Retry — a failed upload never undoes the shipment and never
+ * loses what was chosen.
+ */
+async function uploadAll(orderId, items, progressEl) {
+  const failed = [];
+  for (const [i, item] of items.entries()) {
+    if (progressEl) progressEl.textContent = `Uploading ${i + 1} of ${items.length}: ${item.file.name}…`;
+    try { await uploadFile(orderId, item.file, item.type); } catch (err) { failed.push({ ...item, error: err.message }); }
+  }
+  state.retry = failed.length ? { orderId, items: failed } : null;
+  return failed;
+}
+
+function retryBanner(orderId) {
+  const r = state.retry;
+  if (!r || r.orderId !== orderId || !r.items.length) return '';
+  return `<div class="retry" role="alert">
+    <b>${r.items.length} upload${r.items.length === 1 ? '' : 's'} did not go through.</b> The shipment is saved.
+    <ul>${r.items.map((x) => `<li>${esc(label(x.type))} · ${esc(x.file.name)} — ${esc(x.error)}</li>`).join('')}</ul>
+    <div class="form-actions"><button class="btn primary" type="button" id="dRetry">${icon('rotate-cw')}Retry upload</button>
+      <button class="btn" type="button" id="dRetryDrop">Discard</button></div>
+  </div>`;
+}
+
+const docUrl = (o, d) => `/api/orders/${o.id}/documents/${d.id}`;
+
+function docRows(o, list) {
+  return `<ul class="docs">${list.map((d) => `
+    <li class="doc${d.removed_at ? ' removed' : ''}">
+      ${icon(d.mime_type === 'application/pdf' ? 'file-text' : 'image')}
+      <div class="doc-name">
+        <a href="${docUrl(o, d)}" target="_blank" rel="noopener">${esc(d.original_filename)}</a>
+        <div class="doc-meta">${list.some((x) => x.document_type !== d.document_type) ? `${esc(label(d.document_type))} · ` : ''}${esc(bytes(d.file_size))} · ${esc(d.uploaded_by || 'Someone')}, ${esc(dateTime(d.uploaded_at))}
+          ${d.removed_at ? ` · removed by ${esc(d.removed_by || 'someone')}` : ''}</div>
+      </div>
+      ${d.removed_at ? '' : `<button class="icon-btn bare" type="button" data-remove-doc="${d.id}" title="Remove" aria-label="Remove ${esc(d.original_filename)}">${icon('trash-2')}</button>`}
+    </li>`).join('')}</ul>`;
+}
+
+/** Dispatch photos as thumbnails first, then the paper trail by type. */
+function proofSection(o, documents) {
+  const m = state.meta;
+  const live = documents.filter((d) => !d.removed_at);
+  const photos = live.filter((d) => d.document_type === 'dispatch_product_image');
+  const removedPhotos = documents.filter((d) => d.removed_at && d.document_type === 'dispatch_product_image');
+  const ofType = (t) => documents.filter((d) => d.document_type === t);
+  const others = documents.filter((d) => !['dispatch_product_image', 'tax_invoice', 'courier_receipt'].includes(d.document_type));
+  const canUpload = !m.storage.error;
+  const group = (title, list) => `<div class="proof-group"><div class="proof-h">${esc(title)}</div>
+    ${list.length ? docRows(o, list) : '<p class="muted proof-none">Not uploaded</p>'}</div>`;
+  return `
+    <div class="proof-group">
+      <div class="proof-h">Dispatch Product Images <span class="soft">${photos.length ? `${photos.length} photo${photos.length === 1 ? '' : 's'}` : ''}</span></div>
+      ${photos.length ? `<div class="thumbs">${photos.map((d) => `
+        <figure class="thumb">
+          <a href="${docUrl(o, d)}" target="_blank" rel="noopener" title="${esc(d.original_filename)} · ${esc(d.uploaded_by || 'Someone')}, ${esc(dateTime(d.uploaded_at))}">
+            <img src="${docUrl(o, d)}" alt="Dispatch photo ${esc(d.original_filename)}" loading="lazy" /></a>
+          <button class="thumb-x" type="button" data-remove-doc="${d.id}" title="Remove photo" aria-label="Remove ${esc(d.original_filename)}">${icon('x')}</button>
+        </figure>`).join('')}</div>` : '<p class="muted proof-none">No dispatch photos yet.</p>'}
+      ${canUpload ? `<label class="btn add-photos">${icon('camera')}Add photos
+        <input type="file" id="dPhotos" multiple accept="${esc(acceptFor('dispatch_product_image'))}" hidden /></label>
+        <span class="doc-meta">${esc(formatNames('dispatch_product_image'))}, up to ${esc(bytes(m.maxDocumentBytes))} each.</span>` : ''}
+      ${removedPhotos.length ? `<div class="doc-meta" style="margin-top:6px">${removedPhotos.length} removed: ${removedPhotos.map((d) => `${esc(d.original_filename)} (by ${esc(d.removed_by || 'someone')})`).join(', ')}</div>` : ''}
+    </div>
+    ${group('Tax Invoice', ofType('tax_invoice'))}
+    ${group('Courier Receipt', ofType('courier_receipt'))}
+    ${others.length ? group('Other documents', others) : ''}
+    ${m.storage.error ? `<div class="storage-note">${esc(m.storage.error)}</div>` : `<form class="upload" id="uploadForm">
+      <select class="select" name="type" aria-label="Document type">${m.documentTypes.filter((t) => t !== 'dispatch_product_image')
+        .map((t) => opt(t, label(t), t === (ofType('tax_invoice').some((d) => !d.removed_at) ? 'courier_receipt' : 'tax_invoice'))).join('')}</select>
+      <input type="file" name="file" accept="${esc(acceptFor('tax_invoice'))}" aria-label="File" />
+      <button class="btn" type="submit" id="uploadBtn">${icon('upload')}Upload</button>
+    </form>
+    <div class="doc-meta" style="margin-top:6px">Invoices and receipts: ${esc(formatNames('tax_invoice'))}, up to ${esc(bytes(m.maxDocumentBytes))}.</div>`}
+    ${m.storage.driver === 'local' ? '<div class="storage-note">Development storage (this machine\'s disk). Production uses R2.</div>' : ''}`;
+}
+
 /** The shipment the drawer is showing. */
 const currentShip = () => {
   const list = state.detail.shipments;
@@ -304,24 +415,9 @@ function renderDrawer() {
     </section>
 
     <section class="dsec">
-      <h3 class="dsec-title">Documents <span class="dsec-meta soft">Tax Invoice ${has('tax_invoice') ? '✓' : '—'} · Courier Receipt ${has('courier_receipt') ? '✓' : '—'}</span></h3>
-      ${documents.length ? `<ul class="docs">${documents.map((d) => `
-        <li class="doc${d.removed_at ? ' removed' : ''}">
-          ${icon(d.mime_type === 'application/pdf' ? 'file-text' : 'image')}
-          <div class="doc-name">
-            <a href="/api/orders/${o.id}/documents/${d.id}" target="_blank" rel="noopener">${esc(d.original_filename)}</a>
-            <div class="doc-meta">${esc(label(d.document_type))} · ${esc(bytes(d.file_size))} · ${esc(d.uploaded_by || 'Someone')}, ${esc(dateTime(d.uploaded_at))}
-              ${d.removed_at ? ` · removed by ${esc(d.removed_by || 'someone')}` : ''}</div>
-          </div>
-          ${d.removed_at ? '' : `<button class="icon-btn bare" type="button" data-remove-doc="${d.id}" title="Remove" aria-label="Remove ${esc(d.original_filename)}">${icon('trash-2')}</button>`}
-        </li>`).join('')}</ul>` : '<p class="soft" style="margin:0;font-size:12.5px">No documents yet.</p>'}
-      ${m.storage.error ? `<div class="storage-note">${esc(m.storage.error)}</div>` : `<form class="upload" id="uploadForm">
-        <select class="select" name="type" aria-label="Document type">${m.documentTypes.map((t) => opt(t, label(t), t === (has('tax_invoice') ? 'courier_receipt' : 'tax_invoice'))).join('')}</select>
-        <input type="file" name="file" accept=".pdf,.png,.jpg,.jpeg,application/pdf,image/png,image/jpeg" aria-label="File" />
-        <button class="btn" type="submit" id="uploadBtn">${icon('upload')}Upload</button>
-      </form>
-      <div class="doc-meta" style="margin-top:6px">PDF, PNG or JPG, up to ${bytes(m.maxDocumentBytes)}.</div>`}
-      ${m.storage.driver === 'local' ? '<div class="storage-note">Development storage (this machine\'s disk). Production uses R2.</div>' : ''}
+      <h3 class="dsec-title">Dispatch Proof &amp; Documents</h3>
+      ${retryBanner(o.id)}
+      ${proofSection(o, documents)}
     </section>
 
     <section class="dsec">
@@ -399,8 +495,12 @@ function describeEvent(e) {
     case 'tracking_changed': return ['scan-barcode', '', `Tracking: ${changeList(ch)}`];
     case 'shipment_dates_changed': return ['calendar', '', `Dates: ${changeList(ch)}`];
     case 'order_edited': return ['pencil', '', `Edited: ${changeList(ch)}`];
-    case 'document_uploaded': return ['file-up', 'good', `Uploaded ${esc(label(md.document_type).toLowerCase())} · ${esc(md.filename)}`];
-    case 'document_removed': return ['file-x', 'warn', `Removed ${esc(label(md.document_type).toLowerCase())} · ${esc(md.filename)}`];
+    case 'document_uploaded': return md.document_type === 'dispatch_product_image'
+      ? ['camera', 'good', `Dispatch product image uploaded · ${esc(md.filename)}`]
+      : ['file-up', 'good', `Uploaded ${esc(label(md.document_type).toLowerCase())} · ${esc(md.filename)}`];
+    case 'document_removed': return md.document_type === 'dispatch_product_image'
+      ? ['camera-off', 'warn', `Dispatch product image removed · ${esc(md.filename)}`]
+      : ['file-x', 'warn', `Removed ${esc(label(md.document_type).toLowerCase())} · ${esc(md.filename)}`];
     case 'note_added': return ['message-square-text', '', `Note: ${esc(md.note)}`];
     default: return ['activity', '', esc(label(e.event_type))];
   }
@@ -446,7 +546,27 @@ function trackHelp(courier) {
 }
 
 const dBody = $('#dBody');
-dBody.addEventListener('change', (e) => {
+dBody.addEventListener('change', async (e) => {
+  if (e.target.id === 'dPhotos') {
+    const files = [...e.target.files];
+    if (!files.length) return;
+    const saved = $('#dSaved');
+    const problems = files.map((f) => fileProblem(f, 'dispatch_product_image')).filter(Boolean);
+    if (problems.length) { saved.className = 'saved failed'; saved.textContent = problems.join(' '); e.target.value = ''; return; }
+    saved.className = 'saved pending';
+    const id = state.detail.order.id;
+    const failed = await uploadAll(id, files.map((file) => ({ file, type: 'dispatch_product_image' })), saved);
+    await openOrder(id);
+    $('#dSaved').className = failed.length ? 'saved failed' : 'saved';
+    $('#dSaved').textContent = failed.length ? `${failed.length} of ${files.length} photo${files.length === 1 ? '' : 's'} did not upload — see Retry above.`
+      : `${files.length} photo${files.length === 1 ? '' : 's'} added`;
+    load();
+    return;
+  }
+  if (e.target.name === 'type' && e.target.closest('#uploadForm')) {
+    e.target.form.file.accept = acceptFor(e.target.value);
+    return;
+  }
   if (e.target.id === 'dOrderStatus') patchOrder({ order_status: e.target.value }, 'Order status saved');
   if (e.target.name === 'courier_partner_id') {
     // Show straight away whether the link will be generated or typed.
@@ -473,6 +593,20 @@ function shipmentFields() {
 }
 
 dBody.addEventListener('click', async (e) => {
+  if (e.target.closest('#dRetry')) {
+    const { orderId, items } = state.retry;
+    const btn = e.target.closest('#dRetry');
+    btn.disabled = true;
+    const saved = $('#dSaved');
+    saved.className = 'saved pending';
+    const failed = await uploadAll(orderId, items, saved);
+    await openOrder(orderId);
+    $('#dSaved').className = failed.length ? 'saved failed' : 'saved';
+    $('#dSaved').textContent = failed.length ? `${failed.length} still did not upload.` : 'All uploads went through';
+    load();
+    return;
+  }
+  if (e.target.closest('#dRetryDrop')) { state.retry = null; return renderDrawer(); }
   const tab = e.target.closest('[data-ship]');
   if (tab) { state.shipId = Number(tab.dataset.ship); $('#dSaved').textContent = ''; return renderDrawer(); }
   if (e.target.closest('#dShipSave')) return patchOrder(shipmentFields(), 'Shipment saved', { shipment: true });
@@ -501,7 +635,7 @@ dBody.addEventListener('click', async (e) => {
   }
   const rm = e.target.closest('[data-remove-doc]');
   if (rm) {
-    if (!confirm('Remove this document from the order? It stays in the activity record.')) return;
+    if (!confirm('Remove this from the order? It stays in the activity record.')) return;
     try {
       await api(`/api/orders/${state.detail.order.id}/documents/${rm.dataset.removeDoc}`, { method: 'DELETE' });
       await openOrder(state.detail.order.id);
@@ -522,9 +656,8 @@ dBody.addEventListener('submit', async (e) => {
   const file = form.file.files[0];
   const saved = $('#dSaved');
   if (!file) { saved.className = 'saved failed'; saved.textContent = 'Choose a file first.'; return; }
-  // Checked here for a quick answer; the server checks again, including the bytes.
-  if (!/\.(pdf|png|jpe?g)$/i.test(file.name)) { saved.className = 'saved failed'; saved.textContent = 'Only PDF, PNG, JPG and JPEG files can be uploaded.'; return; }
-  if (file.size > state.meta.maxDocumentBytes) { saved.className = 'saved failed'; saved.textContent = `Files must be ${bytes(state.meta.maxDocumentBytes)} or smaller.`; return; }
+  const problem = fileProblem(file, form.type.value);
+  if (problem) { saved.className = 'saved failed'; saved.textContent = problem; return; }
   const btn = $('#uploadBtn');
   btn.disabled = true;
   saved.className = 'saved pending';
@@ -621,7 +754,6 @@ $('#formError').addEventListener('click', (e) => {
 
 /* ------------------------------------------------------------------ new shipment */
 
-const FILE_OK = /\.(pdf|png|jpe?g)$/i;
 
 function openCreate() {
   const f = $('#createForm');
@@ -643,8 +775,10 @@ function openCreate() {
   f.payment_method.innerHTML = opt('', 'Not known', true) + m.paymentMethods.map((x) => opt(x, label(x))).join('');
   f.fulfillment_type.innerHTML = opt('', 'Not set', true) + m.fulfillmentTypes.map((x) => opt(x, label(x))).join('');
   const docsOff = Boolean(m.storage.error);
-  for (const input of [f.invoice_file, f.receipt_file]) input.disabled = docsOff;
-  $('#cDocsNote').textContent = docsOff ? m.storage.error : `PDF, PNG or JPG, up to ${bytes(m.maxDocumentBytes)}. Optional.`;
+  for (const input of [f.dispatch_files, f.invoice_file, f.receipt_file]) input.disabled = docsOff;
+  $('#cDocsNote').textContent = docsOff ? m.storage.error
+    : `Invoice and receipt: ${formatNames('tax_invoice')}. Photos: ${formatNames('dispatch_product_image')}. Up to ${bytes(m.maxDocumentBytes)} each.`;
+  showPreviews([]);
   $('#createDrawer').hidden = false;
   $('#drawerScrim').hidden = false;
   (state.channel ? f.source_order_id : f.channel).focus();
@@ -655,12 +789,20 @@ function closeCreate() {
   if ($('#drawer').hidden && $('#formDrawer').hidden) $('#drawerScrim').hidden = true;
 }
 
-async function uploadFile(orderId, file, type) {
-  return api(`/api/orders/${orderId}/documents?type=${encodeURIComponent(type)}`, {
-    method: 'POST', body: file,
-    headers: { 'Content-Type': file.type || 'application/octet-stream', 'X-Filename': encodeURIComponent(file.name) },
-  });
+
+let previewUrls = [];
+/** Local previews of the chosen photos, before anything is uploaded. */
+function showPreviews(files) {
+  for (const u of previewUrls) URL.revokeObjectURL(u);
+  previewUrls = files.map((f) => URL.createObjectURL(f));
+  const host = $('#cThumbs');
+  host.hidden = !files.length;
+  host.innerHTML = files.map((f, i) => `<figure class="thumb"><img src="${previewUrls[i]}" alt="${esc(f.name)}" /></figure>`).join('')
+    + (files.length ? `<span class="soft thumbs-n">${files.length} photo${files.length === 1 ? '' : 's'} selected</span>` : '');
 }
+$('#createForm').addEventListener('change', (e) => {
+  if (e.target.name === 'dispatch_files') showPreviews([...e.target.files]);
+});
 
 const orderFieldsReset = () => {
   state.addToExisting = false;
@@ -679,16 +821,18 @@ $('#createForm').addEventListener('submit', async (e) => {
   const err = $('#cError');
   err.hidden = true;
   const body = Object.fromEntries(new FormData(f));
-  delete body.invoice_file; delete body.receipt_file;
+  delete body.invoice_file; delete body.receipt_file; delete body.dispatch_files;
   const missing = [['channel', 'channel'], ['source_order_id', 'order number'], ['courier_partner_id', 'courier partner'], ['tracking_id', 'tracking ID / AWB']]
     .filter(([k]) => !String(body[k] || '').trim()).map(([, l]) => l);
   if (missing.length) { err.textContent = `Enter the ${missing.join(', ')}.`; err.hidden = false; return; }
-  const files = [[f.invoice_file.files[0], 'tax_invoice', 'Tax Invoice'], [f.receipt_file.files[0], 'courier_receipt', 'Courier Receipt']]
-    .filter(([file]) => file);
-  for (const [file, , name] of files) {
-    if (!FILE_OK.test(file.name)) { err.textContent = `${name}: only PDF, PNG, JPG and JPEG files can be uploaded.`; err.hidden = false; return; }
-    if (file.size > state.meta.maxDocumentBytes) { err.textContent = `${name}: files must be ${bytes(state.meta.maxDocumentBytes)} or smaller.`; err.hidden = false; return; }
-  }
+  // Photos first: they are the primary proof. Receipt and invoice are optional.
+  const items = [
+    ...[...f.dispatch_files.files].map((file) => ({ file, type: 'dispatch_product_image' })),
+    ...[[f.invoice_file.files[0], 'tax_invoice'], [f.receipt_file.files[0], 'courier_receipt']]
+      .filter(([file]) => file).map(([file, type]) => ({ file, type })),
+  ];
+  const problems = items.map((x) => fileProblem(x.file, x.type)).filter(Boolean);
+  if (problems.length) { err.textContent = problems.join(' '); err.hidden = false; return; }
   const btn = $('#cSubmit');
   btn.disabled = true;
   $('#cSaved').className = 'saved pending';
@@ -698,18 +842,16 @@ $('#createForm').addEventListener('submit', async (e) => {
       method: 'POST', body: JSON.stringify({ ...body, addToExisting: state.addToExisting }),
     });
     // Documents go up once the shipment exists. A failed upload never undoes the
-    // shipment; the drawer says which file to try again.
-    const failed = [];
-    for (const [file, type, name] of files) {
-      $('#cSaved').textContent = `Uploading ${name}…`;
-      try { await uploadFile(data.orderId, file, type); } catch (ex) { failed.push(`${name}: ${ex.message}`); }
-    }
+    // shipment; the drawer lists what failed with a Retry that keeps the files.
+    const failed = await uploadAll(data.orderId, items, $('#cSaved'));
+    showPreviews([]);
     closeCreate();
     await load();
     await openOrder(data.orderId, { shipmentId: data.shipmentId });
     const saved = $('#dSaved');
     saved.className = failed.length ? 'saved failed' : 'saved';
-    saved.textContent = failed.length ? `Shipment saved, but ${failed.join('; ')}`
+    saved.textContent = failed.length
+      ? `Shipment saved, but ${failed.length} of ${items.length} upload${items.length === 1 ? '' : 's'} failed — Retry is under Dispatch Proof.`
       : (data.createdOrder ? 'Shipment created' : 'Shipment added to this order');
   } catch (ex) {
     $('#cSaved').textContent = '';

@@ -22,6 +22,7 @@ import {
   trackingUrlFor, purgeTestOrders, zonedToUtc,
 } from '../lib/orders.js';
 import { saveUploadedDocument } from '../lib/orders-routes.js';
+import { DOCUMENT_FORMATS } from '../lib/orders.js';
 import {
   validateDocument, storage, signV4, _resetStorage, StorageNotConfigured,
 } from '../lib/storage.js';
@@ -1519,8 +1520,89 @@ await step('new shipment: invoice and receipt attach to the order', async () => 
   return 'tax invoice + courier receipt stored';
 });
 
+// ---- dispatch product images -------------------------------------------------
+const JPG = Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0, 0x10, 0x4a, 0x46, 0x49, 0x46]);
+const PNG = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 0x0d]);
+const WEBP = Buffer.concat([Buffer.from('RIFF'), Buffer.from([0x24, 0, 0, 0]), Buffer.from('WEBPVP8 '), Buffer.alloc(8)]);
+const PDF = Buffer.from('%PDF-1.4 x');
+await step('dispatch image formats: JPG, JPEG, PNG, WEBP accepted; others and fakes refused', async () => {
+  const img = DOCUMENT_FORMATS.dispatch_product_image;
+  const cases = [
+    ['a.jpg', JPG, true], ['a.JPEG', JPG, true], ['a.png', PNG, true], ['a.webp', WEBP, true],
+    ['a.pdf', PDF, false],                                         // photos only
+    ['a.jpg', Buffer.from('MZ\x90\x00 not an image'), false],        // executable renamed .jpg
+    ['a.webp', Buffer.concat([Buffer.from('RIFF'), Buffer.alloc(4), Buffer.from('AVI LIST')]), false], // RIFF but not WEBP
+    ['a.png', JPG, false],                                         // extension and bytes disagree
+    ['a.gif', Buffer.from('GIF89a'), false], ['a.webp', Buffer.alloc(0), false],
+  ];
+  cases.forEach(([name, buf, want], i) => {
+    const got = validateDocument(name, buf, img).ok;
+    if (got !== want) throw new Error(`case ${i} (${name}) → ${got}`);
+  });
+  // Every other type keeps exactly its old formats: PDF yes, WEBP no.
+  if (!validateDocument('inv.pdf', PDF).ok || validateDocument('inv.webp', WEBP).ok) throw new Error('invoice formats changed');
+  return `${cases.length} cases; invoice/receipt formats unchanged`;
+});
+let proofOrder = null;
+await step('multiple dispatch images per shipment, stored in document storage, no receipt needed', async () => {
+  const dl = (await listCouriers()).find((c) => c.name === 'Delhivery');
+  const r = await createShipment({ channel: 'zepto', source_order_id: `${TEST_ORDER}-IMG`, courier_partner_id: dl.id, tracking_id: 'AWB-IMG' }, { actor: ACTOR });
+  proofOrder = r.orderId;
+  const store = storage();
+  const ids = [];
+  for (const [name, buf] of [['carton-1.jpg', JPG], ['label.png', PNG], ['package.webp', WEBP]]) {
+    ids.push(await saveUploadedDocument({ orderId: proofOrder, filename: name, buffer: buf, documentType: 'dispatch_product_image', actor: ACTOR, store }));
+  }
+  const docs = (await orderDocuments(proofOrder)).filter((d) => d.document_type === 'dispatch_product_image');
+  if (docs.length !== 3) throw new Error(`${docs.length} images`);
+  const mimes = docs.map((d) => d.mime_type).sort().join(',');
+  if (mimes !== 'image/jpeg,image/png,image/webp') throw new Error(mimes);
+  const rows = (await getPool().query('SELECT storage_path FROM order_documents WHERE id = ANY($1)', [ids])).rows;
+  for (const { storage_path: key } of rows) {
+    if (!/^orders\/\d{4}-\d{2}\/\d+-[0-9a-f-]{36}\.(jpg|png|webp)$/.test(key)) throw new Error(`key ${key}`);
+    if (!(await store.get(key)).length) throw new Error('object missing');
+  }
+  const o = await getOrder(proofOrder);
+  if (o.dispatch_image_count !== 3 || o.has_invoice) throw new Error(`count ${o.dispatch_image_count}`);
+  // No courier receipt anywhere, and the shipment still moves on.
+  const s = (await orderShipments(proofOrder))[0];
+  await updateShipment(proofOrder, s.id, { shipment_status: 'dispatched' }, { actor: ACTOR, version: s.version });
+  if ((await getOrder(proofOrder)).shipment_status !== 'dispatched') throw new Error('dispatch blocked');
+  return `3 images (jpg/png/webp) under random keys; dispatched with no receipt (${store.name} storage)`;
+});
+await step('dispatch images: failed DB write removes the stored image; audit events written', async () => {
+  const calls = [];
+  const fake = { async put(k) { calls.push(['put', k]); }, async remove(k) { calls.push(['remove', k]); } };
+  try { await saveUploadedDocument({ orderId: 999999999, filename: 'x.jpg', buffer: JPG, documentType: 'dispatch_product_image', actor: ACTOR, store: fake }); throw new Error('accepted'); }
+  catch (err) { if (err.status !== 404) throw err; }
+  if (calls.length !== 2 || calls[1][0] !== 'remove' || calls[0][1] !== calls[1][1]) throw new Error('orphan left: ' + JSON.stringify(calls));
+  const img = (await orderDocuments(proofOrder)).find((d) => d.original_filename === 'label.png');
+  await removeDocument(proofOrder, img.id, { actor: ACTOR });
+  const ev = await orderEvents(proofOrder);
+  const up = ev.filter((e) => e.event_type === 'document_uploaded' && e.metadata.document_type === 'dispatch_product_image');
+  const rm = ev.find((e) => e.event_type === 'document_removed' && e.metadata.document_id === img.id);
+  if (up.length !== 3 || !up.every((e) => e.actor === ACTOR && e.metadata.filename && e.metadata.document_id && e.at)) throw new Error('upload events');
+  if (!rm || rm.metadata.document_type !== 'dispatch_product_image') throw new Error('removal event');
+  if (JSON.stringify(ev).includes('RIFF') || JSON.stringify(ev).includes('storage_path')) throw new Error('bytes or keys in the log');
+  if ((await getOrder(proofOrder)).dispatch_image_count !== 2) throw new Error('count after removal');
+  return '3 uploaded + 1 removed logged with filename, actor, time, id; no bytes or keys';
+});
+await step('existing tax invoice / courier receipt behaviour unchanged', async () => {
+  const objects = new Map();
+  const fake = { async put(k, b) { objects.set(k, b); }, async remove(k) { objects.delete(k); } };
+  await saveUploadedDocument({ orderId: proofOrder, filename: 'inv.pdf', buffer: PDF, documentType: 'tax_invoice', actor: ACTOR, store: fake });
+  await saveUploadedDocument({ orderId: proofOrder, filename: 'rcpt.jpg', buffer: JPG, documentType: 'courier_receipt', actor: ACTOR, store: fake });
+  for (const [t, name, buf] of [['tax_invoice', 'x.webp', WEBP], ['courier_receipt', 'x.webp', WEBP]]) {
+    try { await saveUploadedDocument({ orderId: proofOrder, filename: name, buffer: buf, documentType: t, actor: ACTOR, store: fake }); throw new Error(`${t} accepted webp`); }
+    catch (err) { if (err.status !== 400) throw err; }
+  }
+  if (!(await getOrder(proofOrder)).has_invoice) throw new Error('invoice flag');
+  return 'PDF invoice + JPG receipt accepted as before; their formats did not widen';
+});
+
 await step('new shipment cleanup', async () => {
-  const { orders } = await purgeTestOrders(TEST_ORDER);
+  const { orders, paths } = await purgeTestOrders(TEST_ORDER);
+  for (const p of paths) await storage().remove(p).catch(() => {});
   const left = await getPool().query('SELECT count(*)::int AS n FROM orders WHERE source_order_id LIKE $1', [`${TEST_ORDER}%`]);
   if (left.rows[0].n) throw new Error('orders left behind');
   return `${orders} orders removed`;
