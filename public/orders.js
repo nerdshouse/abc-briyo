@@ -43,11 +43,11 @@ const STEP_TEXT = {
 };
 
 const PAGE = 100;
-const FILTER_KEYS = ['q', 'status', 'shipment', 'courier', 'invoice', 'tracking', 'from', 'to'];
+const FILTER_KEYS = ['q', 'channel', 'destination', 'status', 'shipment', 'courier', 'invoice', 'tracking', 'from', 'to'];
 
 const state = {
   meta: null,
-  channel: '',
+  type: '',          // dispatch type tab: '' = all
   view: '',
   f: Object.fromEntries(FILTER_KEYS.map((k) => [k, ''])),
   orders: [],
@@ -74,13 +74,20 @@ const amount = (v) => (v === null || v === undefined ? '—' : money(v));
 const day = (iso) => (iso ? dateShort(iso) : '—');
 
 const channelLabel = (key) => state.meta.channels.find((c) => c.key === key)?.label || key;
+const typeLabel = (key) => state.meta.dispatchTypes.find((t) => t.key === key)?.label || (key ? label(key) : 'No type');
+const destinationName = (id) => state.meta.destinations.find((d) => d.id === Number(id))?.name || (id ? `#${id}` : '—');
+/** Channels used for a dispatch type (all channels when none is chosen). */
+const channelsFor = (type) => state.meta.channels.filter((c) => c.active
+  && (!type || !c.dispatch_types?.length || c.dispatch_types.includes(type)));
+const destinationsFor = (channel, type) => state.meta.destinations
+  .filter((d) => d.active && (!channel || d.channel === channel) && (!type || d.dispatch_type === type));
 const courierById = (id) => state.meta.couriers.find((c) => c.id === Number(id));
 
 /* ------------------------------------------------------------------ URL state */
 
 function readUrl() {
   const u = new URLSearchParams(window.location.search);
-  state.channel = u.get('channel') || '';
+  state.type = u.get('type') || '';
   state.view = u.get('view') || '';
   for (const k of FILTER_KEYS) state.f[k] = u.get(k) || '';
   const open = u.get('open');
@@ -89,7 +96,7 @@ function readUrl() {
 
 function writeUrl() {
   const u = new URLSearchParams();
-  if (state.channel) u.set('channel', state.channel);
+  if (state.type) u.set('type', state.type);
   if (state.view) u.set('view', state.view);
   for (const k of FILTER_KEYS) if (state.f[k]) u.set(k, state.f[k]);
   if (state.openId) u.set('open', state.openId);
@@ -99,10 +106,17 @@ function writeUrl() {
   history.replaceState(history.state, '', qs ? `/orders?${qs}` : '/orders');
 }
 
-/** The URL for this list with a different channel, keeping the other filters. */
-function channelUrl(channel) {
+/**
+ * The URL for this list under another dispatch-type tab. A channel or
+ * destination that does not belong to the new type is dropped with it.
+ */
+function typeUrl(type) {
   const u = new URL(window.location.href);
-  if (channel) u.searchParams.set('channel', channel); else u.searchParams.delete('channel');
+  if (type) u.searchParams.set('type', type); else u.searchParams.delete('type');
+  const ch = u.searchParams.get('channel');
+  if (type && ch && !channelsFor(type).some((c) => c.key === ch)) u.searchParams.delete('channel');
+  const dest = state.meta.destinations.find((d) => d.id === Number(u.searchParams.get('destination')));
+  if (type && dest && dest.dispatch_type !== type) u.searchParams.delete('destination');
   u.searchParams.delete('open');
   return u.pathname + u.search;
 }
@@ -111,7 +125,7 @@ function channelUrl(channel) {
 
 async function load({ append = false } = {}) {
   const u = new URLSearchParams();
-  if (state.channel) u.set('channel', state.channel);
+  if (state.type) u.set('type', state.type);
   if (state.view) u.set('view', state.view);
   for (const k of FILTER_KEYS) if (state.f[k]) u.set(k, state.f[k]);
   u.set('limit', PAGE);
@@ -133,10 +147,11 @@ async function load({ append = false } = {}) {
 
 function renderHead(data) {
   const view = state.view && state.meta.views[state.view];
-  const title = view || (state.channel ? `${channelLabel(state.channel)} orders` : 'All orders');
+  const here = view || [state.type && typeLabel(state.type), state.f.channel && channelLabel(state.f.channel)].filter(Boolean).join(' · ');
+  const title = view || (here ? `${here} orders` : 'All orders');
   $('#pageTitle').textContent = title;
   $('#crumbGroup').textContent = view ? 'Logistics' : 'Orders';
-  $('#crumbHere').textContent = view || (state.channel ? channelLabel(state.channel) : 'All orders');
+  $('#crumbHere').textContent = here || 'All orders';
   $('#topTitle').textContent = title;
   document.title = `${title} — Briyo`;
   // Only entered values are summed; say how many have none rather than imply ₹0.
@@ -155,10 +170,19 @@ const anyFilter = () => FILTER_KEYS.some((k) => state.f[k]);
 
 function renderTabs(data) {
   const tabs = [{ key: '', label: 'All', n: data.allCount },
-    ...state.meta.channels.filter((c) => c.active || data.channelCounts[c.key])
-      .map((c) => ({ key: c.key, label: c.label, n: data.channelCounts[c.key] || 0 }))];
-  $('#channelTabs').innerHTML = tabs.map((t) => `<button type="button" role="tab" class="tab${t.key === state.channel ? ' active' : ''}"
-      data-channel="${esc(t.key)}" aria-selected="${t.key === state.channel}">${esc(t.label)}<span class="tab-count">${count(t.n)}</span></button>`).join('');
+    ...state.meta.dispatchTypes.map((t) => ({ key: t.key, label: t.label, n: data.typeCounts[t.key] || 0 }))];
+  // Orders from before dispatch types (on a two-type channel) get their own tab until sorted.
+  if (data.typeCounts.none) tabs.push({ key: 'none', label: 'No type', n: data.typeCounts.none });
+  $('#channelTabs').innerHTML = tabs.map((t) => `<button type="button" role="tab" class="tab${t.key === state.type ? ' active' : ''}"
+      data-type="${esc(t.key)}" aria-selected="${t.key === state.type}">${esc(t.label)}<span class="tab-count">${count(t.n)}</span></button>`).join('');
+  // The channel and destination pickers follow the tab.
+  const chans = state.type === 'none' ? state.meta.channels : channelsFor(state.type);
+  $('#fchannel').innerHTML = opt('', 'All channels') + chans.map((c) => opt(c.key, `${c.label}${data.channelCounts[c.key] ? ` (${data.channelCounts[c.key]})` : ''}`, c.key === state.f.channel)).join('');
+  const dests = destinationsFor(state.f.channel, state.type === 'none' ? '' : state.type);
+  $('#fdest').innerHTML = opt('', 'All destinations') + dests.map((d) => opt(d.id, state.f.channel ? d.name : `${d.channel_label} · ${d.name}`, String(d.id) === state.f.destination)).join('');
+  $('#fdest').hidden = !dests.length;
+  $('#fchannel').classList.toggle('on', Boolean(state.f.channel));
+  $('#fdest').classList.toggle('on', Boolean(state.f.destination));
 }
 
 function trackingCell(o) {
@@ -182,7 +206,7 @@ const cancelledTag = (o) => (o.order_status === 'cancelled' ? '<span class="mini
 
 function renderRows() {
   const empty = state.total === 0
-    ? (anyFilter() || state.channel || state.view
+    ? (anyFilter() || state.type || state.view
       ? '<b>Nothing matches.</b>Try clearing a filter.'
       : '<b>No shipments yet.</b>Add one with New Shipment.')
     : '';
@@ -194,7 +218,9 @@ function renderRows() {
   $('#rows').innerHTML = state.orders.map((o) => `
     <tr class="orow${o.id === state.openId ? ' open' : ''}" data-id="${o.id}" tabindex="0">
       <td><span class="cell-main mono" style="font-weight:500">${esc(o.source_order_id)}${cancelledTag(o)}</span></td>
-      <td><span class="chan">${esc(o.channel_label)}</span></td>
+      <td><span class="cell-main chan">${esc(o.channel_label)}</span>${o.destination_name
+        ? `<span class="cell-sub muted" title="${esc(o.destination_name)}">${esc(o.destination_name)}</span>`
+        : o.dispatch_type ? `<span class="cell-sub muted">${esc(typeLabel(o.dispatch_type))}</span>` : ''}</td>
       <td>${o.courier_name ? esc(o.courier_name) : '<span class="muted-cell">—</span>'}</td>
       <td>${trackingCell(o)}</td>
       <td>${indicator(o.shipment_status)}</td>
@@ -208,6 +234,7 @@ function renderRows() {
     <li class="oitem" data-id="${o.id}" tabindex="0">
       <div class="oi-top"><span class="oi-id mono">${esc(o.source_order_id)}</span><span class="chan">${esc(o.channel_label)}</span>${cancelledTag(o)}
         <span class="oi-val">${indicator(o.shipment_status)}</span></div>
+      ${o.destination_name ? `<div class="oi-sub">${icon('map-pin')} ${esc(o.destination_name)}</div>` : ''}
       <div class="oi-sub">${o.tracking_id ? `${esc(o.courier_name || '')} · <span class="mono">${esc(o.tracking_id)}</span>` : 'No courier / AWB yet'}</div>
       <div class="oi-stat"><span class="soft" style="font-size:12.5px">${esc(day(o.order_date))}</span>
         ${proofCell(o)}
@@ -382,7 +409,7 @@ function renderDrawer() {
   const has = (t) => live.some((d) => d.document_type === t);
 
   $('#dTitle').textContent = `Order ${o.source_order_id}`;
-  $('#dSub').textContent = [o.channel_label, o.order_date && dateTime(o.order_date),
+  $('#dSub').textContent = [o.channel_label, o.dispatch_type && typeLabel(o.dispatch_type), o.destination_name, o.order_date && dateTime(o.order_date),
     o.order_status === 'cancelled' && 'Order cancelled'].filter(Boolean).join(' · ');
 
   $('#dBody').innerHTML = `
@@ -412,6 +439,9 @@ function renderDrawer() {
       </dl>
       <div class="form-actions"><button class="btn primary" type="button" id="dShipSave">Save shipment</button>
         ${(NEXT_STEPS[ship.shipment_status] || []).map((s) => `<button class="btn" type="button" data-step="${s}">${esc(STEP_TEXT[s])}</button>`).join('')}</div>
+      ${!['dispatched', 'in_transit', 'out_for_delivery', 'delivered', 'delivery_failed', 'rto'].includes(ship.shipment_status)
+        && !documents.some((d) => !d.removed_at && d.document_type === 'dispatch_product_image')
+        ? `<p class="photo-needed">${icon('camera')}Add a dispatch product photo (below) before marking it dispatched.</p>` : ''}
     </section>
 
     <section class="dsec">
@@ -433,6 +463,8 @@ function renderDrawer() {
       <dl class="kv" style="margin-top:10px">
         <dt>Order Number</dt><dd class="mono">${esc(o.source_order_id)}</dd>
         <dt>Channel</dt><dd>${esc(o.channel_label)}</dd>
+        <dt>Dispatch Type</dt><dd>${o.dispatch_type ? esc(typeLabel(o.dispatch_type)) : '<span class="muted">Not set</span>'}</dd>
+        ${o.destination_name ? `<dt>Destination</dt><dd>${esc(o.destination_name)}</dd>` : ''}
         <dt>Order Date</dt><dd>${o.order_date ? esc(dateTime(o.order_date)) : '<span class="muted">Not entered</span>'}</dd>
         <dt>Order Value</dt><dd>${o.order_value === null ? '<span class="muted">Not entered</span>' : esc(`${money(o.order_value)}${o.currency && o.currency !== 'INR' ? ` ${o.currency}` : ''}`)}</dd>
         <dt>Customer</dt><dd>${esc([o.customer_name, o.customer_phone, o.customer_email].filter(Boolean).join(' · ') || '—')}</dd>
@@ -465,6 +497,8 @@ const fmtVal = (k, v) => {
   if (k === 'courier_partner_id') return courierById(v)?.name || `#${v}`;
   if (k === 'order_value') return money(v);
   if (k === 'channel') return channelLabel(v);
+  if (k === 'dispatch_type') return typeLabel(v);
+  if (k === 'destination_id') return destinationName(v);
   if (/_date$|_at$/.test(k) && k !== 'expected_delivery_date') return dateTime(v);
   if (/status$/.test(k)) return label(v);
   return String(v);
@@ -474,6 +508,7 @@ const FIELD_NAME = {
   customer_email: 'email', payment_method: 'payment method', payment_status: 'payment status',
   order_date: 'order date', courier_partner_id: 'courier', tracking_id: 'AWB', tracking_url: 'tracking link',
   expected_delivery_date: 'expected delivery', dispatch_date: 'dispatched', delivered_at: 'delivered',
+  dispatch_type: 'dispatch type', destination_id: 'destination',
 };
 const changeList = (changes) => Object.entries(changes || {})
   .map(([k, c]) => `${esc(FIELD_NAME[k] || label(k).toLowerCase())} <b>${esc(fmtVal(k, c.from))}</b> → <b>${esc(fmtVal(k, c.to))}</b>`)
@@ -687,8 +722,9 @@ function openForm(order) {
   form.reset();
   $('#formError').hidden = true;
   $('#fSaved').textContent = '';
-  form.channel.innerHTML = state.meta.channels.filter((c) => c.active || c.key === order?.channel)
-    .map((c) => opt(c.key, c.label, c.key === (order?.channel || state.channel))).join('');
+  fillRoute(form, '#fDestField', { type: order.dispatch_type || '', channel: order.channel, destination: order.destination_id || '', required: false });
+  // An old channel (or one switched off) still shows for the order it belongs to.
+  if (!form.channel.value && order.channel) form.channel.insertAdjacentHTML('beforeend', opt(order.channel, channelLabel(order.channel), true));
   form.payment_status.innerHTML = opt('', 'Not known', !order?.payment_status)
     + state.meta.paymentStatuses.map((s) => opt(s, label(s), s === order?.payment_status)).join('');
   form.payment_method.innerHTML = opt('', 'Not known', !order?.payment_method)
@@ -717,12 +753,23 @@ function closeForm() {
   if ($('#drawer').hidden) $('#drawerScrim').hidden = true;
 }
 
+$('#orderForm').addEventListener('change', (e) => {
+  if (['dispatch_type', 'channel'].includes(e.target.name)) routeChanged(e.target.form, '#fDestField', e.target.name, false);
+});
+
 $('#orderForm').addEventListener('submit', async (e) => {
   e.preventDefault();
   const form = e.target;
   const err = $('#formError');
   err.hidden = true;
   const body = Object.fromEntries(new FormData(form));
+  // Only send the route when it is set or being changed, so editing an older
+  // order without a dispatch type does not demand one.
+  if (!body.dispatch_type && !state.editing.dispatch_type) { delete body.dispatch_type; delete body.destination_id; }
+  else if ($('#fDestField').hidden) body.destination_id = '';
+  if (body.dispatch_type && !$('#fDestField').hidden && !body.destination_id) {
+    err.textContent = 'Choose the destination.'; err.hidden = false; return;
+  }
   const missing = [['channel', 'channel'], ['source_order_id', 'order number']]
     .filter(([k]) => !String(body[k] || '').trim()).map(([, l]) => l);
   if (missing.length) { err.textContent = `Enter the ${missing.join(', ')}.`; err.hidden = false; return; }
@@ -752,6 +799,36 @@ $('#formError').addEventListener('click', (e) => {
   openOrder(Number(a.dataset.goto));
 });
 
+/* ------------------------------------------------------------------ route pickers */
+
+/**
+ * Dispatch type → channel → destination, for a form with those three selects.
+ * Each choice narrows the next; a destination only shows for types that need one.
+ */
+function fillRoute(form, fieldId, { type = '', channel = '', destination = '', required = true } = {}) {
+  const m = state.meta;
+  form.dispatch_type.innerHTML = opt('', required ? 'Choose type' : 'Not set', !type)
+    + m.dispatchTypes.map((t) => opt(t.key, t.label, t.key === type)).join('');
+  const chans = channelsFor(type);
+  if (channel && !chans.some((c) => c.key === channel)) channel = '';
+  form.channel.innerHTML = opt('', 'Choose channel', !channel) + chans.map((c) => opt(c.key, c.label, c.key === channel)).join('');
+  if (!channel && chans.length === 1) form.channel.value = chans[0].key;
+  const needs = m.dispatchTypes.find((t) => t.key === type)?.needsDestination;
+  const dests = needs ? destinationsFor(form.channel.value, type) : [];
+  form.destination_id.innerHTML = opt('', form.channel.value ? 'Choose destination' : 'Choose the channel first', !destination)
+    + dests.map((d) => opt(d.id, d.name, String(d.id) === String(destination))).join('');
+  $(fieldId).hidden = !needs;
+}
+
+function routeChanged(form, fieldId, changed, required) {
+  fillRoute(form, fieldId, {
+    type: form.dispatch_type.value,
+    channel: form.channel.value,
+    destination: changed === 'destination_id' ? form.destination_id.value : '',
+    required,
+  });
+}
+
 /* ------------------------------------------------------------------ new shipment */
 
 
@@ -764,8 +841,7 @@ function openCreate() {
   $('#cSaved').textContent = '';
   $('#cSubmit').textContent = 'Create Shipment';
   const m = state.meta;
-  f.channel.innerHTML = opt('', 'Choose channel', !state.channel)
-    + m.channels.filter((c) => c.active).map((c) => opt(c.key, c.label, c.key === state.channel)).join('');
+  fillRoute(f, '#cDestField', { type: state.type === 'none' ? '' : state.type, channel: state.f.channel });
   f.courier_partner_id.innerHTML = opt('', 'Choose courier', true)
     + m.couriers.filter((c) => c.active).map((c) => opt(c.id, c.name)).join('');
   // Packed by default: an AWB means ready to go, not gone. Dispatch is chosen.
@@ -781,7 +857,7 @@ function openCreate() {
   showPreviews([]);
   $('#createDrawer').hidden = false;
   $('#drawerScrim').hidden = false;
-  (state.channel ? f.source_order_id : f.channel).focus();
+  (f.dispatch_type.value ? (f.channel.value ? f.source_order_id : f.channel) : f.dispatch_type).focus();
 }
 
 function closeCreate() {
@@ -802,6 +878,7 @@ function showPreviews(files) {
 }
 $('#createForm').addEventListener('change', (e) => {
   if (e.target.name === 'dispatch_files') showPreviews([...e.target.files]);
+  if (['dispatch_type', 'channel'].includes(e.target.name)) routeChanged(e.target.form, '#cDestField', e.target.name, true);
 });
 
 const orderFieldsReset = () => {
@@ -812,7 +889,7 @@ const orderFieldsReset = () => {
 
 $('#createForm').addEventListener('input', (e) => {
   // Changing which order this is voids an "add to existing" confirmation.
-  if (['channel', 'source_order_id'].includes(e.target.name) && state.addToExisting) orderFieldsReset();
+  if (['channel', 'source_order_id', 'dispatch_type', 'destination_id'].includes(e.target.name) && state.addToExisting) orderFieldsReset();
 });
 
 $('#createForm').addEventListener('submit', async (e) => {
@@ -822,9 +899,23 @@ $('#createForm').addEventListener('submit', async (e) => {
   err.hidden = true;
   const body = Object.fromEntries(new FormData(f));
   delete body.invoice_file; delete body.receipt_file; delete body.dispatch_files;
-  const missing = [['channel', 'channel'], ['source_order_id', 'order number'], ['courier_partner_id', 'courier partner'], ['tracking_id', 'tracking ID / AWB']]
+  const needsDest = !$('#cDestField').hidden;
+  if (!needsDest) delete body.destination_id;
+  const missing = [['dispatch_type', 'dispatch type'], ['channel', 'channel'], ...(needsDest ? [['destination_id', 'destination']] : []),
+    ['source_order_id', 'order number'], ['courier_partner_id', 'courier partner'], ['tracking_id', 'tracking ID / AWB']]
     .filter(([k]) => !String(body[k] || '').trim()).map(([, l]) => l);
   if (missing.length) { err.textContent = `Enter the ${missing.join(', ')}.`; err.hidden = false; return; }
+  // Dispatched (or later) needs a dispatch photo. The shipment is saved as
+  // Packed, the photos go up, then it moves to the chosen status.
+  const SHIPPED = ['dispatched', 'in_transit', 'out_for_delivery', 'delivered', 'delivery_failed', 'rto'];
+  const target = body.shipment_status;
+  if (SHIPPED.includes(target)) {
+    if (!f.dispatch_files.files.length) {
+      err.textContent = `Add at least one Dispatch Product Image to mark it ${label(target)} — or save it as Packed and add photos later.`;
+      err.hidden = false; return;
+    }
+    body.shipment_status = 'packed';
+  }
   // Photos first: they are the primary proof. Receipt and invoice are optional.
   const items = [
     ...[...f.dispatch_files.files].map((file) => ({ file, type: 'dispatch_product_image' })),
@@ -844,15 +935,26 @@ $('#createForm').addEventListener('submit', async (e) => {
     // Documents go up once the shipment exists. A failed upload never undoes the
     // shipment; the drawer lists what failed with a Retry that keeps the files.
     const failed = await uploadAll(data.orderId, items, $('#cSaved'));
+    let moveError = null;
+    if (target !== body.shipment_status) {
+      try {
+        const { shipments } = await api(`/api/orders/${data.orderId}`);
+        const ship = shipments.find((x) => x.id === data.shipmentId);
+        await api(`/api/orders/${data.orderId}/shipments/${ship.id}`, {
+          method: 'PATCH', body: JSON.stringify({ shipment_status: target, version: ship.version }),
+        });
+      } catch (ex2) { moveError = ex2.message; }
+    }
     showPreviews([]);
     closeCreate();
     await load();
     await openOrder(data.orderId, { shipmentId: data.shipmentId });
     const saved = $('#dSaved');
-    saved.className = failed.length ? 'saved failed' : 'saved';
+    saved.className = failed.length || moveError ? 'saved failed' : 'saved';
     saved.textContent = failed.length
-      ? `Shipment saved, but ${failed.length} of ${items.length} upload${items.length === 1 ? '' : 's'} failed — Retry is under Dispatch Proof.`
-      : (data.createdOrder ? 'Shipment created' : 'Shipment added to this order');
+      ? `Shipment saved as Packed, but ${failed.length} of ${items.length} upload${items.length === 1 ? '' : 's'} failed — Retry is under Dispatch Proof.`
+      : moveError ? `Shipment saved as Packed. ${moveError}`
+        : (data.createdOrder ? 'Shipment created' : 'Shipment added to this order');
   } catch (ex) {
     $('#cSaved').textContent = '';
     if (ex.data?.orderExists) {
@@ -912,6 +1014,13 @@ function bind() {
       writeUrl(); load();
     });
   }
+  // Channel and destination options depend on the tab, so they are filled by renderTabs.
+  $('#fchannel').addEventListener('change', (e) => {
+    state.f.channel = e.target.value;
+    state.f.destination = '';   // a destination belongs to one channel
+    writeUrl(); load();
+  });
+  $('#fdest').addEventListener('change', (e) => { state.f.destination = e.target.value; writeUrl(); load(); });
   let t;
   $('#q').addEventListener('input', (e) => {
     clearTimeout(t);
@@ -921,11 +1030,11 @@ function bind() {
     for (const k of FILTER_KEYS) state.f[k] = '';
     fillFilters(); writeUrl(); load();
   });
-  // A channel is a place you can go Back to, so it is a history entry.
+  // A dispatch-type tab is a place you can go Back to, so it is a history entry.
   $('#channelTabs').addEventListener('click', (e) => {
-    const b = e.target.closest('[data-channel]');
-    if (!b || b.dataset.channel === state.channel) return;
-    navigate(channelUrl(b.dataset.channel));
+    const b = e.target.closest('[data-type]');
+    if (!b || b.dataset.type === state.type) return;
+    navigate(typeUrl(b.dataset.type));
   });
   const rowOpen = (e) => {
     if (e.target.closest('a')) return;

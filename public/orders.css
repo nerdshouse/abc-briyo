@@ -3,7 +3,7 @@
 
 .ord-table { table-layout: fixed; min-width: 1060px; }
 .ord-table col.c-order { width: 14%; }
-.ord-table col.c-chan { width: 88px; }
+.ord-table col.c-chan { width: 17%; }
 .ord-table col.c-courier { width: 118px; }
 .ord-table col.c-track { width: 16%; }
 .ord-table col.c-ship { width: 136px; }
@@ -161,3 +161,25 @@
 @media (max-width: 760px) { .thumb { width: 68px; height: 68px; } }
 /* Long tracking links in the activity timeline wrap instead of widening the drawer on phones. */
 #dBody .act-title { overflow-wrap: anywhere; }
+
+/* destination names are long ("BLINK COMMERCE PRIVATE LIMITED-PUNE P3") */
+.board-filters .select.wide-select { max-width: 240px; }
+.oi-sub .lucide { width: 12px; height: 12px; vertical-align: -1px; color: var(--text-3); }
+.photo-needed { display: flex; align-items: center; gap: 6px; margin: 10px 0 0; font-size: 12.5px; color: var(--warning-text); }
+.photo-needed .lucide { width: 14px; height: 14px; }
+
+/* destinations page */
+.dest-add { display: flex; gap: 8px; flex-wrap: wrap; padding: 12px 14px; border-bottom: 1px solid var(--border-soft); }
+.dest-add .input { flex: 1 1 260px; }
+.input.plain { padding-left: 10px; }
+.dest-group { padding: 12px 16px; border-bottom: 1px solid var(--border-soft); }
+.dest-group:last-child { border-bottom: 0; }
+.dest-h { font-size: 12.5px; font-weight: 500; margin-bottom: 8px; display: flex; gap: 8px; align-items: baseline; }
+.dest-h .soft { font-weight: 400; font-size: 12px; }
+.dest-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
+.dest { display: flex; gap: 8px; align-items: center; font-size: 13px; min-width: 0; }
+.dest .input { flex: 1; min-width: 0; height: 30px; }
+.dest.off span, .dest.off .input { color: var(--text-3); }
+.dest-on { display: inline-flex; gap: 6px; align-items: center; font-size: 12.5px; flex: none; }
+.dest .btn { height: 30px; flex: none; }
+.dest-none { margin: 0; font-size: 12.5px; }

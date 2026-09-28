@@ -1,0 +1,112 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Destinations — Briyo</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/ui.css" />
+  <link rel="stylesheet" href="/orders.css" />
+  <script src="https://cdn.jsdelivr.net/npm/lucide@0.469.0/dist/umd/lucide.min.js" defer></script>
+</head>
+<body>
+<div class="app">
+
+  <aside class="sidebar" id="sidebar" aria-label="Main navigation">
+    <div class="brand">
+      <span class="brand-mark"><i data-lucide="package"></i></span>
+      <div>
+        <div class="brand-name">Briyo Operations</div>
+        <div class="brand-sub">Orders &amp; logistics</div>
+      </div>
+    </div>
+
+    <form class="side-search" id="sideSearchForm" role="search" data-recovery data-context="recovery">
+      <i data-lucide="search"></i>
+      <input id="sideSearch" type="search" placeholder="Find a customer" autocomplete="off"
+             aria-label="Search every cart by name, phone or email" />
+      <kbd>⌘ K</kbd>
+    </form>
+
+    <nav>
+      <div class="nav-group" data-admin hidden>
+        <div class="nav-caption">Overview</div>
+        <a class="nav-item" href="/dashboard"><i data-lucide="layout-grid"></i>Dashboard</a>
+      </div>
+
+      <div class="nav-group" data-recovery>
+        <div class="nav-caption">Carts</div>
+        <a class="nav-item" href="/?mode=all" data-view-link="board"><i data-lucide="shopping-bag"></i>Call board</a>
+        <div class="nav-tree">
+          <a class="nav-item" href="/?mode=tocall" data-view-link="tocall">To call<span class="nav-count" id="countToCall" hidden></span></a>
+          <a class="nav-item" href="/?mode=callbacks" data-view-link="callbacks">Callbacks<span class="nav-count" id="countCallbacks" hidden></span></a>
+          <a class="nav-item" href="/?mode=mine" data-view-link="mine">My queue</a>
+          <a class="nav-item" href="/?mode=all" data-view-link="all">All carts</a>
+        </div>
+      </div>
+
+      <div id="ordersNav"></div>
+
+      <div class="nav-group" data-admin hidden>
+        <div class="nav-caption">Team</div>
+        <a class="nav-item" href="/admin"><i data-lucide="users"></i>Members</a>
+      </div>
+
+      <div class="nav-group" data-admin data-context="recovery" hidden>
+        <div class="nav-caption">Data</div>
+        <a class="nav-item" href="/import"><i data-lucide="upload"></i>Import carts</a>
+        <a class="nav-item" href="/api/admin/report.csv?period=day" download><i data-lucide="download"></i>Export report</a>
+      </div>
+    </nav>
+
+    <div class="sidebar-foot">
+      <div class="user-card">
+        <span class="avatar" id="userAvatar">·<span class="live"></span></span>
+        <div style="min-width:0">
+          <div class="user-name" id="userName">Signed in</div>
+          <div class="user-role" id="userRole"></div>
+        </div>
+        <button class="icon-btn bare" id="signOut" type="button" title="Sign out" aria-label="Sign out"><i data-lucide="log-out"></i></button>
+      </div>
+    </div>
+  </aside>
+  <div class="scrim" id="scrim"></div>
+
+  <div class="main">
+    <header class="topbar">
+      <button class="icon-btn" id="navOpen" type="button" aria-label="Open navigation"><i data-lucide="menu"></i></button>
+      <span class="topbar-title" id="topTitle">Destinations</span>
+    </header>
+
+    <main class="page" data-section="orders">
+      <div class="crumbs">
+        <i data-lucide="map-pin"></i><span>Logistics</span><span class="sep">/</span><span class="here">Destinations</span>
+      </div>
+      <div class="page-head">
+        <div>
+          <h1 class="page-title">Destinations</h1>
+          <p class="page-sub">Where stock goes: warehouses, quick-commerce hubs, partner FCs and retailers. These are the choices in New Shipment.</p>
+        </div>
+      </div>
+      <div id="alerts"></div>
+      <section class="card">
+        <header class="card-head board-head"><div class="tabs" id="typeTabs" role="tablist" aria-label="Dispatch type"></div></header>
+        <div class="pane">
+          <div class="dest-add" id="destAdd" hidden>
+            <select class="select" id="aType" aria-label="Dispatch type"></select>
+            <select class="select" id="aChannel" aria-label="Channel"></select>
+            <input class="input plain" id="aName" maxlength="160" placeholder="New destination name" autocomplete="off" />
+            <button class="btn primary" type="button" id="aSave">Add</button>
+          </div>
+          <div id="destGroups"></div>
+        </div>
+      </section>
+      <p class="footnote">Destinations are switched off rather than deleted, so past shipments keep their destination. Easy Ship goes straight to a customer and has no destination.</p>
+    </main>
+  </div>
+</div>
+<script type="module" src="/destinations.js"></script>
+</body>
+</html>

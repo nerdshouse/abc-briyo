@@ -27,7 +27,7 @@ import {
   router as authRouter, requireAuth, requireAdmin, currentUserName, invalidateMembership,
   requireOrders, requireRecovery,
 } from './lib/auth-routes.js';
-import { router as ordersRouter, courierRouter } from './lib/orders-routes.js';
+import { router as ordersRouter, courierRouter, destinationRouter } from './lib/orders-routes.js';
 import { activeUsers, seedAllowedUsers, normalisePhone, bootstrapAdmins, nameFor } from './lib/otp.js';
 import { mapShopifyCsv } from './lib/shopify-csv.js';
 import { toCsv } from './lib/csv.js';
@@ -396,10 +396,12 @@ app.use(requireAuth);
 // stay with callers and admins, exactly as before roles existed.
 app.get(['/', '/index.html'], requireRecovery);
 app.use(['/api/carts', '/api/status', '/api/reasons'], requireRecovery);
-app.get(['/orders', '/orders.html', '/couriers', '/couriers.html'], requireOrders, (req, res) =>
-  res.sendFile(path.join(PUBLIC, req.path.startsWith('/couriers') ? 'couriers.html' : 'orders.html')));
+const ORDER_PAGES = { '/orders': 'orders.html', '/couriers': 'couriers.html', '/destinations': 'destinations.html' };
+app.get(['/orders', '/orders.html', '/couriers', '/couriers.html', '/destinations', '/destinations.html'], requireOrders, (req, res) =>
+  res.sendFile(path.join(PUBLIC, ORDER_PAGES[req.path.replace(/\.html$/, '')])));
 app.use('/api/orders', requireOrders, ordersRouter);
 app.use('/api/couriers', requireOrders, courierRouter);
+app.use('/api/destinations', requireOrders, destinationRouter);
 
 app.use(express.static(PUBLIC));
 

@@ -5,8 +5,9 @@ import {
 import { normalizePayload } from '../lib/normalize.js';
 import { assertMarkerIn, EnvironmentError } from '../lib/env-guard.js';
 import {
-  ensureOrdersSchema, createOrder, updateShipment, orderShipments, listCouriers,
+  ensureOrdersSchema, createOrder, updateShipment, orderShipments, listCouriers, listDestinations,
 } from '../lib/orders.js';
+import { saveUploadedDocument } from '../lib/orders-routes.js';
 
 /**
  * Fills the DEVELOPMENT database with obviously fake carts and orders, so the
@@ -92,20 +93,26 @@ for (const [i, [name, total, items, status]] of CARTS.entries()) {
 // ---- orders -----------------------------------------------------------------
 const couriers = await listCouriers();
 const courier = (name) => couriers.find((c) => c.name === name)?.id;
+// A tiny valid JPEG, standing in for a dispatch photo (one is required before Dispatched).
+const SAMPLE_PHOTO = Buffer.from('/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAgGBgcGBQgHBwcJCQgKDBQNDAsLDBkSEw8UHRofHh0aHBwgJC4nICIsIxwcKDcpLDAxNDQ0Hyc5PTgyPC4zNDL/wAALCAABAAEBAREA/8QAFAABAAAAAAAAAAAAAAAAAAAACP/EABQQAQAAAAAAAAAAAAAAAAAAAAD/2gAIAQEAAD8AVN//2Q==', 'base64');
+const dest = async (channel, type) => (await listDestinations()).find((d) => d.channel === channel && d.dispatch_type === type)?.id;
 const ORDERS = [
-  { channel: 'website', n: 'DEV-1001', value: 1499, name: 'Sample Customer 11', ship: null },
-  { channel: 'website', n: 'DEV-1002', value: null, name: null, ship: null },
-  { channel: 'amazon', n: 'DEV-1001', value: 2199, name: 'Sample Customer 12', ship: { c: 'Amazon Shipping', awb: 'DEVAMZ0001', to: ['packed'] } },
-  { channel: 'blinkit', n: 'DEV-2001', value: 612, name: null, ship: { c: 'Porter', awb: 'DEVPRT01', to: ['packed', 'dispatched', 'in_transit'] } },
-  { channel: 'instamart', n: 'DEV-3001', value: 980, name: 'Sample Customer 13', ship: { c: 'Delhivery', awb: 'DEVDLV0001', to: ['packed', 'dispatched', 'in_transit', 'delivered'] } },
-  { channel: 'zepto', n: 'DEV-4001', value: 450, name: 'Sample Customer 14', ship: { c: 'Blue Dart', awb: 'DEVBD0001', to: ['packed', 'dispatched', 'out_for_delivery', 'delivery_failed', 'rto'] } },
+  { channel: 'website', type: 'easy_ship', n: 'DEV-1001', value: 1499, name: 'Sample Customer 11', ship: null },
+  { channel: 'website', type: 'easy_ship', n: 'DEV-1002', value: null, name: null, ship: null },
+  { channel: 'amazon', type: 'warehouse', n: 'DEV-1001', value: 2199, name: null, ship: { c: 'Amazon Shipping', awb: 'DEVAMZ0001', to: ['packed'] } },
+  { channel: 'blinkit', type: 'quick_commerce', n: 'DEV-2001', value: 612, name: null, ship: { c: 'Porter', awb: 'DEVPRT01', to: ['packed', 'dispatched', 'in_transit'] } },
+  { channel: 'instamart', type: 'quick_commerce', n: 'DEV-3001', value: 980, name: 'Sample Customer 13', ship: { c: 'Delhivery', awb: 'DEVDLV0001', to: ['packed', 'dispatched', 'in_transit', 'delivered'] } },
+  { channel: 'zepto', type: 'quick_commerce', n: 'DEV-4001', value: 450, name: 'Sample Customer 14', ship: { c: 'Blue Dart', awb: 'DEVBD0001', to: ['packed', 'dispatched', 'out_for_delivery', 'delivery_failed', 'rto'] } },
+  { channel: 'retailers', type: 'retailer', n: 'DEV-5001', value: 18400, name: null, ship: { c: 'Porter', awb: 'DEVPRT02', to: ['packed', 'dispatched'] } },
+  { channel: 'tata_1mg', type: 'easy_ship', n: 'DEV-6001', value: 749, name: 'Sample Customer 15', ship: { c: 'Delhivery', awb: 'DEVDLV0002', to: ['packed'] } },
 ];
 let created = 0; let skipped = 0;
 for (const [i, o] of ORDERS.entries()) {
   let id;
   try {
     id = await createOrder({
-      channel: o.channel, source_order_id: o.n, order_value: o.value, customer_name: o.name,
+      channel: o.channel, dispatch_type: o.type, destination_id: o.type === 'easy_ship' ? null : await dest(o.channel, o.type),
+      source_order_id: o.n, order_value: o.value, customer_name: o.name,
       order_date: hoursAgo(6 + i * 9), note: 'Sample order for development',
     }, { actor: ACTOR });
     created += 1;
@@ -114,6 +121,10 @@ for (const [i, o] of ORDERS.entries()) {
     throw err;
   }
   if (!o.ship) continue;
+  if (o.ship.to.length > 1) {
+    await saveUploadedDocument({ orderId: id, filename: 'sample-dispatch-photo.jpg', buffer: SAMPLE_PHOTO,
+      documentType: 'dispatch_product_image', actor: ACTOR });
+  }
   for (const [step, status] of o.ship.to.entries()) {
     const s = (await orderShipments(id))[0];
     await updateShipment(id, s.id, {

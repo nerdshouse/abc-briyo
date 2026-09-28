@@ -109,6 +109,8 @@
               <input class="input" id="q" type="search" autocomplete="off" spellcheck="false"
                      placeholder="Order number, AWB, customer" aria-label="Search orders" />
             </label>
+            <select class="select" id="fchannel" aria-label="Channel"><option value="">All channels</option></select>
+            <select class="select wide-select" id="fdest" aria-label="Destination" hidden><option value="">All destinations</option></select>
             <select class="select" id="fstatus" aria-label="Order status"><option value="">Order status</option></select>
             <select class="select" id="fshipment" aria-label="Shipment"><option value="">Shipment</option></select>
             <select class="select" id="fcourier" aria-label="Courier"><option value="">Courier</option></select>
@@ -136,7 +138,7 @@
                 <col class="c-amt" /><col class="c-act" />
               </colgroup>
               <thead><tr>
-                <th>Order</th><th>Channel</th><th>Courier</th><th>AWB / Tracking</th>
+                <th>Order</th><th>Channel · Destination</th><th>Courier</th><th>AWB / Tracking</th>
                 <th>Shipment Status</th><th title="Dispatch photos and tax invoice">Proof</th><th>Order Date</th>
                 <th class="col-cust">Customer</th><th class="r col-amt">Amount</th>
                 <th class="r"><span class="sr-only">Actions</span></th>
@@ -180,7 +182,9 @@
     <div class="form-error" id="formError" role="alert" hidden></div>
     <section class="dsec">
       <div class="form-grid">
+        <label class="fld"><span>Dispatch Type</span><select class="select" name="dispatch_type"></select></label>
         <label class="fld"><span>Channel <em>*</em></span><select class="select" name="channel" required></select></label>
+        <label class="fld wide" id="fDestField" hidden><span>Destination</span><select class="select" name="destination_id"></select></label>
         <label class="fld"><span>Order Number <em>*</em></span><input class="input" name="source_order_id" required maxlength="100" autocomplete="off" placeholder="e.g. #1524" /></label>
         <label class="fld"><span>Order Date <span class="soft tz-note" id="tzNote"></span></span><input class="input" name="order_date" type="datetime-local" /></label>
         <label class="fld"><span>Order Value (₹)</span><input class="input" name="order_value" inputmode="decimal" autocomplete="off" placeholder="Leave blank if unknown" /></label>
@@ -220,7 +224,7 @@
 <!-- New Shipment: creates the order and its shipment in one step -->
 <aside class="drawer drawer-wide" id="createDrawer" hidden aria-label="Create shipment">
   <div class="drawer-head">
-    <div><h2 class="drawer-title">Create Shipment</h2><div class="drawer-sub">Channel, order number, courier and AWB. Everything else is optional.</div></div>
+    <div><h2 class="drawer-title">Create Shipment</h2><div class="drawer-sub">Where it is going, the order number, courier and AWB. Everything else is optional.</div></div>
     <div class="drawer-nav"><button class="icon-btn" id="cClose" type="button" title="Close" aria-label="Close"><i data-lucide="x"></i></button></div>
   </div>
   <form class="drawer-body" id="createForm" novalidate>
@@ -234,18 +238,21 @@
     </div>
     <section class="dsec">
       <div class="form-grid">
+        <label class="fld"><span>Dispatch Type <em>*</em></span><select class="select" name="dispatch_type" required></select></label>
         <label class="fld"><span>Channel <em>*</em></span><select class="select" name="channel" required></select></label>
+        <label class="fld wide" id="cDestField" hidden><span>Destination <em>*</em></span><select class="select" name="destination_id"></select></label>
         <label class="fld"><span>Order Number <em>*</em></span><input class="input" name="source_order_id" required maxlength="100" autocomplete="off" placeholder="e.g. #1524" /></label>
         <label class="fld"><span>Courier Partner <em>*</em></span><select class="select" name="courier_partner_id" required></select></label>
         <label class="fld"><span>Tracking ID / AWB <em>*</em></span><input class="input mono" name="tracking_id" required maxlength="80" autocomplete="off" /></label>
       </div>
     </section>
     <section class="dsec">
-      <h3 class="dsec-title">Dispatch Proof &amp; Documents <span class="dsec-meta soft">optional</span></h3>
+      <h3 class="dsec-title">Dispatch Proof &amp; Documents</h3>
       <label class="fld proof-field"><span>Dispatch Product Image</span>
         <input class="file" type="file" name="dispatch_files" multiple
                accept=".jpg,.jpeg,.png,.webp,image/jpeg,image/png,image/webp" />
-        <span class="help">Photos of the packed cartons, the label or AWB, the final package. Add as many as needed.</span></label>
+        <span class="help">Photos of the packed cartons, the label or AWB, the final package. Add as many as needed.
+          <b>At least one is required to mark it Dispatched.</b></span></label>
       <div class="thumbs" id="cThumbs" hidden></div>
       <div class="form-grid" style="margin-top:12px">
         <label class="fld"><span>Tax Invoice</span><input class="file" type="file" name="invoice_file" accept=".pdf,.png,.jpg,.jpeg,application/pdf,image/png,image/jpeg" /></label>

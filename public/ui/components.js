@@ -412,8 +412,8 @@ export function initShell(me, { onSearch } = {}) {
 }
 
 /**
- * Orders + Logistics sidebar groups, built from the server's channel list so a
- * new channel appears here without touching any page. Needs an empty
+ * Orders + Logistics sidebar groups, built from the server's dispatch types so
+ * nothing here is hard-coded. Needs an empty
  * <div id="ordersNav"></div> in the sidebar; pages without one are untouched.
  */
 async function renderOrdersNav() {
@@ -428,8 +428,8 @@ async function renderOrdersNav() {
     <div class="nav-group">
       <div class="nav-caption">Orders</div>
       ${link('/orders', 'All orders', 'package')}
-      <div class="nav-tree">${meta.channels.filter((c) => c.active)
-        .map((c) => link(`/orders?channel=${encodeURIComponent(c.key)}`, c.label)).join('')}</div>
+      <div class="nav-tree">${(meta.dispatchTypes || [])
+        .map((t) => link(`/orders?type=${encodeURIComponent(t.key)}`, t.label)).join('')}</div>
     </div>
     <div class="nav-group">
       <div class="nav-caption">Logistics</div>
@@ -437,6 +437,7 @@ async function renderOrdersNav() {
         { pending_dispatch: 'package-open', in_transit: 'truck', delivered: 'package-check', failed: 'undo-2' }[k],
         meta.viewCounts?.[k])).join('')}
       ${link('/couriers', 'Courier partners', 'building-2')}
+      ${link('/destinations', 'Destinations', 'map-pin')}
     </div>`;
   // Re-rendered on every page; replaced only if something (a count) changed.
   if (host.dataset.html === html) return;

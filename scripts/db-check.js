@@ -19,7 +19,7 @@ import { csvCell, toCsv } from '../lib/csv.js';
 import {
   ensureOrdersSchema, createOrder, createShipment, updateOrder, updateShipment, getOrder, listOrders, orderEvents,
   orderShipments, addOrderNote, removeDocument, orderDocuments, listCouriers, saveCourier,
-  trackingUrlFor, purgeTestOrders, zonedToUtc,
+  trackingUrlFor, purgeTestOrders, zonedToUtc, listDestinations, saveDestination, DISPATCH_TYPES,
 } from '../lib/orders.js';
 import { saveUploadedDocument } from '../lib/orders-routes.js';
 import { DOCUMENT_FORMATS } from '../lib/orders.js';
@@ -1121,8 +1121,29 @@ await step('orders schema, shipment table migration, sequence untouched', async 
   if (before && Number(after) < Number(before)) throw new Error('sequence went backwards');
   return `orders_id_seq at ${after}`;
 });
+// Every test order needs a valid route now: a dispatch type the channel is
+// used for and, for everything but Easy Ship, one of its destinations.
+const ROUTES = {};
+await step('dispatch routes: types per channel and seeded destinations', async () => {
+  const dests = await listDestinations();
+  for (const [ch, type] of [['website', 'easy_ship'], ['amazon', 'warehouse'], ['blinkit', 'quick_commerce'],
+    ['instamart', 'quick_commerce'], ['zepto', 'quick_commerce'], ['bigbasket', 'partner'], ['retailers', 'retailer']]) {
+    const d = dests.find((x) => x.channel === ch && x.dispatch_type === type);
+    if (type !== 'easy_ship' && !d) throw new Error(`no ${type} destination for ${ch}`);
+    ROUTES[ch] = { dispatch_type: type, destination_id: type === 'easy_ship' ? null : d.id };
+  }
+  const n = (t) => dests.filter((d) => d.dispatch_type === t).length;
+  return `warehouse ${n('warehouse')}, quick commerce ${n('quick_commerce')}, partner ${n('partner')}, retailer ${n('retailer')}`;
+});
+const R = (channel) => ROUTES[channel] || {};
+const JPEG = Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0, 0x10, 0x4a, 0x46, 0x49, 0x46]);
+/** Adds a dispatch photo (fake storage), which the dispatch rule now requires. */
+const addPhoto = (orderId) => saveUploadedDocument({ orderId, filename: 'dispatch.jpg', buffer: JPEG,
+  documentType: 'dispatch_product_image', actor: 'db-check',
+  store: { async put() {}, async remove() {} } });
+
 await step('create order: one empty shipment, numbering continues', async () => {
-  orderId = await createOrder({ channel: 'amazon', source_order_id: `${TEST_ORDER}-1`,
+  orderId = await createOrder({ ...R('amazon'), channel: 'amazon', source_order_id: `${TEST_ORDER}-1`,
     order_date: NOW(), order_value: '1,299.50' }, { actor: ACTOR });
   const o = await getOrder(orderId);
   if (!/^ORD-\d{6}$/.test(o.internal_order_id)) throw new Error(`bad internal id ${o.internal_order_id}`);
@@ -1132,7 +1153,7 @@ await step('create order: one empty shipment, numbering continues', async () => 
   return o.internal_order_id;
 });
 await step('manual entry: only channel + order number required; value/date optional; note saved', async () => {
-  const id = await createOrder({ channel: 'instamart', source_order_id: `${TEST_ORDER}-min`, note: 'Box damaged at pickup' }, { actor: ACTOR });
+  const id = await createOrder({ ...R('instamart'), channel: 'instamart', source_order_id: `${TEST_ORDER}-min`, note: 'Box damaged at pickup' }, { actor: ACTOR });
   const o = await getOrder(id);
   if (o.order_value !== null || o.order_date !== null || o.currency !== 'INR') throw new Error('optional fields not empty');
   const ev = await orderEvents(id);
@@ -1159,12 +1180,12 @@ await step('create rejects missing required fields and unknown channel', async (
 });
 await step('duplicate channel + source order ID is refused and points at the original', async () => {
   try {
-    await createOrder({ channel: 'amazon', source_order_id: `${TEST_ORDER}-1`, order_date: NOW(), order_value: 1 }, { actor: ACTOR });
+    await createOrder({ ...R('amazon'), channel: 'amazon', source_order_id: `${TEST_ORDER}-1`, order_date: NOW(), order_value: 1 }, { actor: ACTOR });
     throw new Error('duplicate accepted');
   } catch (err) {
     if (err.status !== 409 || err.existingId !== orderId) throw err;
   }
-  await createOrder({ channel: 'blinkit', source_order_id: `${TEST_ORDER}-1`, order_date: NOW(), order_value: 10 }, { actor: ACTOR });
+  await createOrder({ ...R('blinkit'), channel: 'blinkit', source_order_id: `${TEST_ORDER}-1`, order_date: NOW(), order_value: 10 }, { actor: ACTOR });
   return '409 with existing id; other channel allowed';
 });
 await step('channel filtering and tab counts', async () => {
@@ -1192,12 +1213,12 @@ await step('payment model: allowed values, nullable, others refused', async () =
 await step('fulfillment type is independent of channel', async () => {
   let o = await getOrder(orderId); // amazon
   await updateOrder(orderId, { fulfillment_type: 'merchant' }, { actor: ACTOR, version: o.version });
-  const w = await createOrder({ channel: 'website', source_order_id: `${TEST_ORDER}-w`, order_date: NOW(), order_value: 5,
+  const w = await createOrder({ ...R('website'), channel: 'website', source_order_id: `${TEST_ORDER}-w`, order_date: NOW(), order_value: 5,
     fulfillment_type: 'third_party' }, { actor: ACTOR });
   if ((await getOrder(orderId)).fulfillment_type !== 'merchant' || (await getOrder(w)).fulfillment_type !== 'third_party') {
     throw new Error('not stored as given');
   }
-  try { await createOrder({ channel: 'zepto', source_order_id: `${TEST_ORDER}-z`, order_date: NOW(), order_value: 5, fulfillment_type: 'dropship' }, { actor: ACTOR }); throw new Error('accepted dropship'); }
+  try { await createOrder({ ...R('zepto'), channel: 'zepto', source_order_id: `${TEST_ORDER}-z`, order_date: NOW(), order_value: 5, fulfillment_type: 'dropship' }, { actor: ACTOR }); throw new Error('accepted dropship'); }
   catch (err) { if (err.status !== 400) throw err; }
   return 'amazon+merchant, website+third_party accepted';
 });
@@ -1244,6 +1265,7 @@ await step('courier + AWB generate the tracking URL; switching courier drops it'
   const couriers = await listCouriers();
   const delhivery = couriers.find((c) => c.name === 'Delhivery');
   const porter = couriers.find((c) => c.name === 'Porter');
+  await addPhoto(orderId);
   let s = await primary(orderId);
   await updateShipment(orderId, s.id, { courier_partner_id: delhivery.id, tracking_id: 'AWB 123/9', shipment_status: 'dispatched' },
     { actor: ACTOR, version: s.version });
@@ -1292,13 +1314,13 @@ await step('timezone: wall-clock input is IST, stored UTC, day filters use IST b
   if (zonedToUtc('2026-09-24T11:30', 'Asia/Kolkata') !== '2026-09-24T06:00:00.000Z') throw new Error('IST conversion');
   if (zonedToUtc('2026-07-01T12:00', 'America/New_York') !== '2026-07-01T16:00:00.000Z') throw new Error('other-zone conversion');
   // 00:15 IST on the 24th is still the 23rd in UTC.
-  const id = await createOrder({ channel: 'zepto', source_order_id: `${TEST_ORDER}-tz`, order_date: '2026-09-24T00:15', order_value: 1 }, { actor: ACTOR });
+  const id = await createOrder({ ...R('zepto'), channel: 'zepto', source_order_id: `${TEST_ORDER}-tz`, order_date: '2026-09-24T00:15', order_value: 1 }, { actor: ACTOR });
   const o = await getOrder(id);
   if (o.order_date.toISOString() !== '2026-09-23T18:45:00.000Z') throw new Error(`stored ${o.order_date.toISOString()}`);
   const on24 = await listOrders({ q: `${TEST_ORDER}-tz`, from: '2026-09-24', to: '2026-09-24' });
   const on23 = await listOrders({ q: `${TEST_ORDER}-tz`, from: '2026-09-23', to: '2026-09-23' });
   if (on24.total !== 1 || on23.total !== 0) throw new Error(`24th=${on24.total} 23rd=${on23.total}`);
-  const explicit = await createOrder({ channel: 'zepto', source_order_id: `${TEST_ORDER}-tz2`, order_date: '2026-09-24T00:15:00Z', order_value: 1 }, { actor: ACTOR });
+  const explicit = await createOrder({ ...R('zepto'), channel: 'zepto', source_order_id: `${TEST_ORDER}-tz2`, order_date: '2026-09-24T00:15:00Z', order_value: 1 }, { actor: ACTOR });
   if ((await getOrder(explicit)).order_date.toISOString() !== '2026-09-24T00:15:00.000Z') throw new Error('explicit UTC shifted');
   return '00:15 IST → 18:45Z the day before, filed on the IST day';
 });
@@ -1327,7 +1349,9 @@ await step('upload flow: multiple documents, soft removal, object deleted if the
   for (const [type, name] of [['tax_invoice', 'invoice.pdf'], ['courier_receipt', 'receipt.pdf']]) {
     await saveUploadedDocument({ orderId, filename: name, buffer: pdf, documentType: type, actor: ACTOR, store: fake });
   }
-  let docs = await orderDocuments(orderId);
+  // This order also carries a dispatch photo (added for the dispatch rule); count papers only.
+  const papers = async () => (await orderDocuments(orderId)).filter((d) => d.document_type !== 'dispatch_product_image');
+  let docs = await papers();
   if (docs.length !== 2 || objects.size !== 2) throw new Error(`${docs.length} rows, ${objects.size} objects`);
   if (!(await getOrder(orderId)).has_invoice) throw new Error('has_invoice false');
   // DB write fails (order does not exist): the stored object must be removed.
@@ -1341,7 +1365,7 @@ await step('upload flow: multiple documents, soft removal, object deleted if the
   if (calls.length !== before) throw new Error('invalid file was stored');
   const inv = docs.find((d) => d.document_type === 'tax_invoice');
   await removeDocument(orderId, inv.id, { actor: ACTOR });
-  docs = await orderDocuments(orderId);
+  docs = await papers();
   if (docs.length !== 2 || !docs.find((d) => d.id === inv.id).removed_at) throw new Error('removal was not soft');
   if ((await getOrder(orderId)).has_invoice) throw new Error('removed invoice still counted');
   return '2 stored, failed write cleaned up, invalid file never stored';
@@ -1418,7 +1442,7 @@ await step('orders cleanup (sequence left as is)', async () => {
 // ---- new shipment (shipment-first entry) -------------------------------------
 await step('new shipment: creates order + shipment in one step; Packed by default, never Dispatched', async () => {
   const dl = (await listCouriers()).find((c) => c.name === 'Delhivery');
-  const r = await createShipment({ channel: 'blinkit', source_order_id: `${TEST_ORDER}-S1`, courier_partner_id: dl.id,
+  const r = await createShipment({ ...R('blinkit'), channel: 'blinkit', source_order_id: `${TEST_ORDER}-S1`, courier_partner_id: dl.id,
     tracking_id: 'AWB-S1-a', note: 'first box' }, { actor: ACTOR });
   if (!r.createdOrder) throw new Error('order not created');
   const o = await getOrder(r.orderId);
@@ -1441,16 +1465,27 @@ await step('new shipment: required fields; explicit Dispatched is honoured and s
     catch (err) { if (err.status !== 400) throw err; }
   }
   if ((await listOrders({ q: `${TEST_ORDER}-S2` })).total !== 0) throw new Error('a refused shipment left an order behind');
-  const r = await createShipment({ channel: 'zepto', source_order_id: `${TEST_ORDER}-S2`, courier_partner_id: dl.id,
-    tracking_id: 'AWB-S2', shipment_status: 'dispatched' }, { actor: ACTOR });
+  // Dispatched straight away is refused for a brand-new order: there is no photo yet.
+  try {
+    await createShipment({ ...R('zepto'), channel: 'zepto', source_order_id: `${TEST_ORDER}-S2`, courier_partner_id: dl.id,
+      tracking_id: 'AWB-S2', shipment_status: 'dispatched' }, { actor: ACTOR });
+    throw new Error('dispatched without a photo');
+  } catch (err) { if (err.status !== 400 || !err.needsPhoto) throw err; }
+  if ((await listOrders({ q: `${TEST_ORDER}-S2` })).total !== 0) throw new Error('refused create left an order behind');
+  // The screen's way: saved as Packed, photo added, then Dispatched.
+  const r = await createShipment({ ...R('zepto'), channel: 'zepto', source_order_id: `${TEST_ORDER}-S2`, courier_partner_id: dl.id,
+    tracking_id: 'AWB-S2' }, { actor: ACTOR });
+  await addPhoto(r.orderId);
+  const sh = (await orderShipments(r.orderId))[0];
+  await updateShipment(r.orderId, sh.id, { shipment_status: 'dispatched' }, { actor: ACTOR, version: sh.version });
   const o = await getOrder(r.orderId);
   if (o.shipment_status !== 'dispatched' || !o.dispatch_date) throw new Error('dispatch not stamped');
-  return 'missing courier/AWB/number refused with nothing written; dispatched stamped';
+  return 'missing fields refused; Dispatched without a photo refused (nothing saved); with a photo, stamped';
 });
 await step('new shipment on an existing order: no duplicate order; offers the order instead', async () => {
   const bd = (await listCouriers()).find((c) => c.name === 'Blue Dart');
   try {
-    await createShipment({ channel: 'blinkit', source_order_id: `${TEST_ORDER}-S1`, courier_partner_id: bd.id, tracking_id: 'AWB-S1-b' }, { actor: ACTOR });
+    await createShipment({ ...R('blinkit'), channel: 'blinkit', source_order_id: `${TEST_ORDER}-S1`, courier_partner_id: bd.id, tracking_id: 'AWB-S1-b' }, { actor: ACTOR });
     throw new Error('second order accepted');
   } catch (err) {
     if (err.status !== 409 || !err.orderExists || err.shipments?.length !== 1 || err.shipments[0].awb !== 'AWB-S1-a') throw err;
@@ -1458,13 +1493,13 @@ await step('new shipment on an existing order: no duplicate order; offers the or
   const n = (await listOrders({ q: `${TEST_ORDER}-S1`, channel: 'blinkit' })).total;
   if (n !== 1) throw new Error(`${n} orders`);
   // Same number on another channel is a different order.
-  const other = await createShipment({ channel: 'amazon', source_order_id: `${TEST_ORDER}-S1`, courier_partner_id: bd.id, tracking_id: 'AWB-S1-a' }, { actor: ACTOR });
+  const other = await createShipment({ ...R('amazon'), channel: 'amazon', source_order_id: `${TEST_ORDER}-S1`, courier_partner_id: bd.id, tracking_id: 'AWB-S1-a' }, { actor: ACTOR });
   if (!other.createdOrder) throw new Error('other channel treated as the same order');
   return '409 with the existing shipment listed; still one Blinkit order';
 });
 await step('new shipment: add another shipment to an existing order; duplicate AWB refused', async () => {
   const bd = (await listCouriers()).find((c) => c.name === 'Blue Dart');
-  const r = await createShipment({ channel: 'blinkit', source_order_id: `${TEST_ORDER}-S1`, courier_partner_id: bd.id,
+  const r = await createShipment({ ...R('blinkit'), channel: 'blinkit', source_order_id: `${TEST_ORDER}-S1`, courier_partner_id: bd.id,
     tracking_id: 'AWB-S1-b' }, { actor: ACTOR, addToExisting: true });
   if (r.createdOrder) throw new Error('made a new order');
   const ships = await orderShipments(r.orderId);
@@ -1476,18 +1511,18 @@ await step('new shipment: add another shipment to an existing order; duplicate A
   const o = await getOrder(r.orderId);
   if (o.tracking_id !== 'AWB-S1-a' || o.shipment_count !== 2) throw new Error('list row changed');
   for (const awb of ['AWB-S1-b', ' awb-s1-A ']) {
-    try { await createShipment({ channel: 'blinkit', source_order_id: `${TEST_ORDER}-S1`, courier_partner_id: bd.id, tracking_id: awb }, { actor: ACTOR, addToExisting: true }); throw new Error(`duplicate ${awb} accepted`); }
+    try { await createShipment({ ...R('blinkit'), channel: 'blinkit', source_order_id: `${TEST_ORDER}-S1`, courier_partner_id: bd.id, tracking_id: awb }, { actor: ACTOR, addToExisting: true }); throw new Error(`duplicate ${awb} accepted`); }
     catch (err) { if (err.status !== 409 || !err.duplicateAwb) throw err; }
   }
   if ((await orderShipments(r.orderId)).length !== 2) throw new Error('duplicate created a shipment');
   return '2 shipments; repeated AWB (any case/spacing) refused';
 });
 await step('new shipment fills an order\'s untouched shipment instead of adding an empty one', async () => {
-  const id = await createOrder({ channel: 'instamart', source_order_id: `${TEST_ORDER}-S3` }, { actor: ACTOR });
+  const id = await createOrder({ ...R('instamart'), channel: 'instamart', source_order_id: `${TEST_ORDER}-S3` }, { actor: ACTOR });
   const dl = (await listCouriers()).find((c) => c.name === 'Delhivery');
-  try { await createShipment({ channel: 'instamart', source_order_id: `${TEST_ORDER}-S3`, courier_partner_id: dl.id, tracking_id: 'AWB-S3' }, { actor: ACTOR }); throw new Error('no confirmation asked'); }
+  try { await createShipment({ ...R('instamart'), channel: 'instamart', source_order_id: `${TEST_ORDER}-S3`, courier_partner_id: dl.id, tracking_id: 'AWB-S3' }, { actor: ACTOR }); throw new Error('no confirmation asked'); }
   catch (err) { if (err.status !== 409 || !err.canFillShipment || err.shipments.length !== 0) throw err; }
-  const r = await createShipment({ channel: 'instamart', source_order_id: `${TEST_ORDER}-S3`, courier_partner_id: dl.id,
+  const r = await createShipment({ ...R('instamart'), channel: 'instamart', source_order_id: `${TEST_ORDER}-S3`, courier_partner_id: dl.id,
     tracking_id: 'AWB-S3' }, { actor: ACTOR, addToExisting: true });
   const ships = await orderShipments(id);
   if (ships.length !== 1 || ships[0].tracking_id !== 'AWB-S3' || r.orderId !== id) throw new Error('did not fill the blank shipment');
@@ -1496,13 +1531,13 @@ await step('new shipment fills an order\'s untouched shipment instead of adding 
 await step('new shipment: concurrent entries cannot duplicate an order or an AWB', async () => {
   const dl = (await listCouriers()).find((c) => c.name === 'Delhivery');
   const base = { channel: 'website', source_order_id: `${TEST_ORDER}-S4`, courier_partner_id: dl.id };
-  const race = await Promise.allSettled([1, 2, 3].map((i) => createShipment({ ...base, tracking_id: `AWB-S4-${i}` }, { actor: `tab-${i}` })));
+  const race = await Promise.allSettled([1, 2, 3].map((i) => createShipment({ ...R(base.channel), ...base, tracking_id: `AWB-S4-${i}` }, { actor: `tab-${i}` })));
   const won = race.filter((x) => x.status === 'fulfilled');
   const lost = race.filter((x) => x.status === 'rejected');
   if (won.length !== 1 || lost.some((x) => !x.reason.orderExists)) throw new Error(`won ${won.length}; ${lost.map((x) => x.reason.message)}`);
   if ((await listOrders({ q: `${TEST_ORDER}-S4` })).total !== 1) throw new Error('duplicate order');
   const id = won[0].value.orderId;
-  const race2 = await Promise.allSettled([1, 2].map((i) => createShipment({ ...base, tracking_id: 'AWB-S4-SAME' }, { actor: `tab-${i}`, addToExisting: true })));
+  const race2 = await Promise.allSettled([1, 2].map((i) => createShipment({ ...R(base.channel), ...base, tracking_id: 'AWB-S4-SAME' }, { actor: `tab-${i}`, addToExisting: true })));
   const won2 = race2.filter((x) => x.status === 'fulfilled').length;
   if (won2 !== 1 || !race2.find((x) => x.status === 'rejected')?.reason.duplicateAwb) throw new Error(`won ${won2}`);
   if ((await orderShipments(id)).filter((x) => x.tracking_id === 'AWB-S4-SAME').length !== 1) throw new Error('AWB duplicated');
@@ -1546,7 +1581,7 @@ await step('dispatch image formats: JPG, JPEG, PNG, WEBP accepted; others and fa
 let proofOrder = null;
 await step('multiple dispatch images per shipment, stored in document storage, no receipt needed', async () => {
   const dl = (await listCouriers()).find((c) => c.name === 'Delhivery');
-  const r = await createShipment({ channel: 'zepto', source_order_id: `${TEST_ORDER}-IMG`, courier_partner_id: dl.id, tracking_id: 'AWB-IMG' }, { actor: ACTOR });
+  const r = await createShipment({ ...R('zepto'), channel: 'zepto', source_order_id: `${TEST_ORDER}-IMG`, courier_partner_id: dl.id, tracking_id: 'AWB-IMG' }, { actor: ACTOR });
   proofOrder = r.orderId;
   const store = storage();
   const ids = [];
@@ -1600,9 +1635,83 @@ await step('existing tax invoice / courier receipt behaviour unchanged', async (
   return 'PDF invoice + JPG receipt accepted as before; their formats did not widen';
 });
 
+// ---- dispatch types, destinations, dispatch photo rule ------------------------
+await step('routes: dispatch type must fit the channel; destination must fit both', async () => {
+  const dests = await listDestinations();
+  const of = (ch, t) => dests.find((d) => d.channel === ch && d.dispatch_type === t).id;
+  const base = { order_date: NOW(), order_value: 1 };
+  const refuse = async (label, input) => {
+    try { await createOrder({ ...base, ...input }, { actor: ACTOR }); throw new Error(`accepted: ${label}`); }
+    catch (err) { if (err.status !== 400) throw err; }
+  };
+  await refuse('Amazon with no type (it has two)', { channel: 'amazon', source_order_id: `${TEST_ORDER}-RT1` });
+  await refuse('Amazon warehouse with no destination', { channel: 'amazon', dispatch_type: 'warehouse', source_order_id: `${TEST_ORDER}-RT1` });
+  await refuse('Blinkit with a Zepto hub', { channel: 'blinkit', dispatch_type: 'quick_commerce', destination_id: of('zepto', 'quick_commerce'), source_order_id: `${TEST_ORDER}-RT1` });
+  await refuse('Flipkart as a warehouse', { channel: 'flipkart', dispatch_type: 'warehouse', source_order_id: `${TEST_ORDER}-RT1` });
+  await refuse('Amazon FBA code used for Tata 1mg', { channel: 'tata_1mg', dispatch_type: 'warehouse', destination_id: of('amazon', 'warehouse'), source_order_id: `${TEST_ORDER}-RT1` });
+  // A one-type channel takes its type by default; Easy Ship drops any destination.
+  const a = await createOrder({ ...base, channel: 'blinkit', destination_id: of('blinkit', 'quick_commerce'), source_order_id: `${TEST_ORDER}-RT2` }, { actor: ACTOR });
+  const b = await createOrder({ ...base, channel: 'amazon', dispatch_type: 'easy_ship', destination_id: of('amazon', 'warehouse'), source_order_id: `${TEST_ORDER}-RT3` }, { actor: ACTOR });
+  const oa = await getOrder(a); const ob = await getOrder(b);
+  if (oa.dispatch_type !== 'quick_commerce' || !/BLINK COMMERCE/.test(oa.destination_name)) throw new Error(`blinkit ${oa.dispatch_type} ${oa.destination_name}`);
+  if (ob.dispatch_type !== 'easy_ship' || ob.destination_id !== null) throw new Error('easy ship kept a destination');
+  // Changing the destination later is checked the same way and logged.
+  await updateOrder(a, { destination_id: of('blinkit', 'quick_commerce') + 1 }, { actor: ACTOR, version: oa.version });
+  const ev = (await orderEvents(a)).find((e) => e.event_type === 'order_edited' && e.metadata.changes.destination_id);
+  if (!ev) throw new Error('destination change not logged');
+  try { await updateOrder(a, { destination_id: of('zepto', 'quick_commerce') }, { actor: ACTOR, version: oa.version + 1 }); throw new Error('wrong hub accepted'); }
+  catch (err) { if (err.status !== 400) throw err; }
+  return '5 wrong routes refused; one-type channel defaulted; Easy Ship has no destination; change logged';
+});
+await step('dispatch photo is required to leave, not to move between later stages', async () => {
+  const dl = (await listCouriers()).find((c) => c.name === 'Delhivery');
+  const r = await createShipment({ ...R('bigbasket'), channel: 'bigbasket', source_order_id: `${TEST_ORDER}-PH`, courier_partner_id: dl.id, tracking_id: 'AWB-PH' }, { actor: ACTOR });
+  let sh = (await orderShipments(r.orderId))[0];
+  for (const to of ['dispatched', 'in_transit', 'delivered', 'rto']) {
+    try { await updateShipment(r.orderId, sh.id, { shipment_status: to }, { actor: ACTOR, version: sh.version }); throw new Error(`${to} without photo`); }
+    catch (err) { if (!err.needsPhoto) throw err; }
+  }
+  // Courier receipt is still not needed; only the photo.
+  const docId = await addPhoto(r.orderId);
+  await updateShipment(r.orderId, sh.id, { shipment_status: 'dispatched' }, { actor: ACTOR, version: sh.version });
+  // Removing the photo afterwards does not freeze the shipment in transit.
+  await removeDocument(r.orderId, docId, { actor: ACTOR });
+  sh = (await orderShipments(r.orderId))[0];
+  await updateShipment(r.orderId, sh.id, { shipment_status: 'in_transit' }, { actor: ACTOR, version: sh.version });
+  if ((await getOrder(r.orderId)).shipment_status !== 'in_transit') throw new Error('stuck');
+  return 'dispatched/in transit/delivered/RTO refused with no photo; allowed with one; later stages not re-checked';
+});
+await step('destinations: admins add, rename and switch off; mismatches refused', async () => {
+  const d = await saveDestination({ channel: 'retailers', dispatch_type: 'retailer', name: 'DBCHECK Retailer' });
+  const renamed = await saveDestination({ id: d.id, name: 'DBCHECK Retailer Renamed' });
+  const off = await saveDestination({ id: d.id, active: false });
+  if (renamed.name !== 'DBCHECK Retailer Renamed' || off.active) throw new Error('edit not saved');
+  if ((await listDestinations()).some((x) => x.id === d.id)) throw new Error('inactive listed for selection');
+  try { await createOrder({ channel: 'retailers', dispatch_type: 'retailer', destination_id: d.id, source_order_id: `${TEST_ORDER}-OFF` }, { actor: ACTOR }); throw new Error('inactive destination accepted'); }
+  catch (err) { if (err.status !== 400) throw err; }
+  for (const bad of [{ channel: 'flipkart', dispatch_type: 'warehouse', name: 'DBCHECK X' }, { channel: 'retailers', dispatch_type: 'easy_ship', name: 'DBCHECK Y' },
+    { channel: 'retailers', dispatch_type: 'retailer', name: '  ' }]) {
+    try { await saveDestination(bad); throw new Error(`accepted ${JSON.stringify(bad)}`); } catch (err) { if (err.status !== 400) throw err; }
+  }
+  try { await saveDestination({ channel: 'retailers', dispatch_type: 'retailer', name: 'DBCHECK Retailer Renamed' }); throw new Error('duplicate accepted'); }
+  catch (err) { if (err.code !== '23505') throw err; }
+  return 'added, renamed, switched off (and then unusable); wrong type, Easy Ship, blank and duplicate refused';
+});
+await step('list: dispatch-type tabs and destination filter', async () => {
+  const r = await listOrders({ q: TEST_ORDER });
+  const qc = await listOrders({ q: TEST_ORDER, type: 'quick_commerce' });
+  if (qc.orders.some((o) => o.dispatch_type !== 'quick_commerce')) throw new Error('type filter leaked');
+  if (r.typeCounts.quick_commerce !== qc.total) throw new Error(`tab count ${r.typeCounts.quick_commerce} vs ${qc.total}`);
+  const one = qc.orders.find((o) => o.destination_id);
+  const byDest = await listOrders({ q: TEST_ORDER, destination: one.destination_id });
+  if (!byDest.total || byDest.orders.some((o) => o.destination_id !== one.destination_id)) throw new Error('destination filter');
+  return `tabs ${JSON.stringify(r.typeCounts)}`;
+});
+
 await step('new shipment cleanup', async () => {
   const { orders, paths } = await purgeTestOrders(TEST_ORDER);
   for (const p of paths) await storage().remove(p).catch(() => {});
+  await getPool().query(`DELETE FROM dispatch_destinations WHERE name LIKE 'DBCHECK%'`);
   const left = await getPool().query('SELECT count(*)::int AS n FROM orders WHERE source_order_id LIKE $1', [`${TEST_ORDER}%`]);
   if (left.rows[0].n) throw new Error('orders left behind');
   return `${orders} orders removed`;
