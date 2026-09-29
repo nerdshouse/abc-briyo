@@ -246,6 +246,13 @@
         <label class="fld"><span>Tracking ID / AWB <em>*</em></span><input class="input mono" name="tracking_id" required maxlength="80" autocomplete="off" /></label>
       </div>
     </section>
+    <section class="dsec" id="cExtraSec" hidden>
+      <h3 class="dsec-title">More Amazon orders in this parcel <span class="dsec-meta soft">optional</span></h3>
+      <div class="extras" id="cExtras"></div>
+      <button type="button" class="btn" id="cAddExtra"><i data-lucide="plus"></i>Add another order</button>
+      <p class="help" style="margin:8px 0 0">Each order keeps its own number, date and value; they share this courier, AWB and status.
+        An order number that already exists is added to the shipment, not duplicated.</p>
+    </section>
     <section class="dsec">
       <h3 class="dsec-title">Dispatch Proof &amp; Documents</h3>
       <label class="fld proof-field"><span>Dispatch Product Image</span>

@@ -20,6 +20,7 @@ import {
   ensureOrdersSchema, createOrder, createShipment, updateOrder, updateShipment, getOrder, listOrders, orderEvents,
   orderShipments, addOrderNote, removeDocument, orderDocuments, listCouriers, saveCourier,
   trackingUrlFor, purgeTestOrders, zonedToUtc, listDestinations, saveDestination, DISPATCH_TYPES,
+  shipmentMembers, sharedShipmentOf, attachToShipment, detachFromShipment, attachableOrders,
 } from '../lib/orders.js';
 import { saveUploadedDocument } from '../lib/orders-routes.js';
 import { DOCUMENT_FORMATS } from '../lib/orders.js';
@@ -451,7 +452,10 @@ await step('conflict guard catches another user, ignores your own edits', async 
   // Nobody has touched it since — no conflict for either user.
   if (await conflictingUpdate(id, seenAt, 'Caller B')) throw new Error('false conflict with no intervening write');
 
-  // Caller A saves again; Caller B is now working from a stale read.
+  // Caller A saves again; Caller B is now working from a stale read. The guard
+  // compares to the millisecond, and a local database can land two back-to-back
+  // saves in the same one — a real second save is never that close.
+  await new Promise((r) => setTimeout(r, 5));
   await updateStatus(id, { notes: 'second', updatedBy: 'Caller A' });
   const clash = await conflictingUpdate(id, seenAt, 'Caller B');
   if (!clash) throw new Error('did not detect another user overwriting');
@@ -1706,6 +1710,99 @@ await step('list: dispatch-type tabs and destination filter', async () => {
   const byDest = await listOrders({ q: TEST_ORDER, destination: one.destination_id });
   if (!byDest.total || byDest.orders.some((o) => o.destination_id !== one.destination_id)) throw new Error('destination filter');
   return `tabs ${JSON.stringify(r.typeCounts)}`;
+});
+
+// ---- shared shipments: several orders under one AWB ---------------------------
+let sharedShip = null;
+const amz = { dispatch_type: 'easy_ship', channel: 'amazon' };
+await step('shared shipment: one AWB, three independent Amazon orders (created together)', async () => {
+  const dl = (await listCouriers()).find((c) => c.name === 'Delhivery');
+  const r = await createShipment({ ...amz, source_order_id: `${TEST_ORDER}-AZ-A`, order_date: '2026-09-28T10:00', order_value: 1200,
+    courier_partner_id: dl.id, tracking_id: 'AWB-SHARED-1',
+    extra_orders: [{ source_order_id: `${TEST_ORDER}-AZ-B`, order_date: '2026-09-28T12:00', order_value: 800 },
+      { source_order_id: `${TEST_ORDER}-AZ-C`, order_date: '2026-09-29T09:00', order_value: 1500 }] }, { actor: ACTOR });
+  sharedShip = r.shipmentId;
+  const members = await shipmentMembers(sharedShip);
+  if (members.length !== 3 || members[0].role !== 'lead' || members[0].id !== r.orderId) throw new Error(JSON.stringify(members.map((m) => m.role)));
+  const total = members.reduce((a, m) => a + m.order_value, 0);
+  if (total !== 3500) throw new Error(`total ${total}`);
+  // Each keeps its own date and value; all show the shared AWB and status in the list.
+  const list = await listOrders({ q: 'AWB-SHARED-1' });
+  if (list.total !== 3 || list.orders.some((o) => o.tracking_id !== 'AWB-SHARED-1' || o.orders_in_shipment !== 3 || o.shipment_status !== 'packed')) {
+    throw new Error(`list ${list.total}`);
+  }
+  const b = list.orders.find((o) => o.source_order_id.endsWith('AZ-B'));
+  if (!b.in_shared_shipment || b.order_value !== 800) throw new Error('member order not independent');
+  if ((await sharedShipmentOf(b.id)).id !== sharedShip) throw new Error('order does not know its shipment');
+  const ev = await orderEvents(r.orderId);
+  if (ev.filter((e) => e.event_type === 'shipment_order_attached').length !== 2) throw new Error('lead events');
+  if (!(await orderEvents(b.id)).some((e) => e.event_type === 'attached_to_shipment' && e.metadata.tracking_id === 'AWB-SHARED-1')) throw new Error('member event');
+  return '3 orders, ₹3,500, different dates, one AWB; each order finds its shipment';
+});
+await step('shared shipment: an existing order is attached, never duplicated', async () => {
+  const d = await createOrder({ ...amz, source_order_id: `${TEST_ORDER}-AZ-D`, order_value: 450 }, { actor: ACTOR });
+  // By id…
+  const cand = await attachableOrders(sharedShip);
+  if (!cand.some((x) => x.id === d)) throw new Error('not offered');
+  await attachToShipment(sharedShip, { orderIds: [d] }, { actor: ACTOR });
+  // …and typing an existing number while adding new orders attaches that order too.
+  const e = await createOrder({ ...amz, source_order_id: `${TEST_ORDER}-AZ-E`, order_value: 90 }, { actor: ACTOR });
+  await attachToShipment(sharedShip, { newOrders: [{ source_order_id: `${TEST_ORDER}-AZ-E`, order_value: 1 }] }, { actor: ACTOR });
+  const n = (await getPool().query('SELECT count(*)::int n FROM orders WHERE source_order_id = $1', [`${TEST_ORDER}-AZ-E`])).rows[0].n;
+  if (n !== 1 || (await getOrder(e)).order_value !== 90) throw new Error('duplicated or overwritten');
+  if ((await shipmentMembers(sharedShip)).length !== 5) throw new Error('members');
+  return 'attached by id and by number; one row each, values untouched';
+});
+await step('shared shipment: no order in two shipments; wrong channel/type/destination refused', async () => {
+  const dl = (await listCouriers()).find((c) => c.name === 'Delhivery');
+  const other = await createShipment({ ...amz, source_order_id: `${TEST_ORDER}-AZ-X`, courier_partner_id: dl.id, tracking_id: 'AWB-SHARED-2' }, { actor: ACTOR });
+  const b = (await listOrders({ q: `${TEST_ORDER}-AZ-B` })).orders[0].id;
+  const expect = async (label, fn, check) => { try { await fn(); throw new Error(`accepted: ${label}`); } catch (err) { if (!check(err)) throw err; } };
+  await expect('order already in a shared shipment', () => attachToShipment(other.shipmentId, { orderIds: [b] }, { actor: ACTOR }), (e) => e.alreadyShipped);
+  await expect('lead of a shipment with its own AWB', () => attachToShipment(sharedShip, { orderIds: [other.orderId] }, { actor: ACTOR }), (e) => e.alreadyShipped);
+  const lead = (await shipmentMembers(sharedShip))[0].id;
+  await expect('lead into its own shipment', () => attachToShipment(sharedShip, { orderIds: [lead] }, { actor: ACTOR }), (e) => e.status === 400);
+  const web = await createOrder({ channel: 'website', source_order_id: `${TEST_ORDER}-AZ-W` }, { actor: ACTOR });
+  await expect('another channel', () => attachToShipment(sharedShip, { orderIds: [web] }, { actor: ACTOR }), (e) => e.status === 400);
+  const fba = await createOrder({ ...R('amazon'), channel: 'amazon', source_order_id: `${TEST_ORDER}-AZ-F` }, { actor: ACTOR });
+  await expect('Amazon FBA into an Easy Ship parcel', () => attachToShipment(sharedShip, { orderIds: [fba] }, { actor: ACTOR }), (e) => e.status === 400);
+  // Two people add the same order to two shipments at once: one wins.
+  const g = await createOrder({ ...amz, source_order_id: `${TEST_ORDER}-AZ-G` }, { actor: ACTOR });
+  const race = await Promise.allSettled([attachToShipment(sharedShip, { orderIds: [g] }, { actor: 'tab-1' }), attachToShipment(other.shipmentId, { orderIds: [g] }, { actor: 'tab-2' })]);
+  if (race.filter((x) => x.status === 'fulfilled').length !== 1) throw new Error('race: both or neither won');
+  // All-or-nothing: one bad order in a batch leaves nothing attached.
+  const h = await createOrder({ ...amz, source_order_id: `${TEST_ORDER}-AZ-H` }, { actor: ACTOR });
+  const before = (await shipmentMembers(other.shipmentId)).length;
+  await expect('batch with a bad order', () => attachToShipment(other.shipmentId, { orderIds: [h, web] }, { actor: ACTOR }), (e) => e.status === 400);
+  if ((await shipmentMembers(other.shipmentId)).length !== before || (await sharedShipmentOf(h))) throw new Error('partial batch kept');
+  return 'already-shipped, self, other channel, other dispatch type refused; race → 1 winner; batches all-or-nothing';
+});
+await step('shared shipment: one photo rule and one status for all; take an order out', async () => {
+  const lead = (await shipmentMembers(sharedShip))[0].id;
+  let sh = (await orderShipments(lead))[0];
+  try { await updateShipment(lead, sh.id, { shipment_status: 'dispatched' }, { actor: ACTOR, version: sh.version }); throw new Error('no photo'); }
+  catch (err) { if (!err.needsPhoto) throw err; }
+  await addPhoto(lead);
+  await updateShipment(lead, sh.id, { shipment_status: 'dispatched' }, { actor: ACTOR, version: sh.version });
+  const list = await listOrders({ q: 'AWB-SHARED-1' });
+  if (list.orders.some((o) => o.shipment_status !== 'dispatched' || o.dispatch_image_count !== 1)) throw new Error('members did not follow the shipment');
+  const b = list.orders.find((o) => o.source_order_id.endsWith('AZ-B')).id;
+  await detachFromShipment(sharedShip, b, { actor: ACTOR });
+  const ob = await getOrder(b);
+  if (ob.in_shared_shipment || ob.shipment_status !== 'not_ready' || ob.tracking_id) throw new Error('detached order still shows the shared shipment');
+  if ((await shipmentMembers(sharedShip)).some((m) => m.id === b)) throw new Error('still a member');
+  if (!(await orderEvents(b)).some((e) => e.event_type === 'detached_from_shipment')) throw new Error('detach not logged');
+  const hist = (await getPool().query('SELECT detached_at FROM shipment_orders WHERE order_id = $1', [b])).rows;
+  if (hist.length !== 1 || !hist[0].detached_at) throw new Error('history row lost');
+  return 'photo needed once for the parcel; members show dispatched; detached order back on its own, history kept';
+});
+await step('courier list includes Shree Tirupati Courier and it can be used', async () => {
+  const c = (await listCouriers()).find((x) => x.name === 'Shree Tirupati Courier');
+  if (!c || !c.active || c.tracking_url_template) throw new Error(JSON.stringify(c));
+  const r = await createShipment({ ...R('website'), channel: 'website', source_order_id: `${TEST_ORDER}-STC`, courier_partner_id: c.id, tracking_id: 'STC123' }, { actor: ACTOR });
+  const o = await getOrder(r.orderId);
+  if (o.courier_name !== 'Shree Tirupati Courier' || o.tracking_url !== null) throw new Error('not used');
+  return 'active, no tracking pattern (link pasted by hand), usable on a shipment';
 });
 
 await step('new shipment cleanup', async () => {

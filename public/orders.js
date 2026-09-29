@@ -187,7 +187,8 @@ function renderTabs(data) {
 
 function trackingCell(o) {
   if (!o.tracking_id) return '<span class="muted-cell">—</span>';
-  const more = o.shipment_count > 1 ? ` <span class="mini-tag" title="${o.shipment_count} shipments on this order">+${o.shipment_count - 1}</span>` : '';
+  const more = (o.orders_in_shipment > 1 ? ` <span class="mini-tag" title="${o.orders_in_shipment} orders travel in this shipment">${o.orders_in_shipment} orders</span>` : '')
+    + (!o.in_shared_shipment && o.shipment_count > 1 ? ` <span class="mini-tag" title="${o.shipment_count} shipments on this order">+${o.shipment_count - 1}</span>` : '');
   return (o.tracking_url
     ? `<a class="track-link mono" href="${esc(o.tracking_url)}" target="_blank" rel="noopener noreferrer" title="Open the courier's tracking page">${esc(o.tracking_id)}</a>`
     : `<span class="mono">${esc(o.tracking_id)}</span>`) + more;
@@ -338,7 +339,9 @@ function retryBanner(orderId) {
   </div>`;
 }
 
-const docUrl = (o, d) => `/api/orders/${o.id}/documents/${d.id}`;
+const docUrl = (o, d) => `/api/orders/${d.order_id || o.id}/documents/${d.id}`;
+/** Where the drawer's photos and papers go: the shared shipment's lead order, or this order. */
+const proofOrderId = () => state.detail.sharedWith || state.detail.order.id;
 
 function docRows(o, list) {
   return `<ul class="docs">${list.map((d) => `
@@ -349,7 +352,7 @@ function docRows(o, list) {
         <div class="doc-meta">${list.some((x) => x.document_type !== d.document_type) ? `${esc(label(d.document_type))} · ` : ''}${esc(bytes(d.file_size))} · ${esc(d.uploaded_by || 'Someone')}, ${esc(dateTime(d.uploaded_at))}
           ${d.removed_at ? ` · removed by ${esc(d.removed_by || 'someone')}` : ''}</div>
       </div>
-      ${d.removed_at ? '' : `<button class="icon-btn bare" type="button" data-remove-doc="${d.id}" title="Remove" aria-label="Remove ${esc(d.original_filename)}">${icon('trash-2')}</button>`}
+      ${d.removed_at ? '' : `<button class="icon-btn bare" type="button" data-remove-doc="${d.id}" data-doc-order="${d.order_id}" title="Remove" aria-label="Remove ${esc(d.original_filename)}">${icon('trash-2')}</button>`}
     </li>`).join('')}</ul>`;
 }
 
@@ -371,7 +374,7 @@ function proofSection(o, documents) {
         <figure class="thumb">
           <a href="${docUrl(o, d)}" target="_blank" rel="noopener" title="${esc(d.original_filename)} · ${esc(d.uploaded_by || 'Someone')}, ${esc(dateTime(d.uploaded_at))}">
             <img src="${docUrl(o, d)}" alt="Dispatch photo ${esc(d.original_filename)}" loading="lazy" /></a>
-          <button class="thumb-x" type="button" data-remove-doc="${d.id}" title="Remove photo" aria-label="Remove ${esc(d.original_filename)}">${icon('x')}</button>
+          <button class="thumb-x" type="button" data-remove-doc="${d.id}" data-doc-order="${d.order_id}" title="Remove photo" aria-label="Remove ${esc(d.original_filename)}">${icon('x')}</button>
         </figure>`).join('')}</div>` : '<p class="muted proof-none">No dispatch photos yet.</p>'}
       ${canUpload ? `<label class="btn add-photos">${icon('camera')}Add photos
         <input type="file" id="dPhotos" multiple accept="${esc(acceptFor('dispatch_product_image'))}" hidden /></label>
@@ -391,6 +394,58 @@ function proofSection(o, documents) {
     ${m.storage.driver === 'local' ? '<div class="storage-note">Development storage (this machine\'s disk). Production uses R2.</div>' : ''}`;
 }
 
+/* ------------------------------------------------------------------ shared shipments */
+
+/**
+ * The orders travelling in this shipment (several Amazon orders under one AWB),
+ * with their total, and — for Amazon — a way to add more.
+ */
+function sharedBlock(o, ship) {
+  const members = state.detail.members?.[ship.id] || [];
+  const canAdd = o.channel === 'amazon';
+  if (members.length < 2 && !canAdd) return '';
+  const total = members.reduce((sum, x) => sum + (x.order_value || 0), 0);
+  const unknown = members.filter((x) => x.order_value === null).length;
+  return `<div class="shared">
+    ${members.length > 1 ? `
+      <div class="shared-h"><b>${members.length} orders in this shipment</b>
+        <span class="soft">Total ${esc(money(total))}${unknown ? ` · ${unknown} without a value` : ''}</span></div>
+      <ul class="shared-list">${members.map((x) => `
+        <li class="${x.id === o.id ? 'here' : ''}">
+          <button type="button" class="linkish mono" data-open-order="${x.id}" ${x.id === o.id ? 'disabled' : ''}>${esc(x.source_order_id)}</button>
+          ${x.role === 'lead' ? '<span class="mini-tag">Main</span>' : ''}
+          <span class="soft">${esc(day(x.order_date))}</span>
+          <span class="num">${esc(amount(x.order_value))}</span>
+          ${x.order_status === 'cancelled' ? '<span class="mini-tag warn">Cancelled</span>' : ''}
+          ${x.role === 'member' ? `<button type="button" class="icon-btn bare" data-detach="${x.id}" title="Take out of this shipment" aria-label="Take order ${esc(x.source_order_id)} out of this shipment">${icon('x')}</button>` : ''}
+        </li>`).join('')}</ul>
+      ${state.detail.sharedWith ? '<p class="soft shared-note">Shared shipment: courier, AWB, status and photos apply to every order in it.</p>' : ''}` : ''}
+    ${canAdd ? `<button type="button" class="btn" id="dAttachOpen">${icon('plus')}Add orders to this shipment</button>
+      <div class="attach" id="dAttach" hidden>
+        <input class="input plain" id="dAttachQ" placeholder="Find an order number" autocomplete="off" />
+        <ul class="attach-list" id="dAttachList"><li class="soft">Loading…</li></ul>
+        <div class="attach-new"><span class="soft">Or a new ${esc(o.channel_label)} order:</span>
+          <input class="input plain mono" id="dNewNum" placeholder="Order number" autocomplete="off" />
+          <input class="input plain" id="dNewDate" type="datetime-local" aria-label="Order date (IST)" />
+          <input class="input plain" id="dNewValue" inputmode="decimal" placeholder="Value (₹)" autocomplete="off" /></div>
+        <div class="form-actions"><button type="button" class="btn primary" id="dAttachSave">Add to shipment</button>
+          <button type="button" class="btn" id="dAttachCancel">Cancel</button></div>
+      </div>` : ''}
+  </div>`;
+}
+
+async function loadAttachable() {
+  const ship = currentShip();
+  const q = $('#dAttachQ')?.value.trim() || '';
+  const host = $('#dAttachList');
+  try {
+    const { orders } = await api(`/api/orders/shipments/${ship.id}/attachable?q=${encodeURIComponent(q)}`);
+    host.innerHTML = orders.length ? orders.map((x) => `<li><label><input type="checkbox" value="${x.id}" />
+      <span class="mono">${esc(x.source_order_id)}</span><span class="soft">${esc(day(x.order_date))}</span><span class="num">${esc(amount(x.order_value))}</span></label></li>`).join('')
+      : '<li class="soft">No orders waiting that fit this shipment (same channel, type and destination, not shipped yet).</li>';
+  } catch (err) { host.innerHTML = `<li class="saved failed">${esc(err.message)}</li>`; }
+}
+
 /** The shipment the drawer is showing. */
 const currentShip = () => {
   const list = state.detail.shipments;
@@ -407,6 +462,8 @@ function renderDrawer() {
   const notes = events.filter((e) => e.event_type === 'note_added');
   const live = documents.filter((d) => !d.removed_at);
   const has = (t) => live.some((d) => d.document_type === t);
+  // In a shared shipment the photos and papers are the shipment's (kept on its lead order).
+  const proofDocs = state.detail.shipmentDocuments || documents;
 
   $('#dTitle').textContent = `Order ${o.source_order_id}`;
   $('#dSub').textContent = [o.channel_label, o.dispatch_type && typeLabel(o.dispatch_type), o.destination_name, o.order_date && dateTime(o.order_date),
@@ -415,6 +472,7 @@ function renderDrawer() {
   $('#dBody').innerHTML = `
     <section class="dsec">
       <h3 class="dsec-title">Shipment <span class="dsec-meta">${indicator(ship.shipment_status)}</span></h3>
+      ${sharedBlock(o, ship)}
       ${shipments.length > 1 ? `<div class="ship-tabs" role="tablist" aria-label="Shipments">${shipments.map((x, i) => `
         <button type="button" role="tab" class="pill${x.id === ship.id ? ' on' : ''}" data-ship="${x.id}" aria-selected="${x.id === ship.id}">
           ${i + 1} · ${esc(x.tracking_id || 'no AWB')}</button>`).join('')}</div>` : ''}
@@ -440,14 +498,15 @@ function renderDrawer() {
       <div class="form-actions"><button class="btn primary" type="button" id="dShipSave">Save shipment</button>
         ${(NEXT_STEPS[ship.shipment_status] || []).map((s) => `<button class="btn" type="button" data-step="${s}">${esc(STEP_TEXT[s])}</button>`).join('')}</div>
       ${!['dispatched', 'in_transit', 'out_for_delivery', 'delivered', 'delivery_failed', 'rto'].includes(ship.shipment_status)
-        && !documents.some((d) => !d.removed_at && d.document_type === 'dispatch_product_image')
+        && !proofDocs.some((d) => !d.removed_at && d.document_type === 'dispatch_product_image')
         ? `<p class="photo-needed">${icon('camera')}Add a dispatch product photo (below) before marking it dispatched.</p>` : ''}
     </section>
 
     <section class="dsec">
       <h3 class="dsec-title">Dispatch Proof &amp; Documents</h3>
       ${retryBanner(o.id)}
-      ${proofSection(o, documents)}
+      ${proofSection(o, proofDocs)}
+      ${state.detail.sharedWith && documents.length ? `<div class="proof-group"><div class="proof-h">This order's own documents</div>${docRows(o, documents)}</div>` : ''}
     </section>
 
     <section class="dsec">
@@ -519,6 +578,10 @@ function describeEvent(e) {
   const ch = md.changes || {};
   switch (e.event_type) {
     case 'shipment_added': return ['package-plus', 'info', 'Another shipment added to this order'];
+    case 'shipment_order_attached': return ['package-plus', 'info', `Order ${esc(md.source_order_id)} added to this shipment`];
+    case 'shipment_order_detached': return ['package-minus', 'warn', `Order ${esc(md.source_order_id)} taken out of this shipment`];
+    case 'attached_to_shipment': return ['package', 'info', `Added to the shipment of order ${esc(md.lead_source_order_id)}${md.tracking_id ? ` (AWB ${esc(md.tracking_id)})` : ''}`];
+    case 'detached_from_shipment': return ['package-minus', 'warn', 'Taken out of the shared shipment'];
     case 'order_created': return ['plus', 'info', `Order created · ${esc(channelLabel(md.channel))} ${esc(md.source_order_id)}${md.order_value === null || md.order_value === undefined ? '' : ` · ${esc(money(md.order_value))}`}`];
     case 'order_status_changed': return ['circle-dot', ch.order_status?.to === 'cancelled' ? 'bad' : '', `Order ${esc(label(ch.order_status?.from))} → <b>${esc(label(ch.order_status?.to))}</b>`];
     case 'shipment_status_changed': {
@@ -548,7 +611,7 @@ function describeEvent(e) {
 async function patchOrder(fields, doneText = 'Saved', { shipment = false } = {}) {
   const o = state.detail.order;
   const ship = currentShip();
-  const url = shipment ? `/api/orders/${o.id}/shipments/${ship.id}` : `/api/orders/${o.id}`;
+  const url = shipment ? `/api/orders/${ship.order_id || o.id}/shipments/${ship.id}` : `/api/orders/${o.id}`;
   const version = shipment ? ship.version : o.version;
   const saved = $('#dSaved');
   saved.className = 'saved pending';
@@ -581,6 +644,12 @@ function trackHelp(courier) {
 }
 
 const dBody = $('#dBody');
+let attachTimer;
+dBody.addEventListener('input', (e) => {
+  if (e.target.id === 'dAttachQ') { clearTimeout(attachTimer); attachTimer = setTimeout(loadAttachable, 250); }
+});
+onLeave(() => clearTimeout(attachTimer));
+
 dBody.addEventListener('change', async (e) => {
   if (e.target.id === 'dPhotos') {
     const files = [...e.target.files];
@@ -590,7 +659,7 @@ dBody.addEventListener('change', async (e) => {
     if (problems.length) { saved.className = 'saved failed'; saved.textContent = problems.join(' '); e.target.value = ''; return; }
     saved.className = 'saved pending';
     const id = state.detail.order.id;
-    const failed = await uploadAll(id, files.map((file) => ({ file, type: 'dispatch_product_image' })), saved);
+    const failed = await uploadAll(proofOrderId(), files.map((file) => ({ file, type: 'dispatch_product_image' })), saved);
     await openOrder(id);
     $('#dSaved').className = failed.length ? 'saved failed' : 'saved';
     $('#dSaved').textContent = failed.length ? `${failed.length} of ${files.length} photo${files.length === 1 ? '' : 's'} did not upload — see Retry above.`
@@ -628,6 +697,39 @@ function shipmentFields() {
 }
 
 dBody.addEventListener('click', async (e) => {
+  const openOther = e.target.closest('[data-open-order]');
+  if (openOther && !openOther.disabled) return openOrder(Number(openOther.dataset.openOrder));
+  if (e.target.closest('#dAttachOpen')) { $('#dAttach').hidden = false; e.target.closest('#dAttachOpen').hidden = true; return loadAttachable(); }
+  if (e.target.closest('#dAttachCancel')) { $('#dAttach').hidden = true; $('#dAttachOpen').hidden = false; return; }
+  if (e.target.closest('#dAttachSave')) {
+    const ship = currentShip();
+    const orderIds = [...document.querySelectorAll('#dAttachList input:checked')].map((i) => Number(i.value));
+    const num = $('#dNewNum').value.trim();
+    const newOrders = num ? [{ source_order_id: num, order_date: $('#dNewDate').value || undefined, order_value: $('#dNewValue').value }] : [];
+    const saved = $('#dSaved');
+    if (!orderIds.length && !newOrders.length) { saved.className = 'saved failed'; saved.textContent = 'Tick an order or enter a new order number.'; return; }
+    saved.className = 'saved pending'; saved.textContent = 'Adding…';
+    try {
+      const r = await api(`/api/orders/shipments/${ship.id}/orders`, { method: 'POST', body: JSON.stringify({ order_ids: orderIds, new_orders: newOrders }) });
+      await openOrder(state.detail.order.id, { shipmentId: ship.id });
+      $('#dSaved').className = 'saved';
+      $('#dSaved').textContent = `${r.attached.length} order${r.attached.length === 1 ? '' : 's'} added — ${r.members.length} in this shipment`;
+      load();
+    } catch (err) { saved.className = 'saved failed'; saved.textContent = err.message; }
+    return;
+  }
+  const detach = e.target.closest('[data-detach]');
+  if (detach) {
+    if (!confirm('Take this order out of the shipment? It keeps its own details; the change is recorded.')) return;
+    const ship = currentShip();
+    try {
+      await api(`/api/orders/shipments/${ship.id}/orders/${detach.dataset.detach}`, { method: 'DELETE' });
+      await openOrder(state.detail.order.id);
+      $('#dSaved').className = 'saved'; $('#dSaved').textContent = 'Order taken out of the shipment';
+      load();
+    } catch (err) { $('#dSaved').className = 'saved failed'; $('#dSaved').textContent = err.message; }
+    return;
+  }
   if (e.target.closest('#dRetry')) {
     const { orderId, items } = state.retry;
     const btn = e.target.closest('#dRetry');
@@ -672,7 +774,7 @@ dBody.addEventListener('click', async (e) => {
   if (rm) {
     if (!confirm('Remove this from the order? It stays in the activity record.')) return;
     try {
-      await api(`/api/orders/${state.detail.order.id}/documents/${rm.dataset.removeDoc}`, { method: 'DELETE' });
+      await api(`/api/orders/${rm.dataset.docOrder || state.detail.order.id}/documents/${rm.dataset.removeDoc}`, { method: 'DELETE' });
       await openOrder(state.detail.order.id);
       $('#dSaved').textContent = 'Document removed';
       load();
@@ -698,7 +800,7 @@ dBody.addEventListener('submit', async (e) => {
   saved.className = 'saved pending';
   saved.textContent = `Uploading ${file.name}…`;
   try {
-    await api(`/api/orders/${state.detail.order.id}/documents?type=${encodeURIComponent(form.type.value)}`, {
+    await api(`/api/orders/${proofOrderId()}/documents?type=${encodeURIComponent(form.type.value)}`, {
       method: 'POST', body: file,
       headers: { 'Content-Type': file.type || 'application/octet-stream', 'X-Filename': encodeURIComponent(file.name) },
     });
@@ -842,6 +944,8 @@ function openCreate() {
   $('#cSubmit').textContent = 'Create Shipment';
   const m = state.meta;
   fillRoute(f, '#cDestField', { type: state.type === 'none' ? '' : state.type, channel: state.f.channel });
+  $('#cExtras').innerHTML = '';
+  syncExtras();
   f.courier_partner_id.innerHTML = opt('', 'Choose courier', true)
     + m.couriers.filter((c) => c.active).map((c) => opt(c.id, c.name)).join('');
   // Packed by default: an AWB means ready to go, not gone. Dispatch is chosen.
@@ -876,9 +980,30 @@ function showPreviews(files) {
   host.innerHTML = files.map((f, i) => `<figure class="thumb"><img src="${previewUrls[i]}" alt="${esc(f.name)}" /></figure>`).join('')
     + (files.length ? `<span class="soft thumbs-n">${files.length} photo${files.length === 1 ? '' : 's'} selected</span>` : '');
 }
+/** Extra orders in the same parcel — Amazon only, where several orders go under one AWB. */
+function syncExtras() {
+  const amazon = $('#createForm').channel.value === 'amazon';
+  $('#cExtraSec').hidden = !amazon;
+  if (!amazon) $('#cExtras').innerHTML = '';
+}
+function addExtraRow() {
+  $('#cExtras').insertAdjacentHTML('beforeend', `<div class="extra-row">
+    <input class="input plain mono x-num" placeholder="Amazon order number" aria-label="Amazon order number" autocomplete="off" />
+    <input class="input plain x-date" type="datetime-local" aria-label="Order date (IST)" />
+    <input class="input plain x-value" inputmode="decimal" placeholder="Value (₹)" aria-label="Order value" autocomplete="off" />
+    <button type="button" class="icon-btn bare x-remove" title="Remove" aria-label="Remove this order">${icon('x')}</button></div>`);
+  renderIcons();
+  $('#cExtras .extra-row:last-child .x-num').focus();
+}
+$('#cAddExtra').addEventListener('click', addExtraRow);
+$('#cExtras').addEventListener('click', (e) => { const x = e.target.closest('.x-remove'); if (x) x.closest('.extra-row').remove(); });
+const extraOrders = () => [...document.querySelectorAll('#cExtras .extra-row')]
+  .map((r) => ({ source_order_id: r.querySelector('.x-num').value.trim(), order_date: r.querySelector('.x-date').value || undefined, order_value: r.querySelector('.x-value').value }))
+  .filter((x) => x.source_order_id);
+
 $('#createForm').addEventListener('change', (e) => {
   if (e.target.name === 'dispatch_files') showPreviews([...e.target.files]);
-  if (['dispatch_type', 'channel'].includes(e.target.name)) routeChanged(e.target.form, '#cDestField', e.target.name, true);
+  if (['dispatch_type', 'channel'].includes(e.target.name)) { routeChanged(e.target.form, '#cDestField', e.target.name, true); syncExtras(); }
 });
 
 const orderFieldsReset = () => {
@@ -899,6 +1024,10 @@ $('#createForm').addEventListener('submit', async (e) => {
   err.hidden = true;
   const body = Object.fromEntries(new FormData(f));
   delete body.invoice_file; delete body.receipt_file; delete body.dispatch_files;
+  const extras = extraOrders();
+  if (extras.length) body.extra_orders = extras;
+  const nums = [body.source_order_id, ...extras.map((x) => x.source_order_id)].map((n) => String(n || '').trim().toLowerCase());
+  if (new Set(nums).size !== nums.length) { err.textContent = 'The same order number is entered twice.'; err.hidden = false; return; }
   const needsDest = !$('#cDestField').hidden;
   if (!needsDest) delete body.destination_id;
   const missing = [['dispatch_type', 'dispatch type'], ['channel', 'channel'], ...(needsDest ? [['destination_id', 'destination']] : []),
@@ -954,7 +1083,7 @@ $('#createForm').addEventListener('submit', async (e) => {
     saved.textContent = failed.length
       ? `Shipment saved as Packed, but ${failed.length} of ${items.length} upload${items.length === 1 ? '' : 's'} failed — Retry is under Dispatch Proof.`
       : moveError ? `Shipment saved as Packed. ${moveError}`
-        : (data.createdOrder ? 'Shipment created' : 'Shipment added to this order');
+        : (data.createdOrder ? `Shipment created${extras.length ? ` with ${extras.length + 1} orders` : ''}` : 'Shipment added to this order');
   } catch (ex) {
     $('#cSaved').textContent = '';
     if (ex.data?.orderExists) {
