@@ -476,6 +476,7 @@ function renderDrawer() {
   $('#dTitle').textContent = `Order ${o.source_order_id}`;
   $('#dSub').textContent = [o.channel_label, o.dispatch_type && typeLabel(o.dispatch_type), o.destination_name, o.order_date && dateTime(o.order_date),
     o.order_status === 'cancelled' && 'Order cancelled'].filter(Boolean).join(' · ');
+  queueMicrotask(() => loadStock(ship.id));
 
   $('#dBody').innerHTML = `
     <section class="dsec">
@@ -503,6 +504,7 @@ function renderDrawer() {
         <dt>Dispatch Date</dt><dd>${ship.dispatch_date ? esc(dateTime(ship.dispatch_date)) : '—'}</dd>
         <dt>Delivered</dt><dd>${ship.delivered_at ? esc(dateTime(ship.delivered_at)) : '—'}</dd>
       </dl>
+      <div id="dStock" class="stock-block"></div>
       <div class="form-actions"><button class="btn primary" type="button" id="dShipSave">Save shipment</button>
         ${(NEXT_STEPS[ship.shipment_status] || []).map((s) => `<button class="btn" type="button" data-step="${s}">${esc(STEP_TEXT[s])}</button>`).join('')}</div>
       ${!['dispatched', 'in_transit', 'out_for_delivery', 'delivered', 'delivery_failed', 'rto'].includes(ship.shipment_status)
@@ -514,6 +516,15 @@ function renderDrawer() {
   renderIcons();
 }
 
+/** The canonical Briyo SKU for a line, or a loud "Unmapped SKU" when its code matches none. */
+function skuLine(o, it) {
+  if (it.sku_id) {
+    const differs = it.sku && it.canonical_sku && it.sku.toLowerCase() !== it.canonical_sku.toLowerCase();
+    return `SKU <a class="mono" href="/inventory?sku=${it.sku_id}">${esc(it.canonical_sku)}</a>${differs ? ` <span class="soft">(${esc(o.channel_label)} ${esc(it.sku)})</span>` : ''}`;
+  }
+  return `<span class="mini-tag warn" title="This code matches no Briyo SKU. Stock cannot be reserved or dispatched until an admin maps it in Inventory.">Unmapped SKU</span>${it.sku ? ` <span class="mono">${esc(it.sku)}</span>` : ''}`;
+}
+
 /** Line items, as the marketplace listed them. Manual orders have none. */
 function itemsSection(o, items) {
   if (!items.length) return '';
@@ -523,7 +534,7 @@ function itemsSection(o, items) {
       <div class="item-list">${items.map((it) => `
         <div class="item-row">
           <div class="t"><div>${esc(it.title || it.sku || 'Item')}</div>
-            <div class="muted" style="font-size:12px">${[it.sku && `SKU <span class="mono">${esc(it.sku)}</span>`,
+            <div class="muted" style="font-size:12px">${[skuLine(o, it),
               it.promotion_discount ? `Discount ${esc(money(it.promotion_discount))}` : '',
               it.shipping_price ? `Shipping ${esc(money(it.shipping_price))}` : ''].filter(Boolean).join(' · ')}</div></div>
           <div class="n"><div>× ${esc(it.quantity)}</div><div class="muted" style="font-size:12px">${esc(amount(it.item_price))}</div></div>
@@ -825,6 +836,16 @@ dBody.addEventListener('click', async (e) => {
   const tab = e.target.closest('[data-ship]');
   if (tab) { state.shipId = Number(tab.dataset.ship); $('#dSaved').textContent = ''; return renderDrawer(); }
   if (e.target.closest('#dShipSave')) return patchOrder(shipmentFields(), 'Shipment saved', { shipment: true });
+  if (e.target.closest('#dReserve')) return reserveStock();
+  if (e.target.closest('#dRelease')) return releaseStock();
+  if (e.target.closest('[data-alloc-add]')) {
+    const box = e.target.closest('.alloc');
+    const row = box.querySelector('.alloc-row').cloneNode(true);
+    row.querySelector('[data-alloc-batch]').value = '';
+    row.querySelector('[data-alloc-qty]').value = '';
+    box.insertBefore(row, e.target.closest('[data-alloc-add]'));
+    return null;
+  }
   const step = e.target.closest('[data-step]');
   if (step) {
     return patchOrder({ ...shipmentFields(), shipment_status: step.dataset.step },
@@ -1220,6 +1241,99 @@ function fillFilters() {
   $('#q').value = state.f.q;
 }
 
+/* ------------------------------------------------------------ shipment stock */
+
+/**
+ * Stock for the shipment on screen: what its orders need per SKU, the FEFO
+ * batch suggestion (changeable), and Reserve / Release. Dispatch then deducts
+ * exactly what is reserved; the server refuses it otherwise.
+ */
+async function loadStock(shipmentId) {
+  const host = $('#dStock');
+  if (!host) return;
+  try {
+    const { stock } = await api(`/api/inventory/shipments/${shipmentId}`);
+    if (currentShip()?.id !== shipmentId) return;
+    state.stock = stock;
+    renderStock();
+  } catch (err) {
+    host.innerHTML = err.status === 403 ? '' : `<p class="saved failed">${esc(err.message)}</p>`;
+  }
+}
+
+function renderStock() {
+  const st = state.stock;
+  const host = $('#dStock');
+  if (!host || !st || st.state === 'no_items') { if (host) host.innerHTML = ''; return; }
+  const done = st.state === 'dispatched';
+  const editable = !done && !['dispatched', 'in_transit', 'out_for_delivery', 'delivered', 'delivery_failed', 'rto', 'cancelled'].includes(st.status);
+  const head = {
+    reserved: `${icon('circle-check')}Stock reserved — ready to dispatch`,
+    needs_reservation: `${icon('package-search')}Confirm the batches to reserve stock before dispatch`,
+    insufficient: `${icon('triangle-alert')}Not enough stock`,
+    unmapped: `${icon('triangle-alert')}Unmapped SKU — cannot dispatch`,
+    dispatched: `${icon('package-check')}Stock deducted at dispatch`,
+  }[st.state];
+  const tone = { reserved: 'good', dispatched: 'good', needs_reservation: '', insufficient: 'bad', unmapped: 'bad' }[st.state];
+  const allocFor = (l) => (l.reserved.length ? l.reserved.map((r) => ({ batch_id: r.batch_id, quantity: r.quantity }))
+    : l.suggestion.picks.length ? l.suggestion.picks : [{ batch_id: '', quantity: l.required }]);
+  const batchOpts = (l, sel) => opt('', 'Choose batch', !sel) + l.batches.filter((b) => b.effective_status === 'active' && (b.available > 0 || b.id === sel))
+    .map((b) => opt(b.id, `${b.batch_number} · exp ${b.expiry_date ? dateShort(`${b.expiry_date}T00:00:00`) : '—'} · ${b.available} free${b.location ? ` · ${b.location}` : ''}`, b.id === sel)).join('');
+  host.innerHTML = `
+    <div class="stock-head ${tone}">${head}${st.orders.length > 1 ? `<span class="soft"> · ${st.orders.length} orders</span>` : ''}</div>
+    ${st.unmapped.length ? `<ul class="stock-unmapped">${st.unmapped.map((u) => `<li><span class="mini-tag warn">Unmapped SKU</span> <span class="mono">${esc(u.code || '—')}</span> × ${esc(u.quantity)}
+      <span class="soft">order ${esc(u.order_number)}</span></li>`).join('')}</ul>
+      <p class="imp-note">An admin maps these in <a href="/inventory?view=unmapped">Inventory → Unmapped SKUs</a>. No stock is guessed or deducted.</p>` : ''}
+    ${st.lines.map((l) => `<div class="stock-line" data-line="${l.sku_id}">
+      <div class="stock-line-head">
+        <span><a class="mono" href="/inventory?sku=${l.sku_id}">${esc(l.sku)}</a> <span class="soft">${esc(l.product_name)}${l.variant_name ? ` · ${esc(l.variant_name)}` : ''}</span></span>
+        <span class="stock-nums"><b>${count(l.required)}</b> needed${done ? '' : ` · ${count(l.available)} available ${l.enough ? '<span class="ok-mark">✓</span>' : '<span class="mini-tag warn">Insufficient</span>'}`}</span>
+      </div>
+      ${done ? `<div class="soft stock-from">Deducted from ${l.dispatched.map((d) => `<span class="mono">${esc(d.batch_number)}</span> −${count(d.quantity)}`).join(', ')}</div>`
+        : editable ? `<div class="alloc">${allocFor(l).map((a) => `<div class="alloc-row"><select class="select" data-alloc-batch aria-label="Batch for ${esc(l.sku)}">${batchOpts(l, a.batch_id)}</select>
+            <input class="input" data-alloc-qty inputmode="numeric" value="${esc(a.quantity)}" aria-label="Quantity" /></div>`).join('')}
+            <button type="button" class="linkish" data-alloc-add>+ another batch</button></div>`
+          : `<div class="soft stock-from">${l.reserved.map((r) => `<span class="mono">${esc(r.batch_number)}</span> × ${count(r.quantity)}`).join(', ') || 'Nothing reserved'}</div>`}
+      ${!done && l.suggestion.short && !l.reserved_quantity ? `<div class="warn-text stock-from">Short by ${count(l.suggestion.short)}</div>` : ''}
+    </div>`).join('')}
+    ${editable && st.lines.length && !st.unmapped.length ? `<div class="form-actions">
+      <button class="btn" type="button" id="dReserve">${st.state === 'reserved' ? 'Update reservation' : 'Reserve stock'}</button>
+      ${st.lines.some((l) => l.reserved.length) ? '<button class="btn" type="button" id="dRelease">Release</button>' : ''}</div>` : ''}`;
+  renderIcons();
+}
+
+async function reserveStock() {
+  const allocations = [];
+  for (const row of $$('#dStock [data-line]')) {
+    for (const a of row.querySelectorAll('.alloc-row')) {
+      const b = a.querySelector('[data-alloc-batch]').value;
+      const q = a.querySelector('[data-alloc-qty]').value.trim();
+      if (b || (q && q !== '0')) allocations.push({ batch_id: b, quantity: q });
+    }
+  }
+  const saved = $('#dSaved');
+  saved.className = 'saved pending';
+  saved.textContent = 'Reserving…';
+  try {
+    const r = await api(`/api/inventory/shipments/${currentShip().id}/reserve`, { method: 'POST', body: JSON.stringify({ allocations }) });
+    state.stock = r.stock;
+    renderStock();
+    saved.className = 'saved';
+    saved.textContent = 'Stock reserved';
+  } catch (err) { saved.className = 'saved failed'; saved.textContent = err.message; }
+}
+
+async function releaseStock() {
+  const saved = $('#dSaved');
+  try {
+    const r = await api(`/api/inventory/shipments/${currentShip().id}/release`, { method: 'POST' });
+    state.stock = r.stock;
+    renderStock();
+    saved.className = 'saved';
+    saved.textContent = 'Reservation released';
+  } catch (err) { saved.className = 'saved failed'; saved.textContent = err.message; }
+}
+
 /* ---------------------------------------------- one shipment, several orders */
 
 /** The orders ticked so far, and whether they can travel together. */
@@ -1381,7 +1495,10 @@ async function previewImport() {
           ${stat(s.duplicateRows, 'Duplicate rows', s.duplicateRows ? 'warn' : '')}
           ${stat(p.errorCount, 'Rows with errors', p.errorCount ? 'bad' : '')}
           ${stat(money(s.orderValue), 'Order value in file')}
+          ${stat(s.unmappedSkus, 'Unmapped SKUs', s.unmappedSkus ? 'warn' : '')}
         </div>
+        ${p.unmapped?.length ? `<p class="imp-note"><b>Unmapped SKUs:</b> ${p.unmapped.slice(0, 12).map((u) => `<span class="mono">${esc(u.code || '—')}</span> (${count(u.lines)})`).join(', ')}${p.unmapped.length > 12 ? ` and ${count(p.unmapped.length - 12)} more` : ''}.
+          These orders import normally but show "Unmapped SKU" and cannot be dispatched until an admin maps each code to a Briyo SKU in Inventory. No SKU is created.</p>` : ''}
         <p class="imp-note">${[
           s.promotionRows && `${count(s.promotionRows)} promotion row${s.promotionRows > 1 ? 's' : ''} folded into their items.`,
           s.skippedOrders && `${count(s.skippedOrders)} order${s.skippedOrders > 1 ? 's' : ''} will be skipped because of errors.`,

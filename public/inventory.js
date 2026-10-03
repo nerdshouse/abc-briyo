@@ -1,0 +1,618 @@
+/**
+ * Inventory — stock by SKU and batch, the SKU drawer (batches, COAs, ledger),
+ * and the admin forms: new SKU, add inventory, adjust, transfer, batch status,
+ * mapping an Amazon seller SKU. Every number comes from /api/inventory; stock
+ * is never edited here, only recorded as movements.
+ */
+import {
+  $, $$, esc, money, count, icon, renderIcons, setTimezone, dateShort, dateTime, initShell, pageFetch,
+  pageSignal, onLeave, onQueryChange,
+} from './ui/components.js';
+
+const fetch = pageFetch();
+
+const FILTERS = ['q', 'warehouse', 'location', 'status', 'expiring', 'stock'];
+const state = {
+  me: null, meta: null, data: null, view: '', f: Object.fromEntries(FILTERS.map((k) => [k, ''])),
+  openSku: null, detail: null, form: null,
+};
+
+const api = async (url, opts = {}) => {
+  const res = await fetch(url, {
+    ...opts,
+    headers: opts.body && typeof opts.body === 'string' ? { 'Content-Type': 'application/json', ...opts.headers } : opts.headers,
+  });
+  const data = await res.json().catch(() => ({ ok: false, error: `HTTP ${res.status}` }));
+  if (!res.ok || data.ok === false) throw Object.assign(new Error(data.error || `HTTP ${res.status}`), { status: res.status, data });
+  return data;
+};
+const isAdmin = () => Boolean(state.me?.isAdmin);
+const opt = (value, text, selected) => `<option value="${esc(value)}"${selected ? ' selected' : ''}>${esc(text)}</option>`;
+const day = (d) => (d ? dateShort(`${d}T00:00:00`) : '—');
+const amount = (v) => (v === null || v === undefined ? '—' : money(v));
+const requestId = () => (crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random().toString(16).slice(2)}`);
+
+// Batch status dots reuse the board palette: green sellable, amber held, red stopped, grey empty.
+const STATUS = {
+  active: ['recovered', 'Active'], quarantined: ['noresp', 'Quarantined'], blocked: ['lost', 'Blocked'],
+  expired: ['lost', 'Expired'], depleted: ['new', 'Depleted'],
+};
+const statusTag = (s) => `<span class="status ${STATUS[s]?.[0] || ''}"><span class="dot"></span>${esc(STATUS[s]?.[1] || s)}</span>`;
+const expiryCell = (b) => {
+  if (!b.expiry_date) return '<span class="muted-cell">—</span>';
+  const d = b.days_to_expiry;
+  const tone = d !== null && d < 0 ? 'bad' : d !== null && d <= 90 && b.on_hand > 0 ? 'warn' : '';
+  const note = d === null ? '' : d < 0 ? 'expired' : d <= 90 ? `${d} d` : '';
+  return `<span class="${tone ? `exp-${tone}` : ''}">${esc(day(b.expiry_date))}</span>${note && b.on_hand > 0 ? ` <span class="mini-tag ${tone === 'bad' ? 'warn' : ''}">${esc(note)}</span>` : ''}`;
+};
+const stockFlag = (r) => (r.out_of_stock ? '<span class="mini-tag warn">Out of stock</span>' : r.low_stock ? '<span class="mini-tag warn">Low stock</span>' : '');
+
+// ------------------------------------------------------------------ URL
+
+function readUrl() {
+  const u = new URLSearchParams(window.location.search);
+  for (const k of FILTERS) state.f[k] = u.get(k) || '';
+  state.view = u.get('view') || '';
+  state.openSku = /^\d+$/.test(u.get('sku') || '') ? Number(u.get('sku')) : null;
+}
+function writeUrl() {
+  const u = new URLSearchParams();
+  for (const k of FILTERS) if (state.f[k]) u.set(k, state.f[k]);
+  if (state.view) u.set('view', state.view);
+  if (state.openSku) u.set('sku', state.openSku);
+  const next = `${window.location.pathname}${u.toString() ? `?${u}` : ''}`;
+  if (next !== `${window.location.pathname}${window.location.search}`) history.replaceState(history.state, '', next);
+}
+const anyFilter = () => FILTERS.some((k) => state.f[k]);
+
+// ------------------------------------------------------------------ list
+
+async function load() {
+  const u = new URLSearchParams();
+  for (const k of FILTERS) if (state.f[k]) u.set(k, state.f[k]);
+  try {
+    // The forms list every SKU, not just the rows the filters show.
+    const [data, all] = await Promise.all([api(`/api/inventory?${u}`), api('/api/inventory/skus')]);
+    state.data = data;
+    state.skus = all.skus;
+    render();
+    $('#alerts').innerHTML = '';
+  } catch (err) {
+    $('#alerts').innerHTML = `<div class="alert">${icon('circle-alert')}<span>${esc(err.message)}</span></div>`;
+    renderIcons();
+  }
+}
+
+function render() {
+  const { cards: c, rows, unmapped } = state.data;
+  const title = state.view === 'unmapped' ? 'Unmapped SKUs' : state.f.stock === 'low' ? 'Low stock'
+    : state.f.expiring ? 'Expiring stock' : 'Inventory';
+  $('#pageTitle').textContent = title;
+  $('#crumbHere').textContent = title === 'Inventory' ? 'Stock' : title;
+  $('#topTitle').textContent = title;
+  document.title = `${title} — Briyo`;
+  $('#pageSub').textContent = `${count(c.totalSkus)} active SKUs · ${count(c.totalUnits)} units on hand · ${money(c.inventoryValue)} at cost`
+    + (c.unitsWithoutCost ? ` · ${count(c.unitsWithoutCost)} units without a cost` : '');
+
+  const card = (n, label, { tone = '', filter = null, title: tip = '' } = {}) => `<button type="button" class="imp-stat inv-card ${tone}"
+      ${filter ? `data-filter='${esc(JSON.stringify(filter))}'` : 'disabled'} title="${esc(tip)}"><b>${typeof n === 'number' ? count(n) : esc(n)}</b><span>${esc(label)}</span></button>`;
+  $('#cards').innerHTML = [
+    card(c.totalSkus, 'Total SKUs', { filter: {}, title: 'Active SKUs in the master' }),
+    card(c.totalUnits, 'Total units', { title: 'Physically on hand, all batches and statuses' }),
+    card(c.availableUnits, 'Available units', { title: 'Sellable stock not reserved for a shipment' }),
+    card(c.reservedUnits, 'Reserved units', { title: 'Set aside for shipments not yet dispatched' }),
+    card(c.lowStock, 'Low stock', { tone: c.lowStock ? 'warn' : '', filter: { stock: 'low' }, title: 'Available at or under the reorder level' }),
+    card(c.outOfStock, 'Out of stock', { tone: c.outOfStock ? 'bad' : '', filter: { stock: 'out' } }),
+    card(c.expiring90, 'Expiring ≤ 90 days', { tone: c.expiring90 ? 'warn' : '', filter: { expiring: '90' },
+      title: `${c.expiring30} within 30 days, ${c.expiring60} within 60 days${c.expired ? `; ${c.expired} batches already expired` : ''}` }),
+    card(money(c.inventoryValue), 'Inventory value', { title: 'On hand × unit cost, per batch. Not selling price.' }),
+  ].join('');
+
+  // Unmapped seller SKUs: orders that cannot be dispatched until mapped.
+  $('#unmapped').innerHTML = unmapped.length ? `<section class="card unmapped-card${state.view === 'unmapped' ? ' focus' : ''}" id="unmappedCard">
+    <header class="card-head"><h2 class="card-title">${icon('triangle-alert')}Unmapped SKUs <span class="card-meta">${count(unmapped.length)} code${unmapped.length > 1 ? 's' : ''} · their orders cannot be dispatched until mapped</span></h2></header>
+    <div class="pane"><div class="table-wrap"><table class="table"><thead><tr><th>Channel code</th><th>Item</th><th class="r">Orders</th><th class="r">Units</th><th class="r"></th></tr></thead><tbody>
+    ${unmapped.map((u) => `<tr><td class="mono">${esc(u.code)}<span class="cell-sub muted">${esc(u.channel === 'amazon' ? 'Amazon seller SKU' : u.channel)}${u.asin ? ` · ASIN ${esc(u.asin)}` : ''}</span></td>
+      <td><span class="cell-text">${esc(u.title || '—')}</span></td><td class="r num">${count(u.orders)}</td><td class="r num">${count(u.units)}</td>
+      <td class="r">${isAdmin() ? `<button class="btn" type="button" data-map="${esc(u.code)}" data-title="${esc(u.title || '')}" data-asin="${esc(u.asin || '')}">Map to SKU</button>` : '<span class="soft">Ask an admin</span>'}</td></tr>`).join('')}
+    </tbody></table></div></div></section>` : (state.view === 'unmapped' ? '<section class="card"><div class="pane"><div class="empty-note"><b>Every SKU on an order is mapped.</b>Nothing to resolve.</div></div></section>' : '');
+
+  $('#resultNote').textContent = `${count(rows.length)} ${rows.length === 1 ? 'row' : 'rows'}${anyFilter() ? ' matching the filters' : ''} · one row per batch, earliest expiry first`;
+  $('#fclear').hidden = !anyFilter();
+
+  if (!rows.length) {
+    const empty = anyFilter() ? '<b>Nothing matches.</b>Try clearing a filter.'
+      : `<b>No SKUs yet.</b>${isAdmin() ? 'Create one with New SKU, then Add Inventory.' : 'An admin adds SKUs and stock.'}`;
+    $('#rows').innerHTML = `<tr><td colspan="8"><div class="empty-note">${empty}</div></td></tr>`;
+    $('#clist').innerHTML = `<li class="oitem"><div class="empty-note">${empty}</div></li>`;
+    return renderIcons();
+  }
+  $('#rows').innerHTML = rows.map((r) => `
+    <tr class="orow${r.sku_id === state.openSku ? ' open' : ''}" data-sku="${r.sku_id}" tabindex="0">
+      <td><span class="cell-main mono" style="font-weight:500">${esc(r.sku)}</span>${r.sku_active === false ? '<span class="mini-tag">Inactive</span>' : ''}</td>
+      <td><span class="cell-main">${esc(r.product_name)}</span>${r.variant_name ? `<span class="cell-sub muted">${esc(r.variant_name)}</span>` : ''}</td>
+      <td class="r num">${r.empty ? '<span class="muted-cell">—</span>' : count(r.available)}${stockFlag(r) ? `<span class="cell-sub">${stockFlag(r)}</span>` : ''}</td>
+      <td class="r num">${r.empty || !r.reserved ? '<span class="muted-cell">—</span>' : count(r.reserved)}</td>
+      <td>${r.empty ? '<span class="muted-cell">No stock yet</span>' : `<span class="mono">${esc(r.batch_number)}</span><span class="cell-sub muted">${count(r.on_hand)} on hand</span>`}</td>
+      <td>${r.empty ? '<span class="muted-cell">—</span>' : expiryCell(r)}</td>
+      <td>${r.empty ? '<span class="muted-cell">—</span>' : `${esc(r.warehouse_name)}${r.location ? `<span class="cell-sub muted">${esc(r.location)}</span>` : ''}`}</td>
+      <td>${r.empty ? '<span class="muted-cell">—</span>' : statusTag(r.effective_status)}</td>
+    </tr>`).join('');
+  $('#clist').innerHTML = rows.map((r) => `
+    <li class="oitem" data-sku="${r.sku_id}" tabindex="0">
+      <div class="oi-top"><span class="oi-id mono">${esc(r.sku)}</span>${r.empty ? '' : `<span class="oi-val">${statusTag(r.effective_status)}</span>`}</div>
+      <div class="oi-sub">${esc(r.product_name)}${r.variant_name ? ` · ${esc(r.variant_name)}` : ''}</div>
+      <div class="oi-sub">${r.empty ? 'No stock yet' : `Batch <span class="mono">${esc(r.batch_number)}</span> · ${esc(r.warehouse_name)}${r.location ? ` · ${esc(r.location)}` : ''}`}</div>
+      ${r.empty ? '' : `<div class="oi-stat"><span class="soft" style="font-size:12.5px">${count(r.available)} available${r.reserved ? ` · ${count(r.reserved)} reserved` : ''}</span>
+        <span style="font-size:12.5px">${expiryCell(r)}</span>${stockFlag(r)}</div>`}
+    </li>`).join('');
+  renderIcons();
+}
+
+// ------------------------------------------------------------------ SKU drawer
+
+async function openSku(id) {
+  state.openSku = id;
+  writeUrl();
+  $$('.orow').forEach((r) => r.classList.toggle('open', Number(r.dataset.sku) === id));
+  $('#drawer').hidden = false;
+  $('#drawerScrim').hidden = false;
+  $('#dSaved').textContent = '';
+  if (!state.detail || state.detail.sku.id !== id) { $('#dTitle').textContent = 'Loading…'; $('#dSub').textContent = ''; $('#dBody').innerHTML = ''; }
+  try {
+    state.detail = await api(`/api/inventory/skus/${id}`);
+    renderSku();
+  } catch (err) {
+    $('#dBody').innerHTML = `<div class="empty-note"><b>Could not open this SKU.</b>${esc(err.message)}</div>`;
+  }
+}
+function closeSku() {
+  $('#drawer').hidden = true;
+  if ($('#formDrawer').hidden) $('#drawerScrim').hidden = true;
+  state.openSku = null;
+  writeUrl();
+  $$('.orow.open').forEach((r) => r.classList.remove('open'));
+}
+
+const MOVE_TONE = (q) => (q > 0 ? 'good' : 'warn');
+const docUrl = (d, download) => `/api/inventory/batches/${d.batch_id}/documents/${d.id}${download ? '?download=1' : ''}`;
+const refText = (m) => {
+  if (m.shipment_id) return `Shipment${m.source_order_id ? ` · order <span class="mono">${esc(m.source_order_id)}</span>` : ''}`;
+  if (m.reference_id) return `${esc(m.reference_type ? m.reference_type.toUpperCase() : 'Ref')} <span class="mono">${esc(m.reference_id)}</span>`;
+  return '—';
+};
+
+function renderSku() {
+  const { sku: s, batches, movements, reservations, orderLines } = state.detail;
+  $('#dTitle').innerHTML = `<span class="mono">${esc(s.sku)}</span>`;
+  $('#dSub').textContent = [s.product_name, s.variant_name, s.category, !s.active && 'Inactive'].filter(Boolean).join(' · ');
+  const live = batches.filter((b) => b.on_hand > 0 || b.effective_status !== 'depleted');
+  const old = batches.filter((b) => !live.includes(b));
+  const batchRow = (b) => `<tr>
+      <td><span class="mono" style="font-weight:500">${esc(b.batch_number)}</span>
+        <span class="cell-sub muted">${esc(b.warehouse_name)}${b.location ? ` · ${esc(b.location)}` : ''}</span>
+        <span class="cell-sub muted">${[b.mfg_date && `Mfg ${esc(day(b.mfg_date))}`, b.supplier_name ? esc(b.supplier_name) : 'No supplier', b.grn_number && `GRN ${esc(b.grn_number)}`,
+          b.unit_cost !== null && `${esc(money(b.unit_cost))} each · ${esc(money(b.value))}`].filter(Boolean).join(' · ')}</span></td>
+      <td class="r num">${count(b.on_hand)}${b.reserved ? `<span class="cell-sub muted">${count(b.reserved)} reserved</span>` : ''}</td>
+      <td>${expiryCell(b)}</td>
+      <td>${statusTag(b.effective_status)}</td>
+    </tr>
+    <tr class="sub-row"><td colspan="4">
+      <div class="batch-docs">${b.documents.length ? b.documents.map((d) => `<span class="doc-chip">${icon(d.document_type === 'coa' ? 'file-check' : 'file-text')}
+          <b>${esc(d.document_type === 'coa' ? 'COA' : d.document_type.replaceAll('_', ' '))}</b> ${esc(d.original_filename)}
+          <a href="${docUrl(d)}" target="_blank" rel="noopener">View</a><a href="${docUrl(d, true)}">Download</a>
+          ${isAdmin() ? `<button type="button" class="linkish" data-doc-remove="${d.id}" data-batch="${b.id}">Remove</button>` : ''}</span>`).join('')
+        : '<span class="soft">No COA uploaded.</span>'}
+        ${isAdmin() ? `<label class="linkish upload-link">${icon('upload')}Upload COA / document<input type="file" hidden accept=".pdf,.png,.jpg,.jpeg" data-upload="${b.id}" /></label>
+          <select class="select mini-select" data-upload-type="${b.id}" aria-label="Document type">${state.meta.documentTypes.map((t) => opt(t, t === 'coa' ? 'COA' : t.replaceAll('_', ' '))).join('')}</select>` : ''}
+      </div>
+      ${isAdmin() ? `<div class="batch-actions">
+        <button type="button" class="linkish" data-act="adjust" data-batch="${b.id}">Adjust / write off</button>
+        <button type="button" class="linkish" data-act="return" data-batch="${b.id}">Customer return</button>
+        <button type="button" class="linkish" data-act="transfer" data-batch="${b.id}">Transfer</button>
+        <button type="button" class="linkish" data-act="batch" data-batch="${b.id}">Status &amp; details</button>
+      </div>` : ''}
+    </td></tr>`;
+
+  $('#dBody').innerHTML = `
+    <section class="dsec">
+      <h3 class="dsec-title">Stock ${s.out_of_stock ? '<span class="mini-tag warn">Out of stock</span>' : s.low_stock ? '<span class="mini-tag warn">Low stock</span>' : ''}</h3>
+      <div class="imp-stats stock-cards">
+        <div class="imp-stat"><b>${count(s.on_hand)}</b><span>On hand</span></div>
+        <div class="imp-stat"><b>${count(s.reserved)}</b><span>Reserved</span></div>
+        <div class="imp-stat ${s.out_of_stock ? 'bad' : s.low_stock ? 'warn' : ''}"><b>${count(s.available)}</b><span>Available</span></div>
+        <div class="imp-stat"><b>${esc(money(s.value))}</b><span>Value at cost</span></div>
+      </div>
+      <p class="imp-note">Available = on hand − reserved, counting only active, unexpired batches.${s.unsellable ? ` ${count(s.unsellable)} units are quarantined, blocked or expired.` : ''}
+        Reorder level ${count(s.reorder_level)}${s.reorder_quantity ? `, reorder quantity ${count(s.reorder_quantity)}` : ''}.</p>
+      ${isAdmin() ? `<div class="form-actions"><button class="btn primary" type="button" data-act="receive">${icon('plus')}Add inventory</button>
+        <button class="btn" type="button" data-act="edit-sku">${icon('pencil')}Edit SKU</button></div>` : ''}
+    </section>
+
+    <section class="dsec">
+      <h3 class="dsec-title">Batches <span class="dsec-meta soft">earliest expiry first (FEFO)</span></h3>
+      ${batches.length ? `<div class="table-wrap"><table class="table batch-table"><thead><tr><th>Batch</th><th class="r">Qty</th><th>Expiry</th><th>Status</th></tr></thead>
+        <tbody>${live.map(batchRow).join('')}</tbody></table></div>
+        ${old.length ? `<details class="old-batches"><summary class="soft">${count(old.length)} depleted batch${old.length > 1 ? 'es' : ''}</summary>
+          <div class="table-wrap"><table class="table batch-table"><tbody>${old.map(batchRow).join('')}</tbody></table></div></details>` : ''}`
+        : '<p class="soft" style="margin:0">No batches yet.</p>'}
+    </section>
+
+    ${reservations.length ? `<section class="dsec">
+      <h3 class="dsec-title">Reserved for shipments <span class="dsec-meta soft">${count(reservations.reduce((n, r) => n + r.quantity, 0))} units</span></h3>
+      <ul class="d-history">${reservations.map((r) => `<li><span><a class="linkish" href="/orders?open=${r.lead_order_id}">Order ${esc(r.lead_order_number)}</a>
+        ${r.tracking_id ? ` · AWB <span class="mono">${esc(r.tracking_id)}</span>` : ''} · batch <span class="mono">${esc(r.batch_number)}</span></span>
+        <span class="d-when">${count(r.quantity)} · ${esc(r.created_by || '')}</span></li>`).join('')}</ul>
+    </section>` : ''}
+
+    <details class="dsec more-sec" open>
+      <summary class="dsec-title">Product &amp; channels</summary>
+      <dl class="kv" style="margin-top:10px">
+        <dt>SKU</dt><dd class="mono">${esc(s.sku)}</dd>
+        <dt>Product</dt><dd>${esc(s.product_name)}</dd>
+        <dt>Variant</dt><dd>${esc(s.variant_name || '—')}</dd>
+        <dt>Category</dt><dd>${esc(s.category || '—')}</dd>
+        <dt>Unit</dt><dd>${esc(s.unit_type)}</dd>
+        <dt>Shopify SKU</dt><dd class="mono">${esc(s.sku)} <span class="soft">(same canonical SKU)</span></dd>
+        <dt>Amazon seller SKU</dt><dd class="mono">${s.amazon_seller_sku ? esc(s.amazon_seller_sku) : '<span class="soft">Not set — Amazon orders match the SKU itself</span>'}</dd>
+        <dt>ASIN</dt><dd class="mono">${esc(s.asin || '—')}</dd>
+        <dt>Amazon listing ID</dt><dd class="mono">${esc(s.amazon_listing_id || '—')}</dd>
+        <dt>Amazon product ID</dt><dd class="mono">${esc(s.amazon_product_id || '—')}</dd>
+        ${s.amazon_item_name ? `<dt>Amazon item name</dt><dd>${esc(s.amazon_item_name)}</dd>` : ''}
+        <dt>On orders</dt><dd>${count(orderLines.orders)} orders · ${count(orderLines.units)} units</dd>
+      </dl>
+    </details>
+
+    <section class="dsec">
+      <h3 class="dsec-title">Stock movements <span class="dsec-meta soft">${movements.length >= 200 ? 'latest 200' : count(movements.length)}</span></h3>
+      ${movements.length ? `<div class="table-wrap"><table class="table move-table"><thead><tr><th>Date</th><th>Movement</th><th class="r">Qty</th><th>Batch</th><th>Reference</th><th>User</th></tr></thead><tbody>
+      ${movements.map((m) => `<tr>
+        <td class="num">${esc(dateTime(m.at))}</td>
+        <td>${esc(m.label)}${m.reason && m.reason !== m.label ? `<span class="cell-sub muted">${esc(m.reason)}</span>` : ''}${m.notes ? `<span class="cell-sub muted">${esc(m.notes)}</span>` : ''}</td>
+        <td class="r num"><span class="qty-${MOVE_TONE(m.quantity)}">${m.quantity > 0 ? '+' : '−'}${count(Math.abs(m.quantity))}</span></td>
+        <td><span class="mono">${esc(m.batch_number)}</span><span class="cell-sub muted">${esc(m.warehouse_name)}</span></td>
+        <td>${refText(m)}</td>
+        <td>${esc(m.actor || 'System')}</td></tr>`).join('')}
+      </tbody></table></div>` : '<p class="soft" style="margin:0">No movements yet.</p>'}
+    </section>`;
+  renderIcons();
+}
+
+// ------------------------------------------------------------------ forms
+
+function openForm(kind, ctx = {}) {
+  state.form = { kind, ctx, requestId: requestId() };
+  const f = $('#invForm');
+  const m = state.meta;
+  const skus = (state.skus || []).map((x) => ({ sku_id: x.id, sku: x.sku, product_name: x.product_name, variant_name: x.variant_name, sku_active: x.active }));
+  const batch = ctx.batchId ? state.detail?.batches.find((b) => b.id === ctx.batchId) : null;
+  const wh = (sel) => m.warehouses.filter((w) => w.active).map((w) => opt(w.id, w.name, String(w.id) === String(sel))).join('');
+  const skuOptions = (sel) => opt('', 'Choose SKU', !sel) + skus.filter((r) => r.sku_active !== false)
+    .map((r) => opt(r.sku_id, `${r.sku} — ${r.product_name}${r.variant_name ? ` (${r.variant_name})` : ''}`, String(r.sku_id) === String(sel))).join('');
+  const s = kind === 'edit-sku' ? state.detail.sku : (ctx.prefill || {});
+  let title = ''; let sub = ''; let submit = 'Save'; let body = '';
+
+  if (kind === 'sku' || kind === 'edit-sku') {
+    title = kind === 'sku' ? 'New SKU' : `Edit ${s.sku}`;
+    sub = 'One SKU per physical sellable variant, used on every channel.';
+    submit = kind === 'sku' ? 'Create SKU' : 'Save SKU';
+    body = `<section class="dsec"><div class="form-grid">
+      <label class="fld"><span>SKU</span><input class="input mono" name="sku" value="${esc(s.sku || '')}" ${kind === 'edit-sku' ? 'readonly' : 'required'} maxlength="64" placeholder="BRI-D3-60" autocomplete="off" />
+        <span class="help">${kind === 'edit-sku' ? 'A SKU code never changes.' : 'Letters, numbers, - _ . / — no spaces. The same code on Shopify and Amazon.'}</span></label>
+      <label class="fld"><span>Product name</span><input class="input" name="product_name" value="${esc(s.product_name || '')}" required maxlength="200" placeholder="Vitamin D3 2000 IU" /></label>
+      <label class="fld"><span>Variant</span><input class="input" name="variant_name" value="${esc(s.variant_name || '')}" maxlength="120" placeholder="60 Capsules" /></label>
+      <label class="fld"><span>Category</span><input class="input" name="category" value="${esc(s.category || '')}" maxlength="120" /></label>
+      <label class="fld"><span>Unit type</span><input class="input" name="unit_type" value="${esc(s.unit_type || 'bottle')}" maxlength="40" /></label>
+      <label class="fld"><span>Status</span><select class="select" name="active">${opt('true', 'Active', s.active !== false)}${opt('false', 'Inactive', s.active === false)}</select></label>
+      <label class="fld"><span>Reorder level</span><input class="input" name="reorder_level" inputmode="numeric" value="${esc(s.reorder_level ?? '')}" placeholder="0" /></label>
+      <label class="fld"><span>Reorder quantity</span><input class="input" name="reorder_quantity" inputmode="numeric" value="${esc(s.reorder_quantity ?? '')}" placeholder="0" /></label>
+    </div></section>
+    <section class="dsec"><h3 class="dsec-title">Amazon</h3><div class="form-grid">
+      <label class="fld"><span>Amazon seller SKU</span><input class="input mono" name="amazon_seller_sku" value="${esc(s.amazon_seller_sku || '')}" maxlength="80" />
+        <span class="help">Normally the same as the SKU. Set it only if Amazon still uses a different seller SKU for this product.</span></label>
+      <label class="fld"><span>ASIN</span><input class="input mono" name="asin" value="${esc(s.asin || '')}" maxlength="40" /></label>
+      <label class="fld"><span>Listing ID</span><input class="input mono" name="amazon_listing_id" value="${esc(s.amazon_listing_id || '')}" maxlength="80" /></label>
+      <label class="fld"><span>Product ID</span><input class="input mono" name="amazon_product_id" value="${esc(s.amazon_product_id || '')}" maxlength="80" /></label>
+      <label class="fld wide"><span>Amazon item name</span><input class="input" name="amazon_item_name" value="${esc(s.amazon_item_name || '')}" maxlength="500" /></label>
+    </div></section>`;
+  } else if (kind === 'map') {
+    title = 'Map Amazon SKU';
+    sub = `Amazon seller SKU ${ctx.code} → a Briyo SKU. Orders with this code then show the canonical SKU.`;
+    submit = 'Map';
+    body = `<section class="dsec"><dl class="kv"><dt>Amazon seller SKU</dt><dd class="mono">${esc(ctx.code)}</dd><dt>Item</dt><dd>${esc(ctx.title || '—')}</dd>${ctx.asin ? `<dt>ASIN</dt><dd class="mono">${esc(ctx.asin)}</dd>` : ''}</dl>
+      <div class="form-grid" style="margin-top:12px">
+        <label class="fld wide"><span>Briyo SKU</span><select class="select" name="sku_id" required>${skuOptions('')}</select>
+          <span class="help">No new SKU is created. If the product is not in the master yet, create it with New SKU first (use the Briyo code), then map.</span></label>
+      </div></section>`;
+  } else if (kind === 'receive') {
+    title = 'Add Inventory';
+    sub = 'Goods in: creates the batch if it is new and records +quantity in the ledger.';
+    submit = 'Add Inventory';
+    const sup = m.suppliers.map((x) => `<option value="${esc(x.name)}"></option>`).join('');
+    body = `<section class="dsec"><div class="form-grid">
+      <label class="fld wide"><span>SKU</span><select class="select" name="sku_id" required>${skuOptions(ctx.skuId || '')}</select></label>
+      <label class="fld"><span>Batch number</span><input class="input mono" name="batch_number" required maxlength="80" autocomplete="off" /></label>
+      <label class="fld"><span>Quantity</span><input class="input" name="quantity" inputmode="numeric" required /></label>
+      <label class="fld"><span>Manufacturing date</span><input class="input" type="date" name="mfg_date" /></label>
+      <label class="fld"><span>Expiry date</span><input class="input" type="date" name="expiry_date" /></label>
+      <label class="fld"><span>Unit cost (₹)</span><input class="input" name="unit_cost" inputmode="decimal" placeholder="180" /></label>
+      <label class="fld"><span>Received date</span><input class="input" type="date" name="received_date" /></label>
+      <label class="fld"><span>Supplier</span><input class="input" name="supplier_name" list="supList" maxlength="120" autocomplete="off" /><datalist id="supList">${sup}</datalist>
+        <span class="help">Pick one or type a new name; it is added to the supplier list.</span></label>
+      <label class="fld"><span>PO number</span><input class="input mono" name="po_number" maxlength="80" /></label>
+      <label class="fld"><span>GRN number</span><input class="input mono" name="grn_number" maxlength="80" /></label>
+      <label class="fld"><span>Warehouse</span><select class="select" name="warehouse_id">${wh('')}</select></label>
+      <label class="fld"><span>Location / rack</span><input class="input" name="location" maxlength="80" placeholder="Rack B2" /></label>
+      <label class="fld wide"><span>COA</span><input class="input" type="file" name="coa" accept=".pdf,.png,.jpg,.jpeg" ${m.storage.error ? 'disabled' : ''} />
+        <span class="help">${esc(m.storage.error || 'Certificate of Analysis for this batch (PDF, PNG or JPG). You can also add it later.')}</span></label>
+      <label class="fld wide"><span>Notes</span><textarea class="input" name="notes" maxlength="1000"></textarea></label>
+    </div></section>`;
+  } else if (kind === 'adjust' || kind === 'return') {
+    title = kind === 'return' ? 'Customer return' : 'Adjust stock';
+    sub = `Batch ${batch.batch_number} · ${count(batch.on_hand)} on hand${batch.reserved ? `, ${count(batch.reserved)} reserved` : ''}. Recorded as a movement; nothing is overwritten.`;
+    submit = kind === 'return' ? 'Add returned stock' : 'Record adjustment';
+    const types = kind === 'return' ? ['customer_return'] : m.manualMovements.filter((t) => t !== 'customer_return');
+    body = `<section class="dsec"><div class="form-grid">
+      <label class="fld"><span>Change</span><select class="select" name="movement_type">${types.map((t) => {
+        const mt = m.movementTypes.find((x) => x.key === t);
+        return opt(t, `${mt.sign > 0 ? '+' : '−'} ${mt.label}`, false);
+      }).join('')}</select></label>
+      <label class="fld"><span>Quantity</span><input class="input" name="quantity" inputmode="numeric" required /></label>
+      <label class="fld wide"><span>Reason</span><input class="input" name="reason" required maxlength="300" placeholder="${kind === 'return' ? 'Returned sealed, inspected and sellable' : '5 bottles damaged during handling'}" /></label>
+      ${kind === 'return' ? `<label class="fld"><span>Return / order reference</span><input class="input mono" name="reference_id" required maxlength="80" /></label>
+        <p class="imp-note wide">Only sellable returns come back into stock. A damaged return is not added here.</p>` : ''}
+      <label class="fld wide"><span>Notes</span><textarea class="input" name="notes" maxlength="1000"></textarea></label>
+    </div></section>`;
+  } else if (kind === 'transfer') {
+    title = 'Transfer stock';
+    sub = `Batch ${batch.batch_number} from ${batch.warehouse_name} · ${count(batch.available)} available.`;
+    submit = 'Transfer';
+    body = `<section class="dsec"><div class="form-grid">
+      <label class="fld"><span>To warehouse</span><select class="select" name="to_warehouse_id" required>${m.warehouses.filter((w) => w.active && w.id !== batch.warehouse_id).map((w) => opt(w.id, w.name)).join('')}</select></label>
+      <label class="fld"><span>Quantity</span><input class="input" name="quantity" inputmode="numeric" required /></label>
+      <label class="fld"><span>Location / rack there</span><input class="input" name="location" maxlength="80" /></label>
+      <label class="fld wide"><span>Notes</span><textarea class="input" name="notes" maxlength="1000"></textarea></label>
+    </div></section>`;
+  } else if (kind === 'batch') {
+    title = `Batch ${batch.batch_number}`;
+    sub = 'Status and details. Quantities change only through movements.';
+    submit = 'Save batch';
+    body = `<section class="dsec"><div class="form-grid">
+      <label class="fld"><span>Status</span><select class="select" name="status">${m.batchStatuses.map((x) => opt(x, STATUS[x][1], x === batch.status)).join('')}</select>
+        <span class="help">Quarantined, blocked and expired stock is never offered for dispatch.</span></label>
+      <label class="fld"><span>Reason for a status change</span><input class="input" name="reason" maxlength="300" /></label>
+      <label class="fld"><span>Location / rack</span><input class="input" name="location" value="${esc(batch.location || '')}" maxlength="80" /></label>
+      <label class="fld"><span>Unit cost (₹)</span><input class="input" name="unit_cost" inputmode="decimal" value="${esc(batch.unit_cost ?? '')}" /></label>
+      <label class="fld"><span>Manufacturing date</span><input class="input" type="date" name="mfg_date" value="${esc(batch.mfg_date || '')}" /></label>
+      <label class="fld"><span>Expiry date</span><input class="input" type="date" name="expiry_date" value="${esc(batch.expiry_date || '')}" /></label>
+      <label class="fld"><span>PO number</span><input class="input mono" name="po_number" value="${esc(batch.po_number || '')}" /></label>
+      <label class="fld"><span>GRN number</span><input class="input mono" name="grn_number" value="${esc(batch.grn_number || '')}" /></label>
+      <label class="fld wide"><span>Notes</span><textarea class="input" name="notes" maxlength="1000">${esc(batch.notes || '')}</textarea></label>
+    </div></section>`;
+  } else if (kind === 'places') {
+    title = 'Warehouses & suppliers';
+    sub = 'Lists used when receiving stock. Nothing is deleted; switch off what is no longer used.';
+    submit = 'Done';
+    body = `<section class="dsec"><h3 class="dsec-title">Warehouses</h3>
+      <ul class="d-history">${m.warehouses.map((w) => `<li><span>${esc(w.name)}${w.active ? '' : ' <span class="mini-tag">Off</span>'}</span>
+        <button type="button" class="linkish" data-toggle-wh="${w.id}" data-active="${w.active}">${w.active ? 'Switch off' : 'Switch on'}</button></li>`).join('')}</ul>
+      <div class="attach-new"><input class="input plain" id="newWh" placeholder="New warehouse, e.g. 3PL Warehouse" maxlength="120" /><button type="button" class="btn" id="addWh">Add</button></div>
+    </section>
+    <section class="dsec"><h3 class="dsec-title">Suppliers</h3>
+      <ul class="d-history">${m.suppliers.length ? m.suppliers.map((x) => `<li><span>${esc(x.name)}${x.reference ? ` <span class="soft">· ${esc(x.reference)}</span>` : ''}</span></li>`).join('') : '<li class="soft">None yet. They are also added from Add Inventory.</li>'}</ul>
+      <div class="attach-new"><input class="input plain" id="newSup" placeholder="Supplier name" maxlength="120" /><input class="input plain" id="newSupRef" placeholder="Reference (optional)" maxlength="120" /><button type="button" class="btn" id="addSup">Add</button></div>
+    </section>`;
+  }
+  $('#fTitle').textContent = title;
+  $('#fSub').textContent = sub;
+  $('#fSubmit').textContent = submit;
+  f.innerHTML = `<div class="form-error" id="fError" role="alert" hidden></div>${body}`;
+  $('#fSaved').textContent = '';
+  $('#formDrawer').hidden = false;
+  $('#drawerScrim').hidden = false;
+  renderIcons();
+  f.querySelector('input:not([readonly]):not([type=file]), select')?.focus();
+}
+function closeForm() {
+  $('#formDrawer').hidden = true;
+  if ($('#drawer').hidden) $('#drawerScrim').hidden = true;
+  state.form = null;
+}
+const formError = (msg) => { const e = $('#fError'); e.textContent = msg; e.hidden = !msg; };
+
+async function uploadDoc(batchId, file, type = 'coa') {
+  const res = await fetch(`/api/inventory/batches/${batchId}/documents?type=${encodeURIComponent(type)}`, {
+    method: 'POST', body: file, headers: { 'x-filename': encodeURIComponent(file.name) },
+  });
+  const data = await res.json().catch(() => ({ ok: false, error: `HTTP ${res.status}` }));
+  if (!res.ok || data.ok === false) throw new Error(data.error || `HTTP ${res.status}`);
+}
+
+async function refreshMeta() { state.meta = await api('/api/inventory/meta'); }
+
+async function submitForm(e) {
+  e.preventDefault();
+  const { kind, ctx } = state.form;
+  const f = $('#invForm');
+  const v = Object.fromEntries(new FormData(f).entries());
+  delete v.coa;
+  formError('');
+  $('#fSubmit').disabled = true;
+  $('#fSaved').textContent = 'Saving…';
+  try {
+    let openAfter = null;
+    if (kind === 'sku') {
+      const r = await api('/api/inventory/skus', { method: 'POST', body: JSON.stringify(v) });
+      openAfter = r.id;
+    } else if (kind === 'edit-sku') {
+      const { sku, ...rest } = v;
+      await api(`/api/inventory/skus/${state.detail.sku.id}`, { method: 'PATCH', body: JSON.stringify({ ...rest, version: state.detail.sku.version }) });
+      openAfter = state.detail.sku.id;
+    } else if (kind === 'map') {
+      if (!v.sku_id) throw new Error('Choose the Briyo SKU.');
+      const cur = await api(`/api/inventory/skus/${v.sku_id}`);
+      if (cur.sku.amazon_seller_sku && cur.sku.amazon_seller_sku.toLowerCase() !== ctx.code.toLowerCase()
+          && !window.confirm(`${cur.sku.sku} already has Amazon seller SKU ${cur.sku.amazon_seller_sku}. Replace it with ${ctx.code}?`)) throw new Error('Not changed.');
+      await api(`/api/inventory/skus/${v.sku_id}`, { method: 'PATCH', body: JSON.stringify({
+        amazon_seller_sku: ctx.code, ...(cur.sku.asin || !ctx.asin ? {} : { asin: ctx.asin }),
+        ...(cur.sku.amazon_item_name || !ctx.title ? {} : { amazon_item_name: ctx.title }), version: cur.sku.version,
+      }) });
+    } else if (kind === 'receive') {
+      const r = await api('/api/inventory/receive', { method: 'POST', body: JSON.stringify({ ...v, request_id: state.form.requestId }) });
+      const file = f.coa?.files?.[0];
+      if (file) {
+        try { await uploadDoc(r.batchId, file, 'coa'); } catch (err) {
+          openAfter = Number(v.sku_id);
+          $('#alerts').innerHTML = `<div class="alert">${icon('circle-alert')}<span>Stock was added, but the COA did not upload: ${esc(err.message)} Upload it from the batch.</span></div>`;
+        }
+      }
+      openAfter = Number(v.sku_id);
+    } else if (kind === 'adjust' || kind === 'return') {
+      await api('/api/inventory/adjust', { method: 'POST', body: JSON.stringify({ ...v, batch_id: ctx.batchId, request_id: state.form.requestId }) });
+      openAfter = state.detail.sku.id;
+    } else if (kind === 'transfer') {
+      await api('/api/inventory/transfer', { method: 'POST', body: JSON.stringify({ ...v, batch_id: ctx.batchId, request_id: state.form.requestId }) });
+      openAfter = state.detail.sku.id;
+    } else if (kind === 'batch') {
+      const batch = state.detail.batches.find((b) => b.id === ctx.batchId);
+      if (v.status === batch.status) delete v.status;
+      await api(`/api/inventory/batches/${ctx.batchId}`, { method: 'PATCH', body: JSON.stringify({ ...v, version: batch.version }) });
+      openAfter = state.detail.sku.id;
+    }
+    closeForm();
+    await refreshMeta();
+    await load();
+    if (openAfter) await openSku(openAfter);
+  } catch (err) {
+    formError(err.message);
+  } finally {
+    $('#fSubmit').disabled = false;
+    $('#fSaved').textContent = '';
+  }
+}
+
+// ------------------------------------------------------------------ bindings
+
+function fillFilters() {
+  $('#fwarehouse').innerHTML = opt('', 'All warehouses') + state.meta.warehouses.map((w) => opt(w.id, w.name)).join('');
+  for (const k of ['warehouse', 'status', 'expiring', 'stock']) {
+    const el = $(`#f${k}`);
+    el.value = state.f[k];
+    el.classList.toggle('on', Boolean(state.f[k]));
+  }
+  $('#flocation').value = state.f.location;
+  $('#q').value = state.f.q;
+}
+
+function bind() {
+  for (const k of ['warehouse', 'status', 'expiring', 'stock']) {
+    $(`#f${k}`).addEventListener('change', (e) => { state.f[k] = e.target.value; e.target.classList.toggle('on', Boolean(e.target.value)); writeUrl(); load(); });
+  }
+  let t;
+  for (const [id, k] of [['#q', 'q'], ['#flocation', 'location']]) {
+    $(id).addEventListener('input', (e) => { clearTimeout(t); t = setTimeout(() => { state.f[k] = e.target.value.trim(); writeUrl(); load(); }, 250); });
+  }
+  onLeave(() => clearTimeout(t));
+  $('#fclear').addEventListener('click', () => { for (const k of FILTERS) state.f[k] = ''; fillFilters(); writeUrl(); load(); });
+  $('#cards').addEventListener('click', (e) => {
+    const c = e.target.closest('[data-filter]');
+    if (!c) return;
+    const f = JSON.parse(c.dataset.filter);
+    for (const k of FILTERS) state.f[k] = f[k] || '';
+    fillFilters(); writeUrl(); load();
+  });
+  const rowOpen = (e) => { const r = e.target.closest('[data-sku]'); if (r) openSku(Number(r.dataset.sku)); };
+  for (const host of [$('#rows'), $('#clist')]) {
+    host.addEventListener('click', rowOpen);
+    host.addEventListener('keydown', (e) => { if (e.key === 'Enter') rowOpen(e); });
+  }
+  $('#unmapped').addEventListener('click', (e) => {
+    const b = e.target.closest('[data-map]');
+    if (b) openForm('map', { code: b.dataset.map, title: b.dataset.title, asin: b.dataset.asin });
+  });
+  $('#refresh').addEventListener('click', () => { load(); if (state.openSku) openSku(state.openSku); });
+  $('#addInventory').addEventListener('click', () => openForm('receive'));
+  $('#newSku').addEventListener('click', () => openForm('sku'));
+  $('#places').addEventListener('click', () => openForm('places'));
+  $('#dClose').addEventListener('click', closeSku);
+  $('#fClose').addEventListener('click', closeForm);
+  $('#fCancel').addEventListener('click', closeForm);
+  $('#invForm').addEventListener('submit', (e) => {
+    if (state.form?.kind === 'places') { e.preventDefault(); return closeForm(); }
+    return submitForm(e);
+  });
+  $('#invForm').addEventListener('click', async (e) => {
+    try {
+      if (e.target.closest('#addWh')) {
+        await api('/api/inventory/warehouses', { method: 'POST', body: JSON.stringify({ name: $('#newWh').value }) });
+      } else if (e.target.closest('#addSup')) {
+        await api('/api/inventory/suppliers', { method: 'POST', body: JSON.stringify({ name: $('#newSup').value, reference: $('#newSupRef').value }) });
+      } else if (e.target.closest('[data-toggle-wh]')) {
+        const b = e.target.closest('[data-toggle-wh]');
+        const w = state.meta.warehouses.find((x) => x.id === Number(b.dataset.toggleWh));
+        await api(`/api/inventory/warehouses/${w.id}`, { method: 'PATCH', body: JSON.stringify({ name: w.name, active: !w.active }) });
+      } else return;
+      await refreshMeta();
+      fillFilters();
+      openForm('places');
+    } catch (err) { formError(err.message); }
+  });
+  $('#dBody').addEventListener('click', async (e) => {
+    const a = e.target.closest('[data-act]');
+    if (a) {
+      const batchId = a.dataset.batch ? Number(a.dataset.batch) : null;
+      return openForm(a.dataset.act === 'receive' ? 'receive' : a.dataset.act, { batchId, skuId: state.detail.sku.id });
+    }
+    const rm = e.target.closest('[data-doc-remove]');
+    if (rm && window.confirm('Remove this document from the batch? It stays in the audit record.')) {
+      try {
+        await api(`/api/inventory/batches/${rm.dataset.batch}/documents/${rm.dataset.docRemove}`, { method: 'DELETE' });
+        await openSku(state.detail.sku.id);
+      } catch (err) { $('#dSaved').textContent = err.message; }
+    }
+    return null;
+  });
+  $('#dBody').addEventListener('change', async (e) => {
+    const input = e.target.closest('[data-upload]');
+    if (!input?.files?.[0]) return;
+    const type = $(`[data-upload-type="${input.dataset.upload}"]`)?.value || 'coa';
+    $('#dSaved').className = 'saved pending';
+    $('#dSaved').textContent = 'Uploading…';
+    try {
+      await uploadDoc(input.dataset.upload, input.files[0], type);
+      $('#dSaved').className = 'saved';
+      $('#dSaved').textContent = 'Uploaded';
+      await openSku(state.detail.sku.id);
+    } catch (err) { $('#dSaved').className = 'saved failed'; $('#dSaved').textContent = err.message; }
+  });
+  const closeTop = () => { if (!$('#formDrawer').hidden) closeForm(); else if (!$('#drawer').hidden) closeSku(); };
+  $('#drawerScrim').addEventListener('click', closeTop);
+  document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeTop(); }, { signal: pageSignal() });
+  onQueryChange(async () => {
+    readUrl();
+    fillFilters();
+    await load();
+    if (state.openSku) openSku(state.openSku); else if (!$('#drawer').hidden) closeSku();
+    if (state.view === 'unmapped') $('#unmappedCard')?.scrollIntoView({ block: 'start' });
+  });
+}
+
+(async function init() {
+  try {
+    const [me, meta] = await Promise.all([api('/auth/me'), api('/api/inventory/meta')]);
+    state.me = me;
+    state.meta = meta;
+    try { const om = await api('/api/orders/meta'); setTimezone(om.timezone); } catch { /* timezone stays default */ }
+    initShell(me);
+    readUrl();
+    fillFilters();
+    bind();
+    await load();
+    if (state.view === 'unmapped') $('#unmappedCard')?.scrollIntoView({ block: 'start' });
+    if (state.openSku) openSku(state.openSku);
+  } catch (err) {
+    $('#pageSub').textContent = '';
+    $('#alerts').innerHTML = `<div class="alert">${icon('circle-alert')}<span>${esc(err.message)}</span></div>`;
+    renderIcons();
+  }
+}());

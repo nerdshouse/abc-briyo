@@ -25,6 +25,11 @@ import {
 import { saveUploadedDocument } from '../lib/orders-routes.js';
 import { planAmazon, readTable, previewAmazonImport, commitAmazonImport } from '../lib/amazon-import.js';
 import { orderItems } from '../lib/orders.js';
+import {
+  ensureInventorySchema, createSku, updateSku, getSku, skuDetail, receiveInventory, adjustStock, transferStock, updateBatch,
+  uploadBatchDocument, getBatchDocument, shipmentStock, reserveShipmentStock, releaseShipmentStock, dispatchShipmentStock,
+  inventoryOverview, resolveSkuIds, purgeTestInventory, saveWarehouse, unmappedSkus, fefoSuggest,
+} from '../lib/inventory.js';
 import { DOCUMENT_FORMATS } from '../lib/orders.js';
 import {
   validateDocument, storage, signV4, _resetStorage, StorageNotConfigured,
@@ -2061,6 +2066,353 @@ await step('amazon import history is recorded', async () => {
   if (!rows.every((x) => x.imported_at instanceof Date)) throw new Error('no time');
   return `${rows.length} imports recorded with time, person, file, rows, created/updated, items, duplicates, errors`;
 });
+
+// ---- inventory ---------------------------------------------------------------
+// Test SKUs, suppliers and warehouses start with this prefix; purgeTestInventory removes them.
+const TS = 'DBCHECK-INV';
+const INV = {};
+const dayOffset = (n) => new Date(Date.now() + n * 86400000).toISOString().slice(0, 10);
+const COA_PDF = Buffer.from('%PDF-1.4\n1 0 obj<<>>endobj\ntrailer<<>>\n%%EOF\n');
+const rid = () => crypto.randomUUID();
+const stockOf = async (id) => { const s = await getSku(id); return { on: s.on_hand, res: s.reserved, av: s.available }; };
+const expectErr = async (label, fn, check) => {
+  try { await fn(); } catch (err) { if (check(err)) return err; throw new Error(`${label}: wrong error ${err.message}`); }
+  throw new Error(`${label}: accepted`);
+};
+const ledgerSum = async (skuId) => (await getPool().query('SELECT coalesce(sum(quantity),0)::int n FROM inventory_movements WHERE sku_id = $1', [skuId])).rows[0].n;
+
+await step('inventory: schema, leftovers cleared', async () => {
+  await ensureInventorySchema();
+  await purgeTestInventory(TS);
+  return 'skus, batches, ledger, reservations, documents, suppliers, warehouses, audit';
+});
+await step('inventory: create SKU; duplicate (any letter case) rejected', async () => {
+  const before = (await getPool().query('SELECT count(*)::int n FROM skus')).rows[0].n;
+  INV.a = (await createSku({ sku: `${TS}-D3-60`, product_name: 'Vitamin D3 2000 IU', variant_name: '60 Capsules', category: 'Vitamins',
+    unit_type: 'bottle', reorder_level: 10, reorder_quantity: 200, amazon_seller_sku: `${TS}-D3-60`, asin: 'B0TESTD360' }, { actor: ACTOR })).id;
+  INV.b = (await createSku({ sku: `${TS}-B12-30`, product_name: 'Vitamin B12', reorder_level: 5 }, { actor: ACTOR })).id;
+  INV.c = (await createSku({ sku: `${TS}-EASEN`, product_name: 'Easen' }, { actor: ACTOR })).id;
+  await expectErr('duplicate', () => createSku({ sku: `${TS}-d3-60`, product_name: 'x' }, { actor: ACTOR }), (e) => e.status === 409);
+  await expectErr('spaces', () => createSku({ sku: `${TS} BAD`, product_name: 'x' }, { actor: ACTOR }), (e) => e.status === 400);
+  await expectErr('code change', () => updateSku(INV.b, { sku: 'OTHER' }, { actor: ACTOR }), (e) => e.status === 400);
+  // An Amazon seller SKU cannot point at a second SKU, nor be another SKU's code.
+  await expectErr('amazon clash', () => updateSku(INV.b, { amazon_seller_sku: `${TS}-D3-60` }, { actor: ACTOR }), (e) => e.status === 409);
+  const after = (await getPool().query('SELECT count(*)::int n FROM skus')).rows[0].n;
+  if (after !== before + 3) throw new Error('count');
+  return '3 SKUs; duplicate, spaces, code change and Amazon-code clash refused';
+});
+await step('inventory: add a batch of 100 → ledger +100, stock 100; COA uploaded to the batch', async () => {
+  const r = await receiveInventory({ sku_id: INV.a, batch_number: 'D3260812', mfg_date: '2026-08-01', expiry_date: '2028-08',
+    quantity: 100, unit_cost: '180', supplier_name: `${TS} Supplier`, po_number: 'PO-1', grn_number: 'GRN-00231',
+    location: 'Rack B2', request_id: rid() }, { actor: ACTOR });
+  INV.a1 = r.batchId;
+  if (!r.created) throw new Error('not created');
+  const d = await skuDetail(INV.a);
+  const b = d.batches[0];
+  if (b.expiry_date !== '2028-08-31' || b.on_hand !== 100 || b.supplier_name !== `${TS} Supplier` || b.location !== 'Rack B2') throw new Error(JSON.stringify(b));
+  const m = d.movements[0];
+  if (d.movements.length !== 1 || m.quantity !== 100 || m.movement_type !== 'received' || m.reference_id !== 'GRN-00231' || m.actor !== ACTOR) throw new Error(JSON.stringify(m));
+  if ((await stockOf(INV.a)).on !== 100 || await ledgerSum(INV.a) !== 100) throw new Error('stock');
+  const docId = await uploadBatchDocument({ batchId: INV.a1, filename: 'COA-D3260812.pdf', buffer: COA_PDF, documentType: 'coa', actor: ACTOR });
+  const doc = await getBatchDocument(INV.a1, docId);
+  if (!doc || doc.document_type !== 'coa' || !(await storage().get(doc.storage_path)).equals(COA_PDF)) throw new Error('coa');
+  if (await getBatchDocument(INV.a1 + 999999, docId)) throw new Error('document readable through another batch');
+  await expectErr('fake pdf', () => uploadBatchDocument({ batchId: INV.a1, filename: 'coa.pdf', buffer: Buffer.from('not a pdf'), documentType: 'coa', actor: ACTOR }), (e) => e.status === 400);
+  return 'batch D3260812 (exp 2028-08-31, ₹180, supplier, GRN, Rack B2); +100 received by db-check; COA stored and read back';
+});
+await step('inventory: a repeated receive (same request id) adds stock once', async () => {
+  const id = rid();
+  const input = { sku_id: INV.b, batch_number: 'B12-01', expiry_date: dayOffset(400), quantity: 2, unit_cost: 90, request_id: id };
+  const one = await receiveInventory(input, { actor: ACTOR });
+  const two = await receiveInventory(input, { actor: ACTOR });
+  INV.b1 = one.batchId;
+  if (!two.repeated || two.movementId !== one.movementId || (await stockOf(INV.b)).on !== 2) throw new Error(JSON.stringify(two));
+  return 'second call returned the first movement; stock 2, not 4';
+});
+await step('inventory: stock can never be overwritten or the ledger rewritten', async () => {
+  await expectErr('direct on_hand', () => getPool().query('UPDATE inventory_batches SET on_hand = 999 WHERE id = $1', [INV.a1]), (e) => /only through inventory_movements/.test(e.message));
+  await expectErr('ledger edit', () => getPool().query('UPDATE inventory_movements SET quantity = 1 WHERE sku_id = $1', [INV.a]), (e) => /append-only/.test(e.message));
+  await expectErr('ledger delete', () => getPool().query('DELETE FROM inventory_movements WHERE sku_id = $1', [INV.a]), (e) => /append-only/.test(e.message));
+  await expectErr('batch qty edit', () => updateBatch(INV.a1, { on_hand: 5 }, { actor: ACTOR }), (e) => e.status === 400);
+  await expectErr('negative', () => adjustStock({ batch_id: INV.a1, movement_type: 'adjustment_decrease', quantity: 101, reason: 'test' }, { actor: ACTOR }), (e) => e.insufficientStock);
+  await expectErr('no reason', () => adjustStock({ batch_id: INV.a1, movement_type: 'damaged', quantity: 1 }, { actor: ACTOR }), (e) => e.status === 400);
+  if ((await stockOf(INV.a)).on !== 100) throw new Error('changed');
+  return 'direct UPDATE, ledger UPDATE/DELETE, quantity edit, going below zero, reasonless change: all refused';
+});
+
+// Orders for the stock tests come in through the Amazon importer, like real ones.
+const invOrders = async (rows) => commitAmazonImport(amzCsv(rows), 'inventory.csv', { actor: IMPORTER });
+await step('inventory: Amazon seller SKU resolves to the canonical SKU; unknown ones stay Unmapped and create nothing', async () => {
+  const skusBefore = (await getPool().query('SELECT count(*)::int n FROM skus')).rows[0].n;
+  const file = amzCsv([
+    amzRow({ 'order-id': AZ(40), 'order-item-id': 'I40', sku: `${TS}-D3-60`, 'quantity-purchased': '20' }),
+    amzRow({ 'order-id': AZ(41), 'order-item-id': 'I41', sku: `${TS}-AMZ-ONLY-CODE`, 'quantity-purchased': '1' }),
+  ]);
+  const p = await previewAmazonImport(file, 'map.csv');
+  if (p.summary.unmappedSkus !== 1 || p.unmapped[0].code !== `${TS}-AMZ-ONLY-CODE`) throw new Error(JSON.stringify(p.unmapped));
+  const r = await invOrders([
+    amzRow({ 'order-id': AZ(40), 'order-item-id': 'I40', sku: `${TS}-D3-60`, 'quantity-purchased': '20' }),
+    amzRow({ 'order-id': AZ(41), 'order-item-id': 'I41', sku: `${TS}-AMZ-ONLY-CODE`, 'quantity-purchased': '1' }),
+  ]);
+  if (r.summary.unmappedSkus !== 1) throw new Error(JSON.stringify(r.summary));
+  const i40 = (await orderItems((await amzOrder(40)).id))[0];
+  const i41 = (await orderItems((await amzOrder(41)).id))[0];
+  if (i40.sku_id !== INV.a || i40.canonical_sku !== `${TS}-D3-60`) throw new Error(JSON.stringify(i40));
+  if (i41.sku_id !== null || i41.sku !== `${TS}-AMZ-ONLY-CODE`) throw new Error(JSON.stringify(i41));
+  if ((await getPool().query('SELECT count(*)::int n FROM skus')).rows[0].n !== skusBefore) throw new Error('a SKU was created');
+  if (!(await unmappedSkus()).some((u) => u.code === `${TS}-AMZ-ONLY-CODE`)) throw new Error('not listed as unmapped');
+  // Imported orders never touch stock.
+  if ((await stockOf(INV.a)).on !== 100 || (await stockOf(INV.a)).res !== 0) throw new Error('import changed stock');
+  // An admin maps the code to an existing SKU: the waiting line picks it up.
+  const m = await updateSku(INV.c, { amazon_seller_sku: `${TS}-AMZ-ONLY-CODE` }, { actor: ACTOR });
+  if (m.orderItemsMapped !== 1 || (await orderItems((await amzOrder(41)).id))[0].sku_id !== INV.c) throw new Error('not remapped');
+  return 'same code → canonical SKU; unknown code imported as Unmapped, no SKU made, no stock touched; mapping later fixes the line';
+});
+await step('inventory: Shopify and Amazon reference the same canonical SKU', async () => {
+  const c = await getPool().connect();
+  try {
+    const web = await resolveSkuIds(c, 'website', [`${TS}-D3-60`]);
+    const amzn = await resolveSkuIds(c, 'amazon', [`${TS}-d3-60`]);
+    const webAmazonCode = await resolveSkuIds(c, 'website', [`${TS}-AMZ-ONLY-CODE`]);
+    if (web.get(`${TS}-d3-60`.toLowerCase()) !== INV.a || amzn.get(`${TS}-d3-60`.toLowerCase()) !== INV.a) throw new Error('not the same SKU');
+    if (webAmazonCode.size) throw new Error('an Amazon-only code resolved for the website');
+  } finally { c.release(); }
+  return 'BRI code → one SKU id from either channel; an Amazon seller code only resolves for Amazon';
+});
+await step('inventory: shipment creation reserves nothing; reserve 20 → 100 / 20 / 80; release → 100', async () => {
+  const o = await amzOrder(40);
+  const dl = (await listCouriers()).find((x) => x.name === 'Delhivery');
+  INV.s1 = (await createShipmentForOrders([o.id], { courier_partner_id: dl.id, tracking_id: 'AWB-INV-1' }, { actor: ACTOR })).shipmentId;
+  INV.s1lead = o.id;
+  if (JSON.stringify(await stockOf(INV.a)) !== JSON.stringify({ on: 100, res: 0, av: 100 })) throw new Error('shipment changed stock');
+  const st = await shipmentStock(INV.s1);
+  if (st.state !== 'needs_reservation' || st.lines[0].required !== 20 || st.lines[0].suggestion.picks[0].batch_id !== INV.a1) throw new Error(JSON.stringify(st));
+  await reserveShipmentStock(INV.s1, [{ batch_id: INV.a1, quantity: 20 }], { actor: ACTOR });
+  if (JSON.stringify(await stockOf(INV.a)) !== JSON.stringify({ on: 100, res: 20, av: 80 })) throw new Error(JSON.stringify(await stockOf(INV.a)));
+  if ((await shipmentStock(INV.s1)).state !== 'reserved') throw new Error('state');
+  await releaseShipmentStock(INV.s1, { actor: ACTOR });
+  if (JSON.stringify(await stockOf(INV.a)) !== JSON.stringify({ on: 100, res: 0, av: 100 })) throw new Error('release');
+  // Reserving the wrong total, or a batch of another SKU, is refused.
+  await expectErr('short', () => reserveShipmentStock(INV.s1, [{ batch_id: INV.a1, quantity: 19 }], { actor: ACTOR }), (e) => e.status === 400);
+  await expectErr('other sku', () => reserveShipmentStock(INV.s1, [{ batch_id: INV.b1, quantity: 20 }], { actor: ACTOR }), (e) => e.status === 400);
+  return 'shipment made → stock untouched; reserved 20 → on hand 100, reserved 20, available 80; released → 100 available';
+});
+await step('inventory: second batch aggregates; FEFO suggests earliest expiry, skipping expired and quarantined', async () => {
+  INV.a2 = (await receiveInventory({ sku_id: INV.a, batch_number: 'D3260511', expiry_date: dayOffset(200), quantity: 50, unit_cost: 175, request_id: rid() }, { actor: ACTOR })).batchId;
+  INV.aExp = (await receiveInventory({ sku_id: INV.a, batch_number: 'D3-OLD', expiry_date: dayOffset(-1), quantity: 30, unit_cost: 170, request_id: rid() }, { actor: ACTOR })).batchId;
+  INV.aQ = (await receiveInventory({ sku_id: INV.a, batch_number: 'D3-QUAR', expiry_date: dayOffset(10), quantity: 40, unit_cost: 170, request_id: rid() }, { actor: ACTOR })).batchId;
+  await updateBatch(INV.aQ, { status: 'quarantined', reason: 'Awaiting lab result' }, { actor: ACTOR });
+  await expectErr('status without reason', () => updateBatch(INV.aQ, { status: 'active' }, { actor: ACTOR }), (e) => e.status === 400);
+  const s = await stockOf(INV.a);
+  if (s.on !== 220 || s.av !== 150) throw new Error(JSON.stringify(s));
+  const st = await shipmentStock(INV.s1);
+  const pick = st.lines[0].suggestion.picks;
+  if (pick.length !== 1 || pick[0].batch_id !== INV.a2 || pick[0].quantity !== 20) throw new Error(JSON.stringify(pick));
+  await expectErr('expired', () => reserveShipmentStock(INV.s1, [{ batch_id: INV.aExp, quantity: 20 }], { actor: ACTOR }), (e) => e.unsellable);
+  await expectErr('quarantined', () => reserveShipmentStock(INV.s1, [{ batch_id: INV.aQ, quantity: 20 }], { actor: ACTOR }), (e) => e.unsellable);
+  // FEFO across batches when one is not enough.
+  const split = fefoSuggest([{ id: 1, effective_status: 'active', available: 5 }, { id: 2, effective_status: 'active', available: 50 }], 12);
+  if (split.picks.length !== 2 || split.picks[1].quantity !== 7 || split.short) throw new Error('split');
+  return 'on hand 220 = 100+50+30+40; available 150 (expired + quarantined excluded); FEFO picks D3260511 (exp +200d), not the quarantined +10d or expired one';
+});
+await step('inventory: dispatch deducts the confirmed batch once, in the same transaction', async () => {
+  // Dispatch with nothing reserved is refused and the status does not change.
+  let sh = (await orderShipments(INV.s1lead))[0];
+  await addPhoto(INV.s1lead);
+  await expectErr('unreserved', () => updateShipment(INV.s1lead, sh.id, { shipment_status: 'dispatched' }, { actor: ACTOR, version: sh.version }), (e) => e.needsStock);
+  if ((await orderShipments(INV.s1lead))[0].shipment_status !== 'packed') throw new Error('status changed');
+  await reserveShipmentStock(INV.s1, [{ batch_id: INV.a2, quantity: 20 }], { actor: ACTOR });
+  sh = (await orderShipments(INV.s1lead))[0];
+  await updateShipment(INV.s1lead, sh.id, { shipment_status: 'dispatched' }, { actor: ACTOR, version: sh.version });
+  const d = await skuDetail(INV.a);
+  const out = d.movements.filter((m) => m.shipment_id === INV.s1);
+  if (out.length !== 1 || out[0].quantity !== -20 || out[0].batch_id !== INV.a2 || out[0].order_id !== INV.s1lead || out[0].movement_type !== 'shipment_dispatched') throw new Error(JSON.stringify(out));
+  if (JSON.stringify(await stockOf(INV.a)) !== JSON.stringify({ on: 200, res: 0, av: 130 })) throw new Error(JSON.stringify(await stockOf(INV.a)));
+  // Again: same status, a later status, and a direct repeat of the deduction — nothing more is taken.
+  sh = (await orderShipments(INV.s1lead))[0];
+  await updateShipment(INV.s1lead, sh.id, { shipment_status: 'dispatched' }, { actor: ACTOR, version: sh.version });
+  sh = (await orderShipments(INV.s1lead))[0];
+  await updateShipment(INV.s1lead, sh.id, { shipment_status: 'in_transit' }, { actor: ACTOR, version: sh.version });
+  const c = await getPool().connect();
+  try { await c.query('BEGIN'); const again = await dispatchShipmentStock(c, INV.s1, { actor: ACTOR }); await c.query('COMMIT'); if (!again.repeated) throw new Error('not idempotent'); } finally { c.release(); }
+  // Two dispatch requests at the same moment (double click): one deduction.
+  if (await ledgerSum(INV.a) !== 200 || (await stockOf(INV.a)).on !== 200) throw new Error('deducted twice');
+  // Stock has left: the shipment cannot be moved back before dispatch.
+  sh = (await orderShipments(INV.s1lead))[0];
+  await expectErr('un-dispatch', () => updateShipment(INV.s1lead, sh.id, { shipment_status: 'packed' }, { actor: ACTOR, version: sh.version }), (e) => e.stockDispatched);
+  return 'unreserved dispatch refused (status kept); −20 from D3260511 linked to shipment + order; repeat/in-transit/direct retry deduct nothing; un-dispatch refused';
+});
+await step('inventory: concurrent dispatch of one shipment deducts once', async () => {
+  const o = (await invOrders([amzRow({ 'order-id': AZ(42), 'order-item-id': 'I42', sku: `${TS}-D3-60`, 'quantity-purchased': '4' })]), await amzOrder(42));
+  const dl = (await listCouriers()).find((x) => x.name === 'Delhivery');
+  const sid = (await createShipmentForOrders([o.id], { courier_partner_id: dl.id, tracking_id: 'AWB-INV-RACE' }, { actor: ACTOR })).shipmentId;
+  await reserveShipmentStock(sid, [{ batch_id: INV.a2, quantity: 4 }], { actor: ACTOR });
+  await addPhoto(o.id);
+  const sh = (await orderShipments(o.id))[0];
+  const before = await ledgerSum(INV.a);
+  // A double click / retry sends the same request (same version) several times at once.
+  const race = await Promise.allSettled([1, 2, 3].map(() => updateShipment(o.id, sh.id, { shipment_status: 'dispatched' }, { actor: ACTOR, version: sh.version })));
+  if (race.filter((x) => x.status === 'fulfilled').length !== 1) throw new Error(JSON.stringify(race));
+  if (await ledgerSum(INV.a) !== before - 4) throw new Error(`deducted ${before - await ledgerSum(INV.a)}`);
+  return `3 simultaneous dispatches → ${race.filter((x) => x.status === 'fulfilled').length} succeeded, 4 units deducted once`;
+});
+await step('inventory: insufficient stock blocks reservation and dispatch', async () => {
+  await invOrders([amzRow({ 'order-id': AZ(43), 'order-item-id': 'I43', sku: `${TS}-B12-30`, 'quantity-purchased': '3' })]);
+  const o = await amzOrder(43);
+  const dl = (await listCouriers()).find((x) => x.name === 'Delhivery');
+  const sid = (await createShipmentForOrders([o.id], { courier_partner_id: dl.id, tracking_id: 'AWB-INV-SHORT' }, { actor: ACTOR })).shipmentId;
+  const st = await shipmentStock(sid);
+  if (st.state !== 'insufficient' || st.lines[0].available !== 2 || st.lines[0].suggestion.short !== 1) throw new Error(JSON.stringify(st.lines));
+  await expectErr('reserve', () => reserveShipmentStock(sid, [{ batch_id: INV.b1, quantity: 3 }], { actor: ACTOR }), (e) => e.insufficientStock);
+  await addPhoto(o.id);
+  const sh = (await orderShipments(o.id))[0];
+  await expectErr('dispatch', () => updateShipment(o.id, sh.id, { shipment_status: 'dispatched' }, { actor: ACTOR, version: sh.version }), (e) => e.needsStock);
+  if ((await stockOf(INV.b)).on !== 2 || (await orderShipments(o.id))[0].shipment_status !== 'packed') throw new Error('changed');
+  INV.shortShip = { sid, order: o.id };
+  return 'needs 3, has 2: shown as insufficient (short 1); reserve and dispatch refused; nothing changed';
+});
+await step('inventory: unmapped SKU blocks dispatch until mapped', async () => {
+  await invOrders([amzRow({ 'order-id': AZ(44), 'order-item-id': 'I44', sku: `${TS}-NOT-A-SKU`, 'quantity-purchased': '1' })]);
+  const o = await amzOrder(44);
+  const dl = (await listCouriers()).find((x) => x.name === 'Delhivery');
+  const sid = (await createShipmentForOrders([o.id], { courier_partner_id: dl.id, tracking_id: 'AWB-INV-UNMAPPED' }, { actor: ACTOR })).shipmentId;
+  if ((await shipmentStock(sid)).state !== 'unmapped') throw new Error('state');
+  await addPhoto(o.id);
+  const sh = (await orderShipments(o.id))[0];
+  await expectErr('dispatch', () => updateShipment(o.id, sh.id, { shipment_status: 'dispatched' }, { actor: ACTOR, version: sh.version }), (e) => e.unmappedSkus);
+  return 'shipment with an unmapped line cannot be dispatched (no guessing, no deduction)';
+});
+await step('inventory: several orders in one shipment add up per SKU, one movement per order and batch', async () => {
+  await invOrders([
+    amzRow({ 'order-id': AZ(45), 'order-item-id': 'I45', sku: `${TS}-D3-60`, 'quantity-purchased': '2' }),
+    amzRow({ 'order-id': AZ(46), 'order-item-id': 'I46a', sku: `${TS}-D3-60`, 'quantity-purchased': '3' }),
+    amzRow({ 'order-id': AZ(46), 'order-item-id': 'I46b', sku: `${TS}-EASEN`, 'quantity-purchased': '1' }),
+  ]);
+  INV.c1 = (await receiveInventory({ sku_id: INV.c, batch_number: 'EAS-1', expiry_date: dayOffset(300), quantity: 92, unit_cost: 50, request_id: rid() }, { actor: ACTOR })).batchId;
+  const [y, z] = [await amzOrder(45), await amzOrder(46)];
+  const stc = (await listCouriers()).find((x) => x.name === 'Shree Tirupati Courier');
+  const sid = (await createShipmentForOrders([y.id, z.id], { courier_partner_id: stc.id, tracking_id: 'AWB-INV-MULTI' }, { actor: ACTOR })).shipmentId;
+  const st = await shipmentStock(sid);
+  const need = Object.fromEntries(st.lines.map((l) => [l.sku, l.required]));
+  if (need[`${TS}-D3-60`] !== 5 || need[`${TS}-EASEN`] !== 1 || st.lines.length !== 2) throw new Error(JSON.stringify(need));
+  // Reserve exactly the FEFO suggestion, as the UI does.
+  await reserveShipmentStock(sid, st.lines.flatMap((l) => l.suggestion.picks), { actor: ACTOR });
+  await addPhoto(y.id);
+  const sh = (await orderShipments(y.id))[0];
+  await updateShipment(y.id, sh.id, { shipment_status: 'dispatched' }, { actor: ACTOR, version: sh.version });
+  const { rows } = await getPool().query('SELECT order_id, sku_id, quantity FROM inventory_movements WHERE shipment_id = $1 ORDER BY order_id, sku_id', [sid]);
+  const got = rows.map((r) => `${Number(r.order_id) === y.id ? 'Y' : 'Z'}:${r.sku_id === INV.a ? 'D3' : 'EASEN'}:${r.quantity}`).join(' ');
+  if (got !== 'Y:D3:-2 Z:D3:-3 Z:EASEN:-1') throw new Error(got);
+  return 'Y (D3×2) + Z (D3×3, Easen×1) → D3 5, Easen 1; deducted as Y −2, Z −3, Z −1';
+});
+await step('inventory: cancelling a shipment before dispatch releases its reservation', async () => {
+  await invOrders([amzRow({ 'order-id': AZ(47), 'order-item-id': 'I47', sku: `${TS}-D3-60`, 'quantity-purchased': '6' })]);
+  const o = await amzOrder(47);
+  const dl = (await listCouriers()).find((x) => x.name === 'Delhivery');
+  const sid = (await createShipmentForOrders([o.id], { courier_partner_id: dl.id, tracking_id: 'AWB-INV-CANCEL' }, { actor: ACTOR })).shipmentId;
+  await reserveShipmentStock(sid, [{ batch_id: INV.a2, quantity: 6 }], { actor: ACTOR });
+  const before = await stockOf(INV.a);
+  const sh = (await orderShipments(o.id))[0];
+  await updateShipment(o.id, sh.id, { shipment_status: 'cancelled' }, { actor: ACTOR, version: sh.version });
+  const after = await stockOf(INV.a);
+  if (after.res !== before.res - 6 || after.on !== before.on) throw new Error(`${JSON.stringify(before)} ${JSON.stringify(after)}`);
+  return 'reserved 6 → cancelled → released; on hand unchanged';
+});
+await step('inventory: two shipments cannot reserve the same last units', async () => {
+  // B12 has 2 units. Two shipments each try to take 2 at the same moment.
+  await invOrders([
+    amzRow({ 'order-id': AZ(48), 'order-item-id': 'I48', sku: `${TS}-B12-30`, 'quantity-purchased': '2' }),
+    amzRow({ 'order-id': AZ(49), 'order-item-id': 'I49', sku: `${TS}-B12-30`, 'quantity-purchased': '2' }),
+  ]);
+  const dl = (await listCouriers()).find((x) => x.name === 'Delhivery');
+  const s1 = (await createShipmentForOrders([(await amzOrder(48)).id], { courier_partner_id: dl.id, tracking_id: 'AWB-INV-R1' }, { actor: ACTOR })).shipmentId;
+  const s2 = (await createShipmentForOrders([(await amzOrder(49)).id], { courier_partner_id: dl.id, tracking_id: 'AWB-INV-R2' }, { actor: ACTOR })).shipmentId;
+  const race = await Promise.allSettled([s1, s2].map((s) => reserveShipmentStock(s, [{ batch_id: INV.b1, quantity: 2 }], { actor: ACTOR })));
+  if (race.filter((x) => x.status === 'fulfilled').length !== 1) throw new Error(JSON.stringify(race.map((x) => x.status)));
+  const b = await stockOf(INV.b);
+  if (b.res !== 2 || b.av !== 0) throw new Error(JSON.stringify(b));
+  // The winner gives it back so later checks start clean.
+  await releaseShipmentStock(s1, { actor: ACTOR }); await releaseShipmentStock(s2, { actor: ACTOR });
+  return 'one reservation wins, the other is refused; never 4 reserved from 2';
+});
+await step('inventory: customer return, damaged stock and transfer are ledger movements', async () => {
+  const before = await stockOf(INV.a);
+  await expectErr('return needs ref', () => adjustStock({ batch_id: INV.a2, movement_type: 'customer_return', quantity: 1, reason: 'Returned sealed' }, { actor: ACTOR }), (e) => e.status === 400);
+  await adjustStock({ batch_id: INV.a2, movement_type: 'customer_return', quantity: 1, reason: 'Returned sealed, inspected sellable', reference_id: 'RET-1', order_id: INV.s1lead }, { actor: ACTOR });
+  await adjustStock({ batch_id: INV.a1, movement_type: 'damaged', quantity: 5, reason: 'Damaged', notes: '5 bottles damaged during handling' }, { actor: ACTOR });
+  const wh = await saveWarehouse({ name: `${TS} 3PL` });
+  const t = await transferStock({ batch_id: INV.a1, to_warehouse_id: wh.id, quantity: 10, location: 'Bay 1', request_id: rid() }, { actor: ACTOR });
+  const after = await stockOf(INV.a);
+  if (after.on !== before.on + 1 - 5 || await ledgerSum(INV.a) !== after.on) throw new Error(`${JSON.stringify(before)} → ${JSON.stringify(after)}`);
+  const d = await skuDetail(INV.a);
+  const types = d.movements.slice(0, 4).map((m) => `${m.movement_type}:${m.quantity}`).join(' ');
+  if (types !== 'transfer_in:10 transfer_out:-10 damaged:-5 customer_return:1') throw new Error(types);
+  if (!d.batches.some((b) => b.id === t.batchId && b.warehouse_name === `${TS} 3PL` && b.on_hand === 10 && b.location === 'Bay 1')) throw new Error('transfer batch');
+  const ret = d.movements.find((m) => m.movement_type === 'customer_return');
+  if (ret.reference_type !== 'return' || ret.reference_id !== 'RET-1') throw new Error('return reference');
+  return 'return +1 (ref RET-1), damaged −5 with note, transfer 10 to 3PL (−10/+10); ledger sum = on hand';
+});
+await step('inventory: low stock, out of stock, expiry windows and value', async () => {
+  // B12: 2 on hand, reorder level 5 → low. Easen: no reorder level. A fresh SKU with nothing → out of stock.
+  const b = await getSku(INV.b);
+  if (!b.low_stock || b.out_of_stock) throw new Error(JSON.stringify(b));
+  const empty = (await createSku({ sku: `${TS}-EMPTY`, product_name: 'Nothing yet', reorder_level: 10 }, { actor: ACTOR })).id;
+  if (!(await getSku(empty)).out_of_stock) throw new Error('out');
+  const soon = (await receiveInventory({ sku_id: INV.c, batch_number: 'EAS-SOON', expiry_date: dayOffset(20), quantity: 3, unit_cost: 50, request_id: rid() }, { actor: ACTOR })).batchId;
+  const ov = await inventoryOverview({ q: TS });
+  const row = (id) => ov.rows.find((r) => r.id === id);
+  if (row(soon).days_to_expiry !== 20 || row(INV.aExp).effective_status !== 'expired' || row(INV.aQ).effective_status !== 'quarantined') throw new Error('statuses');
+  const e30 = await inventoryOverview({ expiring: '30', q: TS });
+  if (!e30.rows.some((r) => r.id === soon) || e30.rows.some((r) => r.id === INV.a2)) throw new Error('30-day filter');
+  const exp = await inventoryOverview({ expiring: 'expired', q: TS });
+  if (exp.rows.length !== 1 || exp.rows[0].id !== INV.aExp) throw new Error('expired filter');
+  const low = await inventoryOverview({ stock: 'low', q: TS });
+  if (!low.rows.every((r) => r.sku_id === INV.b)) throw new Error('low filter');
+  // Value: on hand × unit cost per batch, never the selling price.
+  const d = await skuDetail(INV.a);
+  const expect = d.batches.reduce((n, x) => n + x.on_hand * (x.unit_cost || 0), 0);
+  if (Math.abs((await getSku(INV.a)).value - expect) > 0.001 || expect <= 0) throw new Error(`${(await getSku(INV.a)).value} vs ${expect}`);
+  const a1 = d.batches.find((x) => x.id === INV.a1);
+  if (a1.value !== a1.on_hand * 180) throw new Error('batch value');
+  return `B12 low (2 ≤ 5); empty SKU out of stock; +20d in the 30-day window, expired/quarantined flagged; D3 value ₹${expect.toLocaleString('en-IN')} = Σ on hand × cost`;
+});
+await step('inventory: overview cards add up', async () => {
+  const ov = await inventoryOverview({});
+  const c = ov.cards;
+  const sums = ov.rows.filter((r) => !r.empty);
+  if (c.totalUnits !== sums.reduce((n, r) => n + r.on_hand, 0) || c.reservedUnits !== sums.reduce((n, r) => n + r.reserved, 0)) throw new Error(JSON.stringify(c));
+  if (!(c.totalSkus >= 4 && c.lowStock >= 1 && c.outOfStock >= 1 && c.expired >= 1 && c.expiring30 >= 1 && c.inventoryValue > 0)) throw new Error(JSON.stringify(c));
+  return `${c.totalSkus} SKUs, ${c.totalUnits} units, ${c.availableUnits} available, ${c.reservedUnits} reserved, ${c.lowStock} low, ${c.outOfStock} out, ${c.expiring90} expiring ≤90d`;
+});
+await step('inventory: every change is attributed (user, time, reason, reference)', async () => {
+  const { rows } = await getPool().query(
+    `SELECT count(*) FILTER (WHERE actor IS NULL OR reason IS NULL OR at IS NULL)::int AS missing, count(*)::int AS n
+     FROM inventory_movements WHERE sku_id IN (SELECT id FROM skus WHERE sku LIKE $1)`, [`${TS}%`]);
+  if (rows[0].missing || rows[0].n < 10) throw new Error(JSON.stringify(rows[0]));
+  const audit = (await getPool().query(`SELECT DISTINCT action FROM inventory_audit WHERE sku_id IN (SELECT id FROM skus WHERE sku LIKE $1) OR actor = $2`, [`${TS}%`, ACTOR])).rows.map((r) => r.action);
+  for (const a of ['sku_created', 'sku_updated', 'batch_created', 'batch_status_changed', 'batch_document_uploaded', 'stock_reserved', 'stock_released', 'stock_dispatched']) {
+    if (!audit.includes(a)) throw new Error(`no ${a}`);
+  }
+  return `${rows[0].n} movements all with user, time and reason; SKU, batch, document and reservation actions audited`;
+});
+await step('inventory: manual orders (no items) still dispatch exactly as before', async () => {
+  const dl = (await listCouriers()).find((x) => x.name === 'Delhivery');
+  const r = await createShipment({ ...R('website'), channel: 'website', source_order_id: `${TEST_ORDER}-INV-MANUAL`, courier_partner_id: dl.id, tracking_id: 'AWB-INV-MAN' }, { actor: ACTOR });
+  await addPhoto(r.orderId);
+  const sh = (await orderShipments(r.orderId))[0];
+  await updateShipment(r.orderId, sh.id, { shipment_status: 'dispatched' }, { actor: ACTOR, version: sh.version });
+  const back = (await orderShipments(r.orderId))[0];
+  await updateShipment(r.orderId, back.id, { shipment_status: 'packed' }, { actor: ACTOR, version: back.version });
+  if ((await getPool().query('SELECT count(*)::int n FROM inventory_movements WHERE shipment_id = $1', [sh.id])).rows[0].n) throw new Error('stock moved');
+  return 'no items → no stock check, no movement; can still be moved back (no stock left)';
+});
+await step('inventory: an order with items cannot join a parcel that already left', async () => {
+  await invOrders([amzRow({ 'order-id': AZ(50), 'order-item-id': 'I50', sku: `${TS}-D3-60`, 'quantity-purchased': '1' })]);
+  const late = await amzOrder(50);
+  await expectErr('attach', () => attachToShipment(INV.s1, { orderIds: [late.id] }, { actor: ACTOR }), (e) => e.alreadyShipped);
+  return 'attach to a dispatched shipment refused for an order with items';
+});
+
 await step('new shipment cleanup', async () => {
   const { orders, paths } = await purgeTestOrders(TEST_ORDER);
   for (const p of paths) await storage().remove(p).catch(() => {});
@@ -2068,6 +2420,13 @@ await step('new shipment cleanup', async () => {
   const left = await getPool().query('SELECT count(*)::int AS n FROM orders WHERE source_order_id LIKE $1', [`${TEST_ORDER}%`]);
   if (left.rows[0].n) throw new Error('orders left behind');
   return `${orders} orders removed`;
+});
+await step('inventory cleanup', async () => {
+  const { skus, paths } = await purgeTestInventory(TS);
+  for (const p of paths) await storage().remove(p).catch(() => {});
+  const left = (await getPool().query('SELECT count(*)::int n FROM skus WHERE sku LIKE $1', [`${TS}%`])).rows[0].n;
+  if (left) throw new Error('SKUs left behind');
+  return `${skus} test SKUs and their batches, ledger, reservations and documents removed`;
 });
 
 // ---- environment guard ------------------------------------------------------

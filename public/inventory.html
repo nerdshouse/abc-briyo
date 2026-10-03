@@ -1,0 +1,172 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Inventory — Briyo</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/ui.css" />
+  <link rel="stylesheet" href="/orders.css" />
+  <script src="https://cdn.jsdelivr.net/npm/lucide@0.469.0/dist/umd/lucide.min.js" defer></script>
+</head>
+<body>
+<div class="app">
+
+  <aside class="sidebar" id="sidebar" aria-label="Main navigation">
+    <div class="brand">
+      <span class="brand-mark"><i data-lucide="package"></i></span>
+      <div>
+        <div class="brand-name">Briyo Operations</div>
+        <div class="brand-sub">Orders &amp; logistics</div>
+      </div>
+    </div>
+
+    <form class="side-search" id="sideSearchForm" role="search" data-recovery data-context="recovery">
+      <i data-lucide="search"></i>
+      <input id="sideSearch" type="search" placeholder="Find a customer" autocomplete="off"
+             aria-label="Search every cart by name, phone or email" />
+      <kbd>⌘ K</kbd>
+    </form>
+
+    <nav>
+      <div class="nav-group" data-admin hidden>
+        <div class="nav-caption">Overview</div>
+        <a class="nav-item" href="/dashboard"><i data-lucide="layout-grid"></i>Dashboard</a>
+      </div>
+
+      <div class="nav-group" data-recovery>
+        <div class="nav-caption">Carts</div>
+        <a class="nav-item" href="/?mode=all" data-view-link="board"><i data-lucide="shopping-bag"></i>Call board</a>
+        <div class="nav-tree">
+          <a class="nav-item" href="/?mode=tocall" data-view-link="tocall">To call<span class="nav-count" id="countToCall" hidden></span></a>
+          <a class="nav-item" href="/?mode=callbacks" data-view-link="callbacks">Callbacks<span class="nav-count" id="countCallbacks" hidden></span></a>
+          <a class="nav-item" href="/?mode=mine" data-view-link="mine">My queue</a>
+          <a class="nav-item" href="/?mode=all" data-view-link="all">All carts</a>
+        </div>
+      </div>
+
+      <div id="ordersNav"></div>
+
+      <div class="nav-group" data-admin hidden>
+        <div class="nav-caption">Team</div>
+        <a class="nav-item" href="/admin"><i data-lucide="users"></i>Members</a>
+      </div>
+
+      <div class="nav-group" data-admin data-context="recovery" hidden>
+        <div class="nav-caption">Data</div>
+        <a class="nav-item" href="/import"><i data-lucide="upload"></i>Import carts</a>
+        <a class="nav-item" href="/api/admin/report.csv?period=day" download><i data-lucide="download"></i>Export report</a>
+      </div>
+    </nav>
+
+    <div class="sidebar-foot">
+      <div class="user-card">
+        <span class="avatar" id="userAvatar">·<span class="live"></span></span>
+        <div style="min-width:0">
+          <div class="user-name" id="userName">Signed in</div>
+          <div class="user-role" id="userRole"></div>
+        </div>
+        <button class="icon-btn bare" id="signOut" type="button" title="Sign out" aria-label="Sign out"><i data-lucide="log-out"></i></button>
+      </div>
+    </div>
+  </aside>
+  <div class="scrim" id="scrim"></div>
+
+  <div class="main">
+    <header class="topbar">
+      <button class="icon-btn" id="navOpen" type="button" aria-label="Open navigation"><i data-lucide="menu"></i></button>
+      <span class="topbar-title" id="topTitle">Inventory</span>
+    </header>
+
+    <main class="page" data-section="orders">
+      <div class="crumbs">
+        <i data-lucide="boxes"></i><span>Inventory</span><span class="sep">/</span><span class="here" id="crumbHere">Stock</span>
+      </div>
+      <div class="page-head">
+        <div>
+          <h1 class="page-title" id="pageTitle">Inventory</h1>
+          <p class="page-sub" id="pageSub">Loading stock…</p>
+        </div>
+        <div class="page-actions">
+          <button class="icon-btn" id="refresh" type="button" title="Refresh" aria-label="Refresh"><i data-lucide="refresh-cw"></i></button>
+          <button class="btn" id="places" type="button" data-admin hidden><i data-lucide="warehouse"></i>Warehouses &amp; suppliers</button>
+          <button class="btn" id="newSku" type="button" data-admin hidden><i data-lucide="tag"></i>New SKU</button>
+          <button class="btn primary" id="addInventory" type="button" data-admin hidden><i data-lucide="plus"></i>Add Inventory</button>
+        </div>
+      </div>
+
+      <div id="alerts"></div>
+      <div id="unmapped"></div>
+      <div class="imp-stats inv-cards" id="cards"></div>
+
+      <section class="card">
+        <div class="pane">
+          <div class="board-filters">
+            <label class="search">
+              <i data-lucide="search"></i>
+              <input class="input" id="q" type="search" autocomplete="off" spellcheck="false" placeholder="SKU, product, batch, ASIN" aria-label="Search stock" />
+            </label>
+            <select class="select" id="fwarehouse" aria-label="Warehouse"><option value="">All warehouses</option></select>
+            <input class="input inv-loc" id="flocation" type="search" placeholder="Location" aria-label="Location" autocomplete="off" />
+            <select class="select" id="fstatus" aria-label="Batch status">
+              <option value="">Status</option><option value="active">Active</option><option value="quarantined">Quarantined</option>
+              <option value="blocked">Blocked</option><option value="expired">Expired</option><option value="depleted">Depleted</option>
+              <option value="no_stock">No batches yet</option>
+            </select>
+            <select class="select" id="fexpiring" aria-label="Expiry">
+              <option value="">Expiry</option><option value="expired">Expired (with stock)</option>
+              <option value="30">Within 30 days</option><option value="60">Within 60 days</option><option value="90">Within 90 days</option>
+            </select>
+            <select class="select" id="fstock" aria-label="Stock level">
+              <option value="">Stock level</option><option value="low">Low stock</option><option value="out">Out of stock</option>
+            </select>
+            <button type="button" class="linkish" id="fclear" hidden>Clear</button>
+          </div>
+          <div class="board-meta" id="resultNote" aria-live="polite"></div>
+          <div class="table-wrap">
+            <table class="table inv-table">
+              <thead><tr>
+                <th>SKU</th><th>Product</th><th class="r">Available</th><th class="r">Reserved</th><th>Batch</th>
+                <th>Expiry</th><th>Location</th><th>Status</th>
+              </tr></thead>
+              <tbody id="rows"></tbody>
+            </table>
+          </div>
+          <ul class="clist" id="clist" aria-label="Stock"></ul>
+        </div>
+      </section>
+      <p class="footnote">Stock changes only through recorded movements — receipts, dispatches, returns and adjustments — each with who, when and why. Importing or creating an order never changes stock; a shipment reserves it and dispatching deducts it.</p>
+    </main>
+  </div>
+</div>
+
+<div class="drawer-scrim" id="drawerScrim" hidden></div>
+<aside class="drawer drawer-wide" id="drawer" hidden aria-label="SKU detail">
+  <div class="drawer-head">
+    <div style="min-width:0"><h2 class="drawer-title" id="dTitle"></h2><div class="drawer-sub" id="dSub"></div></div>
+    <div class="drawer-nav"><button class="icon-btn" id="dClose" type="button" title="Close" aria-label="Close"><i data-lucide="x"></i></button></div>
+  </div>
+  <div class="drawer-body" id="dBody"></div>
+  <div class="drawer-foot"><span class="saved" id="dSaved"></span></div>
+</aside>
+
+<aside class="drawer drawer-wide" id="formDrawer" hidden aria-label="Inventory form">
+  <div class="drawer-head">
+    <div><h2 class="drawer-title" id="fTitle"></h2><div class="drawer-sub" id="fSub"></div></div>
+    <div class="drawer-nav"><button class="icon-btn" id="fClose" type="button" title="Close" aria-label="Close"><i data-lucide="x"></i></button></div>
+  </div>
+  <form class="drawer-body" id="invForm" novalidate></form>
+  <div class="drawer-foot">
+    <span class="saved" id="fSaved"></span>
+    <div style="display:flex;gap:8px">
+      <button class="btn" type="button" id="fCancel">Cancel</button>
+      <button class="btn primary" type="submit" form="invForm" id="fSubmit">Save</button>
+    </div>
+  </div>
+</aside>
+
+<script type="module" src="/inventory.js"></script>
+</body>
+</html>

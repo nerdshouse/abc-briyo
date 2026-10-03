@@ -438,6 +438,15 @@ async function renderOrdersNav() {
         meta.viewCounts?.[k])).join('')}
       ${link('/couriers', 'Courier partners', 'building-2')}
       ${link('/destinations', 'Destinations', 'map-pin')}
+    </div>
+    <div class="nav-group">
+      <div class="nav-caption">Inventory</div>
+      ${link('/inventory', 'Stock', 'boxes')}
+      <div class="nav-tree">
+        ${link('/inventory?stock=low', 'Low stock')}
+        ${link('/inventory?expiring=90', 'Expiring soon')}
+        ${link('/inventory?view=unmapped', 'Unmapped SKUs', '', meta.inventory?.unmappedSkus)}
+      </div>
     </div>`;
   // Re-rendered on every page; replaced only if something (a count) changed.
   if (host.dataset.html === html) return;

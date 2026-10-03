@@ -240,3 +240,76 @@
 .selbar .warn-text { color: var(--warning-text); }
 .status.none .dot { background: transparent; border: 1px dashed var(--text-3); }
 .status.none { color: var(--text-3); }
+
+/* ------------------------------------------------------------ Inventory */
+.inv-cards { margin: 0 0 16px; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); }
+.inv-card { text-align: left; background: var(--surface); font: inherit; color: inherit; cursor: pointer; }
+.inv-card:disabled { cursor: default; }
+.inv-card:not(:disabled):hover { border-color: var(--border-strong); }
+.inv-loc { width: 140px; }
+.inv-table td, .batch-table td, .move-table td { vertical-align: top; }
+.exp-warn { color: var(--warning-text); }
+.exp-bad { color: var(--error-text); }
+.unmapped-card { margin-bottom: 16px; border-color: var(--warn-border, var(--border)); }
+.unmapped-card .card-title svg { color: var(--warning-text); }
+.unmapped-card.focus { box-shadow: 0 0 0 2px var(--warn-border, var(--border-strong)); }
+.batch-table .sub-row td { padding-top: 0; border-top: 0; }
+.batch-docs { display: flex; flex-wrap: wrap; gap: 6px 12px; align-items: center; font-size: 12.5px; }
+.doc-chip { display: inline-flex; align-items: center; gap: 6px; padding: 3px 8px; border: 1px solid var(--border); border-radius: var(--r-sm); }
+.doc-chip svg { width: 14px; height: 14px; }
+.doc-chip a { color: var(--text-2); }
+.upload-link { display: inline-flex; align-items: center; gap: 4px; cursor: pointer; }
+.upload-link svg { width: 14px; height: 14px; }
+.mini-select { height: 26px; padding: 0 22px 0 6px; font-size: 12px; width: auto; }
+.batch-actions { display: flex; flex-wrap: wrap; gap: 4px 14px; margin-top: 6px; font-size: 12.5px; }
+.old-batches { margin-top: 8px; font-size: 12.5px; }
+.qty-good { color: var(--success); font-weight: 500; }
+.qty-warn { color: var(--text); font-weight: 500; }
+.imp-stat.good b { color: var(--success); }
+
+/* Stock for a shipment, inside the order drawer. */
+.stock-block:empty { display: none; }
+.stock-block { margin-top: 14px; padding: 12px; border: 1px solid var(--border); border-radius: var(--r-sm); background: var(--surface-2); }
+.stock-head { display: flex; align-items: center; gap: 6px; font-weight: 500; font-size: 13px; margin-bottom: 8px; }
+.stock-head svg { width: 16px; height: 16px; }
+.stock-head.good svg { color: var(--success); }
+.stock-head.bad svg { color: var(--error-text); }
+.stock-table { font-size: 12.5px; background: var(--surface); }
+.stock-table td { vertical-align: top; }
+.alloc { display: grid; gap: 6px; }
+.alloc-row { display: grid; grid-template-columns: minmax(0, 1fr) 64px; gap: 6px; }
+.alloc-row .select, .alloc-row .input { height: 30px; font-size: 12.5px; }
+.ok-mark { color: var(--success); font-weight: 600; }
+.stock-unmapped { list-style: none; margin: 0 0 6px; padding: 0; display: grid; gap: 4px; font-size: 12.5px; }
+.warn-text { color: var(--warning-text); }
+@media (max-width: 720px) {
+  .inv-loc { width: 100%; }
+  .alloc-row { grid-template-columns: minmax(0, 1fr) 56px; }
+}
+.inv-table { min-width: 860px; }
+@media (max-width: 760px) {
+  .table-wrap:has(.inv-table) { display: none; }
+  .batch-table, .move-table { min-width: 560px; }
+}
+.inv-table .cell-main, .inv-table .cell-sub, .batch-table .cell-sub, .move-table .cell-sub,
+.stock-table .cell-sub, .unmapped-card .cell-sub { display: block; max-width: none; }
+.inv-table .cell-main { max-width: 260px; }
+@media (min-width: 1200px) { .inv-cards { grid-template-columns: repeat(8, minmax(0, 1fr)); } }
+.stock-cards { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+@media (max-width: 480px) { .stock-cards { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+.batch-table { table-layout: auto; }
+.batch-table th:nth-child(2), .batch-table td:nth-child(2) { width: 70px; }
+.batch-table { min-width: 0; width: 100%; }
+.batch-table td, .batch-table .cell-sub { white-space: normal; overflow-wrap: anywhere; }
+.batch-table th:nth-child(3), .batch-table td:nth-child(3) { width: 110px; }
+.batch-table th:nth-child(4), .batch-table td:nth-child(4) { width: 110px; }
+.stock-line { padding: 8px 0; border-top: 1px solid var(--border); }
+.stock-line:first-of-type { border-top: 0; }
+.stock-line-head { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 4px 12px; font-size: 12.5px; margin-bottom: 6px; }
+.stock-nums { white-space: nowrap; }
+.stock-from { font-size: 12.5px; }
+.alloc-row { grid-template-columns: minmax(0, 1fr) 72px; }
+.alloc-row .select, .alloc-row .input { width: 100%; min-width: 0; }
+.alloc [data-alloc-add] { justify-self: start; }
+.page-actions { flex-wrap: wrap; }
+.page-actions .btn { white-space: nowrap; }
