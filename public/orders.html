@@ -92,6 +92,7 @@
         </div>
         <div class="page-actions">
           <button class="icon-btn" id="refresh" type="button" title="Refresh" aria-label="Refresh"><i data-lucide="refresh-cw"></i></button>
+          <button class="btn" id="importOrders" type="button"><i data-lucide="upload"></i>Import</button>
           <button class="btn primary" id="newShipment" type="button"><i data-lucide="plus"></i>New Shipment</button>
         </div>
       </div>
@@ -297,6 +298,32 @@
     <div style="display:flex;gap:8px">
       <button class="btn" type="button" id="cCancel">Cancel</button>
       <button class="btn primary" type="submit" form="createForm" id="cSubmit">Create Shipment</button>
+    </div>
+  </div>
+</aside>
+
+<aside class="drawer drawer-wide" id="importDrawer" hidden aria-label="Import orders">
+  <div class="drawer-head">
+    <div><h2 class="drawer-title">Import orders</h2><div class="drawer-sub">Amazon order report (.xlsx, .csv or .txt). You see what will change before anything is saved.</div></div>
+    <div class="drawer-nav"><button class="icon-btn" id="iClose" type="button" title="Close" aria-label="Close"><i data-lucide="x"></i></button></div>
+  </div>
+  <div class="drawer-body">
+    <div class="form-error" id="iError" role="alert" hidden></div>
+    <section class="dsec">
+      <div class="form-grid">
+        <label class="fld"><span>Channel</span><select class="select" id="iChannel"><option value="amazon">Amazon</option></select></label>
+        <label class="fld wide"><span>Order report file</span>
+          <input class="input" type="file" id="iFile" accept=".xlsx,.csv,.txt,.tsv,text/csv,text/plain,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" />
+          <span class="help">Seller Central → Reports → Order Reports. Re-importing the same file is safe: nothing is duplicated.</span></label>
+      </div>
+    </section>
+    <div id="iResult"></div>
+  </div>
+  <div class="drawer-foot">
+    <span class="saved" id="iSaved"></span>
+    <div style="display:flex;gap:8px">
+      <button class="btn" type="button" id="iCancel">Cancel</button>
+      <button class="btn primary" type="button" id="iSubmit" disabled>Import</button>
     </div>
   </div>
 </aside>

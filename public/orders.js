@@ -517,6 +517,7 @@ function renderDrawer() {
         <li><span style="min-width:0;white-space:pre-wrap">${esc(n.metadata.note)}</span><span class="d-when">${esc(n.actor || 'Someone')}, ${esc(dateTime(n.at))}</span></li>`).join('')}</ul>` : ''}
     </section>
 
+    ${itemsSection(o, state.detail.items || [])}
     <details class="dsec more-sec">
       <summary class="dsec-title">Order details <span class="dsec-meta soft">${esc([amount(o.order_value), o.customer_name].filter((x) => x && x !== '—').join(' · ') || 'value, customer, payment')}</span></summary>
       <dl class="kv" style="margin-top:10px">
@@ -529,7 +530,8 @@ function renderDrawer() {
         <dt>Customer</dt><dd>${esc([o.customer_name, o.customer_phone, o.customer_email].filter(Boolean).join(' · ') || '—')}</dd>
         <dt>Payment</dt><dd>${esc([o.payment_method && label(o.payment_method), o.payment_status && label(o.payment_status)].filter(Boolean).join(' · ') || 'Not known')}</dd>
         <dt>Fulfillment</dt><dd>${esc(o.fulfillment_type ? label(o.fulfillment_type) : 'Not set')}</dd>
-        <dt>Entered</dt><dd>${esc(o.created_by || 'System')}, ${esc(dateTime(o.created_at))}</dd>
+        <dt>Entered</dt><dd>${esc(o.created_by || 'System')}, ${esc(dateTime(o.created_at))}${o.source === 'amazon_import' ? ' · Amazon import' : ''}</dd>
+        ${amazonDetails(o.source_payload?.amazon)}
       </dl>
       <div class="d-row" style="margin-top:12px">
         <label class="d-label" for="dOrderStatus">Order status</label>
@@ -549,6 +551,41 @@ function renderDrawer() {
       }).join('')}</div>
     </section>`;
   renderIcons();
+}
+
+/** Line items, as the marketplace listed them. Manual orders have none. */
+function itemsSection(o, items) {
+  if (!items.length) return '';
+  const units = items.reduce((n, it) => n + it.quantity, 0);
+  return `<section class="dsec">
+      <h3 class="dsec-title">Items <span class="dsec-meta soft">${count(items.length)} line${items.length === 1 ? '' : 's'} · ${count(units)} unit${units === 1 ? '' : 's'}</span></h3>
+      <div class="item-list">${items.map((it) => `
+        <div class="item-row">
+          <div class="t"><div>${esc(it.title || it.sku || 'Item')}</div>
+            <div class="muted" style="font-size:12px">${[it.sku && `SKU <span class="mono">${esc(it.sku)}</span>`,
+              it.promotion_discount ? `Discount ${esc(money(it.promotion_discount))}` : '',
+              it.shipping_price ? `Shipping ${esc(money(it.shipping_price))}` : ''].filter(Boolean).join(' · ')}</div></div>
+          <div class="n"><div>× ${esc(it.quantity)}</div><div class="muted" style="font-size:12px">${esc(amount(it.item_price))}</div></div>
+        </div>`).join('')}</div>
+    </section>`;
+}
+
+/** What the Amazon report said beyond the order's own fields. */
+function amazonDetails(a) {
+  if (!a) return '';
+  const to = a.ship_to || {};
+  const place = [to.city, to.state, to.postal_code].filter(Boolean).join(', ');
+  const win = (from, until) => [from && dateShort(from), until && dateShort(until)].filter(Boolean).join(' – ');
+  const rows = [
+    ['Ship To', [to.name, place].filter(Boolean).join(' · ')],
+    ['Service Level', a.ship_service_level],
+    ['Ship By', win(a.earliest_ship_date, a.latest_ship_date)],
+    ['Deliver By', win(a.earliest_delivery_date, a.latest_delivery_date)],
+    ['Amazon Flags', [a.is_prime && 'Prime', a.is_business_order && 'Business', a.fulfilled_by, a.is_amazon_invoiced && 'Amazon invoiced'].filter(Boolean).join(' · ')],
+    ['PO Number', a.purchase_order_number],
+    ['Delivery Note', a.delivery_instructions],
+  ].filter(([, v]) => v);
+  return rows.map(([k, v]) => `<dt>${k}</dt><dd>${esc(v)}</dd>`).join('');
 }
 
 const fmtVal = (k, v) => {
@@ -582,7 +619,7 @@ function describeEvent(e) {
     case 'shipment_order_detached': return ['package-minus', 'warn', `Order ${esc(md.source_order_id)} taken out of this shipment`];
     case 'attached_to_shipment': return ['package', 'info', `Added to the shipment of order ${esc(md.lead_source_order_id)}${md.tracking_id ? ` (AWB ${esc(md.tracking_id)})` : ''}`];
     case 'detached_from_shipment': return ['package-minus', 'warn', 'Taken out of the shared shipment'];
-    case 'order_created': return ['plus', 'info', `Order created · ${esc(channelLabel(md.channel))} ${esc(md.source_order_id)}${md.order_value === null || md.order_value === undefined ? '' : ` · ${esc(money(md.order_value))}`}`];
+    case 'order_created': return ['plus', 'info', `${md.source === 'amazon_import' ? 'Imported from Amazon ·' : `Order created · ${esc(channelLabel(md.channel))}`} ${esc(md.source_order_id)}${md.order_value === null || md.order_value === undefined ? '' : ` · ${esc(money(md.order_value))}`}`];
     case 'order_status_changed': return ['circle-dot', ch.order_status?.to === 'cancelled' ? 'bad' : '', `Order ${esc(label(ch.order_status?.from))} → <b>${esc(label(ch.order_status?.to))}</b>`];
     case 'shipment_status_changed': {
       const to = ch.shipment_status?.to;
@@ -599,6 +636,12 @@ function describeEvent(e) {
     case 'document_removed': return md.document_type === 'dispatch_product_image'
       ? ['camera-off', 'warn', `Dispatch product image removed · ${esc(md.filename)}`]
       : ['file-x', 'warn', `Removed ${esc(label(md.document_type).toLowerCase())} · ${esc(md.filename)}`];
+    case 'amazon_import_updated': {
+      const parts = [changeList(ch), md.items_added && `${md.items_added} item${md.items_added > 1 ? 's' : ''} added`,
+        md.items_updated && `${md.items_updated} item${md.items_updated > 1 ? 's' : ''} updated`,
+        md.details_changed && 'Amazon details refreshed'].filter(Boolean);
+      return ['file-down', 'info', `Updated from Amazon import${parts.length ? `: ${parts.join('; ')}` : ''}`];
+    }
     case 'note_added': return ['message-square-text', '', `Note: ${esc(md.note)}`];
     default: return ['activity', '', esc(label(e.event_type))];
   }
@@ -1134,6 +1177,130 @@ function fillFilters() {
   $('#q').value = state.f.q;
 }
 
+/* ---------------------------------------------------------- Amazon import */
+
+const imp = { file: null, busy: false, done: false };
+
+function openImport() {
+  imp.file = null; imp.done = false;
+  $('#iFile').value = '';
+  $('#iResult').innerHTML = '';
+  $('#iError').hidden = true;
+  $('#iSaved').textContent = '';
+  $('#iSubmit').disabled = true;
+  $('#iSubmit').textContent = 'Import';
+  $('#iCancel').textContent = 'Cancel';
+  $('#importDrawer').hidden = false;
+  $('#drawerScrim').hidden = false;
+  $('#iFile').focus();
+}
+
+function closeImport() {
+  if (imp.busy) return;
+  $('#importDrawer').hidden = true;
+  if ($('#drawer').hidden && $('#formDrawer').hidden && $('#createDrawer').hidden) $('#drawerScrim').hidden = true;
+}
+
+const importError = (msg) => { $('#iError').textContent = msg; $('#iError').hidden = !msg; };
+
+async function sendImport(step) {
+  const res = await fetch(`/api/orders/import/amazon/${step}`, {
+    method: 'POST', body: imp.file, headers: { 'x-filename': encodeURIComponent(imp.file.name) },
+  });
+  const data = await res.json().catch(() => ({ ok: false, error: res.status === 413 ? 'The file is too large (15 MB at most).' : `HTTP ${res.status}` }));
+  if (!res.ok || data.ok === false) throw new Error(data.error || `HTTP ${res.status}`);
+  return data;
+}
+
+const stat = (n, text, tone = '') => `<div class="imp-stat ${tone}"><b>${typeof n === 'number' ? count(n) : esc(n)}</b><span>${esc(text)}</span></div>`;
+
+function errorTable(errors, total) {
+  if (!total) return '';
+  return `<section class="dsec">
+      <h3 class="dsec-title">Rows not imported <span class="dsec-meta soft">${count(total)}${total > errors.length ? `, first ${count(errors.length)} shown` : ''}</span></h3>
+      <p class="imp-note" style="margin:0 0 4px">An order with any bad row is left out whole, so it is never half-imported. Fix the file and import it again.</p>
+      <div class="imp-scroll"><table class="imp-errors"><thead><tr><th>Row</th><th>Order</th><th>Reason</th></tr></thead><tbody>
+        ${errors.map((e) => `<tr><td class="mono">${e.row}</td><td class="mono">${esc(e.orderId || '—')}</td><td>${esc(e.reason)}</td></tr>`).join('')}
+      </tbody></table></div>
+    </section>`;
+}
+
+async function previewImport() {
+  importError('');
+  $('#iSubmit').disabled = true;
+  if (!imp.file) { $('#iResult').innerHTML = ''; return; }
+  $('#iResult').innerHTML = '<section class="dsec"><p class="muted" style="margin:0">Reading the file…</p></section>';
+  try {
+    const p = await sendImport('preview');
+    const s = p.summary;
+    $('#iResult').innerHTML = `
+      <section class="dsec">
+        <h3 class="dsec-title">Preview <span class="dsec-meta soft">nothing saved yet</span></h3>
+        <div class="imp-stats">
+          ${stat(s.rows, 'Rows in file')}
+          ${stat(s.ordersInFile, 'Unique orders')}
+          ${stat(s.lineItems, 'Line items')}
+          ${stat(s.newOrders, 'New orders')}
+          ${stat(s.existingOrders, `Already here${s.existingOrders ? ` (${count(s.ordersToUpdate)} to update)` : ''}`)}
+          ${stat(s.newLineItems, 'New line items')}
+          ${stat(s.duplicateRows, 'Duplicate rows', s.duplicateRows ? 'warn' : '')}
+          ${stat(p.errorCount, 'Rows with errors', p.errorCount ? 'bad' : '')}
+          ${stat(money(s.orderValue), 'Order value in file')}
+        </div>
+        <p class="imp-note">${[
+          s.promotionRows && `${count(s.promotionRows)} promotion row${s.promotionRows > 1 ? 's' : ''} folded into their items.`,
+          s.skippedOrders && `${count(s.skippedOrders)} order${s.skippedOrders > 1 ? 's' : ''} will be skipped because of errors.`,
+          'Order value is what buyers paid: items with tax, plus shipping, less discounts.',
+        ].filter(Boolean).map(esc).join(' ')}</p>
+      </section>
+      ${errorTable(p.errors, p.errorCount)}`;
+    const work = s.newOrders + s.ordersToUpdate;
+    $('#iSubmit').disabled = !work;
+    $('#iSubmit').textContent = work ? `Import ${count(work)} order${work > 1 ? 's' : ''}` : 'Nothing to import';
+  } catch (err) {
+    $('#iResult').innerHTML = '';
+    importError(err.message);
+  }
+}
+
+async function commitImport() {
+  if (!imp.file || imp.busy) return;
+  imp.busy = true;
+  $('#iSubmit').disabled = true;
+  $('#iSaved').textContent = 'Importing…';
+  try {
+    const r = await sendImport('commit');
+    const s = r.summary;
+    imp.done = true;
+    $('#iResult').innerHTML = `
+      <section class="dsec">
+        <h3 class="dsec-title">Imported <span class="dsec-meta">${indicator('completed')}</span></h3>
+        <div class="imp-stats">
+          ${stat(s.ordersCreated, 'Orders added')}
+          ${stat(s.ordersUpdated, 'Orders updated')}
+          ${stat(s.ordersUnchanged, 'Already up to date')}
+          ${stat(s.lineItemsAdded, 'Line items added')}
+          ${stat(s.lineItemsUpdated, 'Line items updated')}
+          ${stat(s.duplicateRows, 'Duplicate rows skipped', s.duplicateRows ? 'warn' : '')}
+          ${stat(r.errorCount, 'Rows not imported', r.errorCount ? 'bad' : '')}
+        </div>
+        <p class="imp-note">New orders are in the Easy Ship tab, ready for a courier and AWB.</p>
+      </section>
+      ${errorTable(r.errors, r.errorCount)}`;
+    $('#iSaved').textContent = '';
+    $('#iSubmit').textContent = 'Done';
+    $('#iSubmit').disabled = false;
+    $('#iCancel').textContent = 'Close';
+    load();
+  } catch (err) {
+    $('#iSaved').textContent = '';
+    importError(`${err.message} Nothing was saved.`);
+    $('#iSubmit').disabled = false;
+  } finally {
+    imp.busy = false;
+  }
+}
+
 function bind() {
   const ids = { status: 'fstatus', shipment: 'fshipment', courier: 'fcourier', invoice: 'finvoice', tracking: 'ftracking', from: 'ffrom', to: 'fto' };
   for (const [k, id] of Object.entries(ids)) {
@@ -1178,13 +1345,19 @@ function bind() {
   $('#moreBtn').addEventListener('click', () => load({ append: true }));
   $('#refresh').addEventListener('click', () => { load(); if (state.openId) openOrder(state.openId); });
   $('#newShipment').addEventListener('click', openCreate);
+  $('#importOrders').addEventListener('click', openImport);
+  $('#iClose').addEventListener('click', closeImport);
+  $('#iCancel').addEventListener('click', closeImport);
+  $('#iFile').addEventListener('change', (e) => { imp.file = e.target.files[0] || null; imp.done = false; previewImport(); });
+  $('#iSubmit').addEventListener('click', () => (imp.done ? closeImport() : commitImport()));
   $('#cClose').addEventListener('click', closeCreate);
   $('#cCancel').addEventListener('click', closeCreate);
   $('#dClose').addEventListener('click', closeDrawer);
   $('#fClose').addEventListener('click', closeForm);
   $('#fCancel').addEventListener('click', closeForm);
   const closeTop = () => {
-    if (!$('#createDrawer').hidden) closeCreate();
+    if (!$('#importDrawer').hidden) closeImport();
+    else if (!$('#createDrawer').hidden) closeCreate();
     else if (!$('#formDrawer').hidden) closeForm();
     else if (!$('#drawer').hidden) closeDrawer();
   };

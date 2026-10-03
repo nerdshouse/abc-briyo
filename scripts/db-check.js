@@ -23,6 +23,8 @@ import {
   shipmentMembers, sharedShipmentOf, attachToShipment, detachFromShipment, attachableOrders,
 } from '../lib/orders.js';
 import { saveUploadedDocument } from '../lib/orders-routes.js';
+import { planAmazon, readTable, previewAmazonImport, commitAmazonImport } from '../lib/amazon-import.js';
+import { orderItems } from '../lib/orders.js';
 import { DOCUMENT_FORMATS } from '../lib/orders.js';
 import {
   validateDocument, storage, signV4, _resetStorage, StorageNotConfigured,
@@ -1803,6 +1805,151 @@ await step('courier list includes Shree Tirupati Courier and it can be used', as
   const o = await getOrder(r.orderId);
   if (o.courier_name !== 'Shree Tirupati Courier' || o.tracking_url !== null) throw new Error('not used');
   return 'active, no tracking pattern (link pasted by hand), usable on a shipment';
+});
+
+// ---- Amazon order import ------------------------------------------------------
+// Fixtures follow Seller Central's order report: one row per line item, plus the
+// promotion-detail row Amazon writes after a discounted item.
+const AMZ_HEAD = ['order-id', 'order-item-id', 'purchase-date', 'payments-date', 'buyer-email', 'buyer-name', 'buyer-phone-number',
+  'sku', 'product-name', 'quantity-purchased', 'currency', 'item-price', 'item-tax', 'shipping-price', 'shipping-tax',
+  'gift-wrap-price', 'ship-service-level', 'recipient-name', 'ship-city', 'ship-state', 'ship-postal-code', 'ship-country',
+  'item-promotion-discount', 'item-promotion-id', 'ship-promotion-discount', 'ship-promotion-id', 'payment-method',
+  'cod-collectible-amount', 'is-business-order', 'purchase-order-number', 'is-prime', 'fulfilled-by', 'is-iba'];
+const AZ = (n) => `${TEST_ORDER}-AMZ-${n}`;
+const amzRow = (o) => {
+  const v = { 'purchase-date': '2026-09-20T10:15:00+00:00', 'payments-date': '2026-09-20T10:16:00+00:00', 'buyer-name': 'Test Buyer',
+    sku: 'SKU-1', 'product-name': 'Test product', 'quantity-purchased': '1', currency: 'INR', 'item-price': '499.00', 'item-tax': '76.12',
+    'shipping-price': '0', 'shipping-tax': '0', 'ship-service-level': 'Standard', 'ship-city': 'PUNE', 'ship-country': 'IN',
+    'is-prime': 'false', 'is-business-order': 'false', 'fulfilled-by': 'Easy Ship', 'gift-wrap-price': '9', 'is-iba': 'false', ...o };
+  return AMZ_HEAD.map((h) => v[h] ?? '');
+};
+const amzCsv = (rows) => Buffer.from([AMZ_HEAD, ...rows].map((r) => r.map((c) => (/[",\n]/.test(c) ? `"${c.replace(/"/g, '""')}"` : c)).join(',')).join('\n'));
+const amzCount = async () => (await getPool().query(`SELECT count(*)::int n FROM orders WHERE channel = 'amazon' AND source_order_id LIKE $1`, [`${TEST_ORDER}-AMZ-%`])).rows[0].n;
+const amzOrder = async (n) => (await listOrders({ q: AZ(n), channel: 'amazon' })).orders.find((o) => o.source_order_id === AZ(n));
+
+await step('amazon import: one order, one item', async () => {
+  const file = amzCsv([amzRow({ 'order-id': AZ(1), 'order-item-id': 'I1' })]);
+  const p = await previewAmazonImport(file, 'one.csv');
+  if (p.summary.newOrders !== 1 || p.summary.lineItems !== 1 || p.errorCount || await amzCount()) throw new Error(`preview ${JSON.stringify(p.summary)}`);
+  const r = await commitAmazonImport(file, 'one.csv', { actor: ACTOR });
+  if (r.summary.ordersCreated !== 1 || r.summary.lineItemsAdded !== 1) throw new Error(JSON.stringify(r.summary));
+  const o = await amzOrder(1);
+  const items = await orderItems(o.id);
+  if (o.dispatch_type !== 'easy_ship' || o.order_value !== 499 || o.source !== 'amazon_import' || o.shipment_status !== 'not_ready') throw new Error(JSON.stringify(o));
+  if (items.length !== 1 || items[0].source_line_item_id !== 'I1' || items[0].item_tax !== 76.12) throw new Error(JSON.stringify(items));
+  if ('gift-wrap-price' in (o.source_payload.amazon || {}) || JSON.stringify(o.source_payload).includes('gift')) throw new Error('ignored column stored');
+  return 'preview wrote nothing; import made 1 order (Easy Ship, ₹499, blank shipment) + 1 item; ignored columns not stored';
+});
+await step('amazon import: one order with two items; several orders in one file', async () => {
+  const file = amzCsv([
+    amzRow({ 'order-id': AZ(2), 'order-item-id': 'I1', 'item-price': '100', 'shipping-price': '80' }),
+    amzRow({ 'order-id': AZ(2), 'order-item-id': 'I2', sku: 'SKU-2', 'quantity-purchased': '3', 'item-price': '300' }),
+    amzRow({ 'order-id': AZ(3), 'order-item-id': 'I1', 'payment-method': 'COD' }),
+    amzRow({ 'order-id': AZ(4), 'order-item-id': 'I1' }),
+  ]);
+  const r = await commitAmazonImport(file, 'multi.csv', { actor: ACTOR });
+  if (r.summary.ordersCreated !== 3 || r.summary.lineItemsAdded !== 4) throw new Error(JSON.stringify(r.summary));
+  const o2 = await amzOrder(2);
+  const items = await orderItems(o2.id);
+  if (items.length !== 2 || items[1].quantity !== 3 || o2.order_value !== 480) throw new Error(`${o2.order_value} ${JSON.stringify(items)}`);
+  const o3 = await amzOrder(3);
+  if (o3.payment_method !== 'cod' || o3.payment_status !== 'pending') throw new Error('COD not mapped');
+  if (o2.payment_method !== 'marketplace' || o2.payment_status !== 'paid') throw new Error('prepaid not mapped');
+  return '3 orders, 4 items; value = items + shipping (₹480); COD vs paid-on-Amazon mapped';
+});
+await step('amazon import: the same file twice changes nothing', async () => {
+  const file = amzCsv([amzRow({ 'order-id': AZ(1), 'order-item-id': 'I1' })]);
+  const before = (await orderEvents((await amzOrder(1)).id)).length;
+  const v = (await amzOrder(1)).version;
+  const r = await commitAmazonImport(file, 'one.csv', { actor: ACTOR });
+  const s = r.summary;
+  if (s.ordersCreated || s.ordersUpdated || s.lineItemsAdded || s.lineItemsUpdated || s.ordersUnchanged !== 1) throw new Error(JSON.stringify(s));
+  if ((await amzCount()) !== 4 || (await amzOrder(1)).version !== v || (await orderEvents((await amzOrder(1)).id)).length !== before) throw new Error('something was written');
+  return 'no new orders, items, versions or events';
+});
+await step('amazon import: an existing order gets a new line item and updated fields', async () => {
+  const file = amzCsv([
+    amzRow({ 'order-id': AZ(1), 'order-item-id': 'I1', 'item-tax': '80.00' }),
+    amzRow({ 'order-id': AZ(1), 'order-item-id': 'I9', sku: 'SKU-9', 'item-price': '250' }),
+  ]);
+  const p = await previewAmazonImport(file, 'grow.csv');
+  if (p.summary.existingOrders !== 1 || p.summary.newLineItems !== 1 || p.summary.changedLineItems !== 1) throw new Error(JSON.stringify(p.summary));
+  const o = await amzOrder(1);
+  // Hand-entered shipment details survive the re-import.
+  const dl = (await listCouriers()).find((c) => c.name === 'Delhivery');
+  const sh = (await orderShipments(o.id))[0];
+  await updateShipment(o.id, sh.id, { courier_partner_id: dl.id, tracking_id: 'AWB-AMZ-1', shipment_status: 'packed' }, { actor: ACTOR, version: sh.version });
+  const r = await commitAmazonImport(file, 'grow.csv', { actor: ACTOR });
+  if (r.summary.ordersUpdated !== 1 || r.summary.lineItemsAdded !== 1 || r.summary.lineItemsUpdated !== 1) throw new Error(JSON.stringify(r.summary));
+  const after = await amzOrder(1);
+  if (after.order_value !== 749 || after.tracking_id !== 'AWB-AMZ-1' || after.shipment_status !== 'packed') throw new Error(JSON.stringify(after));
+  if ((await orderItems(o.id)).length !== 2) throw new Error('items');
+  const ev = (await orderEvents(o.id)).find((e) => e.event_type === 'amazon_import_updated');
+  if (!ev || ev.metadata.items_added !== 1 || ev.metadata.changes.order_value?.to !== 749) throw new Error(JSON.stringify(ev));
+  return 'item added, tax updated, value ₹499 → ₹749 logged; courier, AWB and status untouched';
+});
+await step('amazon import: duplicate rows, promotion rows, bad rows and missing order-id', async () => {
+  const file = amzCsv([
+    amzRow({ 'order-id': AZ(5), 'order-item-id': 'I1', 'item-promotion-discount': '-50', 'item-promotion-id': 'PROMO' }),
+    AMZ_HEAD.map((h) => ({ 'order-id': AZ(5), 'order-item-id': 'I1', 'item-promotion-discount': '0', 'ship-promotion-discount': '0', 'ship-promotion-id': 'SHIPPROMO' }[h] ?? '')),
+    amzRow({ 'order-id': AZ(6), 'order-item-id': 'I1' }),
+    amzRow({ 'order-id': AZ(6), 'order-item-id': 'I1' }),                         // exact repeat
+    amzRow({ 'order-id': AZ(7), 'order-item-id': 'I1' }),
+    amzRow({ 'order-id': AZ(7), 'order-item-id': 'I2', 'quantity-purchased': 'two' }), // bad → whole order out
+    amzRow({ 'order-id': AZ(8), 'order-item-id': 'I1', 'purchase-date': 'yesterday' }),
+    amzRow({ 'order-id': AZ(9), 'order-item-id': 'I1', 'item-price': '4,99.x' }),
+    amzRow({ 'order-id': '', 'order-item-id': 'I1' }),
+    amzRow({ 'order-id': AZ(10), 'order-item-id': '' }),
+    amzRow({ 'order-id': AZ(11), 'order-item-id': 'I1', 'fulfilled-by': 'Amazon' }),
+  ]);
+  const r = await commitAmazonImport(file, 'mixed.csv', { actor: ACTOR });
+  const s = r.summary;
+  if (s.rows !== 11 || s.promotionRows !== 1 || s.duplicateRows !== 1 || s.ordersCreated !== 2 || r.errorCount !== 6) throw new Error(`${JSON.stringify(s)} ${JSON.stringify(r.errors)}`);
+  const rowsOf = Object.fromEntries(r.errors.map((e) => [e.row, e]));
+  if (!/quantity/.test(rowsOf[7].reason) || !/purchase-date/.test(rowsOf[8].reason) || !/item-price/.test(rowsOf[9].reason)
+    || rowsOf[10].reason !== 'Missing order-id' || rowsOf[10].orderId !== null || !/order-item-id/.test(rowsOf[11].reason) || !/Easy Ship/.test(rowsOf[12].reason)) throw new Error(JSON.stringify(r.errors));
+  if (await amzOrder(7) || await amzOrder(8) || await amzOrder(11)) throw new Error('a bad order was imported');
+  if ((await orderItems((await amzOrder(6)).id)).length !== 1) throw new Error('duplicate row became an item');
+  const o5 = await amzOrder(5);
+  if (o5.order_value !== 449 || (await orderItems(o5.id))[0].promotion_discount !== -50) throw new Error(`promo ${o5.order_value}`);
+  return '2 good orders in; duplicate + promotion rows folded; 6 bad rows reported with row number, order and reason';
+});
+await step('amazon import: numbers and dates parse; xlsx and tab-separated files read', async () => {
+  const plan = planAmazon(readTable(amzCsv([amzRow({ 'order-id': 'X', 'order-item-id': 'I', 'item-price': '₹1,299.50', 'quantity-purchased': '12',
+    'purchase-date': '2026-09-21T23:30:00+05:30' })]), 'x.csv'));
+  const o = plan.orders[0];
+  if (o.items[0].item_price !== 1299.5 || o.items[0].quantity !== 12 || o.order_date !== '2026-09-21T18:00:00.000Z') throw new Error(JSON.stringify(o));
+  const tsv = Buffer.from([AMZ_HEAD, amzRow({ 'order-id': 'T', 'order-item-id': 'I', 'product-name': 'Tea, green' })].map((r) => r.join('\t')).join('\r\n'));
+  const t = planAmazon(readTable(tsv, 'report.txt'));
+  if (t.orders[0].items[0].title !== 'Tea, green') throw new Error('tab file');
+  // A minimal .xlsx: shared strings, a numeric cell and an Excel date serial.
+  const { xlsxFixture } = await import('./fixtures/amazon-xlsx.js');
+  const x = planAmazon(readTable(xlsxFixture(), 'orders.xlsx'));
+  if (x.errors.length || x.orders.length !== 1 || x.orders[0].items[0].quantity !== 2 || x.orders[0].order_value !== 250
+    || !x.orders[0].order_date.startsWith('2026-09-20')) throw new Error(JSON.stringify(x));
+  try { planAmazon(readTable(Buffer.from('a,b\n1,2'), 'x.csv')); throw new Error('accepted'); } catch (err) { if (!/missing column/.test(err.message)) throw err; }
+  return '₹1,299.50 → 1299.5, IST date → UTC, tab file with a comma inside, xlsx with date serial; wrong file refused';
+});
+await step('amazon import: orders show in the Orders list and filters', async () => {
+  const all = await listOrders({ channel: 'amazon', q: `${TEST_ORDER}-AMZ` });
+  const easy = await listOrders({ channel: 'amazon', type: 'easy_ship', q: `${TEST_ORDER}-AMZ` });
+  if (all.total !== 6 || easy.total !== 6) throw new Error(`${all.total} ${easy.total}`);
+  if (all.orders.some((o) => o.channel_label !== 'Amazon')) throw new Error('label');
+  return '6 imported orders listed under Amazon / Easy Ship';
+});
+await step('amazon import: several imported orders share one shipment', async () => {
+  const [a, b, c] = await Promise.all([amzOrder(2), amzOrder(3), amzOrder(4)]);
+  const dl = (await listCouriers()).find((x) => x.name === 'Delhivery');
+  const sh = (await orderShipments(a.id))[0];
+  await updateShipment(a.id, sh.id, { courier_partner_id: dl.id, tracking_id: 'AWB-AMZ-SHARED' }, { actor: ACTOR, version: sh.version });
+  await attachToShipment(sh.id, { orderIds: [b.id, c.id] }, { actor: ACTOR });
+  if ((await shipmentMembers(sh.id)).length !== 3) throw new Error('members');
+  if ((await listOrders({ q: 'AWB-AMZ-SHARED' })).total !== 3) throw new Error('AWB search');
+  // Re-importing members leaves the shared shipment alone.
+  await commitAmazonImport(amzCsv([amzRow({ 'order-id': AZ(3), 'order-item-id': 'I1', 'payment-method': 'COD', 'item-price': '520' })]), 'again.csv', { actor: ACTOR });
+  const b2 = await amzOrder(3);
+  if (!b2.in_shared_shipment || b2.tracking_id !== 'AWB-AMZ-SHARED' || b2.order_value !== 520) throw new Error(JSON.stringify(b2));
+  return '3 imported orders under one AWB; re-import updates value, membership kept';
 });
 
 await step('new shipment cleanup', async () => {
