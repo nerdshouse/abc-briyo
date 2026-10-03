@@ -20,7 +20,7 @@ import {
   ensureOrdersSchema, createOrder, createShipment, updateOrder, updateShipment, getOrder, listOrders, orderEvents,
   orderShipments, addOrderNote, removeDocument, orderDocuments, listCouriers, saveCourier,
   trackingUrlFor, purgeTestOrders, zonedToUtc, listDestinations, saveDestination, DISPATCH_TYPES,
-  shipmentMembers, sharedShipmentOf, attachToShipment, detachFromShipment, attachableOrders,
+  shipmentMembers, sharedShipmentOf, attachToShipment, detachFromShipment, attachableOrders, createShipmentForOrders,
 } from '../lib/orders.js';
 import { saveUploadedDocument } from '../lib/orders-routes.js';
 import { planAmazon, readTable, previewAmazonImport, commitAmazonImport } from '../lib/amazon-import.js';
@@ -1816,6 +1816,10 @@ const AMZ_HEAD = ['order-id', 'order-item-id', 'purchase-date', 'payments-date',
   'item-promotion-discount', 'item-promotion-id', 'ship-promotion-discount', 'ship-promotion-id', 'payment-method',
   'cod-collectible-amount', 'is-business-order', 'purchase-order-number', 'is-prime', 'fulfilled-by', 'is-iba'];
 const AZ = (n) => `${TEST_ORDER}-AMZ-${n}`;
+// Imports are recorded under this name, so the test purge also removes their history rows.
+const IMPORTER = `${TEST_ORDER}-importer`;
+const amzShipments = async () => (await getPool().query(
+  `SELECT count(*)::int n FROM order_shipments s JOIN orders o ON o.id = s.order_id WHERE o.source_order_id LIKE $1`, [`${TEST_ORDER}-AMZ-%`])).rows[0].n;
 const amzRow = (o) => {
   const v = { 'purchase-date': '2026-09-20T10:15:00+00:00', 'payments-date': '2026-09-20T10:16:00+00:00', 'buyer-name': 'Test Buyer',
     sku: 'SKU-1', 'product-name': 'Test product', 'quantity-purchased': '1', currency: 'INR', 'item-price': '499.00', 'item-tax': '76.12',
@@ -1831,14 +1835,15 @@ await step('amazon import: one order, one item', async () => {
   const file = amzCsv([amzRow({ 'order-id': AZ(1), 'order-item-id': 'I1' })]);
   const p = await previewAmazonImport(file, 'one.csv');
   if (p.summary.newOrders !== 1 || p.summary.lineItems !== 1 || p.errorCount || await amzCount()) throw new Error(`preview ${JSON.stringify(p.summary)}`);
-  const r = await commitAmazonImport(file, 'one.csv', { actor: ACTOR });
+  const r = await commitAmazonImport(file, 'one.csv', { actor: IMPORTER });
   if (r.summary.ordersCreated !== 1 || r.summary.lineItemsAdded !== 1) throw new Error(JSON.stringify(r.summary));
   const o = await amzOrder(1);
   const items = await orderItems(o.id);
-  if (o.dispatch_type !== 'easy_ship' || o.order_value !== 499 || o.source !== 'amazon_import' || o.shipment_status !== 'not_ready') throw new Error(JSON.stringify(o));
+  if (o.dispatch_type !== 'easy_ship' || o.order_value !== 499 || o.source !== 'amazon_import') throw new Error(JSON.stringify(o));
+  if (o.shipment_id !== null || o.shipment_status !== null || (await orderShipments(o.id)).length) throw new Error('import created a shipment');
   if (items.length !== 1 || items[0].source_line_item_id !== 'I1' || items[0].item_tax !== 76.12) throw new Error(JSON.stringify(items));
   if ('gift-wrap-price' in (o.source_payload.amazon || {}) || JSON.stringify(o.source_payload).includes('gift')) throw new Error('ignored column stored');
-  return 'preview wrote nothing; import made 1 order (Easy Ship, ₹499, blank shipment) + 1 item; ignored columns not stored';
+  return 'preview wrote nothing; import made 1 order (Easy Ship, ₹499) + 1 item and no shipment; ignored columns not stored';
 });
 await step('amazon import: one order with two items; several orders in one file', async () => {
   const file = amzCsv([
@@ -1847,21 +1852,23 @@ await step('amazon import: one order with two items; several orders in one file'
     amzRow({ 'order-id': AZ(3), 'order-item-id': 'I1', 'payment-method': 'COD' }),
     amzRow({ 'order-id': AZ(4), 'order-item-id': 'I1' }),
   ]);
-  const r = await commitAmazonImport(file, 'multi.csv', { actor: ACTOR });
+  const r = await commitAmazonImport(file, 'multi.csv', { actor: IMPORTER });
   if (r.summary.ordersCreated !== 3 || r.summary.lineItemsAdded !== 4) throw new Error(JSON.stringify(r.summary));
   const o2 = await amzOrder(2);
   const items = await orderItems(o2.id);
   if (items.length !== 2 || items[1].quantity !== 3 || o2.order_value !== 480) throw new Error(`${o2.order_value} ${JSON.stringify(items)}`);
   const o3 = await amzOrder(3);
   if (o3.payment_method !== 'cod' || o3.payment_status !== 'pending') throw new Error('COD not mapped');
-  if (o2.payment_method !== 'marketplace' || o2.payment_status !== 'paid') throw new Error('prepaid not mapped');
-  return '3 orders, 4 items; value = items + shipping (₹480); COD vs paid-on-Amazon mapped';
+  // Blank payment-method: marketplace, status not known — a payments-date alone is not "paid".
+  if (o2.payment_method !== 'marketplace' || o2.payment_status !== null) throw new Error(`blank payment mapped to ${o2.payment_method}/${o2.payment_status}`);
+  if (await amzShipments()) throw new Error('import created shipments');
+  return '3 orders, 4 items, 0 shipments; value = items + shipping (₹480); COD → cod/pending, blank → marketplace/not known';
 });
 await step('amazon import: the same file twice changes nothing', async () => {
   const file = amzCsv([amzRow({ 'order-id': AZ(1), 'order-item-id': 'I1' })]);
   const before = (await orderEvents((await amzOrder(1)).id)).length;
   const v = (await amzOrder(1)).version;
-  const r = await commitAmazonImport(file, 'one.csv', { actor: ACTOR });
+  const r = await commitAmazonImport(file, 'one.csv', { actor: IMPORTER });
   const s = r.summary;
   if (s.ordersCreated || s.ordersUpdated || s.lineItemsAdded || s.lineItemsUpdated || s.ordersUnchanged !== 1) throw new Error(JSON.stringify(s));
   if ((await amzCount()) !== 4 || (await amzOrder(1)).version !== v || (await orderEvents((await amzOrder(1)).id)).length !== before) throw new Error('something was written');
@@ -1877,16 +1884,19 @@ await step('amazon import: an existing order gets a new line item and updated fi
   const o = await amzOrder(1);
   // Hand-entered shipment details survive the re-import.
   const dl = (await listCouriers()).find((c) => c.name === 'Delhivery');
-  const sh = (await orderShipments(o.id))[0];
-  await updateShipment(o.id, sh.id, { courier_partner_id: dl.id, tracking_id: 'AWB-AMZ-1', shipment_status: 'packed' }, { actor: ACTOR, version: sh.version });
-  const r = await commitAmazonImport(file, 'grow.csv', { actor: ACTOR });
+  await createShipmentForOrders([o.id], { courier_partner_id: dl.id, tracking_id: 'AWB-AMZ-1' }, { actor: ACTOR });
+  await addOrderNote(o.id, 'Packed with care', { actor: ACTOR });
+  await updateOrder(o.id, { payment_status: 'refunded' }, { actor: ACTOR, version: (await getOrder(o.id)).version });
+  const r = await commitAmazonImport(file, 'grow.csv', { actor: IMPORTER });
   if (r.summary.ordersUpdated !== 1 || r.summary.lineItemsAdded !== 1 || r.summary.lineItemsUpdated !== 1) throw new Error(JSON.stringify(r.summary));
   const after = await amzOrder(1);
-  if (after.order_value !== 749 || after.tracking_id !== 'AWB-AMZ-1' || after.shipment_status !== 'packed') throw new Error(JSON.stringify(after));
+  if (after.order_value !== 749 || after.tracking_id !== 'AWB-AMZ-1' || after.shipment_status !== 'packed' || after.courier_name !== 'Delhivery') throw new Error(JSON.stringify(after));
+  if (after.payment_status !== 'refunded') throw new Error('re-import overwrote the payment status the team set');
+  if ((await orderShipments(o.id)).length !== 1 || !(await orderEvents(o.id)).some((e) => e.metadata?.note === 'Packed with care')) throw new Error('shipment or note changed');
   if ((await orderItems(o.id)).length !== 2) throw new Error('items');
   const ev = (await orderEvents(o.id)).find((e) => e.event_type === 'amazon_import_updated');
   if (!ev || ev.metadata.items_added !== 1 || ev.metadata.changes.order_value?.to !== 749) throw new Error(JSON.stringify(ev));
-  return 'item added, tax updated, value ₹499 → ₹749 logged; courier, AWB and status untouched';
+  return 'item added, tax updated, value ₹499 → ₹749 logged; shipment, courier, AWB, status, note and payment status untouched';
 });
 await step('amazon import: duplicate rows, promotion rows, bad rows and missing order-id', async () => {
   const file = amzCsv([
@@ -1902,7 +1912,7 @@ await step('amazon import: duplicate rows, promotion rows, bad rows and missing 
     amzRow({ 'order-id': AZ(10), 'order-item-id': '' }),
     amzRow({ 'order-id': AZ(11), 'order-item-id': 'I1', 'fulfilled-by': 'Amazon' }),
   ]);
-  const r = await commitAmazonImport(file, 'mixed.csv', { actor: ACTOR });
+  const r = await commitAmazonImport(file, 'mixed.csv', { actor: IMPORTER });
   const s = r.summary;
   if (s.rows !== 11 || s.promotionRows !== 1 || s.duplicateRows !== 1 || s.ordersCreated !== 2 || r.errorCount !== 6) throw new Error(`${JSON.stringify(s)} ${JSON.stringify(r.errors)}`);
   const rowsOf = Object.fromEntries(r.errors.map((e) => [e.row, e]));
@@ -1934,24 +1944,72 @@ await step('amazon import: orders show in the Orders list and filters', async ()
   const all = await listOrders({ channel: 'amazon', q: `${TEST_ORDER}-AMZ` });
   const easy = await listOrders({ channel: 'amazon', type: 'easy_ship', q: `${TEST_ORDER}-AMZ` });
   if (all.total !== 6 || easy.total !== 6) throw new Error(`${all.total} ${easy.total}`);
+  if (await amzShipments() !== 1) throw new Error('only the one shipment made by hand should exist');
   if (all.orders.some((o) => o.channel_label !== 'Amazon')) throw new Error('label');
-  return '6 imported orders listed under Amazon / Easy Ship';
+  return '6 imported orders listed under Amazon / Easy Ship; the only shipment is the one made by hand';
 });
-await step('amazon import: several imported orders share one shipment', async () => {
+await step('amazon import → no shipments → pick 3 orders → one Shree Tirupati shipment', async () => {
   const [a, b, c] = await Promise.all([amzOrder(2), amzOrder(3), amzOrder(4)]);
-  const dl = (await listCouriers()).find((x) => x.name === 'Delhivery');
-  const sh = (await orderShipments(a.id))[0];
-  await updateShipment(a.id, sh.id, { courier_partner_id: dl.id, tracking_id: 'AWB-AMZ-SHARED' }, { actor: ACTOR, version: sh.version });
-  await attachToShipment(sh.id, { orderIds: [b.id, c.id] }, { actor: ACTOR });
-  if ((await shipmentMembers(sh.id)).length !== 3) throw new Error('members');
-  if ((await listOrders({ q: 'AWB-AMZ-SHARED' })).total !== 3) throw new Error('AWB search');
-  // Re-importing members leaves the shared shipment alone.
-  await commitAmazonImport(amzCsv([amzRow({ 'order-id': AZ(3), 'order-item-id': 'I1', 'payment-method': 'COD', 'item-price': '520' })]), 'again.csv', { actor: ACTOR });
+  if ([a, b, c].some((o) => o.shipment_id !== null)) throw new Error('imported orders already have shipments');
+  // They wait in Pending dispatch and under "No shipment yet".
+  const waiting = await listOrders({ view: 'pending_dispatch', q: `${TEST_ORDER}-AMZ` });
+  const none = await listOrders({ shipment: 'none', q: `${TEST_ORDER}-AMZ` });
+  for (const o of [a, b, c]) {
+    if (!waiting.orders.some((x) => x.id === o.id) || !none.orders.some((x) => x.id === o.id)) throw new Error('not listed as waiting');
+  }
+  const stc = (await listCouriers()).find((x) => x.name === 'Shree Tirupati Courier');
+  const r = await createShipmentForOrders([a.id, b.id, c.id], { courier_partner_id: stc.id, tracking_id: 'AWB-AMZ-STC' }, { actor: ACTOR });
+  if (r.orderId !== a.id) throw new Error('first order is not the main one');
+  const members = await shipmentMembers(r.shipmentId);
+  if (members.length !== 3 || members[0].id !== a.id) throw new Error(`members ${JSON.stringify(members)}`);
+  // One shipment row in total for the three orders.
+  const n = (await getPool().query(`SELECT count(*)::int n FROM order_shipments WHERE order_id = ANY($1)`, [[a.id, b.id, c.id]])).rows[0].n;
+  if (n !== 1) throw new Error(`${n} shipment rows`);
+  // Each order is still its own row in the list, all showing the one AWB and courier.
+  const list = await listOrders({ q: 'AWB-AMZ-STC' });
+  if (list.total !== 3 || list.orders.some((o) => o.shipment_id !== r.shipmentId || o.courier_name !== 'Shree Tirupati Courier'
+    || o.shipment_status !== 'packed' || o.orders_in_shipment !== 3)) throw new Error(JSON.stringify(list.orders));
+  // Opening any of them shows the shared shipment and its three orders.
+  for (const o of [b, c]) {
+    const shared = await sharedShipmentOf(o.id);
+    if (!shared || shared.id !== r.shipmentId || (await shipmentMembers(shared.id)).length !== 3) throw new Error('drawer would not show the shipment');
+  }
+  // Re-importing a member updates its Amazon fields and leaves the shipment alone.
+  await commitAmazonImport(amzCsv([amzRow({ 'order-id': AZ(3), 'order-item-id': 'I1', 'payment-method': 'COD', 'item-price': '520' })]), 'again.csv', { actor: IMPORTER });
   const b2 = await amzOrder(3);
-  if (!b2.in_shared_shipment || b2.tracking_id !== 'AWB-AMZ-SHARED' || b2.order_value !== 520) throw new Error(JSON.stringify(b2));
-  return '3 imported orders under one AWB; re-import updates value, membership kept';
+  if (!b2.in_shared_shipment || b2.tracking_id !== 'AWB-AMZ-STC' || b2.order_value !== 520) throw new Error(JSON.stringify(b2));
+  if ((await shipmentMembers(r.shipmentId)).length !== 3) throw new Error('membership changed');
+  return '3 imported orders → 1 shipment (Shree Tirupati, one AWB); 3 rows in the list; drawer shows all 3; re-import kept it';
 });
-
+await step('create shipment from orders: refusals are all-or-nothing', async () => {
+  const dl = (await listCouriers()).find((x) => x.name === 'Delhivery');
+  const shipped = await amzOrder(2);
+  const free = await amzOrder(5);
+  const web = await createOrder({ channel: 'website', source_order_id: `${TEST_ORDER}-AMZ-WEB` }, { actor: ACTOR });
+  const before = (await getPool().query('SELECT count(*)::int n FROM order_shipments')).rows[0].n;
+  const refused = async (ids, input, check) => {
+    try { await createShipmentForOrders(ids, input, { actor: ACTOR }); throw new Error('accepted'); } catch (err) { if (!check(err)) throw err; }
+  };
+  await refused([free.id, shipped.id], { courier_partner_id: dl.id, tracking_id: 'X1' }, (e) => e.alreadyShipped);
+  await refused([shipped.id, free.id], { courier_partner_id: dl.id, tracking_id: 'X2' }, (e) => e.alreadyShipped);
+  await refused([free.id, web], { courier_partner_id: dl.id, tracking_id: 'X3' }, (e) => e.status === 400);
+  await refused([free.id], { tracking_id: 'X4' }, (e) => /courier/.test(e.message));
+  await refused([free.id], { courier_partner_id: dl.id }, (e) => /AWB/.test(e.message));
+  await refused([], { courier_partner_id: dl.id, tracking_id: 'X5' }, (e) => e.status === 400);
+  const after = (await getPool().query('SELECT count(*)::int n FROM order_shipments')).rows[0].n;
+  if (after !== before || (await amzOrder(5)).shipment_id !== null) throw new Error('a refused request left a shipment');
+  return 'already-shipped order, other channel, no courier, no AWB, no orders → refused, nothing written';
+});
+await step('amazon import history is recorded', async () => {
+  const { rows } = await getPool().query(`SELECT * FROM order_imports WHERE imported_by = $1 ORDER BY id`, [IMPORTER]);
+  const mixed = rows.find((x) => x.filename === 'mixed.csv');
+  if (!mixed || mixed.channel !== 'amazon' || mixed.rows_processed !== 11 || mixed.orders_created !== 2 || mixed.duplicate_rows !== 1
+    || mixed.error_rows !== 6 || mixed.errors.length !== 6 || mixed.promotion_rows !== 1 || !/^[0-9a-f]{64}$/.test(mixed.file_sha256)) throw new Error(JSON.stringify(mixed));
+  const grow = rows.find((x) => x.filename === 'grow.csv');
+  if (grow.orders_updated !== 1 || grow.items_created !== 1 || grow.items_updated !== 1) throw new Error(JSON.stringify(grow));
+  if (!rows.every((x) => x.imported_at instanceof Date)) throw new Error('no time');
+  return `${rows.length} imports recorded with time, person, file, rows, created/updated, items, duplicates, errors`;
+});
 await step('new shipment cleanup', async () => {
   const { orders, paths } = await purgeTestOrders(TEST_ORDER);
   for (const p of paths) await storage().remove(p).catch(() => {});

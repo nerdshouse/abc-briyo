@@ -27,6 +27,11 @@ const DOT = {
   out_for_delivery: 'callback', delivered: 'recovered', delivery_failed: 'lost', rto: 'lost',
 };
 const indicator = (v) => `<span class="status ${DOT[v] || ''}"><span class="dot"></span>${esc(label(v))}</span>`;
+const NO_SHIPMENT = '<span class="status none" title="Not in any shipment yet"><span class="dot"></span>No shipment yet</span>';
+const shipIndicator = (o) => (o.shipment_id ? indicator(o.shipment_status) : NO_SHIPMENT);
+// Only an order with no shipment, not cancelled, can be ticked for a new one.
+const pickable = (o) => !o.shipment_id && o.order_status !== 'cancelled';
+const pickBox = (o) => (pickable(o) ? `<label class="pick" title="Choose for a shipment"><input type="checkbox" data-pick="${o.id}"${state.sel.has(o.id) ? ' checked' : ''} aria-label="Choose order ${esc(o.source_order_id)}" /></label>` : '');
 
 // The usual next move from each shipment state. Anything else is in the select.
 const NEXT_STEPS = {
@@ -57,6 +62,7 @@ const state = {
   detail: null,
   editing: null,
   retry: null,       // uploads that failed, kept (with their files) for Retry
+  sel: new Map(),    // orders ticked for one new shipment: id → order
 };
 
 const api = async (url, opts = {}) => {
@@ -209,7 +215,7 @@ function renderRows() {
   const empty = state.total === 0
     ? (anyFilter() || state.type || state.view
       ? '<b>Nothing matches.</b>Try clearing a filter.'
-      : '<b>No shipments yet.</b>Add one with New Shipment.')
+      : '<b>No orders yet.</b>Add a shipment with New Shipment, or Import orders.')
     : '';
   if (empty) {
     $('#rows').innerHTML = `<tr><td colspan="10"><div class="empty-note">${empty}</div></td></tr>`;
@@ -218,13 +224,13 @@ function renderRows() {
   }
   $('#rows').innerHTML = state.orders.map((o) => `
     <tr class="orow${o.id === state.openId ? ' open' : ''}" data-id="${o.id}" tabindex="0">
-      <td><span class="cell-main mono" style="font-weight:500">${esc(o.source_order_id)}${cancelledTag(o)}</span></td>
+      <td><span class="cell-main mono" style="font-weight:500">${pickBox(o)}${esc(o.source_order_id)}${cancelledTag(o)}</span></td>
       <td><span class="cell-main chan">${esc(o.channel_label)}</span>${o.destination_name
         ? `<span class="cell-sub muted" title="${esc(o.destination_name)}">${esc(o.destination_name)}</span>`
         : o.dispatch_type ? `<span class="cell-sub muted">${esc(typeLabel(o.dispatch_type))}</span>` : ''}</td>
       <td>${o.courier_name ? esc(o.courier_name) : '<span class="muted-cell">—</span>'}</td>
       <td>${trackingCell(o)}</td>
-      <td>${indicator(o.shipment_status)}</td>
+      <td>${shipIndicator(o)}</td>
       <td>${proofCell(o)}</td>
       <td class="num"${o.order_date ? '' : ' title="No order date — shown by when it was entered"'}>${esc(day(o.order_date))}</td>
       <td class="col-cust"><span class="cell-main">${o.customer_name ? esc(o.customer_name) : '<span class="muted-cell">—</span>'}</span></td>
@@ -233,14 +239,15 @@ function renderRows() {
     </tr>`).join('');
   $('#clist').innerHTML = state.orders.map((o) => `
     <li class="oitem" data-id="${o.id}" tabindex="0">
-      <div class="oi-top"><span class="oi-id mono">${esc(o.source_order_id)}</span><span class="chan">${esc(o.channel_label)}</span>${cancelledTag(o)}
-        <span class="oi-val">${indicator(o.shipment_status)}</span></div>
+      <div class="oi-top">${pickBox(o)}<span class="oi-id mono">${esc(o.source_order_id)}</span><span class="chan">${esc(o.channel_label)}</span>${cancelledTag(o)}
+        <span class="oi-val">${shipIndicator(o)}</span></div>
       ${o.destination_name ? `<div class="oi-sub">${icon('map-pin')} ${esc(o.destination_name)}</div>` : ''}
-      <div class="oi-sub">${o.tracking_id ? `${esc(o.courier_name || '')} · <span class="mono">${esc(o.tracking_id)}</span>` : 'No courier / AWB yet'}</div>
+      <div class="oi-sub">${o.tracking_id ? `${esc(o.courier_name || '')} · <span class="mono">${esc(o.tracking_id)}</span>` : o.shipment_id ? 'No courier / AWB yet' : 'Not in a shipment yet'}</div>
       <div class="oi-stat"><span class="soft" style="font-size:12.5px">${esc(day(o.order_date))}</span>
         ${proofCell(o)}
         ${o.order_value !== null ? `<span class="soft" style="font-size:12.5px">${esc(amount(o.order_value))}</span>` : ''}</div>
     </li>`).join('');
+  renderSelection();
   renderIcons();
 }
 
@@ -456,6 +463,7 @@ function renderDrawer() {
   const { order: o, shipments, documents, events } = state.detail;
   const m = state.meta;
   const ship = currentShip();
+  if (!ship) return renderDrawerNoShipment();
   state.shipId = ship.id;
   const courier = courierById(ship.courier_partner_id);
   const autoLink = Boolean(courier?.tracking_url_template);
@@ -502,6 +510,49 @@ function renderDrawer() {
         ? `<p class="photo-needed">${icon('camera')}Add a dispatch product photo (below) before marking it dispatched.</p>` : ''}
     </section>
 
+    ${drawerCommon(o, documents, proofDocs, events, notes)}`;
+  renderIcons();
+}
+
+/** Line items, as the marketplace listed them. Manual orders have none. */
+function itemsSection(o, items) {
+  if (!items.length) return '';
+  const units = items.reduce((n, it) => n + it.quantity, 0);
+  return `<section class="dsec">
+      <h3 class="dsec-title">Items <span class="dsec-meta soft">${count(items.length)} line${items.length === 1 ? '' : 's'} · ${count(units)} unit${units === 1 ? '' : 's'}</span></h3>
+      <div class="item-list">${items.map((it) => `
+        <div class="item-row">
+          <div class="t"><div>${esc(it.title || it.sku || 'Item')}</div>
+            <div class="muted" style="font-size:12px">${[it.sku && `SKU <span class="mono">${esc(it.sku)}</span>`,
+              it.promotion_discount ? `Discount ${esc(money(it.promotion_discount))}` : '',
+              it.shipping_price ? `Shipping ${esc(money(it.shipping_price))}` : ''].filter(Boolean).join(' · ')}</div></div>
+          <div class="n"><div>× ${esc(it.quantity)}</div><div class="muted" style="font-size:12px">${esc(amount(it.item_price))}</div></div>
+        </div>`).join('')}</div>
+    </section>`;
+}
+
+/** What the Amazon report said beyond the order's own fields. */
+function amazonDetails(a) {
+  if (!a) return '';
+  const to = a.ship_to || {};
+  const place = [to.city, to.state, to.postal_code].filter(Boolean).join(', ');
+  const win = (from, until) => [from && dateShort(from), until && dateShort(until)].filter(Boolean).join(' – ');
+  const rows = [
+    ['Ship To', [to.name, place].filter(Boolean).join(' · ')],
+    ['Service Level', a.ship_service_level],
+    ['Ship By', win(a.earliest_ship_date, a.latest_ship_date)],
+    ['Deliver By', win(a.earliest_delivery_date, a.latest_delivery_date)],
+    ['Amazon Flags', [a.is_prime && 'Prime', a.is_business_order && 'Business', a.fulfilled_by, a.is_amazon_invoiced && 'Amazon invoiced'].filter(Boolean).join(' · ')],
+    ['PO Number', a.purchase_order_number],
+    ['Delivery Note', a.delivery_instructions],
+  ].filter(([, v]) => v);
+  return rows.map(([k, v]) => `<dt>${k}</dt><dd>${esc(v)}</dd>`).join('');
+}
+
+/** Proof, notes, items, order details and activity: the same with or without a shipment. */
+function drawerCommon(o, documents, proofDocs, events, notes) {
+  const m = state.meta;
+  return `
     <section class="dsec">
       <h3 class="dsec-title">Dispatch Proof &amp; Documents</h3>
       ${retryBanner(o.id)}
@@ -550,42 +601,25 @@ function renderDrawer() {
           <span class="act-time">${esc(dateTime(e.at))}</span></div>`;
       }).join('')}</div>
     </section>`;
+}
+
+/** An order no shipment has been made for yet, e.g. one just imported from Amazon. */
+function renderDrawerNoShipment() {
+  const { order: o, documents, events } = state.detail;
+  state.shipId = null;
+  const notes = events.filter((e) => e.event_type === 'note_added');
+  $('#dTitle').textContent = `Order ${o.source_order_id}`;
+  $('#dSub').textContent = [o.channel_label, o.dispatch_type && typeLabel(o.dispatch_type), o.destination_name, o.order_date && dateTime(o.order_date),
+    o.order_status === 'cancelled' && 'Order cancelled'].filter(Boolean).join(' · ');
+  $('#dBody').innerHTML = `
+    <section class="dsec">
+      <h3 class="dsec-title">Shipment <span class="dsec-meta">${NO_SHIPMENT}</span></h3>
+      <p class="imp-note" style="margin:0 0 12px">Nothing has been shipped for this order. When it is packed, create a shipment — several orders can share one parcel and AWB.</p>
+      ${o.order_status === 'cancelled' ? '' : `<div class="form-actions" style="margin-top:0"><button class="btn primary" type="button" id="dShipNew">${icon('package-plus')}Create shipment</button>
+        <button class="btn" type="button" id="dShipPick">${icon('list-checks')}Choose more orders for it</button></div>`}
+    </section>
+    ${drawerCommon(o, documents, documents, events, notes)}`;
   renderIcons();
-}
-
-/** Line items, as the marketplace listed them. Manual orders have none. */
-function itemsSection(o, items) {
-  if (!items.length) return '';
-  const units = items.reduce((n, it) => n + it.quantity, 0);
-  return `<section class="dsec">
-      <h3 class="dsec-title">Items <span class="dsec-meta soft">${count(items.length)} line${items.length === 1 ? '' : 's'} · ${count(units)} unit${units === 1 ? '' : 's'}</span></h3>
-      <div class="item-list">${items.map((it) => `
-        <div class="item-row">
-          <div class="t"><div>${esc(it.title || it.sku || 'Item')}</div>
-            <div class="muted" style="font-size:12px">${[it.sku && `SKU <span class="mono">${esc(it.sku)}</span>`,
-              it.promotion_discount ? `Discount ${esc(money(it.promotion_discount))}` : '',
-              it.shipping_price ? `Shipping ${esc(money(it.shipping_price))}` : ''].filter(Boolean).join(' · ')}</div></div>
-          <div class="n"><div>× ${esc(it.quantity)}</div><div class="muted" style="font-size:12px">${esc(amount(it.item_price))}</div></div>
-        </div>`).join('')}</div>
-    </section>`;
-}
-
-/** What the Amazon report said beyond the order's own fields. */
-function amazonDetails(a) {
-  if (!a) return '';
-  const to = a.ship_to || {};
-  const place = [to.city, to.state, to.postal_code].filter(Boolean).join(', ');
-  const win = (from, until) => [from && dateShort(from), until && dateShort(until)].filter(Boolean).join(' – ');
-  const rows = [
-    ['Ship To', [to.name, place].filter(Boolean).join(' · ')],
-    ['Service Level', a.ship_service_level],
-    ['Ship By', win(a.earliest_ship_date, a.latest_ship_date)],
-    ['Deliver By', win(a.earliest_delivery_date, a.latest_delivery_date)],
-    ['Amazon Flags', [a.is_prime && 'Prime', a.is_business_order && 'Business', a.fulfilled_by, a.is_amazon_invoiced && 'Amazon invoiced'].filter(Boolean).join(' · ')],
-    ['PO Number', a.purchase_order_number],
-    ['Delivery Note', a.delivery_instructions],
-  ].filter(([, v]) => v);
-  return rows.map(([k, v]) => `<dt>${k}</dt><dd>${esc(v)}</dd>`).join('');
 }
 
 const fmtVal = (k, v) => {
@@ -614,6 +648,7 @@ function describeEvent(e) {
   const md = e.metadata || {};
   const ch = md.changes || {};
   switch (e.event_type) {
+    case 'shipment_created': return ['package-plus', 'info', md.orders > 1 ? `Shipment created for ${md.orders} orders` : 'Shipment created'];
     case 'shipment_added': return ['package-plus', 'info', 'Another shipment added to this order'];
     case 'shipment_order_attached': return ['package-plus', 'info', `Order ${esc(md.source_order_id)} added to this shipment`];
     case 'shipment_order_detached': return ['package-minus', 'warn', `Order ${esc(md.source_order_id)} taken out of this shipment`];
@@ -796,6 +831,14 @@ dBody.addEventListener('click', async (e) => {
       STEP_TEXT[step.dataset.step].replace(/^Mark /, 'Marked '), { shipment: true });
   }
   if (e.target.closest('#dEdit')) return openForm(state.detail.order);
+  // No shipment yet: start one with this order, now or after choosing more in the list.
+  if (e.target.closest('#dShipNew, #dShipPick')) {
+    const o = state.detail.order;
+    if (!state.sel.has(o.id)) state.sel = new Map([[o.id, o], ...state.sel]);
+    renderRows();
+    if (e.target.closest('#dShipNew')) return openShipNew();
+    return closeDrawer();
+  }
   if (e.target.closest('#dNoteAdd')) {
     const note = $('#dNote').value.trim();
     if (!note) return;
@@ -1167,7 +1210,7 @@ $('#createDrawer').addEventListener('click', (e) => {
 function fillFilters() {
   const m = state.meta;
   $('#fstatus').innerHTML = opt('', 'Order status') + m.orderStatuses.map((s) => opt(s, label(s))).join('');
-  $('#fshipment').innerHTML = opt('', 'Shipment') + m.shipmentStatuses.map((s) => opt(s, label(s))).join('');
+  $('#fshipment').innerHTML = opt('', 'Shipment') + opt('none', 'No shipment yet') + m.shipmentStatuses.map((s) => opt(s, label(s))).join('');
   $('#fcourier').innerHTML = opt('', 'Courier') + opt('none', 'No courier') + m.couriers.map((c) => opt(c.id, c.name)).join('');
   const ids = { status: 'fstatus', shipment: 'fshipment', courier: 'fcourier', invoice: 'finvoice', tracking: 'ftracking', from: 'ffrom', to: 'fto' };
   for (const [k, id] of Object.entries(ids)) {
@@ -1175,6 +1218,84 @@ function fillFilters() {
     $(`#${id}`).classList.toggle('on', Boolean(state.f[k]));
   }
   $('#q').value = state.f.q;
+}
+
+/* ---------------------------------------------- one shipment, several orders */
+
+/** The orders ticked so far, and whether they can travel together. */
+function renderSelection() {
+  const list = [...state.sel.values()];
+  $('#selBar').hidden = !list.length;
+  if (!list.length) return;
+  const first = list[0];
+  const mixed = list.some((o) => o.channel !== first.channel || (o.dispatch_type || '') !== (first.dispatch_type || '')
+    || (o.destination_id ?? null) !== (first.destination_id ?? null));
+  $('#selText').innerHTML = `<b>${count(list.length)}</b> order${list.length > 1 ? 's' : ''} chosen`
+    + (mixed ? ' · <span class="warn-text">only orders of the same channel, type and destination can share a shipment</span>' : '');
+  $('#selShip').disabled = mixed;
+}
+
+function togglePick(id, on) {
+  const o = state.orders.find((x) => x.id === id) || (state.detail?.order.id === id ? state.detail.order : null);
+  if (on && o) state.sel.set(id, o); else state.sel.delete(id);
+  renderSelection();
+}
+
+function openShipNew() {
+  const list = [...state.sel.values()];
+  if (!list.length) return;
+  const f = $('#shipNewForm');
+  f.reset();
+  $('#sError').hidden = true;
+  $('#sSaved').textContent = '';
+  f.courier_partner_id.innerHTML = opt('', 'Choose courier', true)
+    + state.meta.couriers.filter((c) => c.active).map((c) => opt(c.id, c.name)).join('');
+  $('#sTitle').textContent = list.length > 1 ? `Create Shipment · ${list.length} orders` : 'Create Shipment';
+  const total = list.reduce((n, o) => n + (o.order_value || 0), 0);
+  $('#sTotal').textContent = `${list[0].channel_label}${list[0].dispatch_type ? ` · ${typeLabel(list[0].dispatch_type)}` : ''} · ${money(total)}`;
+  $('#sOrders').innerHTML = list.map((o, i) => `<li><span class="mono">${esc(o.source_order_id)}</span>
+    ${i === 0 ? '<span class="mini-tag">Main</span>' : ''}<span class="soft">${esc(day(o.order_date))}</span><span class="num">${esc(amount(o.order_value))}</span>
+    <button type="button" class="icon-btn bare" data-unpick="${o.id}" title="Leave out" aria-label="Leave order ${esc(o.source_order_id)} out">${icon('x')}</button></li>`).join('');
+  $('#shipDrawer').hidden = false;
+  $('#drawerScrim').hidden = false;
+  renderIcons();
+  f.courier_partner_id.focus();
+}
+
+function closeShipNew() {
+  $('#shipDrawer').hidden = true;
+  if ($('#drawer').hidden && $('#formDrawer').hidden && $('#createDrawer').hidden && $('#importDrawer').hidden) $('#drawerScrim').hidden = true;
+}
+
+async function submitShipNew(e) {
+  e.preventDefault();
+  const f = $('#shipNewForm');
+  const err = $('#sError');
+  err.hidden = true;
+  if (!f.courier_partner_id.value) { err.textContent = 'Choose the courier partner.'; err.hidden = false; return; }
+  if (!f.tracking_id.value.trim()) { err.textContent = 'Enter the AWB / tracking ID.'; err.hidden = false; return; }
+  $('#sSubmit').disabled = true;
+  $('#sSaved').textContent = 'Creating…';
+  try {
+    const r = await api('/api/orders/shipments/from-orders', {
+      method: 'POST',
+      body: JSON.stringify({
+        order_ids: [...state.sel.keys()], courier_partner_id: f.courier_partner_id.value,
+        tracking_id: f.tracking_id.value.trim(), tracking_url: f.tracking_url.value.trim() || undefined,
+        shipment_status: f.shipment_status.value,
+      }),
+    });
+    state.sel.clear();
+    closeShipNew();
+    load();
+    openOrder(r.orderId, { shipmentId: r.shipmentId });
+  } catch (x) {
+    err.textContent = x.message;
+    err.hidden = false;
+  } finally {
+    $('#sSubmit').disabled = false;
+    $('#sSaved').textContent = '';
+  }
 }
 
 /* ---------------------------------------------------------- Amazon import */
@@ -1193,6 +1314,20 @@ function openImport() {
   $('#importDrawer').hidden = false;
   $('#drawerScrim').hidden = false;
   $('#iFile').focus();
+  loadImportHistory();
+}
+
+async function loadImportHistory() {
+  try {
+    const { imports } = await api('/api/orders/import/history');
+    $('#iHistory').innerHTML = imports.length ? `<section class="dsec">
+      <h3 class="dsec-title">Recent imports</h3>
+      <div class="imp-scroll"><table class="imp-errors"><thead><tr><th>When</th><th>By</th><th>File</th><th>Rows</th><th>New</th><th>Updated</th><th>Items</th><th>Dup.</th><th>Errors</th></tr></thead><tbody>
+      ${imports.map((x) => `<tr><td>${esc(dateTime(x.imported_at))}</td><td>${esc(x.imported_by || '—')}</td><td>${esc(x.filename || '—')}</td>
+        <td class="num">${count(x.rows_processed)}</td><td class="num">${count(x.orders_created)}</td><td class="num">${count(x.orders_updated)}</td>
+        <td class="num">${count(x.items_created)}</td><td class="num">${count(x.duplicate_rows)}</td><td class="num">${count(x.error_rows)}</td></tr>`).join('')}
+      </tbody></table></div></section>` : '';
+  } catch { $('#iHistory').innerHTML = ''; }
 }
 
 function closeImport() {
@@ -1284,7 +1419,7 @@ async function commitImport() {
           ${stat(s.duplicateRows, 'Duplicate rows skipped', s.duplicateRows ? 'warn' : '')}
           ${stat(r.errorCount, 'Rows not imported', r.errorCount ? 'bad' : '')}
         </div>
-        <p class="imp-note">New orders are in the Easy Ship tab, ready for a courier and AWB.</p>
+        <p class="imp-note">No shipments were created. To ship, tick the orders in the list (Shipment → No shipment yet) and choose Create Shipment.</p>
       </section>
       ${errorTable(r.errors, r.errorCount)}`;
     $('#iSaved').textContent = '';
@@ -1292,6 +1427,7 @@ async function commitImport() {
     $('#iSubmit').disabled = false;
     $('#iCancel').textContent = 'Close';
     load();
+    loadImportHistory();
   } catch (err) {
     $('#iSaved').textContent = '';
     importError(`${err.message} Nothing was saved.`);
@@ -1333,10 +1469,28 @@ function bind() {
     navigate(typeUrl(b.dataset.type));
   });
   const rowOpen = (e) => {
-    if (e.target.closest('a')) return;
+    if (e.target.closest('a, .pick')) return;
     const r = e.target.closest('[data-id]');
     if (r) openOrder(Number(r.dataset.id));
   };
+  for (const host of [$('#rows'), $('#clist')]) {
+    host.addEventListener('change', (e) => {
+      const box = e.target.closest('[data-pick]');
+      if (box) togglePick(Number(box.dataset.pick), box.checked);
+    });
+  }
+  $('#selClear').addEventListener('click', () => { state.sel.clear(); renderRows(); });
+  $('#selShip').addEventListener('click', openShipNew);
+  $('#sClose').addEventListener('click', closeShipNew);
+  $('#sCancel').addEventListener('click', closeShipNew);
+  $('#shipNewForm').addEventListener('submit', submitShipNew);
+  $('#sOrders').addEventListener('click', (e) => {
+    const b = e.target.closest('[data-unpick]');
+    if (!b) return;
+    state.sel.delete(Number(b.dataset.unpick));
+    renderRows();
+    if (state.sel.size) openShipNew(); else closeShipNew();
+  });
   $('#rows').addEventListener('click', rowOpen);
   $('#clist').addEventListener('click', rowOpen);
   for (const host of [$('#rows'), $('#clist')]) {
@@ -1356,7 +1510,8 @@ function bind() {
   $('#fClose').addEventListener('click', closeForm);
   $('#fCancel').addEventListener('click', closeForm);
   const closeTop = () => {
-    if (!$('#importDrawer').hidden) closeImport();
+    if (!$('#shipDrawer').hidden) closeShipNew();
+    else if (!$('#importDrawer').hidden) closeImport();
     else if (!$('#createDrawer').hidden) closeCreate();
     else if (!$('#formDrawer').hidden) closeForm();
     else if (!$('#drawer').hidden) closeDrawer();

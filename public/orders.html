@@ -130,6 +130,11 @@
             <button type="button" class="linkish" id="fclear" hidden>Clear</button>
           </div>
           <div class="board-meta" id="resultNote" aria-live="polite"></div>
+          <div class="selbar" id="selBar" hidden>
+            <span id="selText"></span>
+            <button class="btn primary" type="button" id="selShip"><i data-lucide="package-plus"></i>Create Shipment</button>
+            <button class="linkish" type="button" id="selClear">Clear</button>
+          </div>
 
           <div class="table-wrap">
             <table class="table ord-table">
@@ -302,6 +307,38 @@
   </div>
 </aside>
 
+<aside class="drawer drawer-wide" id="shipDrawer" hidden aria-label="Create shipment for orders">
+  <div class="drawer-head">
+    <div><h2 class="drawer-title" id="sTitle">Create Shipment</h2><div class="drawer-sub">One parcel, one courier and AWB, for every order below.</div></div>
+    <div class="drawer-nav"><button class="icon-btn" id="sClose" type="button" title="Close" aria-label="Close"><i data-lucide="x"></i></button></div>
+  </div>
+  <form class="drawer-body" id="shipNewForm" novalidate>
+    <div class="form-error" id="sError" role="alert" hidden></div>
+    <section class="dsec">
+      <h3 class="dsec-title">Orders in this shipment <span class="dsec-meta soft" id="sTotal"></span></h3>
+      <ul class="shared-list" id="sOrders"></ul>
+      <p class="imp-note">The first order is the shipment's main order. To add more, close this, tick them in the list and come back.</p>
+    </section>
+    <section class="dsec">
+      <div class="form-grid">
+        <label class="fld"><span>Courier</span><select class="select" name="courier_partner_id" required></select></label>
+        <label class="fld"><span>AWB / Tracking ID</span><input class="input mono" name="tracking_id" maxlength="80" autocomplete="off" required /></label>
+        <label class="fld wide"><span>Tracking Link</span><input class="input" name="tracking_url" maxlength="500" autocomplete="off" placeholder="Optional — filled from the courier and AWB where it can be" /></label>
+        <label class="fld"><span>Shipment Status</span><select class="select" name="shipment_status">
+          <option value="packed" selected>Packed</option><option value="not_ready">Not ready</option></select>
+          <span class="help">Mark it dispatched from the shipment once the dispatch photo is in.</span></label>
+      </div>
+    </section>
+  </form>
+  <div class="drawer-foot">
+    <span class="saved" id="sSaved"></span>
+    <div style="display:flex;gap:8px">
+      <button class="btn" type="button" id="sCancel">Cancel</button>
+      <button class="btn primary" type="submit" form="shipNewForm" id="sSubmit">Create Shipment</button>
+    </div>
+  </div>
+</aside>
+
 <aside class="drawer drawer-wide" id="importDrawer" hidden aria-label="Import orders">
   <div class="drawer-head">
     <div><h2 class="drawer-title">Import orders</h2><div class="drawer-sub">Amazon order report (.xlsx, .csv or .txt). You see what will change before anything is saved.</div></div>
@@ -318,6 +355,7 @@
       </div>
     </section>
     <div id="iResult"></div>
+    <div id="iHistory"></div>
   </div>
   <div class="drawer-foot">
     <span class="saved" id="iSaved"></span>
