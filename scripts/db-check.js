@@ -1924,6 +1924,57 @@ await step('amazon import: duplicate rows, promotion rows, bad rows and missing 
   if (o5.order_value !== 449 || (await orderItems(o5.id))[0].promotion_discount !== -50) throw new Error(`promo ${o5.order_value}`);
   return '2 good orders in; duplicate + promotion rows folded; 6 bad rows reported with row number, order and reason';
 });
+await step('amazon import: promotion-only rows are recognised by content, wherever they sit', async () => {
+  const promo = (o) => AMZ_HEAD.map((h) => o[h] ?? '');
+  const file = amzCsv([
+    // Promotion row BEFORE its item, with another order in between, carrying a real discount and id.
+    promo({ 'order-id': AZ(20), 'order-item-id': 'P1', 'item-promotion-discount': '-20', 'ship-promotion-discount': '-5', 'item-promotion-id': 'PROMO-X' }),
+    amzRow({ 'order-id': AZ(21), 'order-item-id': 'Q1' }),
+    amzRow({ 'order-id': AZ(20), 'order-item-id': 'P1', 'item-price': '300', 'shipping-price': '80' }),
+    // Amazon's usual zero-value detail row, straight after its item.
+    amzRow({ 'order-id': AZ(22), 'order-item-id': 'R1' }),
+    promo({ 'order-id': AZ(22), 'order-item-id': 'R1', 'item-promotion-discount': '0', 'ship-promotion-discount': '0' }),
+    // Promotion row for an item id that order does not have → reported; that order held back.
+    amzRow({ 'order-id': AZ(23), 'order-item-id': 'S1' }),
+    promo({ 'order-id': AZ(23), 'order-item-id': 'S-MISSING', 'item-promotion-discount': '-10' }),
+    // Promotion row for an order not in the file at all → reported, nothing created.
+    promo({ 'order-id': AZ(24), 'order-item-id': 'T1', 'item-promotion-discount': '-10' }),
+    // No item fields and no promotion fields: NOT a promotion row — an invalid row.
+    promo({ 'order-id': AZ(25), 'order-item-id': 'U1' }),
+  ]);
+  const plan = planAmazon(readTable(file, 'promo.csv'));
+  if (plan.stats.promotionRows !== 2) throw new Error(`promotion rows ${plan.stats.promotionRows}`);
+  const r = await commitAmazonImport(file, 'promo.csv', { actor: IMPORTER });
+  if (r.summary.ordersCreated !== 3 || r.summary.lineItemsAdded !== 3 || r.errorCount !== 3) throw new Error(`${JSON.stringify(r.summary)} ${JSON.stringify(r.errors)}`);
+  const o20 = await amzOrder(20);
+  const items = await orderItems(o20.id);
+  // 300 + 80 − 20 − 5 = 355; one item, discount and promotion id taken from the promotion row.
+  if (o20.order_value !== 355 || items.length !== 1 || items[0].promotion_discount !== -20 || items[0].promotion_id !== 'PROMO-X') throw new Error(`${o20.order_value} ${JSON.stringify(items)}`);
+  if ((await orderItems((await amzOrder(22)).id)).length !== 1 || (await amzOrder(22)).order_value !== 499) throw new Error('zero promo row changed order 22');
+  const byRow = Object.fromEntries(r.errors.map((e) => [e.row, e]));
+  if (!/no matching line item/.test(byRow[8]?.reason) || !/no matching line item/.test(byRow[9]?.reason) || !/purchase-date/.test(byRow[10]?.reason)) throw new Error(JSON.stringify(r.errors));
+  if (await amzOrder(23) || await amzOrder(24) || await amzOrder(25)) throw new Error('unmatched promotion row produced an order');
+  const stray = (await getPool().query(`SELECT count(*)::int n FROM order_items WHERE source_line_item_id IN ('S-MISSING','T1','U1')`)).rows[0].n;
+  if (stray) throw new Error('promotion row became an item');
+  return 'matched before/after its item and across other orders; discount + id applied (₹355); unmatched ones reported, no order or item made';
+});
+await step('amazon import: the 14 excluded columns are never read or stored', async () => {
+  const { IGNORED_COLUMNS } = await import('../lib/amazon-import.js');
+  const excluded = [...IGNORED_COLUMNS];
+  if (excluded.length !== 14) throw new Error(`${excluded.length} excluded`);
+  const head = [...AMZ_HEAD, ...excluded.filter((c) => !AMZ_HEAD.includes(c))];
+  const row = head.map((h) => (excluded.includes(h) ? `EXCLUDED-MARKER-${h}` : amzRow({ 'order-id': AZ(30), 'order-item-id': 'E1' })[AMZ_HEAD.indexOf(h)]));
+  const file = Buffer.from([head, row].map((r) => r.join(',')).join('\n'));
+  const r = await commitAmazonImport(file, 'excluded.csv', { actor: IMPORTER });
+  if (r.summary.ordersCreated !== 1 || r.errorCount) throw new Error(JSON.stringify(r));
+  const o = await amzOrder(30);
+  const stored = JSON.stringify([o, await orderItems(o.id), await orderEvents(o.id),
+    (await getPool().query(`SELECT * FROM order_imports WHERE filename = 'excluded.csv'`)).rows]);
+  if (stored.includes('EXCLUDED-MARKER')) throw new Error('an excluded column was stored');
+  // Even is-iba / already-paid style values cannot change the mapping.
+  if (o.payment_status !== null || o.order_value !== 499) throw new Error(JSON.stringify(o));
+  return '14 columns filled with markers; none appears in the order, items, events or import record';
+});
 await step('amazon import: numbers and dates parse; xlsx and tab-separated files read', async () => {
   const plan = planAmazon(readTable(amzCsv([amzRow({ 'order-id': 'X', 'order-item-id': 'I', 'item-price': '₹1,299.50', 'quantity-purchased': '12',
     'purchase-date': '2026-09-21T23:30:00+05:30' })]), 'x.csv'));
@@ -1943,10 +1994,10 @@ await step('amazon import: numbers and dates parse; xlsx and tab-separated files
 await step('amazon import: orders show in the Orders list and filters', async () => {
   const all = await listOrders({ channel: 'amazon', q: `${TEST_ORDER}-AMZ` });
   const easy = await listOrders({ channel: 'amazon', type: 'easy_ship', q: `${TEST_ORDER}-AMZ` });
-  if (all.total !== 6 || easy.total !== 6) throw new Error(`${all.total} ${easy.total}`);
+  if (all.total !== 10 || easy.total !== 10) throw new Error(`${all.total} ${easy.total}`);
   if (await amzShipments() !== 1) throw new Error('only the one shipment made by hand should exist');
   if (all.orders.some((o) => o.channel_label !== 'Amazon')) throw new Error('label');
-  return '6 imported orders listed under Amazon / Easy Ship; the only shipment is the one made by hand';
+  return '10 imported orders listed under Amazon / Easy Ship; the only shipment is the one made by hand';
 });
 await step('amazon import → no shipments → pick 3 orders → one Shree Tirupati shipment', async () => {
   const [a, b, c] = await Promise.all([amzOrder(2), amzOrder(3), amzOrder(4)]);
