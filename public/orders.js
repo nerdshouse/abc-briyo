@@ -516,13 +516,20 @@ function renderDrawer() {
   renderIcons();
 }
 
-/** The canonical Briyo SKU for a line, or a loud "Unmapped SKU" when its code matches none. */
+/**
+ * A line's identifiers, kept apart: the Briyo SKU (internal, canonical) and the
+ * channel's own codes (Amazon SKU, ASIN). An unknown channel code says so loudly.
+ */
 function skuLine(o, it) {
-  if (it.sku_id) {
-    const differs = it.sku && it.canonical_sku && it.sku.toLowerCase() !== it.canonical_sku.toLowerCase();
-    return `SKU <a class="mono" href="/inventory?sku=${it.sku_id}">${esc(it.canonical_sku)}</a>${differs ? ` <span class="soft">(${esc(o.channel_label)} ${esc(it.sku)})</span>` : ''}`;
-  }
-  return `<span class="mini-tag warn" title="This code matches no Briyo SKU. Stock cannot be reserved or dispatched until an admin maps it in Inventory.">Unmapped SKU</span>${it.sku ? ` <span class="mono">${esc(it.sku)}</span>` : ''}`;
+  const amazon = o.channel === 'amazon';
+  const channelCode = it.sku ? `${amazon ? 'Amazon SKU' : `${esc(o.channel_label)} SKU`} <span class="mono">${esc(it.sku)}</span>` : '';
+  const asin = it.asin ? `ASIN <span class="mono">${esc(it.asin)}</span>` : '';
+  const briyo = it.sku_id
+    ? `Briyo SKU <a class="mono" href="/inventory?sku=${it.sku_id}"><b>${esc(it.canonical_sku)}</b></a>`
+    : '<span class="mini-tag warn" title="This code matches no Briyo SKU. Stock cannot be reserved or dispatched until an admin maps it in Inventory.">Unmapped SKU</span>';
+  // A channel code identical to the Briyo SKU is not repeated.
+  const same = it.sku_id && it.sku && it.canonical_sku && it.sku.toLowerCase() === it.canonical_sku.toLowerCase();
+  return [briyo, same ? '' : channelCode, asin].filter(Boolean).join(' · ');
 }
 
 /** Line items, as the marketplace listed them. Manual orders have none. */
@@ -1248,6 +1255,13 @@ function fillFilters() {
  * batch suggestion (changeable), and Reserve / Release. Dispatch then deducts
  * exactly what is reserved; the server refuses it otherwise.
  */
+// Batch dates are calendar days ('YYYY-MM-DD'): formatted in UTC from their own parts so no timezone shifts them.
+const DAY_FMT = new Intl.DateTimeFormat('en-IN', { day: 'numeric', month: 'short', year: 'numeric', timeZone: 'UTC' });
+const calendarDay = (d) => {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(d || ''));
+  return m ? DAY_FMT.format(Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3]))) : '—';
+};
+
 async function loadStock(shipmentId) {
   const host = $('#dStock');
   if (!host) return;
@@ -1278,7 +1292,7 @@ function renderStock() {
   const allocFor = (l) => (l.reserved.length ? l.reserved.map((r) => ({ batch_id: r.batch_id, quantity: r.quantity }))
     : l.suggestion.picks.length ? l.suggestion.picks : [{ batch_id: '', quantity: l.required }]);
   const batchOpts = (l, sel) => opt('', 'Choose batch', !sel) + l.batches.filter((b) => b.effective_status === 'active' && (b.available > 0 || b.id === sel))
-    .map((b) => opt(b.id, `${b.batch_number} · exp ${b.expiry_date ? dateShort(`${b.expiry_date}T00:00:00`) : '—'} · ${b.available} free${b.location ? ` · ${b.location}` : ''}`, b.id === sel)).join('');
+    .map((b) => opt(b.id, `${b.batch_number} · exp ${calendarDay(b.expiry_date)} · ${b.available} free${b.location ? ` · ${b.location}` : ''}`, b.id === sel)).join('');
   host.innerHTML = `
     <div class="stock-head ${tone}">${head}${st.orders.length > 1 ? `<span class="soft"> · ${st.orders.length} orders</span>` : ''}</div>
     ${st.unmapped.length ? `<ul class="stock-unmapped">${st.unmapped.map((u) => `<li><span class="mini-tag warn">Unmapped SKU</span> <span class="mono">${esc(u.code || '—')}</span> × ${esc(u.quantity)}
@@ -1287,7 +1301,7 @@ function renderStock() {
     ${st.lines.map((l) => `<div class="stock-line" data-line="${l.sku_id}">
       <div class="stock-line-head">
         <span><a class="mono" href="/inventory?sku=${l.sku_id}">${esc(l.sku)}</a> <span class="soft">${esc(l.product_name)}${l.variant_name ? ` · ${esc(l.variant_name)}` : ''}</span></span>
-        <span class="stock-nums"><b>${count(l.required)}</b> needed${done ? '' : ` · ${count(l.available)} available ${l.enough ? '<span class="ok-mark">✓</span>' : '<span class="mini-tag warn">Insufficient</span>'}`}</span>
+        <span class="stock-nums"><b>${count(l.required)}</b> needed${done ? '' : ` · ${count(l.available)} available to dispatch ${l.enough ? '<span class="ok-mark">✓</span>' : '<span class="mini-tag warn">Insufficient</span>'}`}</span>
       </div>
       ${done ? `<div class="soft stock-from">Deducted from ${l.dispatched.map((d) => `<span class="mono">${esc(d.batch_number)}</span> −${count(d.quantity)}`).join(', ')}</div>`
         : editable ? `<div class="alloc">${allocFor(l).map((a) => `<div class="alloc-row"><select class="select" data-alloc-batch aria-label="Batch for ${esc(l.sku)}">${batchOpts(l, a.batch_id)}</select>
@@ -1296,6 +1310,7 @@ function renderStock() {
           : `<div class="soft stock-from">${l.reserved.map((r) => `<span class="mono">${esc(r.batch_number)}</span> × ${count(r.quantity)}`).join(', ') || 'Nothing reserved'}</div>`}
       ${!done && l.suggestion.short && !l.reserved_quantity ? `<div class="warn-text stock-from">Short by ${count(l.suggestion.short)}</div>` : ''}
     </div>`).join('')}
+    ${st.untracked?.length ? `<p class="imp-note">${st.untracked.map((u) => `<span class="mono">${esc(u.sku)}</span>`).join(', ')} not inventory-tracked — no stock needed.</p>` : ''}
     ${editable && st.lines.length && !st.unmapped.length ? `<div class="form-actions">
       <button class="btn" type="button" id="dReserve">${st.state === 'reserved' ? 'Update reservation' : 'Reserve stock'}</button>
       ${st.lines.some((l) => l.reserved.length) ? '<button class="btn" type="button" id="dRelease">Release</button>' : ''}</div>` : ''}`;

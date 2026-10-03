@@ -294,7 +294,7 @@
 .inv-table .cell-main, .inv-table .cell-sub, .batch-table .cell-sub, .move-table .cell-sub,
 .stock-table .cell-sub, .unmapped-card .cell-sub { display: block; max-width: none; }
 .inv-table .cell-main { max-width: 260px; }
-@media (min-width: 1200px) { .inv-cards { grid-template-columns: repeat(8, minmax(0, 1fr)); } }
+@media (min-width: 1200px) { .inv-cards { grid-template-columns: repeat(5, minmax(0, 1fr)); } }
 .stock-cards { grid-template-columns: repeat(4, minmax(0, 1fr)); }
 @media (max-width: 480px) { .stock-cards { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
 .batch-table { table-layout: auto; }
@@ -313,3 +313,4 @@
 .alloc [data-alloc-add] { justify-self: start; }
 .page-actions { flex-wrap: wrap; }
 .page-actions .btn { white-space: nowrap; }
+.inv-formula { margin: -6px 0 16px; }

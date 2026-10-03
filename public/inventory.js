@@ -5,7 +5,7 @@
  * is never edited here, only recorded as movements.
  */
 import {
-  $, $$, esc, money, count, icon, renderIcons, setTimezone, dateShort, dateTime, initShell, pageFetch,
+  $, $$, esc, money, count, icon, renderIcons, setTimezone, dateTime, initShell, pageFetch,
   pageSignal, onLeave, onQueryChange,
 } from './ui/components.js';
 
@@ -28,7 +28,13 @@ const api = async (url, opts = {}) => {
 };
 const isAdmin = () => Boolean(state.me?.isAdmin);
 const opt = (value, text, selected) => `<option value="${esc(value)}"${selected ? ' selected' : ''}>${esc(text)}</option>`;
-const day = (d) => (d ? dateShort(`${d}T00:00:00`) : '—');
+// A batch date is a calendar day ('YYYY-MM-DD'): formatted in UTC from its own
+// parts, so the viewer's timezone can never move it to the day before.
+const DAY_FMT = new Intl.DateTimeFormat('en-IN', { day: 'numeric', month: 'short', year: 'numeric', timeZone: 'UTC' });
+const day = (d) => {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(d || ''));
+  return m ? DAY_FMT.format(Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3]))) : '—';
+};
 const amount = (v) => (v === null || v === undefined ? '—' : money(v));
 const requestId = () => (crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random().toString(16).slice(2)}`);
 
@@ -91,22 +97,27 @@ function render() {
   $('#crumbHere').textContent = title === 'Inventory' ? 'Stock' : title;
   $('#topTitle').textContent = title;
   document.title = `${title} — Briyo`;
-  $('#pageSub').textContent = `${count(c.totalSkus)} active SKUs · ${count(c.totalUnits)} units on hand · ${money(c.inventoryValue)} at cost`
+  $('#pageSub').textContent = `${count(c.totalSkus)} active SKUs · ${count(c.availableUnits)} available to dispatch of ${count(c.onHandUnits)} on hand · ${money(c.inventoryValue)} at cost`
     + (c.unitsWithoutCost ? ` · ${count(c.unitsWithoutCost)} units without a cost` : '');
 
   const card = (n, label, { tone = '', filter = null, title: tip = '' } = {}) => `<button type="button" class="imp-stat inv-card ${tone}"
       ${filter ? `data-filter='${esc(JSON.stringify(filter))}'` : 'disabled'} title="${esc(tip)}"><b>${typeof n === 'number' ? count(n) : esc(n)}</b><span>${esc(label)}</span></button>`;
   $('#cards').innerHTML = [
-    card(c.totalSkus, 'Total SKUs', { filter: {}, title: 'Active SKUs in the master' }),
-    card(c.totalUnits, 'Total units', { title: 'Physically on hand, all batches and statuses' }),
-    card(c.availableUnits, 'Available units', { title: 'Sellable stock not reserved for a shipment' }),
-    card(c.reservedUnits, 'Reserved units', { title: 'Set aside for shipments not yet dispatched' }),
-    card(c.lowStock, 'Low stock', { tone: c.lowStock ? 'warn' : '', filter: { stock: 'low' }, title: 'Available at or under the reorder level' }),
-    card(c.outOfStock, 'Out of stock', { tone: c.outOfStock ? 'bad' : '', filter: { stock: 'out' } }),
-    card(c.expiring90, 'Expiring ≤ 90 days', { tone: c.expiring90 ? 'warn' : '', filter: { expiring: '90' },
-      title: `${c.expiring30} within 30 days, ${c.expiring60} within 60 days${c.expired ? `; ${c.expired} batches already expired` : ''}` }),
-    card(money(c.inventoryValue), 'Inventory value', { title: 'On hand × unit cost, per batch. Not selling price.' }),
+    card(c.onHandUnits, 'On hand', { title: 'Physically in stock: every batch, whatever its status' }),
+    card(c.sellableUnits, 'Sellable', { title: 'On hand in active, unexpired batches' }),
+    card(c.reservedSellableUnits, 'Reserved', { title: 'Sellable stock set aside for shipments not yet dispatched' }),
+    card(c.availableUnits, 'Available to dispatch', { tone: 'good', title: 'Sellable − reserved' }),
+    card(c.expiredUnits, 'Expired', { tone: c.expiredUnits ? 'bad' : '', filter: { status: 'expired' } }),
+    card(c.quarantinedUnits + c.blockedUnits, c.blockedUnits ? 'Quarantined / blocked' : 'Quarantined', { tone: c.quarantinedUnits + c.blockedUnits ? 'warn' : '', filter: { status: 'quarantined' },
+      title: `${c.quarantinedUnits} quarantined, ${c.blockedUnits} blocked` }),
+    card(c.lowStock, 'Low stock SKUs', { tone: c.lowStock ? 'warn' : '', filter: { stock: 'low' }, title: 'Available to dispatch at or under the reorder level' }),
+    card(c.outOfStock, 'Out of stock SKUs', { tone: c.outOfStock ? 'bad' : '', filter: { stock: 'out' }, title: 'Nothing available to dispatch' }),
+    card(c.expiring90, 'Batches expiring ≤ 90 d', { tone: c.expiring90 ? 'warn' : '', filter: { expiring: '90' },
+      title: `${c.expiring30} within 30 days, ${c.expiring60} within 60 days` }),
+    card(money(c.inventoryValue), 'Inventory value', { title: 'On hand × unit cost, per batch (all statuses). Not selling price.' }),
   ].join('');
+  $('#formula').textContent = `On hand ${count(c.onHandUnits)} = sellable ${count(c.sellableUnits)} + expired ${count(c.expiredUnits)} + quarantined ${count(c.quarantinedUnits)} + blocked ${count(c.blockedUnits)}.`
+    + ` Available to dispatch ${count(c.availableUnits)} = sellable ${count(c.sellableUnits)} − reserved ${count(c.reservedSellableUnits)}.`;
 
   // Unmapped seller SKUs: orders that cannot be dispatched until mapped.
   $('#unmapped').innerHTML = unmapped.length ? `<section class="card unmapped-card${state.view === 'unmapped' ? ' focus' : ''}" id="unmappedCard">
@@ -219,12 +230,18 @@ function renderSku() {
       <h3 class="dsec-title">Stock ${s.out_of_stock ? '<span class="mini-tag warn">Out of stock</span>' : s.low_stock ? '<span class="mini-tag warn">Low stock</span>' : ''}</h3>
       <div class="imp-stats stock-cards">
         <div class="imp-stat"><b>${count(s.on_hand)}</b><span>On hand</span></div>
-        <div class="imp-stat"><b>${count(s.reserved)}</b><span>Reserved</span></div>
-        <div class="imp-stat ${s.out_of_stock ? 'bad' : s.low_stock ? 'warn' : ''}"><b>${count(s.available)}</b><span>Available</span></div>
+        <div class="imp-stat"><b>${count(s.sellable)}</b><span>Sellable</span></div>
+        <div class="imp-stat"><b>${count(s.reserved_sellable)}</b><span>Reserved</span></div>
+        <div class="imp-stat ${s.out_of_stock ? 'bad' : s.low_stock ? 'warn' : 'good'}"><b>${count(s.available)}</b><span>Available to dispatch</span></div>
+      </div>
+      <div class="imp-stats stock-cards" style="margin-top:8px">
+        <div class="imp-stat ${s.expired ? 'bad' : ''}"><b>${count(s.expired)}</b><span>Expired</span></div>
+        <div class="imp-stat ${s.quarantined ? 'warn' : ''}"><b>${count(s.quarantined)}</b><span>Quarantined</span></div>
+        <div class="imp-stat ${s.blocked ? 'bad' : ''}"><b>${count(s.blocked)}</b><span>Blocked</span></div>
         <div class="imp-stat"><b>${esc(money(s.value))}</b><span>Value at cost</span></div>
       </div>
-      <p class="imp-note">Available = on hand − reserved, counting only active, unexpired batches.${s.unsellable ? ` ${count(s.unsellable)} units are quarantined, blocked or expired.` : ''}
-        Reorder level ${count(s.reorder_level)}${s.reorder_quantity ? `, reorder quantity ${count(s.reorder_quantity)}` : ''}.</p>
+      <p class="imp-note">On hand = sellable + expired + quarantined + blocked. Available to dispatch = sellable − reserved.
+        ${s.track_inventory ? '' : '<b>Not inventory-tracked:</b> orders for this SKU dispatch without a stock check. '}Reorder level ${count(s.reorder_level)}${s.reorder_quantity ? `, reorder quantity ${count(s.reorder_quantity)}` : ''}.</p>
       ${isAdmin() ? `<div class="form-actions"><button class="btn primary" type="button" data-act="receive">${icon('plus')}Add inventory</button>
         <button class="btn" type="button" data-act="edit-sku">${icon('pencil')}Edit SKU</button></div>` : ''}
     </section>
@@ -248,13 +265,14 @@ function renderSku() {
     <details class="dsec more-sec" open>
       <summary class="dsec-title">Product &amp; channels</summary>
       <dl class="kv" style="margin-top:10px">
-        <dt>SKU</dt><dd class="mono">${esc(s.sku)}</dd>
+        <dt>Briyo SKU</dt><dd class="mono"><b>${esc(s.sku)}</b> <span class="soft">internal, canonical</span></dd>
         <dt>Product</dt><dd>${esc(s.product_name)}</dd>
         <dt>Variant</dt><dd>${esc(s.variant_name || '—')}</dd>
         <dt>Category</dt><dd>${esc(s.category || '—')}</dd>
         <dt>Unit</dt><dd>${esc(s.unit_type)}</dd>
-        <dt>Shopify SKU</dt><dd class="mono">${esc(s.sku)} <span class="soft">(same canonical SKU)</span></dd>
-        <dt>Amazon seller SKU</dt><dd class="mono">${s.amazon_seller_sku ? esc(s.amazon_seller_sku) : '<span class="soft">Not set — Amazon orders match the SKU itself</span>'}</dd>
+        <dt>Inventory</dt><dd>${s.track_inventory ? 'Tracked — stock is reserved and deducted at dispatch' : 'Not tracked — no stock check at dispatch'}</dd>
+        <dt>Shopify SKU</dt><dd class="mono">${esc(s.sku)} <span class="soft">same as the Briyo SKU</span></dd>
+        <dt>Amazon SKU</dt><dd class="mono">${s.amazon_seller_sku ? `${esc(s.amazon_seller_sku)} <span class="soft">external · maps to ${esc(s.sku)}</span>` : '<span class="soft">Not set — Amazon orders match the Briyo SKU itself</span>'}</dd>
         <dt>ASIN</dt><dd class="mono">${esc(s.asin || '—')}</dd>
         <dt>Amazon listing ID</dt><dd class="mono">${esc(s.amazon_listing_id || '—')}</dd>
         <dt>Amazon product ID</dt><dd class="mono">${esc(s.amazon_product_id || '—')}</dd>
@@ -304,12 +322,14 @@ function openForm(kind, ctx = {}) {
       <label class="fld"><span>Category</span><input class="input" name="category" value="${esc(s.category || '')}" maxlength="120" /></label>
       <label class="fld"><span>Unit type</span><input class="input" name="unit_type" value="${esc(s.unit_type || 'bottle')}" maxlength="40" /></label>
       <label class="fld"><span>Status</span><select class="select" name="active">${opt('true', 'Active', s.active !== false)}${opt('false', 'Inactive', s.active === false)}</select></label>
+      <label class="fld"><span>Inventory</span><select class="select" name="track_inventory">${opt('true', 'Tracked (physical stock)', s.track_inventory !== false)}${opt('false', 'Not tracked', s.track_inventory === false)}</select>
+        <span class="help">Tracked SKUs must have stock reserved before a shipment can be dispatched.</span></label>
       <label class="fld"><span>Reorder level</span><input class="input" name="reorder_level" inputmode="numeric" value="${esc(s.reorder_level ?? '')}" placeholder="0" /></label>
       <label class="fld"><span>Reorder quantity</span><input class="input" name="reorder_quantity" inputmode="numeric" value="${esc(s.reorder_quantity ?? '')}" placeholder="0" /></label>
     </div></section>
     <section class="dsec"><h3 class="dsec-title">Amazon</h3><div class="form-grid">
-      <label class="fld"><span>Amazon seller SKU</span><input class="input mono" name="amazon_seller_sku" value="${esc(s.amazon_seller_sku || '')}" maxlength="80" />
-        <span class="help">Normally the same as the SKU. Set it only if Amazon still uses a different seller SKU for this product.</span></label>
+      <label class="fld"><span>Amazon SKU (seller SKU)</span><input class="input mono" name="amazon_seller_sku" value="${esc(s.amazon_seller_sku || '')}" maxlength="80" placeholder="e.g. WF-IATY-Z4SW" />
+        <span class="help">The SKU as it is in Seller Central. An external identifier that maps to this Briyo SKU; Seller Central is not changed.</span></label>
       <label class="fld"><span>ASIN</span><input class="input mono" name="asin" value="${esc(s.asin || '')}" maxlength="40" /></label>
       <label class="fld"><span>Listing ID</span><input class="input mono" name="amazon_listing_id" value="${esc(s.amazon_listing_id || '')}" maxlength="80" /></label>
       <label class="fld"><span>Product ID</span><input class="input mono" name="amazon_product_id" value="${esc(s.amazon_product_id || '')}" maxlength="80" /></label>
@@ -333,10 +353,11 @@ function openForm(kind, ctx = {}) {
       <label class="fld wide"><span>SKU</span><select class="select" name="sku_id" required>${skuOptions(ctx.skuId || '')}</select></label>
       <label class="fld"><span>Batch number</span><input class="input mono" name="batch_number" required maxlength="80" autocomplete="off" /></label>
       <label class="fld"><span>Quantity</span><input class="input" name="quantity" inputmode="numeric" required /></label>
-      <label class="fld"><span>Manufacturing date</span><input class="input" type="date" name="mfg_date" /></label>
-      <label class="fld"><span>Expiry date</span><input class="input" type="date" name="expiry_date" /></label>
+      <label class="fld"><span>Manufacturing date</span><input class="input" name="mfg_date" placeholder="08/2026 or 01/08/2026" autocomplete="off" /></label>
+      <label class="fld"><span>Expiry</span><input class="input" name="expiry_date" placeholder="08/2028 or 31/08/2028" autocomplete="off" />
+        <span class="help">A month alone means its last day: 08/2028 = 31 Aug 2028.</span></label>
       <label class="fld"><span>Unit cost (₹)</span><input class="input" name="unit_cost" inputmode="decimal" placeholder="180" /></label>
-      <label class="fld"><span>Received date</span><input class="input" type="date" name="received_date" /></label>
+      <label class="fld"><span>Received date</span><input class="input" name="received_date" placeholder="Today if empty" autocomplete="off" /></label>
       <label class="fld"><span>Supplier</span><input class="input" name="supplier_name" list="supList" maxlength="120" autocomplete="off" /><datalist id="supList">${sup}</datalist>
         <span class="help">Pick one or type a new name; it is added to the supplier list.</span></label>
       <label class="fld"><span>PO number</span><input class="input mono" name="po_number" maxlength="80" /></label>
@@ -383,8 +404,9 @@ function openForm(kind, ctx = {}) {
       <label class="fld"><span>Reason for a status change</span><input class="input" name="reason" maxlength="300" /></label>
       <label class="fld"><span>Location / rack</span><input class="input" name="location" value="${esc(batch.location || '')}" maxlength="80" /></label>
       <label class="fld"><span>Unit cost (₹)</span><input class="input" name="unit_cost" inputmode="decimal" value="${esc(batch.unit_cost ?? '')}" /></label>
-      <label class="fld"><span>Manufacturing date</span><input class="input" type="date" name="mfg_date" value="${esc(batch.mfg_date || '')}" /></label>
-      <label class="fld"><span>Expiry date</span><input class="input" type="date" name="expiry_date" value="${esc(batch.expiry_date || '')}" /></label>
+      <label class="fld"><span>Manufacturing date</span><input class="input" name="mfg_date" value="${esc(batch.mfg_date || '')}" placeholder="08/2026" autocomplete="off" /></label>
+      <label class="fld"><span>Expiry</span><input class="input" name="expiry_date" value="${esc(batch.expiry_date || '')}" placeholder="08/2028 or 31/08/2028" autocomplete="off" />
+        <span class="help">A month alone means its last day.</span></label>
       <label class="fld"><span>PO number</span><input class="input mono" name="po_number" value="${esc(batch.po_number || '')}" /></label>
       <label class="fld"><span>GRN number</span><input class="input mono" name="grn_number" value="${esc(batch.grn_number || '')}" /></label>
       <label class="fld wide"><span>Notes</span><textarea class="input" name="notes" maxlength="1000">${esc(batch.notes || '')}</textarea></label>
@@ -476,6 +498,8 @@ async function submitForm(e) {
     } else if (kind === 'batch') {
       const batch = state.detail.batches.find((b) => b.id === ctx.batchId);
       if (v.status === batch.status) delete v.status;
+      if (v.mfg_date === (batch.mfg_date || '')) delete v.mfg_date;
+      if (v.expiry_date === (batch.expiry_date || '')) delete v.expiry_date;
       await api(`/api/inventory/batches/${ctx.batchId}`, { method: 'PATCH', body: JSON.stringify({ ...v, version: batch.version }) });
       openAfter = state.detail.sku.id;
     }

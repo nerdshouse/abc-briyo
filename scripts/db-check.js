@@ -2384,6 +2384,65 @@ await step('inventory: overview cards add up', async () => {
   if (!(c.totalSkus >= 4 && c.lowStock >= 1 && c.outOfStock >= 1 && c.expired >= 1 && c.expiring30 >= 1 && c.inventoryValue > 0)) throw new Error(JSON.stringify(c));
   return `${c.totalSkus} SKUs, ${c.totalUnits} units, ${c.availableUnits} available, ${c.reservedUnits} reserved, ${c.lowStock} low, ${c.outOfStock} out, ${c.expiring90} expiring ≤90d`;
 });
+await step('inventory: on hand vs sellable vs reserved vs available to dispatch (1,000 / 100 expired / 20 quarantined / 50 reserved → 830)', async () => {
+  const id = (await createSku({ sku: `${TS}-AVAIL`, product_name: 'Availability example' }, { actor: ACTOR })).id;
+  const good = (await receiveInventory({ sku_id: id, batch_number: 'AV-GOOD', expiry_date: '12/2030', quantity: 880, unit_cost: 10, request_id: rid() }, { actor: ACTOR })).batchId;
+  await receiveInventory({ sku_id: id, batch_number: 'AV-EXP', expiry_date: dayOffset(-10), quantity: 100, unit_cost: 10, request_id: rid() }, { actor: ACTOR });
+  const q = (await receiveInventory({ sku_id: id, batch_number: 'AV-QUAR', expiry_date: '12/2030', quantity: 20, unit_cost: 10, request_id: rid() }, { actor: ACTOR })).batchId;
+  await updateBatch(q, { status: 'quarantined', reason: 'Lab retest' }, { actor: ACTOR });
+  await invOrders([amzRow({ 'order-id': AZ(60), 'order-item-id': 'I60', sku: `${TS}-AVAIL`, 'quantity-purchased': '50' })]);
+  const dl = (await listCouriers()).find((x) => x.name === 'Delhivery');
+  const sid = (await createShipmentForOrders([(await amzOrder(60)).id], { courier_partner_id: dl.id, tracking_id: 'AWB-INV-AVAIL' }, { actor: ACTOR })).shipmentId;
+  await reserveShipmentStock(sid, [{ batch_id: good, quantity: 50 }], { actor: ACTOR });
+  const s = await getSku(id);
+  const got = { on_hand: s.on_hand, sellable: s.sellable, expired: s.expired, quarantined: s.quarantined, blocked: s.blocked, reserved: s.reserved_sellable, available: s.available };
+  const want = { on_hand: 1000, sellable: 880, expired: 100, quarantined: 20, blocked: 0, reserved: 50, available: 830 };
+  if (JSON.stringify(got) !== JSON.stringify(want)) throw new Error(JSON.stringify(got));
+  if (s.on_hand !== s.sellable + s.expired + s.quarantined + s.blocked) throw new Error('buckets do not add up');
+  // Blocking the good batch takes it out of available to dispatch too.
+  await updateBatch(good, { status: 'blocked', reason: 'Recall check' }, { actor: ACTOR });
+  const b = await getSku(id);
+  if (b.available !== 0 || b.blocked !== 880 || b.sellable !== 0 || !b.out_of_stock) throw new Error(JSON.stringify(b));
+  await updateBatch(good, { status: 'active', reason: 'Cleared' }, { actor: ACTOR });
+  await releaseShipmentStock(sid, { actor: ACTOR });
+  return 'on hand 1,000 = sellable 880 + expired 100 + quarantined 20; available to dispatch = 880 − 50 = 830; blocked batch → 0 available';
+});
+await step('inventory: month-only expiry is the last calendar day, stored as a date, never shifted', async () => {
+  const id = (await createSku({ sku: `${TS}-EXPIRY`, product_name: 'Expiry dates' }, { actor: ACTOR })).id;
+  const cases = [['08/2028', '2028-08-31'], ['2028-08', '2028-08-31'], ['02/2028', '2028-02-29'], ['02/2027', '2027-02-28'], ['31/12/2029', '2029-12-31'], ['2029-01-15', '2029-01-15']];
+  for (const [i, [input, want]] of cases.entries()) {
+    const r = await receiveInventory({ sku_id: id, batch_number: `EXP-${i}`, expiry_date: input, quantity: 1, request_id: rid() }, { actor: ACTOR });
+    const raw = (await getPool().query('SELECT expiry_date, expiry_date::text AS t, pg_typeof(expiry_date)::text AS ty FROM inventory_batches WHERE id = $1', [r.batchId])).rows[0];
+    const shown = (await skuDetail(id)).batches.find((b) => b.id === r.batchId).expiry_date;
+    if (raw.t !== want || raw.ty !== 'date' || raw.expiry_date !== want || shown !== want) throw new Error(`${input} → ${raw.t} / ${raw.expiry_date} / ${shown}`);
+  }
+  for (const badInput of ['13/2028', '31/02/2028', 'Aug 2028']) {
+    await expectErr(badInput, () => receiveInventory({ sku_id: id, batch_number: 'EXP-BAD', expiry_date: badInput, quantity: 1 }, { actor: ACTOR }), (e) => e.status === 400);
+  }
+  return `${cases.length} spellings stored as exact DATEs (08/2028 → 2028-08-31, 02/2028 → 2028-02-29), read back as text in TZ=${process.env.TZ || 'system'}; bad months refused`;
+});
+await step('inventory: only inventory-tracked SKUs need stock at dispatch', async () => {
+  const svc = (await createSku({ sku: `${TS}-GIFTCARD`, product_name: 'Gift card (not stock)', track_inventory: false }, { actor: ACTOR })).id;
+  await invOrders([amzRow({ 'order-id': AZ(61), 'order-item-id': 'I61', sku: `${TS}-GIFTCARD`, 'quantity-purchased': '1' })]);
+  const o = await amzOrder(61);
+  const dl = (await listCouriers()).find((x) => x.name === 'Delhivery');
+  const sid = (await createShipmentForOrders([o.id], { courier_partner_id: dl.id, tracking_id: 'AWB-INV-UNTRACKED' }, { actor: ACTOR })).shipmentId;
+  const st = await shipmentStock(sid);
+  if (st.state !== 'no_items' || st.untracked.length !== 1) throw new Error(JSON.stringify(st));
+  await addPhoto(o.id);
+  const sh = (await orderShipments(o.id))[0];
+  await updateShipment(o.id, sh.id, { shipment_status: 'dispatched' }, { actor: ACTOR, version: sh.version });
+  if ((await getPool().query('SELECT count(*)::int n FROM inventory_movements WHERE shipment_id = $1', [sid])).rows[0].n) throw new Error('stock moved');
+  const g = await getSku(svc);
+  if (g.out_of_stock || g.low_stock) throw new Error('untracked SKU flagged as out of stock');
+  // Tracked again → the same kind of order needs stock.
+  await updateSku(svc, { track_inventory: true }, { actor: ACTOR });
+  await invOrders([amzRow({ 'order-id': AZ(62), 'order-item-id': 'I62', sku: `${TS}-GIFTCARD`, 'quantity-purchased': '1' })]);
+  const o2 = await amzOrder(62);
+  const sid2 = (await createShipmentForOrders([o2.id], { courier_partner_id: dl.id, tracking_id: 'AWB-INV-TRACKED' }, { actor: ACTOR })).shipmentId;
+  if ((await shipmentStock(sid2)).state !== 'insufficient') throw new Error('tracked SKU not checked');
+  return 'untracked SKU: dispatched with no reservation or movement, never "out of stock"; tracked: stock required';
+});
 await step('inventory: every change is attributed (user, time, reason, reference)', async () => {
   const { rows } = await getPool().query(
     `SELECT count(*) FILTER (WHERE actor IS NULL OR reason IS NULL OR at IS NULL)::int AS missing, count(*)::int AS n
