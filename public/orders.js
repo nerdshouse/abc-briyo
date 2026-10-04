@@ -5,7 +5,7 @@
  */
 import {
   $, $$, esc, money, count, icon, renderIcons, setTimezone, dateShort, dateTime, initShell, pageFetch,
-  navigate, pageSignal, onLeave, onQueryChange,
+  navigate, pageSignal, onLeave, onQueryChange, ordersMeta,
 } from './ui/components.js';
 
 // Requests belong to this page: cancelled, and never rendered, once it is left.
@@ -129,15 +129,20 @@ function typeUrl(type) {
 
 /* ------------------------------------------------------------------ list */
 
-async function load({ append = false } = {}) {
+const ordersUrl = (append) => {
   const u = new URLSearchParams();
   if (state.type) u.set('type', state.type);
   if (state.view) u.set('view', state.view);
   for (const k of FILTER_KEYS) if (state.f[k]) u.set(k, state.f[k]);
   u.set('limit', PAGE);
   u.set('offset', append ? state.offset : 0);
+  return `/api/orders?${u}`;
+};
+
+/** `pending` is an orders request already in flight (the first load starts it early). */
+async function load({ append = false, pending = null } = {}) {
   try {
-    const data = await api(`/api/orders?${u}`);
+    const data = await (pending || api(ordersUrl(append)));
     state.orders = append ? [...state.orders, ...data.orders] : data.orders;
     state.offset = state.orders.length;
     state.total = data.total;
@@ -224,7 +229,7 @@ function renderRows() {
   }
   $('#rows').innerHTML = state.orders.map((o) => `
     <tr class="orow${o.id === state.openId ? ' open' : ''}" data-id="${o.id}" tabindex="0">
-      <td><span class="cell-main mono" style="font-weight:500">${pickBox(o)}${esc(o.source_order_id)}${cancelledTag(o)}</span></td>
+      <td><span class="cell-main mono" style="font-weight:500">${pickBox(o)}${esc(o.source_order_id)}${cancelledTag(o)}</span>${lineSkus(o)}</td>
       <td><span class="cell-main chan">${esc(o.channel_label)}</span>${o.destination_name
         ? `<span class="cell-sub muted" title="${esc(o.destination_name)}">${esc(o.destination_name)}</span>`
         : o.dispatch_type ? `<span class="cell-sub muted">${esc(typeLabel(o.dispatch_type))}</span>` : ''}</td>
@@ -241,6 +246,7 @@ function renderRows() {
     <li class="oitem" data-id="${o.id}" tabindex="0">
       <div class="oi-top">${pickBox(o)}<span class="oi-id mono">${esc(o.source_order_id)}</span><span class="chan">${esc(o.channel_label)}</span>${cancelledTag(o)}
         <span class="oi-val">${shipIndicator(o)}</span></div>
+      ${o.line_skus?.length ? `<div class="oi-sub">${lineSkus(o)}</div>` : ''}
       ${o.destination_name ? `<div class="oi-sub">${icon('map-pin')} ${esc(o.destination_name)}</div>` : ''}
       <div class="oi-sub">${o.tracking_id ? `${esc(o.courier_name || '')} · <span class="mono">${esc(o.tracking_id)}</span>` : o.shipment_id ? 'No courier / AWB yet' : 'Not in a shipment yet'}</div>
       <div class="oi-stat"><span class="soft" style="font-size:12.5px">${esc(day(o.order_date))}</span>
@@ -517,19 +523,41 @@ function renderDrawer() {
 }
 
 /**
- * A line's identifiers, kept apart: the Briyo SKU (internal, canonical) and the
- * channel's own codes (Amazon SKU, ASIN). An unknown channel code says so loudly.
+ * The one SKU staff use to identify a product on this order's channel:
+ *   Amazon   → SKU = the Amazon seller SKU (what Seller Central shows),
+ *              with the Briyo SKU beside it, labelled, and the ASIN.
+ *   Website and other channels → SKU = the Briyo SKU (Shopify uses it as is).
+ * Only an Amazon code with no Briyo SKU is flagged; it blocks dispatch until mapped.
  */
-function skuLine(o, it) {
-  const amazon = o.channel === 'amazon';
-  const channelCode = it.sku ? `${amazon ? 'Amazon SKU' : `${esc(o.channel_label)} SKU`} <span class="mono">${esc(it.sku)}</span>` : '';
-  const asin = it.asin ? `ASIN <span class="mono">${esc(it.asin)}</span>` : '';
-  const briyo = it.sku_id
-    ? `Briyo SKU <a class="mono" href="/inventory?sku=${it.sku_id}"><b>${esc(it.canonical_sku)}</b></a>`
-    : '<span class="mini-tag warn" title="This code matches no Briyo SKU. Stock cannot be reserved or dispatched until an admin maps it in Inventory.">Unmapped SKU</span>';
-  // A channel code identical to the Briyo SKU is not repeated.
-  const same = it.sku_id && it.sku && it.canonical_sku && it.sku.toLowerCase() === it.canonical_sku.toLowerCase();
-  return [briyo, same ? '' : channelCode, asin].filter(Boolean).join(' · ');
+function skuIdentity({ channel, code, briyo, briyoId, asin = null, compact = false }) {
+  const link = (text) => (briyoId ? `<a class="mono" href="/inventory?sku=${briyoId}">${esc(text)}</a>` : `<span class="mono">${esc(text)}</span>`);
+  if (channel === 'amazon') {
+    const primary = code ? `SKU <b class="mono">${esc(code)}</b>` : 'SKU <span class="soft">none</span>';
+    const second = briyoId ? `Briyo SKU ${link(briyo)}`
+      : '<span class="mini-tag warn" title="This Amazon SKU is not mapped to a Briyo SKU yet. Stock cannot be reserved or dispatched until an admin maps it in Inventory → Unmapped SKUs.">Briyo SKU not mapped</span>';
+    return [primary, second, !compact && asin ? `ASIN <span class="mono">${esc(asin)}</span>` : ''].filter(Boolean).join(' · ');
+  }
+  const own = briyo || code;
+  if (!own) return '';
+  return `SKU <b>${link(own)}</b>${briyoId ? '' : ' <span class="mini-tag" title="This SKU is not in the SKU master yet.">Not in SKU master</span>'}`;
+}
+const skuLine = (o, it) => skuIdentity({ channel: o.channel, code: it.sku, briyo: it.canonical_sku, briyoId: it.sku_id, asin: it.asin });
+
+/**
+ * Orders list: each line's SKU under the order number, one identifier per row
+ * so a narrow column never breaks a code in half. Amazon: SKU (seller SKU),
+ * then the Briyo SKU or "not mapped". Other channels: SKU (the Briyo SKU).
+ */
+function lineSkus(o) {
+  const lines = o.line_skus || [];
+  if (!lines.length) return '';
+  const qty = (l) => (l.quantity > 1 ? ` ×${l.quantity}` : '');
+  const rows = lines.slice(0, 2).flatMap((l) => (o.channel === 'amazon'
+    ? [`<span class="ls" title="Amazon SKU ${esc(l.code || '')}">SKU <b>${esc(l.code || '—')}</b>${qty(l)}</span>`,
+      l.sku_id ? `<span class="ls" title="Briyo SKU ${esc(l.briyo_sku)}">Briyo SKU ${esc(l.briyo_sku)}</span>`
+        : '<span class="ls warn-text" title="This Amazon SKU is not mapped to a Briyo SKU yet">Briyo SKU not mapped</span>']
+    : [`<span class="ls" title="SKU ${esc(l.briyo_sku || l.code || '')}">SKU <b>${esc(l.briyo_sku || l.code || '—')}</b>${qty(l)}</span>`]));
+  return `<span class="cell-sub line-skus">${rows.join('')}${lines.length > 2 ? `<span class="ls">+${lines.length - 2} more</span>` : ''}</span>`;
 }
 
 /** Line items, as the marketplace listed them. Manual orders have none. */
@@ -1285,7 +1313,7 @@ function renderStock() {
     reserved: `${icon('circle-check')}Stock reserved — ready to dispatch`,
     needs_reservation: `${icon('package-search')}Confirm the batches to reserve stock before dispatch`,
     insufficient: `${icon('triangle-alert')}Not enough stock`,
-    unmapped: `${icon('triangle-alert')}Unmapped SKU — cannot dispatch`,
+    unmapped: `${icon('triangle-alert')}SKU not mapped to a Briyo SKU — cannot dispatch`,
     dispatched: `${icon('package-check')}Stock deducted at dispatch`,
   }[st.state];
   const tone = { reserved: 'good', dispatched: 'good', needs_reservation: '', insufficient: 'bad', unmapped: 'bad' }[st.state];
@@ -1295,12 +1323,15 @@ function renderStock() {
     .map((b) => opt(b.id, `${b.batch_number} · exp ${calendarDay(b.expiry_date)} · ${b.available} free${b.location ? ` · ${b.location}` : ''}`, b.id === sel)).join('');
   host.innerHTML = `
     <div class="stock-head ${tone}">${head}${st.orders.length > 1 ? `<span class="soft"> · ${st.orders.length} orders</span>` : ''}</div>
-    ${st.unmapped.length ? `<ul class="stock-unmapped">${st.unmapped.map((u) => `<li><span class="mini-tag warn">Unmapped SKU</span> <span class="mono">${esc(u.code || '—')}</span> × ${esc(u.quantity)}
+    ${st.unmapped.length ? `<ul class="stock-unmapped">${st.unmapped.map((u) => `<li>SKU <b class="mono">${esc(u.code || '—')}</b> × ${esc(u.quantity)} · <span class="mini-tag warn">Briyo SKU not mapped</span>
       <span class="soft">order ${esc(u.order_number)}</span></li>`).join('')}</ul>
       <p class="imp-note">An admin maps these in <a href="/inventory?view=unmapped">Inventory → Unmapped SKUs</a>. No stock is guessed or deducted.</p>` : ''}
     ${st.lines.map((l) => `<div class="stock-line" data-line="${l.sku_id}">
       <div class="stock-line-head">
-        <span><a class="mono" href="/inventory?sku=${l.sku_id}">${esc(l.sku)}</a> <span class="soft">${esc(l.product_name)}${l.variant_name ? ` · ${esc(l.variant_name)}` : ''}</span></span>
+        <span>${st.channel === 'amazon'
+          ? `SKU <b class="mono">${esc((l.codes || []).join(', ') || '—')}</b> · Briyo SKU <a class="mono" href="/inventory?sku=${l.sku_id}">${esc(l.sku)}</a>`
+          : `SKU <b><a class="mono" href="/inventory?sku=${l.sku_id}">${esc(l.sku)}</a></b>`}
+          <span class="soft">${esc(l.product_name)}${l.variant_name ? ` · ${esc(l.variant_name)}` : ''}</span></span>
         <span class="stock-nums"><b>${count(l.required)}</b> needed${done ? '' : ` · ${count(l.available)} available to dispatch ${l.enough ? '<span class="ok-mark">✓</span>' : '<span class="mini-tag warn">Insufficient</span>'}`}</span>
       </div>
       ${done ? `<div class="soft stock-from">Deducted from ${l.dispatched.map((d) => `<span class="mono">${esc(d.batch_number)}</span> −${count(d.quantity)}`).join(', ')}</div>`
@@ -1513,7 +1544,7 @@ async function previewImport() {
           ${stat(s.unmappedSkus, 'Unmapped SKUs', s.unmappedSkus ? 'warn' : '')}
         </div>
         ${p.unmapped?.length ? `<p class="imp-note"><b>Unmapped SKUs:</b> ${p.unmapped.slice(0, 12).map((u) => `<span class="mono">${esc(u.code || '—')}</span> (${count(u.lines)})`).join(', ')}${p.unmapped.length > 12 ? ` and ${count(p.unmapped.length - 12)} more` : ''}.
-          These orders import normally but show "Unmapped SKU" and cannot be dispatched until an admin maps each code to a Briyo SKU in Inventory. No SKU is created.</p>` : ''}
+          These orders import normally but show "Briyo SKU not mapped" and cannot be dispatched until an admin maps each code to a Briyo SKU in Inventory. No SKU is created.</p>` : ''}
         <p class="imp-note">${[
           s.promotionRows && `${count(s.promotionRows)} promotion row${s.promotionRows > 1 ? 's' : ''} folded into their items.`,
           s.skippedOrders && `${count(s.skippedOrders)} order${s.skippedOrders > 1 ? 's' : ''} will be skipped because of errors.`,
@@ -1666,15 +1697,19 @@ function bind() {
 
 (async function init() {
   try {
-    const [me, meta] = await Promise.all([api('/auth/me'), api('/api/orders/meta')]);
+    // The orders themselves do not depend on meta: request all three at once
+    // rather than waiting for meta before asking for the orders.
+    readUrl();
+    const firstOrders = api(ordersUrl(false));
+    firstOrders.catch(() => {});
+    const [me, meta] = await Promise.all([api('/auth/me'), ordersMeta()]);
     state.meta = meta;
     setTimezone(meta.timezone);
     for (const el of $$('.tz-note')) el.textContent = meta.timezone === 'Asia/Kolkata' ? '(IST)' : `(${meta.timezone})`;
     initShell(me);
-    readUrl();
     fillFilters();
     bind();
-    await load();
+    await load({ pending: firstOrders });
     if (state.openId) openOrder(state.openId);
   } catch (err) {
     $('#pageSub').textContent = '';

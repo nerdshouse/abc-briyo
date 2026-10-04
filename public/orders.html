@@ -9,6 +9,10 @@
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap" rel="stylesheet" />
   <link rel="stylesheet" href="/ui.css" />
   <link rel="stylesheet" href="/orders.css" />
+  <!-- The page script imports these; preloading fetches them in parallel instead of one after another. -->
+  <link rel="modulepreload" href="/ui/components.js" />
+  <link rel="modulepreload" href="/ui/nav.js" />
+  <link rel="modulepreload" href="/orders.js" />
   <script src="https://cdn.jsdelivr.net/npm/lucide@0.469.0/dist/umd/lucide.min.js" defer></script>
 </head>
 <body>

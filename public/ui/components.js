@@ -416,10 +416,29 @@ export function initShell(me, { onSearch } = {}) {
  * nothing here is hard-coded. Needs an empty
  * <div id="ordersNav"></div> in the sidebar; pages without one are untouched.
  */
+/**
+ * /api/orders/meta, shared: the page and the sidebar ask for it at the same
+ * moment, so they share one request instead of making two.
+ */
+let metaRequest = null;
+let metaAt = 0;
+export function ordersMeta() {
+  if (!metaRequest || Date.now() - metaAt > 2000) {
+    metaAt = Date.now();
+    metaRequest = fetch('/api/orders/meta').then(async (res) => {
+      const data = await res.json().catch(() => ({ ok: false, error: `HTTP ${res.status}` }));
+      if (!res.ok || data.ok === false) throw Object.assign(new Error(data.error || `HTTP ${res.status}`), { status: res.status, data });
+      return data;
+    });
+    metaRequest.catch(() => { metaRequest = null; });
+  }
+  return metaRequest;
+}
+
 async function renderOrdersNav() {
   const host = document.getElementById('ordersNav');
   if (!host) return;
-  const meta = await (await fetch('/api/orders/meta')).json();
+  const meta = await ordersMeta();
   if (!meta.ok) return;
   const link = (href, label, ico, n) => `<a class="nav-item" href="${href}">`
     + `${ico ? `<i data-lucide="${ico}"></i>` : ''}${esc(label)}`

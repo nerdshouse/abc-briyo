@@ -1847,7 +1847,10 @@ await step('amazon import: one order, one item', async () => {
   if (o.dispatch_type !== 'easy_ship' || o.order_value !== 499 || o.source !== 'amazon_import') throw new Error(JSON.stringify(o));
   if (o.shipment_id !== null || o.shipment_status !== null || (await orderShipments(o.id)).length) throw new Error('import created a shipment');
   if (items.length !== 1 || items[0].source_line_item_id !== 'I1' || items[0].item_tax !== 76.12) throw new Error(JSON.stringify(items));
-  if ('gift-wrap-price' in (o.source_payload.amazon || {}) || JSON.stringify(o.source_payload).includes('gift')) throw new Error('ignored column stored');
+  // The list leaves out the raw payload; the full order (as the drawer reads it) has it.
+  const full = await getOrder(o.id);
+  if (!full.source_payload?.amazon || 'gift-wrap-price' in full.source_payload.amazon || JSON.stringify(full.source_payload).includes('gift')) throw new Error('ignored column stored');
+  if ('source_payload' in o) throw new Error('list rows still carry the raw payload');
   return 'preview wrote nothing; import made 1 order (Easy Ship, ₹499) + 1 item and no shipment; ignored columns not stored';
 });
 await step('amazon import: one order with two items; several orders in one file', async () => {
@@ -1973,7 +1976,7 @@ await step('amazon import: the 14 excluded columns are never read or stored', as
   const r = await commitAmazonImport(file, 'excluded.csv', { actor: IMPORTER });
   if (r.summary.ordersCreated !== 1 || r.errorCount) throw new Error(JSON.stringify(r));
   const o = await amzOrder(30);
-  const stored = JSON.stringify([o, await orderItems(o.id), await orderEvents(o.id),
+  const stored = JSON.stringify([await getOrder(o.id), await orderItems(o.id), await orderEvents(o.id),
     (await getPool().query(`SELECT * FROM order_imports WHERE filename = 'excluded.csv'`)).rows]);
   if (stored.includes('EXCLUDED-MARKER')) throw new Error('an excluded column was stored');
   // Even is-iba / already-paid style values cannot change the mapping.
@@ -2442,6 +2445,25 @@ await step('inventory: only inventory-tracked SKUs need stock at dispatch', asyn
   const sid2 = (await createShipmentForOrders([o2.id], { courier_partner_id: dl.id, tracking_id: 'AWB-INV-TRACKED' }, { actor: ACTOR })).shipmentId;
   if ((await shipmentStock(sid2)).state !== 'insufficient') throw new Error('tracked SKU not checked');
   return 'untracked SKU: dispatched with no reservation or movement, never "out of stock"; tracked: stock required';
+});
+await step('orders list: fixed number of queries whatever the page size (no N+1); each row carries its SKUs', async () => {
+  const pool = getPool();
+  const real = pool.query.bind(pool);
+  let n = 0;
+  pool.query = (...a) => { n += 1; return real(...a); };
+  try {
+    await listOrders({}, { limit: 1 });
+    const small = n; n = 0;
+    const big = await listOrders({}, { limit: 500 });
+    if (n !== small || big.orders.length < 10) throw new Error(`${small} queries for 1 row, ${n} for ${big.orders.length}`);
+  } finally { pool.query = real; }
+  // Amazon row: seller SKU and Briyo SKU side by side; no raw payload.
+  const row = (await listOrders({ q: AZ(40) })).orders.find((o) => o.source_order_id === AZ(40));
+  const l = row.line_skus?.[0];
+  if (!l || l.code !== `${TS}-D3-60` || l.briyo_sku !== `${TS}-D3-60` || l.sku_id !== INV.a || l.quantity !== 20 || 'source_payload' in row) throw new Error(JSON.stringify(row.line_skus));
+  const unm = (await listOrders({ q: AZ(44) })).orders[0].line_skus[0];
+  if (unm.code !== `${TS}-NOT-A-SKU` || unm.sku_id !== null || unm.briyo_sku !== null) throw new Error(JSON.stringify(unm));
+  return `${n} queries for 1 row and for a full page; rows list each line's channel SKU + Briyo SKU`;
 });
 await step('inventory: every change is attributed (user, time, reason, reference)', async () => {
   const { rows } = await getPool().query(

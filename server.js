@@ -29,6 +29,7 @@ import {
 } from './lib/auth-routes.js';
 import { router as ordersRouter, courierRouter, destinationRouter } from './lib/orders-routes.js';
 import { router as inventoryRouter } from './lib/inventory-routes.js';
+import { ensureInventorySchema } from './lib/inventory.js';
 import { activeUsers, seedAllowedUsers, normalisePhone, bootstrapAdmins, nameFor } from './lib/otp.js';
 import { mapShopifyCsv } from './lib/shopify-csv.js';
 import { toCsv } from './lib/csv.js';
@@ -1035,6 +1036,12 @@ app.listen(port, async () => {
       await ensureSchema();
       const info = await ping();
       console.log(`Postgres connected: ${String(info.version).split(',')[0]}`);
+      // Orders and inventory tables are prepared now, in the background, rather
+      // than inside the first visitor's request. Requests that arrive meanwhile
+      // wait on this same promise; a failure is logged and retried by them.
+      ensureInventorySchema()
+        .then(() => console.log('Orders & inventory schema ready'))
+        .catch((e) => console.error('Orders & inventory schema setup failed (will retry on first request):', e.message));
     } catch (err) {
       console.error(`\n  Postgres connection FAILED: ${err.message}\n  Check DATABASE_URL.\n`);
     }

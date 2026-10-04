@@ -2,10 +2,10 @@
    existing selector, so the dashboard and call board are untouched. */
 
 .ord-table { table-layout: fixed; min-width: 1060px; }
-.ord-table col.c-order { width: 14%; }
-.ord-table col.c-chan { width: 17%; }
+.ord-table col.c-order { width: 19%; }   /* room for the SKU lines under the number */
+.ord-table col.c-chan { width: 14%; }
 .ord-table col.c-courier { width: 118px; }
-.ord-table col.c-track { width: 16%; }
+.ord-table col.c-track { width: 14%; }
 .ord-table col.c-ship { width: 136px; }
 .ord-table col.c-inv { width: 98px; }
 .ord-table col.c-date { width: 92px; }
@@ -314,3 +314,7 @@
 .page-actions { flex-wrap: wrap; }
 .page-actions .btn { white-space: nowrap; }
 .inv-formula { margin: -6px 0 16px; }
+.line-skus { margin-top: 2px; font-weight: 400; }
+.line-skus .ls { display: block; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.line-skus b { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-weight: 500; color: var(--text-2); }
+.oi-sub .line-skus .ls { display: inline; margin-right: 10px; }
