@@ -547,6 +547,48 @@ export function toast(message, { tone = 'ok', ms = 3200 } = {}) {
   setTimeout(() => el.remove(), ms);
 }
 
+/**
+ * A confirmation modal for anything destructive or hard to undo. Resolves true
+ * only on an explicit confirm. `typeToConfirm`: the text the person must type
+ * before the button enables (e.g. a phone number). Esc and Cancel resolve false.
+ */
+export function confirmDialog({ title, body = '', confirmLabel = 'Confirm', danger = false, typeToConfirm = '' }) {
+  return new Promise((resolve) => {
+    const back = document.activeElement;
+    const wrap = document.createElement('div');
+    wrap.className = 'modal-scrim';
+    wrap.innerHTML = `<div class="modal" role="alertdialog" aria-modal="true" aria-labelledby="mdlTitle" aria-describedby="mdlBody">
+      <h2 class="modal-title" id="mdlTitle">${esc(title)}</h2>
+      <div class="modal-body" id="mdlBody">${body}</div>
+      ${typeToConfirm ? `<label class="fld"><span>Type <b class="mono">${esc(typeToConfirm)}</b> to confirm</span><input class="input" id="mdlType" autocomplete="off" /></label>` : ''}
+      <div class="modal-foot"><button class="btn" type="button" data-x="0">Cancel</button>
+        <button class="btn ${danger ? 'danger' : 'primary'}" type="button" data-x="1"${typeToConfirm ? ' disabled' : ''}>${esc(confirmLabel)}</button></div></div>`;
+    document.body.appendChild(wrap);
+    document.documentElement.classList.add('drawer-open');
+    const modal = wrap.querySelector('.modal');
+    const ok = wrap.querySelector('[data-x="1"]');
+    const typed = wrap.querySelector('#mdlType');
+    const done = (v) => {
+      wrap.remove();
+      if (!document.querySelector('.drawer:not([hidden]), .modal-scrim')) document.documentElement.classList.remove('drawer-open');
+      if (back && document.contains(back)) back.focus({ preventScroll: true });
+      resolve(v);
+    };
+    typed?.addEventListener('input', () => { ok.disabled = typed.value.trim().replace(/^\+/, '') !== typeToConfirm.replace(/^\+/, ''); });
+    wrap.addEventListener('click', (e) => { const b = e.target.closest('[data-x]'); if (b && !b.disabled) done(b.dataset.x === '1'); else if (e.target === wrap) done(false); });
+    wrap.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape') { e.stopPropagation(); done(false); }
+      if (e.key === 'Tab') { // keep focus inside the dialog
+        const f = [...modal.querySelectorAll('button:not([disabled]), input')];
+        if (!f.length) return;
+        if (e.shiftKey && document.activeElement === f[0]) { e.preventDefault(); f.at(-1).focus(); }
+        else if (!e.shiftKey && document.activeElement === f.at(-1)) { e.preventDefault(); f[0].focus(); }
+      }
+    });
+    (typed || wrap.querySelector('[data-x="0"]')).focus();
+  });
+}
+
 /** One loading / empty / error block for every page. */
 export function stateBlock(kind, title, detail = '', { action = '', iconName = '' } = {}) {
   const ico = iconName || { loading: 'loader', empty: 'inbox', error: 'circle-alert' }[kind] || 'info';

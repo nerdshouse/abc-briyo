@@ -4,79 +4,80 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Members — Briyo OS</title>
-  <link rel="stylesheet" href="/styles.css" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/ui.css" />
+  <link rel="stylesheet" href="/orders.css" />
+  <!-- The page script imports these; preloading fetches them in parallel instead of one after another. -->
+  <link rel="modulepreload" href="/ui/components.js" />
+  <link rel="modulepreload" href="/ui/nav.js" />
+  <link rel="modulepreload" href="/members.js" />
+  <script src="https://cdn.jsdelivr.net/npm/lucide@0.469.0/dist/umd/lucide.min.js" defer></script>
 </head>
 <body>
-  <div class="wrap">
-    <header class="page">
-      <div>
-        <h1>Members</h1>
-        <p class="sub">
-          Only these numbers can sign in. Anyone here can see every customer's
-          name, phone and email — add people accordingly.
-        </p>
-      </div>
-      <div class="session">
-        <a class="btnlink" href="/">← Back to the board</a>
-      </div>
+<div class="app">
+
+  <aside class="sidebar" id="sidebar" aria-label="Main navigation"></aside>
+  <div class="scrim" id="scrim"></div>
+
+  <div class="main">
+    <header class="topbar">
+      <button class="icon-btn" id="navOpen" type="button" aria-label="Open navigation"><i data-lucide="menu"></i></button>
+      <span class="topbar-title" id="topTitle">Members</span>
     </header>
 
-    <div id="banner" class="banner error" hidden></div>
-    <div id="ok" class="banner success" hidden></div>
-
-    <section class="panel insight">
-      <header><h2>Add a member</h2></header>
-      <form id="addForm" class="addrow">
-        <div class="field">
-          <label for="mname">Name</label>
-          <input id="mname" type="text" placeholder="Priya" maxlength="60" required />
+    <main class="page" data-section="admin">
+      <div class="crumbs"><i data-lucide="users"></i><span>Admin</span><span class="sep">/</span><span class="here">Members</span></div>
+      <div class="page-head">
+        <div>
+          <h1 class="page-title">Members</h1>
+          <p class="page-sub" id="pageSub">Loading members…</p>
         </div>
-        <div class="field">
-          <label for="mphone">Mobile number</label>
-          <div class="phone-input">
-            <span class="prefix">+91</span>
-            <input id="mphone" type="tel" inputmode="numeric" placeholder="98765 43210" required />
+        <div class="page-actions">
+          <button class="icon-btn" id="refresh" type="button" title="Refresh" aria-label="Refresh"><i data-lucide="refresh-cw"></i></button>
+          <button class="btn primary" id="addMember" type="button"><i data-lucide="user-plus"></i>Add member</button>
+        </div>
+      </div>
+
+      <div id="alerts"></div>
+
+      <section class="card">
+        <div class="pane">
+          <div class="tabs mb-tabs" role="tablist" aria-label="Show" id="tabs"></div>
+          <div class="board-filters">
+            <label class="search"><i data-lucide="search"></i><input class="input" id="q" type="search" autocomplete="off" placeholder="Name, email or mobile" aria-label="Search members" /></label>
           </div>
+          <div class="board-meta" id="resultNote" aria-live="polite"></div>
+          <div class="table-wrap">
+            <table class="table mb-table">
+              <thead><tr><th>Member</th><th>Mobile</th><th>Departments</th><th>Profile</th><th>Last active</th><th>Status</th></tr></thead>
+              <tbody id="rows"><tr><td colspan="6"><div class="state loading" aria-busy="true"><b>Loading members…</b></div></td></tr></tbody>
+            </table>
+          </div>
+          <ul class="clist" id="clist" aria-label="Members"></ul>
         </div>
-        <div id="addModules" class="module-selects"></div>
-        <label class="checkline" for="madmin">
-          <input id="madmin" type="checkbox" />
-          Admin (all modules, can manage members)
-        </label>
-        <button type="submit" class="primary" id="addBtn">Add member</button>
-      </form>
-      <p class="hint">
-        They sign in at the board with this number and a one-time code on WhatsApp.
-        No password to share, nothing to send them.
-      </p>
-    </section>
+      </section>
 
-    <div class="panel">
-      <table>
-        <thead>
-          <tr>
-            <th>Name</th><th>Mobile</th><th>Access</th>
-            <th>Last signed in</th><th>Added</th><th>Actions</th>
-          </tr>
-        </thead>
-        <tbody id="memberRows">
-          <tr><td colspan="6" class="empty">Loading…</td></tr>
-        </tbody>
-      </table>
-    </div>
-
-    <section class="panel insight" style="margin-top:18px">
-      <header><h2>Recent changes</h2></header>
-      <div id="memberLog"><p class="muted">Loading…</p></div>
-    </section>
-
-    <p class="note">
-      Removing someone takes effect within a minute — their session is checked against this
-      list, not just their sign-in. To force everyone out immediately, bump
-      <code>SESSION_EPOCH</code> in the environment.
-    </p>
+      <section class="card mb-log" aria-labelledby="logTitle">
+        <header class="card-head"><h2 class="card-title" id="logTitle"><i data-lucide="history"></i>Recent changes</h2><span class="card-meta">Last 20, in IST</span></header>
+        <div class="pane" id="log"></div>
+      </section>
+      <p class="footnote">Members sign in with their WhatsApp number and a one-time code. Removing or deactivating someone takes effect within a minute. Everyone completes their profile — name, email and a photo — before using Briyo OS.</p>
+    </main>
   </div>
+</div>
 
-  <script src="/admin.js"></script>
+<div class="drawer-scrim" id="drawerScrim" hidden></div>
+<aside class="drawer drawer-wide" id="drawer" hidden aria-label="Member">
+  <div class="drawer-head">
+    <div style="min-width:0"><h2 class="drawer-title" id="dTitle"></h2><div class="drawer-sub" id="dSub"></div></div>
+    <div class="drawer-nav"><button class="icon-btn" id="dClose" type="button" title="Close" aria-label="Close"><i data-lucide="x"></i></button></div>
+  </div>
+  <div class="drawer-body" id="dBody"></div>
+  <div class="drawer-foot"><span class="saved" id="dSaved" aria-live="polite"></span><button class="btn" type="button" id="dDone">Close</button></div>
+</aside>
+
+<script type="module" src="/members.js"></script>
 </body>
 </html>

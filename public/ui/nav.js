@@ -18,7 +18,7 @@
 
 // Only these paths share the shell. Everything else (Members, Import, login,
 // auth, API, downloads) is left to the browser.
-const SHELL_PATHS = new Set(['/', '/overview', '/dashboard', '/orders', '/couriers', '/destinations', '/inventory', '/hr/jobs', '/hr/candidates']);
+const SHELL_PATHS = new Set(['/', '/overview', '/admin', '/dashboard', '/orders', '/couriers', '/destinations', '/inventory', '/hr/jobs', '/hr/candidates']);
 
 let ctl = new AbortController();
 let leaveFns = [];

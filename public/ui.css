@@ -1200,3 +1200,38 @@ a.ov-metric:hover { background: var(--surface-2); }
 .form-error a { color: inherit; font-weight: 500; }
 .form-actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 12px; }
 .form-actions .btn { height: 32px; }
+
+/* confirmation modal: centred, one decision */
+.modal-scrim { position: fixed; inset: 0; z-index: 70; background: rgba(16, 24, 40, 0.32); display: grid; place-items: center; padding: 16px; }
+.modal { width: min(440px, 100%); background: var(--surface); border-radius: var(--r-panel); box-shadow: 0 20px 48px rgba(16, 24, 40, 0.24); padding: 20px; display: flex; flex-direction: column; gap: 12px; }
+.modal-title { margin: 0; font-size: 16px; font-weight: 600; }
+.modal-body { font-size: var(--fs-body); color: var(--text-2); }
+.modal-body p { margin: 0 0 8px; }
+.modal-foot { display: flex; justify-content: flex-end; gap: 8px; margin-top: 4px; }
+.btn.danger { background: var(--error); border-color: var(--error); color: #fff; }
+.btn.danger:hover:not(:disabled) { background: #D92D20; }
+.btn.danger:disabled { opacity: .5; }
+
+/* --------------------------------------------------------------------------
+   Members
+   -------------------------------------------------------------------------- */
+.mb-tabs { padding: 10px 12px 0; border-bottom: 1px solid var(--border-soft); }
+.tab-count { margin-left: 6px; font-size: 11px; color: var(--text-3); font-variant-numeric: tabular-nums; }
+.mb-who { display: flex; align-items: center; gap: 10px; min-width: 0; }
+.mb-who .avatar { width: 32px; height: 32px; font-size: 12px; }
+.mb-chips { display: flex; flex-wrap: wrap; gap: 4px; }
+.mb-inactive td { opacity: .6; }
+.mb-head { display: flex; gap: 16px; align-items: center; }
+.avatar.mb-avatar-lg { width: 72px; height: 72px; font-size: 22px; }
+.mb-name { font-size: 17px; font-weight: 600; }
+.mb-missing { display: flex; align-items: center; gap: 6px; margin: 0 0 10px; font-size: var(--fs-meta); color: var(--warning-text); }
+.mb-missing .lucide { width: 14px; height: 14px; }
+.mb-note { font-size: var(--fs-meta); margin: 0 0 10px; }
+.mb-check { display: flex; align-items: center; gap: 8px; margin-top: 12px; font-size: var(--fs-body); }
+.mb-log { margin-top: var(--sp-4); }
+.mb-loglist { padding: 4px 0; }
+.mb-loglist li { padding: 6px 16px; }
+.dsec-title > span { font-weight: 500; text-transform: none; letter-spacing: 0; color: var(--text-2); display: inline-flex; align-items: center; gap: 6px; }
+.mb-table .cell-main, .mb-table .cell-sub { display: block; max-width: 260px; white-space: nowrap; }
+/* Any table with a phone list beside it gives way to the list on phones. */
+@media (max-width: 760px) { .table-wrap:has(~ .clist) { display: none; } }
