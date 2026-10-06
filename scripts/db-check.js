@@ -2991,6 +2991,12 @@ const OLD = {
   recovery: (role) => role === 'admin' || role === 'caller',
   adminOnly: (role) => role === 'admin',                                // inventory writes, couriers/destinations writes, members, dashboard
 };
+// Briyo OS profile gate: fixture members get a complete profile (name, email, photo key)
+// before a real server is started, so access tests test access, not the profile step.
+const completeTestProfiles = () => getPool().query(`UPDATE allowed_users SET email = coalesce(email, phone || '@example.test'),
+  photo_key = coalesce(photo_key, 'test/db-check-photo.jpg'), photo_mime = coalesce(photo_mime, 'image/jpeg')
+  WHERE added_by = 'db-check' AND phone <> '919000000306'`);
+
 await step('rbac: capability matrix — every module role grants exactly its capabilities', async () => {
   const caps = (roles, admin = false) => capabilitiesOf({ allowed: true, admin, roles });
   const want = {
@@ -3116,6 +3122,7 @@ await step('rbac: route matrix on the real server — granted only by capability
   await setModuleRole(RB.lview, 'logistics', 'viewer', { actor: 'db-check' });
   await setModuleRole(RB.invOnly, 'inventory', 'manager', { actor: 'db-check' });
   const port = await freePort();
+  await completeTestProfiles();
   rbServer = spawn(process.execPath, ['server.js'], {
     cwd: new URL('..', import.meta.url).pathname,
     env: { ...process.env, PORT: String(port), APP_ENV: 'test', ADMIN_PHONES: RB.env, ELEVENZA_AUTH_TOKEN: '', SHOPIFY_ACCESS_TOKEN: '',
@@ -3260,7 +3267,7 @@ await step('rbac cleanup', async () => {
 
 // ---- HR / recruitment ----------------------------------------------------------
 const HRT = 'DBCHECK-HR';
-const HRM = { mgr: '919000000301', multi: '919000000302', nonHr: '919000000303', adm: '919000000304' };
+const HRM = { mgr: '919000000301', multi: '919000000302', nonHr: '919000000303', adm: '919000000304', inc: '919000000306' };
 const HRS = {};   // server, base, stub, dir, ids
 const hrPhones = Object.values(HRM);
 const hrCleanMembers = async () => {
@@ -3311,7 +3318,7 @@ await step('hr: schema is additive and idempotent; HR role pair accepted, nothin
   await ensureHrSchema(); await ensureHrSchema();
   const before = (await getPool().query('SELECT count(*)::int n FROM member_module_roles')).rows[0].n;
   await hrCleanMembers();
-  await getPool().query(`INSERT INTO allowed_users (phone, name, is_admin, added_by) VALUES ($1,'HR mgr',false,'db-check'),($2,'HR multi',false,'db-check'),($3,'Not HR',false,'db-check'),($4,'HR admin',true,'db-check')`, hrPhones);
+  await getPool().query(`INSERT INTO allowed_users (phone, name, is_admin, added_by) VALUES ($1,'HR mgr',false,'db-check'),($2,'HR multi',false,'db-check'),($3,'Not HR',false,'db-check'),($4,'HR admin',true,'db-check')`, hrPhones.slice(0, 4));
   await setModuleRole(HRM.mgr, 'hr', 'manager', { actor: 'db-check' });
   for (const [m, r] of [['logistics', 'operator'], ['inventory', 'viewer'], ['hr', 'manager']]) await setModuleRole(HRM.multi, m, r, { actor: 'db-check' });
   await setModuleRole(HRM.nonHr, 'support', 'agent', { actor: 'db-check' });
@@ -3335,6 +3342,7 @@ await step('hr: server with careers host, Turnstile stub and throwaway storage',
     res.setHeader('content-type', 'application/json'); res.end(JSON.stringify({ success: ok }));
   }); }).listen(0);
   const port = await freePort();
+  await completeTestProfiles();
   HRS.server = spawn(process.execPath, ['server.js'], {
     cwd: new URL('..', import.meta.url).pathname,
     env: { ...process.env, PORT: String(port), APP_ENV: 'test', ADMIN_PHONES: '', ELEVENZA_AUTH_TOKEN: '', SHOPIFY_ACCESS_TOKEN: '',
@@ -3892,6 +3900,68 @@ await step('overview: each member sees only their departments; numbers match the
   void pool;
   if (bad.length) throw new Error(bad.join(' | '));
   return `HR manager → hr; multi-module → hr, inventory, logistics; support → support; admin → all + people + ingest; signed out 401 / login; careers host 404; ${cmp.length} numbers equal their source counts; ${ov.attention.length} attention items, non-zero, sorted, linked`;
+});
+
+await step('profiles: incomplete member is held at /profile until name, email and photo are in; photos validated; admin controls', async () => {
+  const bad = [];
+  const pool = getPool();
+  await pool.query(`INSERT INTO allowed_users (phone, name, is_admin, added_by) VALUES ($1, 'Team', false, 'db-check') ON CONFLICT (phone) DO NOTHING`, [HRM.inc]);
+  await setModuleRole(HRM.inc, 'support', 'agent', { actor: 'db-check' });
+  const rolesBefore = JSON.stringify(await moduleRolesOf(HRM.inc));
+  const raw = (method, path_, buf, headers = {}) => fetch(`${HRS.base}${path_}`, { method, body: buf,
+    headers: { cookie: `${SESSION_COOKIE}=${issueSession(HRM.inc)}`, ...headers } }).then(async (r) => ({ status: r.status, body: await r.json().catch(() => ({})) }));
+  // Held: pages → /profile, APIs → 403 PROFILE_INCOMPLETE; profile, /auth/me and photos open.
+  for (const p of ['/', '/overview', '/orders']) {
+    const r = await internal('inc', 'GET', p);
+    if (r.status !== 302 || r.headers.get('location') !== '/profile') bad.push(`page ${p}: ${r.status} ${r.headers.get('location')}`);
+  }
+  const held = await internal('inc', 'GET', '/api/carts?days=1');
+  if (held.status !== 403 || held.body.code !== 'PROFILE_INCOMPLETE') bad.push(`api: ${held.status} ${held.body.code}`);
+  const me = await internal('inc', 'GET', '/auth/me');
+  if (me.status !== 200 || me.body.profileComplete !== false || me.body.profile.missing.join() !== 'name,email,photo' || me.body.phone !== HRM.inc) bad.push(`auth/me ${JSON.stringify(me.body.profile)}`);
+  if ((await internal('inc', 'GET', '/profile')).status !== 200 || (await internal('inc', 'GET', '/api/profile')).status !== 200) bad.push('profile not open');
+  for (const p of ['/healthz']) if ((await internal(null, 'GET', p)).status !== 200) bad.push(`${p} affected`);
+  // Validation: name, email, photo type and size.
+  const put = (b) => internal('inc', 'PUT', '/api/profile', b);
+  for (const [b, field] of [[{ name: 'Team' }, 'name'], [{ name: '  ' }, 'name'], [{ email: 'nope' }, 'email'], [{ email: '' }, 'email']]) {
+    const r = await put(b);
+    if (r.status !== 400 || r.body.field !== field) bad.push(`${JSON.stringify(b)} → ${r.status} ${r.body.field}`);
+  }
+  const png = Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), Buffer.alloc(4000, 7)]);
+  for (const [buf, name, want] of [[Buffer.from('not an image'), 'me.png', 400], [Buffer.from('%PDF-1.4 x'), 'cv.pdf', 400], [Buffer.alloc(0), 'me.png', 400],
+    [Buffer.concat([Buffer.from([0xff, 0xd8, 0xff, 0xe0]), Buffer.alloc(2 * 1024 * 1024 + 10)]), 'big.jpg', 413]]) {
+    const r = await raw('POST', '/api/profile/photo', buf, { 'x-filename': name });
+    if (r.status !== want) bad.push(`photo ${name}: ${r.status} ≠ ${want}`);
+  }
+  if ((await internal('inc', 'GET', '/api/profile')).body.profile.hasPhoto) bad.push('a rejected photo was stored');
+  // Complete it: photo, then name + email.
+  const up = await raw('POST', '/api/profile/photo', png, { 'x-filename': 'me.png' });
+  if (up.status !== 201 || !up.body.profile.hasPhoto || 'photo_key' in up.body.profile) bad.push(`upload ${up.status}`);
+  if ((await internal('inc', 'GET', '/api/carts?days=1')).status !== 403) bad.push('photo alone completed the profile');
+  const done = await put({ name: '  Inaya   Test ', email: ' Inaya@Example.TEST ' });
+  if (done.status !== 200 || !done.body.profile.complete || done.body.profile.name !== 'Inaya Test' || done.body.profile.email !== 'inaya@example.test') bad.push(`complete ${JSON.stringify(done.body)}`);
+  if ((await internal('inc', 'GET', '/api/carts?days=1')).status !== 200 || (await internal('inc', 'GET', '/')).status !== 200) bad.push('still held after completing');
+  if (JSON.stringify(await moduleRolesOf(HRM.inc)) !== rolesBefore) bad.push('roles changed');
+  if ((await pool.query('SELECT phone FROM allowed_users WHERE phone = $1', [HRM.inc])).rows.length !== 1) bad.push('phone changed');
+  // The photo is private: signed-in members only, streamed, never a storage URL.
+  const url = done.body.profile.photoUrl;
+  const asTeam = await fetch(`${HRS.base}${url}`, { headers: { cookie: `${SESSION_COOKIE}=${issueSession(HRM.mgr)}` } });
+  if (asTeam.status !== 200 || asTeam.headers.get('x-content-type-options') !== 'nosniff' || !/^private/.test(asTeam.headers.get('cache-control'))) bad.push(`photo for teammate ${asTeam.status}`);
+  if ((await fetch(`${HRS.base}${url}`)).status !== 401 || (await careers('GET', url.split('?')[0], { cookieAs: 'adm' })).status !== 404) bad.push('photo reachable signed out / on careers');
+  // Admin view: profile fields, no storage key; only admins edit others.
+  const list = (await internal('adm', 'GET', '/api/members')).body.members.find((m) => m.phone === HRM.inc);
+  if (!list?.profile_complete || list.email !== 'inaya@example.test' || !list.photo_url || 'photo_key' in list && list.photo_key) bad.push('members list profile fields');
+  if ((await internal('mgr', 'GET', '/api/members')).status !== 403 || (await internal('mgr', 'PATCH', `/api/members/${HRM.inc}`, { email: 'x@y.zz' })).status !== 403
+    || (await internal('mgr', 'DELETE', `/api/members/${HRM.inc}/photo`)).status !== 403 || (await internal('mgr', 'GET', `/api/members/${HRM.inc}/activity`)).status !== 403) bad.push('non-admin reached member admin');
+  if ((await internal('adm', 'PATCH', `/api/members/${HRM.inc}`, { email: 'bad' })).status !== 400) bad.push('admin bad email');
+  if ((await internal('adm', 'PATCH', `/api/members/${HRM.inc}`, { email: 'inaya.new@example.test' })).status !== 200) bad.push('admin email edit');
+  const cleared = await internal('adm', 'DELETE', `/api/members/${HRM.inc}/photo`);
+  if (cleared.status !== 200 || cleared.body.profile.complete || cleared.body.profile.missing.join() !== 'photo') bad.push(`admin clear ${cleared.status}`);
+  if ((await internal('inc', 'GET', '/api/carts?days=1')).status !== 403) bad.push('cleared photo did not re-hold the member');
+  const act = (await internal('adm', 'GET', `/api/members/${HRM.inc}/activity`)).body;
+  if (!act.changes?.some((c) => /photo removed by an admin/.test(c.detail)) || !act.changes.some((c) => /photo added/.test(c.detail))) bad.push('activity log');
+  if (bad.length) throw new Error(bad.join(' | '));
+  return 'pages → /profile, APIs 403 PROFILE_INCOMPLETE, /auth/me + /profile open; placeholder/blank name, bad/empty email, fake PNG, PDF, empty, >2 MB refused and nothing stored; photo alone not enough; name+email+photo → full access, roles and phone unchanged; photo private (teammates yes, signed out 401, careers 404); admin sees profile fields (no storage key), edits email, clears photo → member held again; activity logged; non-admins refused';
 });
 
 await step('hr cleanup', async () => {

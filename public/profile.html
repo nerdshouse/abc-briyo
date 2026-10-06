@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Your profile — Briyo OS</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/ui.css" />
+  <!-- The page script imports these; preloading fetches them in parallel instead of one after another. -->
+  <link rel="modulepreload" href="/ui/components.js" />
+  <link rel="modulepreload" href="/ui/nav.js" />
+  <link rel="modulepreload" href="/profile.js" />
+  <script src="https://cdn.jsdelivr.net/npm/lucide@0.469.0/dist/umd/lucide.min.js" defer></script>
+</head>
+<body>
+<div class="app">
+
+  <aside class="sidebar" id="sidebar" aria-label="Main navigation"></aside>
+  <div class="scrim" id="scrim"></div>
+
+  <div class="main">
+    <header class="topbar">
+      <button class="icon-btn" id="navOpen" type="button" aria-label="Open navigation"><i data-lucide="menu"></i></button>
+      <span class="topbar-title" id="topTitle">Your profile</span>
+    </header>
+
+    <main class="page pf" data-section="profile">
+      <div class="page-head">
+        <div>
+          <h1 class="page-title" id="pfTitle">Your profile</h1>
+          <p class="page-sub" id="pfSub">Loading…</p>
+        </div>
+      </div>
+      <div id="pfGate"></div>
+
+      <div class="pf-grid">
+        <section class="card pf-card" aria-labelledby="pfIdTitle">
+          <header class="card-head"><h2 class="card-title" id="pfIdTitle"><i data-lucide="id-card"></i>Profile</h2><span class="card-meta" id="pfMeter"></span></header>
+          <form id="pfForm" class="pf-form" novalidate>
+            <div class="pf-photo">
+              <div class="pf-avatar" id="pfAvatar" aria-hidden="true"></div>
+              <div class="pf-photo-side">
+                <p class="pf-photo-title">Profile photo <span class="req">required</span></p>
+                <p class="soft pf-help">A clear photo of your face, so the team knows who is who. JPG, PNG or WebP. We crop it to a square.</p>
+                <div class="form-actions">
+                  <label class="btn" for="pfFile"><i data-lucide="camera"></i><span id="pfFileLabel">Upload photo</span></label>
+                  <input type="file" id="pfFile" accept="image/jpeg,image/png,image/webp" class="sr-only" />
+                </div>
+                <p class="err" id="pfPhotoErr" role="alert"></p>
+              </div>
+            </div>
+            <div class="pf-fields">
+              <label class="fld"><span>Full name <em>*</em></span><input class="input" id="pfName" name="name" autocomplete="name" maxlength="60" required /><span class="err" id="pfNameErr" role="alert"></span></label>
+              <label class="fld"><span>Email <em>*</em></span><input class="input" id="pfEmail" name="email" type="email" autocomplete="email" maxlength="254" required /><span class="err" id="pfEmailErr" role="alert"></span></label>
+              <label class="fld"><span>Mobile (WhatsApp)</span><input class="input mono" id="pfPhone" readonly aria-describedby="pfPhoneHelp" /><span class="help" id="pfPhoneHelp">The number you sign in with. Ask an admin to change it.</span></label>
+            </div>
+            <div class="pf-actions"><span class="saved" id="pfSaved" aria-live="polite"></span><button class="btn primary" type="submit" id="pfSave">Save profile</button></div>
+          </form>
+        </section>
+
+        <section class="card pf-card" aria-labelledby="pfAccessTitle">
+          <header class="card-head"><h2 class="card-title" id="pfAccessTitle"><i data-lucide="shield-check"></i>Departments &amp; access</h2></header>
+          <div class="pane pf-access" id="pfAccess"></div>
+        </section>
+      </div>
+    </main>
+  </div>
+</div>
+
+<script type="module" src="/profile.js"></script>
+</body>
+</html>

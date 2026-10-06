@@ -470,10 +470,13 @@ export function initShell(me, { onSearch } = {}) {
   for (const el of document.querySelectorAll('[data-recovery]')) el.hidden = !hasCap(me, 'support.work');
   renderOrdersNav(me).catch(() => {});
 
+  // A profile that became incomplete (e.g. an admin took the photo down) is
+  // completed before anything else; the server enforces the same on every request.
+  if (me && me.profileComplete === false && window.location.pathname !== '/profile') { window.location.href = '/profile'; return; }
   if (me?.name) {
-    $('#userName').textContent = me.name;
+    $('#userName').textContent = me.profile?.name || me.name;
     $('#userRole').textContent = roleSummary(me);
-    setAvatar($('#userAvatar'), me);
+    setAvatar($('#userAvatar'), { name: me.profile?.name || me.name, photoUrl: me.photoUrl || me.profile?.photoUrl });
   }
   syncSidebarActive();
   renderIcons();

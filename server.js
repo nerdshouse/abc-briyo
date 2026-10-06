@@ -25,8 +25,9 @@ import {
 } from './lib/normalize.js';
 import {
   router as authRouter, requireAuth, requireAdmin, currentUserName, invalidateMembership,
-  requirePermission, requirePage,
+  requirePermission, requirePage, requireCompleteProfile,
 } from './lib/auth-routes.js';
+import { getProfile, updateProfile, savePhoto, clearPhoto, photoFile, memberActivity, MAX_PHOTO_BYTES } from './lib/profile.js';
 import { homeFor, MODULE_KEYS, isValidAssignment } from './lib/permissions.js';
 import { careersHost } from './lib/careers.js';
 import { router as hrRouter } from './lib/hr-routes.js';
@@ -402,6 +403,56 @@ app.use('/auth', authRouter);
 
 // --- everything below requires a session ------------------------------------
 app.use(requireAuth);
+
+// ---------------------------------------------------------------------------
+// Member profile (Briyo OS). Before the profile gate: these are exactly the
+// routes a member with an incomplete profile may use.
+// ---------------------------------------------------------------------------
+const profileError = (res, err) => (err.status && err.status < 500
+  ? res.status(err.status).json({ ok: false, error: err.message, field: err.field, conflict: err.conflict })
+  : fail(res, err));
+app.get('/profile', (_req, res) => res.sendFile(path.join(PUBLIC, 'profile.html')));
+app.get('/api/profile', async (req, res) => {
+  try { res.json({ ok: true, profile: await getProfile(req.session.phone), home: homeFor(req.session.caps || []) }); }
+  catch (err) { profileError(res, err); }
+});
+app.put('/api/profile', async (req, res) => {
+  try {
+    const { name, email } = req.body ?? {};
+    const profile = await updateProfile(req.session.phone, { name, email }, { actor: await currentUserName(req) });
+    invalidateMembership(req.session.phone);
+    res.json({ ok: true, profile });
+  } catch (err) { profileError(res, err); }
+});
+app.post('/api/profile/photo', express.raw({ type: () => true, limit: MAX_PHOTO_BYTES + 1024 }), async (req, res) => {
+  try {
+    let filename = '';
+    try { filename = decodeURIComponent(String(req.get('x-filename') || 'photo')); } catch { filename = 'photo'; }
+    const profile = await savePhoto(req.session.phone, { filename, buffer: Buffer.isBuffer(req.body) ? req.body : Buffer.alloc(0) },
+      { actor: await currentUserName(req) });
+    invalidateMembership(req.session.phone);
+    res.status(201).json({ ok: true, profile });
+  } catch (err) {
+    if (err.name === 'StorageNotConfigured') return res.status(503).json({ ok: false, error: 'Photo storage is not configured.' });
+    profileError(res, err);
+  }
+});
+// A photo over the limit is stopped by the body parser: answer like the route would.
+// eslint-disable-next-line no-unused-vars
+app.use('/api/profile/photo', (err, _req, res, _next) => (err.type === 'entity.too.large'
+  ? res.status(413).json({ ok: false, field: 'photo', error: 'That photo is larger than 2 MB. Please choose a smaller one.' })
+  : fail(res, err)));
+// Any signed-in member may see a teammate's photo (avatars). Streamed, never a storage URL.
+app.get('/api/members/:phone/photo', async (req, res) => {
+  try {
+    const f = await photoFile(normalisePhone(req.params.phone) || '');
+    if (req.get('if-none-match') === f.etag) return res.status(304).end();
+    res.set({ 'Content-Type': f.mime, 'Content-Disposition': 'inline', 'X-Content-Type-Options': 'nosniff',
+      'Cache-Control': 'private, max-age=86400', ETag: f.etag });
+    res.send(f.buffer);
+  } catch (err) { res.status(err.status || 500).type('text').send(err.status ? 'Not found' : 'Error'); }
+});
+app.use(requireCompleteProfile);
 
 // Module access: every area checks a capability (lib/permissions.js), never a
 // role name. Pages a member cannot use send them to one they can, or to the
@@ -874,6 +925,17 @@ app.get('/api/admin/report.csv', requireAdmin, async (req, res) => {
   } catch (err) { return fail(res, err); }
 });
 
+app.get('/api/members/:phone/activity', requireAdmin, async (req, res) => {
+  try { res.json({ ok: true, ...(await memberActivity(normalisePhone(req.params.phone) || '')) }); } catch (err) { fail(res, err); }
+});
+app.delete('/api/members/:phone/photo', requireAdmin, async (req, res) => {
+  try {
+    const phone = normalisePhone(req.params.phone) || '';
+    const profile = await clearPhoto(phone, { actor: await currentUserName(req) });
+    invalidateMembership(phone);
+    res.json({ ok: true, profile });
+  } catch (err) { profileError(res, err); }
+});
 app.get('/api/members', requireAdmin, async (_req, res) => {
   try {
     if (MOCK) return res.json({ ok: true, mock: true, members: [], log: [] });
@@ -954,8 +1016,11 @@ app.patch('/api/members/:phone', requireAdmin, async (req, res) => {
     if (!phone) return res.status(400).json({ ok: false, error: 'Invalid number.' });
 
     const actor = await currentUserName(req);
-    const { name, active, isAdmin } = req.body ?? {};
+    const { name, active, isAdmin, email } = req.body ?? {};
     const parsed = parseModuleChanges(req.body);
+    if (email !== undefined) {
+      try { await updateProfile(phone, { email }, { actor }); } catch (err) { return profileError(res, err); }
+    }
     if (parsed.error) return res.status(400).json({ ok: false, error: parsed.error });
     const losingAdmin = active === false || isAdmin === false;
 
