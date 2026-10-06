@@ -18,7 +18,7 @@ import { mapShopifyCsv } from '../lib/shopify-csv.js';
 import { csvCell, toCsv } from '../lib/csv.js';
 import {
   ensureOrdersSchema, createOrder, createShipment, updateOrder, updateShipment, getOrder, listOrders, orderEvents,
-  orderShipments, addOrderNote, removeDocument, orderDocuments, listCouriers, saveCourier,
+  orderShipments, addOrderNote, removeDocument, orderDocuments, getDocument, listCouriers, saveCourier,
   trackingUrlFor, purgeTestOrders, zonedToUtc, listDestinations, saveDestination, DISPATCH_TYPES,
   shipmentMembers, sharedShipmentOf, attachToShipment, detachFromShipment, attachableOrders, createShipmentForOrders,
 } from '../lib/orders.js';
@@ -1396,7 +1396,13 @@ await step('upload flow: multiple documents, soft removal, object deleted if the
   docs = await papers();
   if (docs.length !== 2 || !docs.find((d) => d.id === inv.id).removed_at) throw new Error('removal was not soft');
   if ((await getOrder(orderId)).has_invoice) throw new Error('removed invoice still counted');
-  return '2 stored, failed write cleaned up, invalid file never stored';
+  // A removed document stays in the record but is never served again.
+  const rec = docs.find((d) => d.document_type === 'courier_receipt');
+  if (await getDocument(orderId, inv.id) || !(await getDocument(orderId, rec.id))) throw new Error('removed document still served / live one not served');
+  // The drawer's remove and detach buttons carry their ids (a stray quote once emptied them).
+  const ui = await fsp.readFile(new URL('../public/orders.js', import.meta.url), 'utf8');
+  if (/=""\$\{/.test(ui) || !/data-remove-doc="\$\{d\.id\}"/.test(ui) || !/data-detach="\$\{x\.id\}"/.test(ui)) throw new Error('orders.js button ids broken');
+  return '2 stored, failed write cleaned up, invalid file never stored; removed document not served; remove/detach buttons carry ids';
 });
 await step('storage: R2 request signing matches the AWS reference example', async () => {
   // docs.aws.amazon.com/AmazonS3/latest/API/sig-v4-header-based-auth.html — "GET Object"

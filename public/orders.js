@@ -364,11 +364,11 @@ function docRows(o, list) {
     <li class="doc${d.removed_at ? ' removed' : ''}">
       ${icon(d.mime_type === 'application/pdf' ? 'file-text' : 'image')}
       <div class="doc-name">
-        <a href="${docUrl(o, d)}" target="_blank" rel="noopener">${esc(d.original_filename)}</a>
+        ${d.removed_at ? `<span>${esc(d.original_filename)}</span>` : `<a href="${docUrl(o, d)}" target="_blank" rel="noopener">${esc(d.original_filename)}</a>`}
         <div class="doc-meta">${list.some((x) => x.document_type !== d.document_type) ? `${esc(label(d.document_type))} · ` : ''}${esc(bytes(d.file_size))} · ${esc(d.uploaded_by || 'Someone')}, ${esc(dateTime(d.uploaded_at))}
           ${d.removed_at ? ` · removed by ${esc(d.removed_by || 'someone')}` : ''}</div>
       </div>
-      ${d.removed_at || !canEdit() ? '' : `<button class="icon-btn bare" type="button" data-remove-doc=""${d.id}" data-doc-order="${d.order_id}" title="Remove" aria-label="Remove ${esc(d.original_filename)}">${icon('trash-2')}</button>`}
+      ${d.removed_at || !canEdit() ? '' : `<button class="icon-btn bare" type="button" data-remove-doc="${d.id}" data-doc-order="${d.order_id}" title="Remove" aria-label="Remove ${esc(d.original_filename)}">${icon('trash-2')}</button>`}
     </li>`).join('')}</ul>`;
 }
 
@@ -433,7 +433,7 @@ function sharedBlock(o, ship) {
           <span class="soft">${esc(day(x.order_date))}</span>
           <span class="num">${esc(amount(x.order_value))}</span>
           ${x.order_status === 'cancelled' ? '<span class="mini-tag warn">Cancelled</span>' : ''}
-          ${x.role === 'member' && canEdit() ? `<button type="button" class="icon-btn bare" data-detach=""${x.id}" title="Take out of this shipment" aria-label="Take order ${esc(x.source_order_id)} out of this shipment">${icon('x')}</button>` : ''}
+          ${x.role === 'member' && canEdit() ? `<button type="button" class="icon-btn bare" data-detach="${x.id}" title="Take out of this shipment" aria-label="Take order ${esc(x.source_order_id)} out of this shipment">${icon('x')}</button>` : ''}
         </li>`).join('')}</ul>
       ${state.detail.sharedWith ? '<p class="soft shared-note">Shared shipment: courier, AWB, status and photos apply to every order in it.</p>' : ''}` : ''}
     ${canAdd ? `<button type="button" class="btn" id="dAttachOpen">${icon('plus')}Add orders to this shipment</button>
