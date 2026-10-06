@@ -49,7 +49,7 @@ import fsp from 'node:fs/promises';
 import http from 'node:http';
 import { ensureHrSchema, purgeTestHr, slugify, normalizePhone, removeResume, retryPendingRemovals } from '../lib/hr.js';
 import { jobPostingLd } from '../lib/careers-pages.js';
-import { issueFormToken, verifyTurnstile } from '../lib/careers.js';
+import { issueFormToken, verifyTurnstile, normalizeHost, isCareersRequest } from '../lib/careers.js';
 import net from 'node:net';
 import {
   isIngestSilent, buildDailySummary, shouldSendSummary, boardDay,
@@ -3732,6 +3732,45 @@ await step('hr: host isolation — the careers host serves careers routes only',
   }
   if (bad.length) throw new Error(bad.join(' | '));
   return `${paths.length * 2 + 5} internal paths on the careers host (pages answer the careers 404 page) → 404 (no cookie set), with and without an admin session; careers headers; internal host serves no careers routes`;
+});
+
+await step('careers host detection behind a proxy — the Host header decides, never X-Forwarded-Host', async () => {
+  const bad = [];
+  // Unit: normalisation and the decision itself.
+  const saved = process.env.CAREERS_HOST; process.env.CAREERS_HOST = 'Careers.Briyo.xyz';
+  for (const [host, want] of [['careers.briyo.xyz', true], ['careers.briyo.xyz:443', true], ['CAREERS.BRIYO.XYZ', true], ['careers.briyo.xyz.', true],
+    ['abc.briyo.xyz', false], ['abc.briyo.xyz:443', false], ['careers.briyo.xyz.evil.test', false], ['xcareers.briyo.xyz', false], ['', false], [undefined, false]]) {
+    if (isCareersRequest({ headers: { host } }) !== want) bad.push(`unit ${host} ≠ ${want}`);
+  }
+  if (isCareersRequest({ headers: { host: 'abc.briyo.xyz', 'x-forwarded-host': 'careers.briyo.xyz' }, hostname: 'careers.briyo.xyz' })) bad.push('unit: forwarded host made abc careers');
+  if (!isCareersRequest({ headers: { host: 'careers.briyo.xyz', 'x-forwarded-host': 'abc-briyo-sg.onrender.com' }, hostname: 'abc-briyo-sg.onrender.com' })) bad.push('unit: forwarded host hid careers');
+  if (normalizeHost('[::1]:3000') !== '[::1]') bad.push('ipv6');
+  process.env.CAREERS_HOST = ''; if (isCareersRequest({ headers: { host: '' } })) bad.push('unset host matched');
+  process.env.CAREERS_HOST = saved;
+  // On the real server, which trusts one proxy hop (as on Render).
+  const xfh = (v) => ({ 'x-forwarded-host': v });
+  for (const [label, host, headers, check] of [
+    ['careers + port', 'careers.test:443', {}, (r) => r.status === 200 && /Careers at Briyo/.test(r.body)],
+    ['careers, proxy says another host', 'careers.test', xfh('abc-briyo-sg.onrender.com'), (r) => r.status === 200 && /Careers at Briyo/.test(r.body)],
+    ['careers /login, proxy says another host', 'careers.test', xfh('abc.briyo.xyz'), (r) => r.status === 404 && !r.headers.get('location')],
+    ['careers /dashboard', 'careers.test', xfh('abc.briyo.xyz'), (r) => r.status === 404],
+    ['internal, forwarded host claims careers', '127.0.0.1', xfh('careers.test'), (r) => r.status === 302 && r.headers.get('location') === '/login'],
+    ['internal + port, forwarded host claims careers', `127.0.0.1:${new URL(HRS.base).port}`, xfh('careers.test'), (r) => r.status === 302],
+  ]) {
+    const path_ = /dashboard/.test(label) ? '/dashboard' : /login/.test(label) ? '/login' : '/';
+    const r = await careers('GET', path_, { headers: { host, ...headers } });
+    if (!check(r)) bad.push(`${label}: ${r.status} ${r.headers.get('location') || ''}`);
+  }
+  for (const p of ['/api/orders', '/api/hr/jobs', '/auth/me']) {
+    const r = await careers('GET', p, { headers: { host: 'careers.test:443', ...xfh('abc.briyo.xyz') }, cookieAs: 'adm' });
+    if (r.status !== 404) bad.push(`careers ${p}: ${r.status}`);
+  }
+  const jobs = await careers('GET', '/jobs', { headers: { host: '127.0.0.1', ...xfh('careers.test') }, cookieAs: 'adm' });
+  if (jobs.status === 200 && typeof jobs.body === 'object' && jobs.body.jobs) bad.push('careers feed on the internal host via forwarded host');
+  const app = await careers('GET', '/api/hr/jobs', { headers: { host: '127.0.0.1', ...xfh('careers.test') }, cookieAs: 'adm' });
+  if (app.status !== 200 || !Array.isArray(app.body.jobs)) bad.push(`internal API with forwarded careers host: ${app.status}`);
+  if (bad.length) throw new Error(bad.join(' | '));
+  return 'unit: 10 Host forms + forwarded-host both ways; server: careers with :443 and a different forwarded host → careers (home 200, /login /dashboard 404, APIs 404 with an admin session); internal Host + forwarded careers → internal app (login redirect, API 200, no careers feed)';
 });
 
 await step('hr cleanup', async () => {
