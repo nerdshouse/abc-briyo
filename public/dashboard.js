@@ -194,7 +194,10 @@ function renderWorklist() {
   if (state.inv) {
     add(state.inv.unmapped?.length, 'warn', 'Unmapped platform SKUs', 'Marketplace SKUs on orders with no Master SKU', { href: '/inventory?view=unmapped' });
     add(c.expired, 'error', 'Expired batches with stock', 'Still on hand past expiry', { href: '/inventory?expiring=expired' });
-    add(c.outOfStock, 'warn', 'Out of stock', 'Active Master SKUs with nothing available to dispatch', { href: '/inventory?stock=out' });
+    // Before any batch exists every SKU is "out of stock", which says nothing:
+    // the row appears once stock has actually been received.
+    const tracking = (state.inv.rows || []).some((r) => !r.empty);
+    if (tracking) add(c.outOfStock, 'warn', 'Out of stock', 'Active Master SKUs with nothing available to dispatch', { href: '/inventory?stock=out' });
     add(c.lowStock, 'warn', 'Low stock', 'At or under the reorder level', { href: '/inventory?stock=low' });
   }
   if (!rows.length) {
@@ -227,7 +230,7 @@ function renderQuickStatus() {
     row('Orders', o?.viewCounts ? count(o.total) : null),
     row('Order lines', all ? count(sum((x) => (x.line_skus || []).length)) : null, 'Product lines across every order.'),
     row('Shipments', all ? count(sum((x) => x.shipment_count || 0)) : null, 'Every shipment record, including several on one order.'),
-    row('Documents', all ? count(sum((x) => x.document_count || 0)) : null, 'Documents attached to orders. Removed documents are not counted.'),
+    row('Active documents', all ? count(sum((x) => x.document_count || 0)) : null, 'Documents attached to orders. Removed documents are not counted.'),
     row('Master SKUs', state.inv ? count(state.inv.cards.totalSkus) : null, 'Active master SKUs.'),
     row('Carts', carts !== null && carts !== undefined ? count(carts) : null, 'Every abandoned cart received.'),
     row('Team', state.overview ? `${count(state.overview.team)} member${state.overview.team === 1 ? '' : 's'} · ${count(state.overview.online.length)} online` : null),
