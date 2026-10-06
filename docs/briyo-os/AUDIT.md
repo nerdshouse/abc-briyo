@@ -137,3 +137,40 @@ Baseline: production `cad0feb`. This audit is read-only and covers the whole rep
 - **Dashboard rewrite:** the existing admin analytics (recovery funnel, report, CSV) must remain reachable.
 - **Careers:** must remain untouched, with isolation tests kept.
 - **Timezone:** HR stays fixed to IST. Board and orders follow `BOARD_TIMEZONE`, which defaults to Asia/Kolkata. Do not change it globally.
+
+---
+
+## 13. Terminology map (applied)
+
+| Word | Meaning in Briyo OS | Examples |
+|---|---|---|
+| **New …** | Opens a form for a record that does not exist yet | New shipment, New job, New master SKU |
+| **Create …** | Submits that form | Create shipment, Create order |
+| **Add …** | Puts something into a list or collection | Add member, Add inventory, Add destination |
+| **Save …** | Keeps edits to something that exists | Save changes, Save profile, Save access |
+| **Remove** | Takes something out but keeps its history | Remove member, Remove photo, Remove document |
+| **Delete** | Permanent, with no history kept for the item itself (the audit log keeps a record) | Delete job (only when nobody has applied) |
+| **Archive** | Hides a record and keeps it | Archive job |
+| **Close** | Stops intake and keeps the record visible | Close applications |
+| **Deactivate** | Stops a person's access; reversible | Deactivate member |
+
+All buttons and headings use sentence case. Data values such as document types keep their own names.
+
+## 14. Semantic colour
+
+| Meaning | Token | Used for |
+|---|---|---|
+| Healthy / success | `--success`, `--success-text`, `--success-soft` | Delivered, complete profile, Healthy |
+| Warning | `--warning*` | Low stock, unmapped SKUs, past SLA, missing profile fields |
+| Critical / failed / blocked | `--error*` | Failed delivery / RTO, expired stock, overdue callbacks |
+| Informational | `--info*` | Admin badge, awaiting review, Attention |
+| Neutral | `--neutral*` | Draft, deactivated, no data |
+
+Colour never stands alone: every badge, dot and health indicator carries a word. Text greys meet WCAG AA: `--text-2` is 7.7:1 and `--text-3` is 5.0:1. `--text-faint` is for decoration only.
+
+## 15. Not built (deliberately)
+
+The brief's navigation listed some pages that do not exist as separate screens today: Shipments, Documents, Batches, Movements, Suppliers, Warehouses, Team, Settings, Recovery activity and Reports.
+- They live inside existing screens: the order drawer, the SKU drawer, the Warehouses & suppliers form, and Analytics.
+- They were not given sidebar links, because a link to a page that does not exist is a dead link.
+- Each can become its own page later without changing the navigation model.

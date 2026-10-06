@@ -15,8 +15,10 @@
 
   /* text */
   --text: #182230;
-  --text-2: #667085;
-  --text-3: #98A2B3;
+  /* text: every step meets WCAG AA (4.5:1) on white and on --bg */
+  --text-2: #475467;   /* 7.7:1 */
+  --text-3: #667085;   /* 5.0:1 */
+  --text-faint: #98A2B3; /* decorative only (dots, tree lines) — never for words */
 
   /* lines */
   --border: #E7E9ED;
