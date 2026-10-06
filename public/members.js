@@ -30,6 +30,7 @@ const FILTERS = {
   inactive: ['Deactivated', (m) => !m.active],
 };
 const FIELD = { name: 'name', email: 'email', photo: 'photo' };
+const FIELD_LABEL = { name: 'full name', email: 'email', photo: 'profile photo' };
 const CAP_LABEL = {
   'logistics.view': 'See orders and shipments', 'logistics.edit': 'Create and update orders and shipments', 'logistics.setup': 'Manage couriers and destinations',
   'inventory.view': 'See stock and SKUs', 'inventory.move': 'Receive, adjust and transfer stock', 'inventory.catalog': 'Manage SKUs, suppliers and warehouses',
@@ -80,6 +81,14 @@ function render() {
   const active = all.filter((m) => m.active);
   const incomplete = active.filter((m) => !m.profile_complete).length;
   $('#pageSub').textContent = `${count(active.length)} active member${active.length === 1 ? '' : 's'}${incomplete ? ` · ${count(incomplete)} with an incomplete profile` : ' · every profile complete'}`;
+  const noDept = active.filter(FILTERS.no_access[1]).length;
+  const byDept = Object.keys(state.catalog).map((k) => [k, active.filter((m) => m.modules?.[k]).length]);
+  $('#summary').innerHTML = `
+    <div class="mb-stat"><span>Members</span><b class="num">${count(all.length)}</b></div>
+    <div class="mb-stat"><span>Active</span><b class="num">${count(active.length)}</b></div>
+    <a class="mb-stat${incomplete ? ' warn' : ''}" href="/admin?filter=incomplete"><span>Incomplete profiles</span><b class="num">${count(incomplete)}</b></a>
+    <a class="mb-stat${noDept ? ' info' : ''}" href="/admin?filter=no_access"><span>No department</span><b class="num">${count(noDept)}</b></a>
+    <div class="mb-stat mb-depts"><span>By department</span><div class="mb-chips">${byDept.map(([k, v]) => `<span class="badge">${esc(deptLabel(k))} <b class="num">${count(v)}</b></span>`).join('')}<span class="badge info">Admins <b class="num">${count(active.filter((m) => m.is_admin).length)}</b></span></div></div>`;
   $('#tabs').innerHTML = Object.entries(FILTERS).map(([k, [label, fn]]) => `<button type="button" class="tab${state.filter === k ? ' active' : ''}" role="tab" aria-selected="${state.filter === k}" data-filter="${k}">${esc(label)}<span class="tab-count">${count(all.filter(fn).length)}</span></button>`).join('');
   const q = state.q.toLowerCase().replace(/^\+/, '');
   const rows = all.filter(FILTERS[state.filter][1]).filter((m) => !q || [m.name, m.email, m.phone].some((v) => String(v || '').toLowerCase().includes(q)));
@@ -174,7 +183,8 @@ function renderMember(m, act) {
     </section>
 
     <section class="dsec"><h3 class="dsec-title">Profile <span><span class="pf-meter"><span style="width:${pct}%"></span></span> ${pct}%</span></h3>
-      ${m.profile_complete ? '' : `<p class="mb-missing">${icon('circle-alert')} Missing: ${esc(m.profile_missing.join(', '))}. They complete it at their next sign-in.</p>`}
+      ${m.profile_complete ? '' : `<p class="mb-missing">${icon('circle-alert')} Missing: ${esc(m.profile_missing.map((x) => FIELD_LABEL[x]).join(', '))}. ${m.profile_required
+        ? 'They must complete it before using Briyo OS.' : 'They can keep working; Briyo OS reminds them to finish it.'}</p>`}
       <form id="mbProfile" class="form-grid" novalidate>
         <label class="fld"><span>Full name</span><input class="input" name="name" value="${esc(m.name)}" maxlength="60" /></label>
         <label class="fld"><span>Email</span><input class="input" name="email" type="email" value="${esc(m.email || '')}" maxlength="254" /></label>
@@ -258,9 +268,9 @@ async function act(kind) {
       await send(`/api/members/${phone}`, 'PATCH', body);
       toast('Profile saved');
     } else if (kind === 'clear-photo') {
-      if (!await confirmDialog({ title: 'Remove this photo?', body: `<p>${esc(m.name)} will be asked for a new photo before they can use Briyo OS again.</p>`, confirmLabel: 'Remove photo', danger: true })) return;
+      if (!await confirmDialog({ title: 'Remove profile photo?', body: '<p>This will make the member\'s profile incomplete until a new photo is uploaded.</p>', confirmLabel: 'Remove photo', danger: true })) return;
       await send(`/api/members/${phone}/photo`, 'DELETE');
-      toast('Photo removed — they will be asked for a new one');
+      toast('Photo removed — the profile is incomplete until a new one is uploaded');
     } else if (kind === 'save-modules') {
       const changes = changesFrom($('#mbModules'), m.modules || {});
       if (!Object.keys(changes).length) { saved('No changes'); return; }

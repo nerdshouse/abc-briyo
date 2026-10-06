@@ -2995,7 +2995,7 @@ const OLD = {
 // before a real server is started, so access tests test access, not the profile step.
 const completeTestProfiles = () => getPool().query(`UPDATE allowed_users SET email = coalesce(email, phone || '@example.test'),
   photo_key = coalesce(photo_key, 'test/db-check-photo.jpg'), photo_mime = coalesce(photo_mime, 'image/jpeg')
-  WHERE added_by = 'db-check' AND phone <> '919000000306'`);
+  WHERE added_by = 'db-check' AND phone NOT IN ('919000000306', '919000000307')`);
 
 await step('rbac: capability matrix — every module role grants exactly its capabilities', async () => {
   const caps = (roles, admin = false) => capabilitiesOf({ allowed: true, admin, roles });
@@ -3267,7 +3267,7 @@ await step('rbac cleanup', async () => {
 
 // ---- HR / recruitment ----------------------------------------------------------
 const HRT = 'DBCHECK-HR';
-const HRM = { mgr: '919000000301', multi: '919000000302', nonHr: '919000000303', adm: '919000000304', inc: '919000000306' };
+const HRM = { mgr: '919000000301', multi: '919000000302', nonHr: '919000000303', adm: '919000000304', inc: '919000000306', old: '919000000307' };
 const HRS = {};   // server, base, stub, dir, ids
 const hrPhones = Object.values(HRM);
 const hrCleanMembers = async () => {
@@ -3962,6 +3962,55 @@ await step('profiles: incomplete member is held at /profile until name, email an
   if (!act.changes?.some((c) => /photo removed by an admin/.test(c.detail)) || !act.changes.some((c) => /photo added/.test(c.detail))) bad.push('activity log');
   if (bad.length) throw new Error(bad.join(' | '));
   return 'pages → /profile, APIs 403 PROFILE_INCOMPLETE, /auth/me + /profile open; placeholder/blank name, bad/empty email, fake PNG, PDF, empty, >2 MB refused and nothing stored; photo alone not enough; name+email+photo → full access, roles and phone unchanged; photo private (teammates yes, signed out 401, careers 404); admin sees profile fields (no storage key), edits email, clears photo → member held again; activity logged; non-admins refused';
+});
+
+await step('profiles: existing members keep working with an incomplete profile and are reminded; new members are held', async () => {
+  const bad = [];
+  const pool = getPool();
+  // Migration semantics: rows that existed when the column arrived are grandfathered (false); new rows default to required.
+  const { rows: [col] } = await pool.query(`SELECT column_default, is_nullable FROM information_schema.columns WHERE table_name = 'allowed_users' AND column_name = 'profile_required'`);
+  if (col?.column_default !== 'true' || col.is_nullable !== 'NO') bad.push(`column default ${JSON.stringify(col)}`);
+  // An existing member (as production members will be after deploy): incomplete, not required.
+  await pool.query(`INSERT INTO allowed_users (phone, name, is_admin, added_by, profile_required) VALUES ($1, 'Old Timer', false, 'db-check', false) ON CONFLICT (phone) DO NOTHING`, [HRM.old]);
+  await setModuleRole(HRM.old, 'support', 'agent', { actor: 'db-check' });
+  const rolesBefore = JSON.stringify(await moduleRolesOf(HRM.old));
+  // A. full access, reminded
+  for (const [p, want] of [['/', 200], ['/overview', 200], ['/profile', 200]]) { const r = await internal('old', 'GET', p); if (r.status !== want) bad.push(`existing ${p}: ${r.status} ${r.headers.get('location') || ''}`); }
+  if ((await internal('old', 'GET', '/api/carts?days=1')).status !== 200 || (await internal('old', 'GET', '/api/overview')).status !== 200) bad.push('existing member refused an API');
+  const me = (await internal('old', 'GET', '/auth/me')).body;
+  if (me.profileComplete !== false || me.profileRequired !== false || me.profile.missing.join() !== 'email,photo' || me.profile.required !== false) bad.push(`existing auth/me ${JSON.stringify({ c: me.profileComplete, r: me.profileRequired, m: me.profile?.missing })}`);
+  // RBAC unchanged for them: support only.
+  if ((await internal('old', 'GET', '/api/orders?limit=1')).status !== 403 || (await internal('old', 'GET', '/api/members')).status !== 403) bad.push('existing member RBAC changed');
+  // Can complete normally.
+  const png = Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), Buffer.alloc(3000, 3)]);
+  const up = await fetch(`${HRS.base}/api/profile/photo`, { method: 'POST', body: png, headers: { cookie: `${SESSION_COOKIE}=${issueSession(HRM.old)}`, 'x-filename': 'me.png' } });
+  const put = await internal('old', 'PUT', '/api/profile', { email: 'old.timer@example.test' });
+  if (up.status !== 201 || put.status !== 200 || !put.body.profile.complete) bad.push(`existing complete ${up.status}/${put.status}`);
+  // C. complete member: normal access, no reminder
+  const me2 = (await internal('old', 'GET', '/auth/me')).body;
+  if (me2.profileComplete !== true || (await internal('old', 'GET', '/')).status !== 200) bad.push('complete member');
+  // D. admin removes the photo: incomplete again, still operational, missing photo shown
+  const cl = await internal('adm', 'DELETE', `/api/members/${HRM.old}/photo`);
+  if (cl.status !== 200 || cl.body.profile.missing.join() !== 'photo') bad.push(`clear ${cl.status}`);
+  if ((await internal('old', 'GET', '/api/carts?days=1')).status !== 200 || (await internal('old', 'GET', '/')).status !== 200) bad.push('existing member blocked after photo removal');
+  if ((await internal('old', 'GET', '/auth/me')).body.profile.missing.join() !== 'photo') bad.push('missing photo not shown');
+  const listed = (await internal('adm', 'GET', '/api/members')).body.members.find((m) => m.phone === HRM.old);
+  if (listed.profile_complete || listed.profile_required !== false || listed.profile_missing.join() !== 'photo') bad.push('members list for existing member');
+  if (JSON.stringify(await moduleRolesOf(HRM.old)) !== rolesBefore) bad.push('roles changed');
+  // B (still): a new member — the default — is held at /profile and refused by APIs.
+  await pool.query(`INSERT INTO allowed_users (phone, name, added_by) VALUES ('919000000308', 'Team', 'db-check')`);
+  await setModuleRole('919000000308', 'support', 'agent', { actor: 'db-check' });
+  const fresh = (method, p) => fetch(`${HRS.base}${p}`, { method, redirect: 'manual', headers: { cookie: `${SESSION_COOKIE}=${issueSession('919000000308')}` } });
+  const fp = await fresh('GET', '/'); const fa = await fresh('GET', '/api/carts?days=1');
+  if (fp.status !== 302 || fp.headers.get('location') !== '/profile' || fa.status !== 403 || (await fa.json()).code !== 'PROFILE_INCOMPLETE') bad.push(`new member not held ${fp.status}/${fa.status}`);
+  // E. Overview counts incomplete active profiles exactly.
+  const ov = (await internal('adm', 'GET', '/api/overview')).body.sections.people;
+  const { rows: [{ n }] } = await pool.query(`SELECT count(*)::int n FROM allowed_users WHERE active AND (photo_key IS NULL OR coalesce(btrim(email), '') = '' OR coalesce(btrim(name), '') IN ('', 'Team'))`);
+  if (ov.incomplete_profiles !== n) bad.push(`overview incomplete ${ov.incomplete_profiles} vs ${n}`);
+  await pool.query(`DELETE FROM member_log WHERE target_phone = '919000000308'`);
+  await pool.query(`DELETE FROM allowed_users WHERE phone = '919000000308'`);
+  if (bad.length) throw new Error(bad.join(' | '));
+  return `column defaults to required, existing rows grandfathered; existing incomplete member: pages + APIs 200, auth/me says incomplete/not required, RBAC unchanged, completes normally; complete → normal; photo removed → missing photo shown, still operational, roles kept; new member (default) → /profile + 403 PROFILE_INCOMPLETE; Overview incomplete count = ${n} = records`;
 });
 
 await step('hr cleanup', async () => {

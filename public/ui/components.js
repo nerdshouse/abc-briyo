@@ -472,7 +472,8 @@ export function initShell(me, { onSearch } = {}) {
 
   // A profile that became incomplete (e.g. an admin took the photo down) is
   // completed before anything else; the server enforces the same on every request.
-  if (me && me.profileComplete === false && window.location.pathname !== '/profile') { window.location.href = '/profile'; return; }
+  if (me && me.profileComplete === false && me.profileRequired && window.location.pathname !== '/profile') { window.location.href = '/profile'; return; }
+  profileNudge(me);
   if (me?.name) {
     $('#userName').textContent = me.profile?.name || me.name;
     $('#userRole').textContent = roleSummary(me);
@@ -593,6 +594,36 @@ export function confirmDialog({ title, body = '', confirmLabel = 'Confirm', dang
 export function stateBlock(kind, title, detail = '', { action = '', iconName = '' } = {}) {
   const ico = iconName || { loading: 'loader', empty: 'inbox', error: 'circle-alert' }[kind] || 'info';
   return `<div class="state ${kind}"${kind === 'loading' ? ' aria-busy="true"' : ''}>${icon(ico)}<b>${esc(title)}</b>${detail ? `<span>${esc(detail)}</span>` : ''}${action}</div>`;
+}
+
+/**
+ * Members who existed before profiles keep using Briyo OS with an incomplete
+ * profile; this is their reminder. One slim line under the page header on
+ * every page (not a popup), naming what is missing, with a link to finish.
+ * "Later" hides it for this browser session only.
+ */
+const FIELD_NAMES = { name: 'Full name', email: 'Email', photo: 'Profile photo' };
+function profileNudge(me) {
+  document.querySelector('.profile-nudge')?.remove();
+  document.querySelector('.user-card')?.classList.toggle('incomplete', Boolean(me && me.profileComplete === false));
+  if (!me || me.profileComplete !== false || me.profileRequired || window.location.pathname === '/profile') return;
+  let hidden = false;
+  try { hidden = sessionStorage.getItem('briyo.nudge.hidden') === '1'; } catch { /* storage blocked: show it */ }
+  if (hidden) return;
+  const missing = (me.profile?.missing || []).map((m) => FIELD_NAMES[m] || m);
+  const main = document.querySelector('main.page');
+  if (!main) return;
+  main.insertAdjacentHTML('afterbegin', `<div class="profile-nudge" role="status">
+    ${icon('user-round-pen')}
+    <div class="pn-text"><b>Profile incomplete</b><span>Missing: ${missing.map(esc).join(', ') || 'details'}</span></div>
+    <a class="btn primary" href="/profile">Complete profile</a>
+    <button class="linkish pn-later" type="button">Later</button>
+  </div>`);
+  main.querySelector('.pn-later')?.addEventListener('click', () => {
+    try { sessionStorage.setItem('briyo.nudge.hidden', '1'); } catch { /* ignore */ }
+    main.querySelector('.profile-nudge')?.remove();
+  });
+  renderIcons();
 }
 
 /** An avatar: the member's photo when they have one, initials until then. */

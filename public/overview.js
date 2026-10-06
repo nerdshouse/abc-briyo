@@ -58,6 +58,8 @@ const BODIES = {
   ].join(''),
   inventory: (s) => [
     metric('Master SKUs', n(s.master_skus), { href: '/inventory' }),
+    s.stock_tracked ? metric('In stock', n(s.in_stock), { href: '/inventory', note: 'SKUs with stock to dispatch' })
+      : metric('In stock', '—', { note: 'Starts with the first batch' }),
     s.stock_tracked ? metric('Low stock', n(s.low_stock), { href: '/inventory?stock=low', tone: toneIf(s.low_stock, 'warn') })
       : metric('Low stock', '—', { note: 'Starts with the first batch' }),
     s.stock_tracked ? metric('Out of stock', n(s.out_of_stock), { href: '/inventory?stock=out', tone: toneIf(s.out_of_stock, 'warn') })
@@ -65,29 +67,34 @@ const BODIES = {
     metric('Unmapped SKUs', n(s.unmapped_skus), { href: '/inventory?view=unmapped', tone: toneIf(s.unmapped_skus, 'warn') }),
     metric('Expired batches', n(s.expired_batches), { href: '/inventory?expiring=expired', tone: toneIf(s.expired_batches, 'bad') }),
     metric('Expiring ≤ 30 days', n(s.expiring_30), { href: '/inventory?expiring=30' }),
+    metric('Reserved units', n(s.reserved_units), { href: '/inventory', note: 'Held for shipments' }),
     metric('Available units', n(s.available_units), { href: '/inventory' }),
-    metric('Reserved units', n(s.reserved_units), { href: '/inventory' }),
   ].join(''),
   support: (s) => [
-    metric('Not called', n(s.not_called), { href: '/?mode=tocall' }),
+    metric('Uncalled', n(s.not_called), { href: '/?mode=tocall' }),
     metric(`Past ${s.sla_hours}h SLA`, n(s.uncalled_past_sla), { href: '/?mode=tocall', tone: toneIf(s.uncalled_past_sla, 'warn') }),
-    metric('Unassigned', n(s.unassigned), { href: '/?mode=tocall' }),
-    metric('Callbacks today', n(s.callbacks_today), { href: '/?mode=callbacks' }),
+    metric('Unassigned', n(s.unassigned), { href: '/?mode=tocall', note: 'Uncalled, no owner' }),
+    metric('Assigned', n(s.assigned), { href: '/?mode=all', note: 'Open, with an owner' }),
+    metric('Callbacks due', n(s.callbacks_due), { href: '/?mode=callbacks', note: 'Today and overdue' }),
     metric('Callbacks overdue', n(s.callbacks_overdue), { href: '/?mode=callbacks', tone: toneIf(s.callbacks_overdue, 'bad') }),
     metric('Assigned to you', n(s.assigned_to_me), { href: '/?mode=mine' }),
-  ].join('') + `<p class="ov-foot">Today: ${n(s.today.carts)} ${s.today.carts === 1 ? 'cart' : 'carts'} in · ${n(s.today.called)} called · ${n(s.today.recovered)} recovered${s.today.recovered_value ? ` (${money(s.today.recovered_value)})` : ''}</p>`,
+    metric('Worked today', n(s.worked_today), { href: '/?mode=all', note: 'Carts updated today' }),
+    metric('Recovered today', n(s.recovered_today), { href: '/?mode=all', tone: toneIf(s.recovered_today, 'ok') }),
+  ].join('') + `<p class="ov-foot">Received today: ${n(s.today.carts)} ${s.today.carts === 1 ? 'cart' : 'carts'} · ${n(s.today.called)} of them called · ${n(s.today.recovered)} recovered${s.today.recovered_value ? ` (${money(s.today.recovered_value)})` : ''}</p>`,
   hr: (s) => [
     metric('Open jobs', n(s.open_jobs), { href: '/hr/jobs?status=published' }),
     metric('Drafts', n(s.draft_jobs), { href: '/hr/jobs?status=draft' }),
+    metric('Applications', n(s.applications), { href: '/hr/candidates', note: `${n(s.candidates)} ${s.candidates === 1 ? 'candidate' : 'candidates'}` }),
     metric('Awaiting review', n(s.awaiting_review), { href: '/hr/candidates?status=applied', tone: toneIf(s.awaiting_review, 'info') }),
     metric('In progress', n(s.in_progress), { href: '/hr/candidates', note: 'Screening · interview · offer' }),
-    metric('Hired, 30 days', n(s.hired_30d), { href: '/hr/candidates?status=hired' }),
     metric('New this week', n(s.new_7d), { href: '/hr/candidates' }),
+    metric('Hired, 30 days', n(s.hired_30d), { href: '/hr/candidates?status=hired', tone: toneIf(s.hired_30d, 'ok') }),
   ].join(''),
   people: (s) => {
     const cat = state.me?.moduleCatalog || {};
     const depts = Object.entries(s.by_department || {}).map(([k, v]) => `<span class="badge">${esc(cat[k]?.label || k)} <b class="num">${n(v)}</b></span>`).join('');
     return [
+      metric('Members', n(s.total), { href: '/admin' }),
       metric('Active members', n(s.active), { href: '/admin', note: s.total !== s.active ? `${n(s.total - s.active)} deactivated` : '' }),
       metric('Admins', n(s.admins), { href: '/admin' }),
       metric('Online now', n(s.online), { href: '/admin' }),
@@ -129,7 +136,7 @@ function render() {
         <div class="state error"><b>Unavailable right now</b><span>This department could not be counted. Refresh to try again.</span></div></section>`;
     }
     const [tone, word] = deptHealth(k);
-    return `<section class="card ov-dept" aria-labelledby="ov-${k}">
+    return `<section class="card ov-dept h-${tone}" aria-labelledby="ov-${k}">
       <header class="ov-dept-head">
         <h2 id="ov-${k}"><a href="${dept.href}">${icon(dept.icon)}${esc(dept.label)}</a></h2>
         <span class="health ${tone}">${word}</span>

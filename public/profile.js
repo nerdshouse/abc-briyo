@@ -14,7 +14,7 @@ const CAP_LABEL = {
   'inventory.move': 'Receive, adjust and transfer stock', 'inventory.catalog': 'Manage master SKUs, platforms, suppliers and warehouses',
   'support.work': 'Work the cart recovery call board', 'hr.view': 'See jobs, candidates and resumes', 'hr.manage': 'Manage jobs and applications',
 };
-const FIELD = { name: 'full name', email: 'email', photo: 'profile photo' };
+const FIELD_LABEL = { name: 'Full name', email: 'Email', photo: 'Profile photo' };
 
 const api = async (url, opts = {}) => {
   const res = await fetch(url, opts);
@@ -33,14 +33,17 @@ function renderAvatar(url) {
 function render() {
   const p = state.profile;
   const incomplete = !p.complete;
-  document.querySelector('.app').classList.toggle('locked', incomplete);
+  // New members are held here until complete; existing members keep full access while they finish.
+  const held = incomplete && p.required;
+  document.querySelector('.app').classList.toggle('locked', held);
   $('#pfTitle').textContent = incomplete ? 'Complete your profile' : 'Your profile';
-  $('#pfSub').textContent = incomplete
+  $('#pfSub').textContent = held
     ? 'Briyo OS opens once your profile has your name, email and a photo. It takes a minute.'
-    : 'How you appear to the team across Briyo OS.';
+    : incomplete ? 'Add what is missing so the team knows who you are. You can keep using Briyo OS meanwhile.'
+      : 'How you appear to the team across Briyo OS.';
   $('#pfMeter').innerHTML = `<span class="pf-meter" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${p.completion}" aria-label="Profile complete"><span style="width:${p.completion}%"></span></span> ${p.completion}%`;
   $('#pfGate').innerHTML = incomplete
-    ? `<div class="alert warn pf-gate">${icon('user-round-pen')}<span><b>Still needed:</b> ${p.missing.map((m) => FIELD[m] || m).join(', ')}.</span></div>` : '';
+    ? `<div class="alert warn pf-gate">${icon('user-round-pen')}<div><b>Profile incomplete</b><ul class="pf-missing">${p.missing.map((m) => `<li>${esc(FIELD_LABEL[m] || m)}</li>`).join('')}</ul></div></div>` : '';
   if (document.activeElement !== $('#pfName')) $('#pfName').value = p.name && p.name !== 'Team' ? p.name : '';
   if (document.activeElement !== $('#pfEmail')) $('#pfEmail').value = p.email || '';
   $('#pfPhone').value = `+${p.phone}`;
@@ -124,8 +127,10 @@ async function saveFields(e) {
 /** The moment a profile becomes complete, Briyo OS opens. */
 function afterSave() {
   if (state.wasIncomplete && state.profile.complete) {
-    toast('Profile complete — welcome to Briyo OS');
-    setTimeout(() => { window.location.href = state.home; }, 700);
+    try { sessionStorage.removeItem('briyo.nudge.hidden'); } catch { /* ignore */ }
+    toast(state.profile.required ? 'Profile complete — welcome to Briyo OS' : 'Profile complete — thank you');
+    // A new member was waiting for this to open Briyo OS; an existing one just carries on here.
+    if (state.profile.required) setTimeout(() => { window.location.href = state.home; }, 700);
   }
 }
 

@@ -1263,3 +1263,32 @@ a.ov-metric:hover { background: var(--surface-2); }
   .page .alert-link, .page .linkish { display: inline-flex; align-items: center; min-height: 40px; }
   .page input[type=checkbox], .drawer input[type=checkbox] { width: 20px; height: 20px; }
 }
+
+/* Existing member, profile incomplete: one quiet line on every page */
+.profile-nudge { display: flex; align-items: center; gap: 12px; margin: 0 0 var(--sp-4); padding: 10px 14px;
+  border: 1px solid #FEDF89; border-radius: var(--r-card); background: var(--warning-soft); color: var(--warning-text); font-size: 13px; }
+.profile-nudge > .lucide { width: 18px; height: 18px; flex: none; }
+.pn-text { display: flex; flex-wrap: wrap; gap: 2px 8px; min-width: 0; flex: 1; }
+.pn-text b { color: var(--warning-text); }
+.pn-text span { color: var(--text-2); }
+.profile-nudge .btn { flex: none; }
+.pn-later { flex: none; color: var(--text-2); background: none; border: 0; cursor: pointer; font: inherit; font-size: 12.5px; text-decoration: underline; text-underline-offset: 2px; }
+.user-card.incomplete .avatar { box-shadow: 0 0 0 2px var(--surface), 0 0 0 4px var(--warning); }
+.pf-missing { margin: 4px 0 0; padding-left: 18px; }
+@media (max-width: 640px) { .profile-nudge { flex-wrap: wrap; } .pn-text { flex-basis: calc(100% - 30px); } }
+/* department health: a thin accent on the card edge, always beside the word */
+.ov-dept { border-top-width: 3px; }
+.ov-dept.h-healthy { border-top-color: var(--success); }
+.ov-dept.h-attention { border-top-color: var(--info); }
+.ov-dept.h-warning { border-top-color: var(--warning); }
+.ov-dept.h-critical { border-top-color: var(--error); }
+.ov-m-value.ok { color: var(--success-text); }
+.mb-summary { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)) minmax(0, 2fr); gap: var(--sp-3); margin-bottom: var(--sp-4); }
+.mb-stat { display: flex; flex-direction: column; gap: 4px; padding: 12px 14px; border: 1px solid var(--border); border-radius: var(--r-card); background: var(--surface); color: var(--text); min-width: 0; }
+.mb-stat > span { font-size: var(--fs-meta); color: var(--text-2); }
+.mb-stat > b { font-size: 20px; font-weight: 600; }
+a.mb-stat:hover { background: var(--surface-2); }
+.mb-stat.warn > b { color: var(--warning-text); }
+.mb-stat.info > b { color: var(--info-text); }
+.mb-stat .badge b { color: var(--text); }
+@media (max-width: 1100px) { .mb-summary { grid-template-columns: repeat(2, minmax(0, 1fr)); } .mb-depts { grid-column: 1 / -1; } }
