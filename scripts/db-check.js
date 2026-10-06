@@ -36,11 +36,18 @@ import { DOCUMENT_FORMATS } from '../lib/orders.js';
 import {
   validateDocument, storage, signV4, _resetStorage, StorageNotConfigured,
 } from '../lib/storage.js';
-import { canUseOrders, canUseRecovery, roleFor } from '../lib/otp.js';
+import { canUseOrders, canUseRecovery, roleFor, resolveAccess } from '../lib/otp.js';
+import { capabilitiesOf, CAPABILITIES, homeFor, legacyRole } from '../lib/permissions.js';
+import { backfillModuleRoles, setModuleRole, moduleRolesOf } from '../lib/db.js';
+import { requireAuth, requirePermission, _setMembershipLookup, router as authRouterForTest } from '../lib/auth-routes.js';
+import express from 'express';
+import cookieParser from 'cookie-parser';
+import { spawn } from 'node:child_process';
+import net from 'node:net';
 import {
   isIngestSilent, buildDailySummary, shouldSendSummary, boardDay,
 } from '../lib/sla-alert.js';
-import { issueSession, verifySession } from '../lib/session.js';
+import { issueSession, verifySession, COOKIE as SESSION_COOKIE } from '../lib/session.js';
 import { rateLimit, _reset as resetRateLimit } from '../lib/rate-limit.js';
 import { assertDatabaseEnvironment, assertMarkerIn } from '../lib/env-guard.js';
 
@@ -2951,6 +2958,290 @@ await step('cleanup', async () => {
     client.release();
   }
   return 'test rows removed';
+});
+
+// ---- RBAC: module roles -------------------------------------------------------
+const RB = {
+  log: '919000000201', call: '919000000202', multi: '919000000203', none: '919000000204',
+  lview: '919000000205', invOnly: '919000000206', adm: '919000000207', env: '919000000208',
+  legacyNull: '919000000209', legacyAdmin: '919000000210',
+};
+const RB_PHONES = Object.values(RB);
+const rbClean = async () => {
+  await getPool().query('DELETE FROM member_log WHERE target_phone = ANY($1)', [RB_PHONES]);
+  await getPool().query('DELETE FROM allowed_users WHERE phone = ANY($1)', [RB_PHONES]);
+};
+// The access rules before module roles, verbatim, for the parity check.
+const OLD = {
+  orders: (role) => role === 'admin' || role === 'logistics',          // orders, couriers, destinations, inventory reads, reserve/release
+  recovery: (role) => role === 'admin' || role === 'caller',
+  adminOnly: (role) => role === 'admin',                                // inventory writes, couriers/destinations writes, members, dashboard
+};
+await step('rbac: capability matrix — every module role grants exactly its capabilities', async () => {
+  const caps = (roles, admin = false) => capabilitiesOf({ allowed: true, admin, roles });
+  const want = {
+    'logistics:viewer': ['logistics.view'], 'logistics:operator': ['logistics.view', 'logistics.edit'],
+    'logistics:manager': ['logistics.view', 'logistics.edit', 'logistics.setup'],
+    'inventory:viewer': ['inventory.view'], 'inventory:operator': ['inventory.view', 'inventory.move'],
+    'inventory:manager': ['inventory.view', 'inventory.move', 'inventory.catalog'],
+    'support:agent': ['support.work'], 'support:lead': ['support.work'],
+  };
+  for (const [k, v] of Object.entries(want)) {
+    const [m, r] = k.split(':');
+    if (caps({ [m]: r }).join() !== v.join()) throw new Error(`${k}: ${caps({ [m]: r })}`);
+  }
+  if (caps({}, true).join() !== CAPABILITIES.join()) throw new Error('admin is not all');
+  if (capabilitiesOf({ allowed: false, admin: true, roles: {} }).length) throw new Error('disallowed member has capabilities');
+  if (caps({ bogus: 'manager' }).length || caps({ logistics: 'agent' }).length) throw new Error('unknown module/role granted something');
+  return '8 module roles + admin + unknown/disallowed';
+});
+await step('rbac: migrated access equals the old role rules — nothing expanded, nothing lost', async () => {
+  // What the backfill gives each old role, and what each old rule maps to.
+  const migrated = { logistics: { logistics: 'operator', inventory: 'viewer' }, caller: { support: 'agent' } };
+  for (const role of ['admin', 'logistics', 'caller']) {
+    const access = { allowed: true, admin: role === 'admin', roles: migrated[role] || {} };
+    const c = capabilitiesOf(access);
+    const has = (x) => c.includes(x);
+    const now = {
+      orders: has('logistics.view') && has('logistics.edit') && has('inventory.view'),
+      recovery: has('support.work'),
+      adminOnly: has('logistics.setup') && has('inventory.move') && has('inventory.catalog'),
+    };
+    for (const k of Object.keys(OLD)) if (OLD[k](role) !== now[k]) throw new Error(`${role}: ${k} was ${OLD[k](role)}, now ${now[k]}`);
+    // No capability beyond what the old role reached.
+    const allowed = new Set([...(OLD.orders(role) ? ['logistics.view', 'logistics.edit', 'inventory.view'] : []),
+      ...(OLD.recovery(role) ? ['support.work'] : []), ...(OLD.adminOnly(role) ? CAPABILITIES : [])]);
+    const extra = c.filter((x) => !allowed.has(x));
+    if (extra.length) throw new Error(`${role} gained ${extra}`);
+    if (legacyRole(access) !== role) throw new Error(`legacy role ${legacyRole(access)} ≠ ${role}`);
+  }
+  return 'admin = all; logistics = orders+edit+inventory read (no setup, no stock moves, no catalog); caller = call board only';
+});
+await step('rbac: migration maps every old role once and is idempotent', async () => {
+  await rbClean();
+  for (const [phone, role, admin] of [[RB.log, 'logistics', false], [RB.call, 'caller', false], [RB.legacyNull, null, false], [RB.legacyAdmin, null, true]]) {
+    await getPool().query(`INSERT INTO allowed_users (phone, name, is_admin, role, added_by) VALUES ($1, 'RBAC test', $2, $3, 'db-check')`, [phone, admin, role]);
+  }
+  const marker = await getPool().query(`SELECT value FROM system_state WHERE key = 'rbac_module_roles_backfill_v1'`);
+  if (!marker.rows.length) throw new Error('backfill did not run at boot');
+  // Re-run as on a fresh database: the marker is the only thing gating it.
+  await getPool().query(`DELETE FROM system_state WHERE key = 'rbac_module_roles_backfill_v1'`);
+  const first = await backfillModuleRoles();
+  const got = async (p) => JSON.stringify(Object.entries(await moduleRolesOf(p)).sort());
+  if (await got(RB.log) !== JSON.stringify([['inventory', 'viewer'], ['logistics', 'operator']])) throw new Error(`logistics → ${await got(RB.log)}`);
+  if (await got(RB.call) !== JSON.stringify([['support', 'agent']])) throw new Error(`caller → ${await got(RB.call)}`);
+  if (await got(RB.legacyNull) !== JSON.stringify([['support', 'agent']])) throw new Error(`NULL → ${await got(RB.legacyNull)}`);
+  if (await got(RB.legacyAdmin) !== JSON.stringify([['support', 'agent']])) throw new Error('admin row');
+  // A role removed after migration is not re-added by another run.
+  await setModuleRole(RB.log, 'inventory', null, { actor: 'db-check' });
+  const second = await backfillModuleRoles();
+  const third = await backfillModuleRoles();
+  if (!first.ran || second.ran || third.ran || second.added || await got(RB.log) !== JSON.stringify([['logistics', 'operator']])) {
+    throw new Error(JSON.stringify({ first, second, third, log: await got(RB.log) }));
+  }
+  return `first run added ${first.added} rows (incl. any test fixtures); reruns: no-op; a removed role stays removed`;
+});
+await step('rbac: one member, three modules; changing one module leaves the others', async () => {
+  await getPool().query(`INSERT INTO allowed_users (phone, name, added_by) VALUES ($1, 'RBAC multi', 'db-check') ON CONFLICT (phone) DO NOTHING`, [RB.multi]);
+  await setModuleRole(RB.multi, 'logistics', 'operator', { actor: 'db-check' });
+  await setModuleRole(RB.multi, 'inventory', 'manager', { actor: 'db-check' });
+  await setModuleRole(RB.multi, 'support', 'agent', { actor: 'db-check' });
+  let a = await resolveAccess(RB.multi);
+  const c = capabilitiesOf(a);
+  for (const x of ['logistics.view', 'logistics.edit', 'inventory.view', 'inventory.move', 'inventory.catalog', 'support.work']) if (!c.includes(x)) throw new Error(`missing ${x}`);
+  if (c.includes('logistics.setup') || a.admin) throw new Error('too much');
+  await setModuleRole(RB.multi, 'inventory', 'viewer', { actor: 'db-check' });
+  a = await resolveAccess(RB.multi);
+  if (a.roles.logistics !== 'operator' || a.roles.support !== 'agent' || a.roles.inventory !== 'viewer') throw new Error(JSON.stringify(a.roles));
+  await setModuleRole(RB.multi, 'support', null, { actor: 'db-check' });
+  a = await resolveAccess(RB.multi);
+  if (a.roles.support || a.roles.logistics !== 'operator' || a.roles.inventory !== 'viewer') throw new Error(JSON.stringify(a.roles));
+  if ((await getPool().query('SELECT role FROM allowed_users WHERE phone = $1', [RB.multi])).rows[0].role !== 'logistics') throw new Error('legacy column not kept for rollback');
+  await expectErr('two roles in one module', () => getPool().query(`INSERT INTO member_module_roles (phone, module, role) VALUES ($1, 'logistics', 'viewer')`, [RB.multi]), (e) => e.code === '23505');
+  await expectErr('role from another module', () => getPool().query(`INSERT INTO member_module_roles (phone, module, role) VALUES ($1, 'support', 'manager')`, [RB.multi]), (e) => e.code === '23514');
+  // Changing a number carries the roles; removing the member removes them.
+  await getPool().query('UPDATE allowed_users SET phone = $2 WHERE phone = $1', [RB.multi, '919000000299']);
+  if ((await moduleRolesOf('919000000299')).logistics !== 'operator') throw new Error('roles lost on number change');
+  await getPool().query('UPDATE allowed_users SET phone = $2 WHERE phone = $1', ['919000000299', RB.multi]);
+  return 'L-operator + I-manager + S-agent → 6 capabilities, no setup/admin; I→viewer and S removed independently; one role per module; cascade on number change';
+});
+await step('rbac: a failed membership lookup denies access (fail closed)', async () => {
+  const app = express();
+  app.use(cookieParser());
+  app.use('/auth', authRouterForTest);
+  app.use(requireAuth);
+  app.get('/api/x', (_req, res) => res.json({ ok: true }));
+  app.get('/page', (_req, res) => res.send('page'));
+  const server = app.listen(0);
+  const base = `http://127.0.0.1:${server.address().port}`;
+  const cookie = `${SESSION_COOKIE}=${issueSession(RB.call)}`;
+  try {
+    _setMembershipLookup(async () => { throw new Error('simulated database failure'); });
+    const api = await fetch(`${base}/api/x`, { headers: { cookie } });
+    const page = await fetch(`${base}/page`, { headers: { cookie }, redirect: 'manual' });
+    const me = await fetch(`${base}/auth/me`, { headers: { cookie } });
+    if (api.status !== 503 || page.status !== 503 || me.status !== 503) throw new Error(`api ${api.status} page ${page.status} me ${me.status}`);
+    _setMembershipLookup(null);
+    const ok = await fetch(`${base}/api/x`, { headers: { cookie } });
+    if (ok.status !== 200) throw new Error(`after recovery ${ok.status}`);
+  } finally { _setMembershipLookup(null); server.close(); }
+  return 'lookup error → 503 on API, page and /auth/me (was: allowed as caller); next good lookup → 200';
+});
+
+// The real server, on the test database, with signed sessions for each member.
+const freePort = () => new Promise((ok) => { const s = net.createServer().listen(0, () => { const p = s.address().port; s.close(() => ok(p)); }); });
+let rbServer = null; let RBASE = '';
+await step('rbac: route matrix on the real server — granted only by capability', async () => {
+  // Members, as the migration would leave them, plus new combinations.
+  await getPool().query(`INSERT INTO allowed_users (phone, name, is_admin, added_by) VALUES
+    ($1, 'RBAC none', false, 'db-check'), ($2, 'RBAC lview', false, 'db-check'), ($3, 'RBAC inv', false, 'db-check'),
+    ($4, 'RBAC adm', true, 'db-check'), ($5, 'RBAC env', false, 'db-check') ON CONFLICT (phone) DO NOTHING`, [RB.none, RB.lview, RB.invOnly, RB.adm, RB.env]);
+  await setModuleRole(RB.log, 'inventory', 'viewer', { actor: 'db-check' });   // back to the migrated logistics shape
+  await setModuleRole(RB.multi, 'inventory', 'manager', { actor: 'db-check' });
+  await setModuleRole(RB.multi, 'support', 'agent', { actor: 'db-check' });
+  await setModuleRole(RB.lview, 'logistics', 'viewer', { actor: 'db-check' });
+  await setModuleRole(RB.invOnly, 'inventory', 'manager', { actor: 'db-check' });
+  const port = await freePort();
+  rbServer = spawn(process.execPath, ['server.js'], {
+    cwd: new URL('..', import.meta.url).pathname,
+    env: { ...process.env, PORT: String(port), APP_ENV: 'test', ADMIN_PHONES: RB.env, ELEVENZA_AUTH_TOKEN: '', SHOPIFY_ACCESS_TOKEN: '',
+      SHOPIFY_POLL_ENABLED: 'false', SHOPIFY_POLL_MINUTES: '0', SLA_ALERTS_ENABLED: 'false', DAILY_SUMMARY_ENABLED: 'false', KEEPALIVE_URL: '', RENDER_EXTERNAL_URL: '' },
+    stdio: ['ignore', 'ignore', 'pipe'],
+  });
+  let stderr = ''; rbServer.stderr.on('data', (d) => { stderr += d; });
+  RBASE = `http://127.0.0.1:${port}`;
+  for (let i = 0; i < 100; i++) {
+    try { if ((await fetch(`${RBASE}/healthz`)).ok) break; } catch { /* starting */ }
+    await new Promise((r) => setTimeout(r, 150));
+    if (i === 99) throw new Error(`server did not start: ${stderr.slice(-400)}`);
+  }
+  const as = (who) => ({ cookie: `${SESSION_COOKIE}=${issueSession(RB[who])}`, 'content-type': 'application/json' });
+  const call = async (who, method, path, body) => {
+    const r = await fetch(`${RBASE}${path}`, { method, headers: as(who), body: body ? JSON.stringify(body) : undefined, redirect: 'manual' });
+    return { status: r.status, location: r.headers.get('location') };
+  };
+  // [path, method, body, { who: expectation }]: a number is the exact status, 'ok' means not 401/403/5xx, '→x' a redirect to x.
+  const M = [
+    ['/', 'GET', null, { call: 'ok', multi: 'ok', adm: 'ok', log: '→/orders', invOnly: '→/inventory', none: '→/no-access', lview: '→/orders' }],
+    ['/no-access', 'GET', null, { none: 'ok', log: '→/orders', call: '→/' }],
+    ['/orders', 'GET', null, { log: 'ok', lview: 'ok', multi: 'ok', adm: 'ok', call: '→/', invOnly: '→/inventory', none: '→/no-access' }],
+    ['/inventory', 'GET', null, { log: 'ok', invOnly: 'ok', multi: 'ok', call: '→/', lview: '→/orders', none: '→/no-access' }],
+    ['/couriers', 'GET', null, { log: 'ok', lview: 'ok', call: '→/' }],
+    ['/api/carts?days=1', 'GET', null, { call: 'ok', multi: 'ok', adm: 'ok', log: 403, lview: 403, invOnly: 403, none: 403 }],
+    ['/api/carts.csv?days=1', 'GET', null, { call: 'ok', adm: 'ok', log: 403, none: 403 }],
+    ['/api/status', 'POST', {}, { log: 403, none: 403, call: 'ok' }],
+    ['/api/orders?limit=1', 'GET', null, { log: 'ok', lview: 'ok', multi: 'ok', adm: 'ok', call: 403, invOnly: 403, none: 403 }],
+    ['/api/orders', 'POST', {}, { lview: 403, call: 403, invOnly: 403, log: 'ok', multi: 'ok', adm: 'ok' }],
+    ['/api/orders/999999999', 'PATCH', {}, { lview: 403, log: 'ok' }],
+    ['/api/couriers', 'GET', null, { lview: 'ok', log: 'ok', call: 403 }],
+    ['/api/couriers', 'POST', {}, { log: 403, multi: 403, lview: 403, adm: 'ok' }],
+    ['/api/destinations', 'POST', {}, { log: 403, adm: 'ok' }],
+    ['/api/inventory', 'GET', null, { log: 'ok', invOnly: 'ok', multi: 'ok', adm: 'ok', lview: 403, call: 403, none: 403 }],
+    ['/api/inventory/receive', 'POST', {}, { log: 403, lview: 403, call: 403, multi: 'ok', invOnly: 'ok', adm: 'ok' }],
+    ['/api/inventory/skus', 'POST', {}, { log: 403, multi: 'ok', invOnly: 'ok', adm: 'ok' }],
+    ['/api/inventory/platforms', 'POST', {}, { log: 403, multi: 'ok' }],
+    ['/api/inventory/warehouses', 'POST', {}, { log: 403, invOnly: 'ok' }],
+    ['/api/inventory/shipments/999999999', 'GET', null, { log: 'ok', lview: 'ok', invOnly: 'ok', call: 403 }],
+    ['/api/inventory/shipments/999999999/reserve', 'POST', {}, { log: 'ok', multi: 'ok', adm: 'ok', invOnly: 403, lview: 403, call: 403 }],
+    ['/api/inventory/shipments/999999999/release', 'POST', {}, { log: 'ok', invOnly: 403 }],
+    ['/api/members', 'GET', null, { adm: 'ok', env: 'ok', log: 403, multi: 403, call: 403 }],
+    ['/dashboard', 'GET', null, { adm: 'ok', multi: 403, log: 403 }],
+    ['/api/admin/overview?days=1', 'GET', null, { adm: 'ok', multi: 403 }],
+  ];
+  let checks = 0; const bad = [];
+  for (const [path, method, body, exp] of M) {
+    for (const [who, want] of Object.entries(exp)) {
+      const r = await call(who, method, path, body);
+      const okish = r.status !== 401 && r.status !== 403 && r.status < 500 && !(r.status >= 300 && r.status < 400);
+      const pass = typeof want === 'number' ? r.status === want
+        : want === 'ok' ? okish
+          : r.status === 302 && r.location === want.slice(1);
+      checks += 1;
+      if (!pass) bad.push(`${who} ${method} ${path}: ${r.status}${r.location ? ` → ${r.location}` : ''} (want ${want})`);
+    }
+  }
+  if (bad.length) throw new Error(bad.join(' | '));
+  return `${checks} member × route checks: pages, APIs, writes; no redirect loops`;
+});
+await step('rbac: /auth/me tells the page what to show', async () => {
+  const me = async (who) => (await fetch(`${RBASE}/auth/me`, { headers: { cookie: `${SESSION_COOKIE}=${issueSession(RB[who])}` } })).json();
+  const multi = await me('multi'); const none = await me('none'); const adm = await me('adm'); const log = await me('log');
+  if (multi.isAdmin || multi.modules.logistics !== 'operator' || multi.modules.inventory !== 'manager' || multi.modules.support !== 'agent'
+    || !multi.caps.includes('inventory.catalog') || multi.caps.includes('logistics.setup') || multi.home !== '/') throw new Error(JSON.stringify(multi));
+  if (none.caps.length || none.home !== '/no-access' || none.canOrders || none.canRecovery) throw new Error(JSON.stringify(none));
+  if (!adm.isAdmin || adm.caps.length !== CAPABILITIES.length) throw new Error('admin caps');
+  if (log.role !== 'logistics' || !log.canOrders || log.canRecovery || log.home !== '/orders') throw new Error(JSON.stringify(log));
+  if (!multi.moduleCatalog?.support?.roles?.some((r) => r.key === 'lead')) throw new Error('catalog');
+  return 'modules, caps and home per member; legacy role/canOrders/canRecovery kept for old tabs';
+});
+await step('rbac: Members API — modules per member, legacy role, admin protections', async () => {
+  const H = { cookie: `${SESSION_COOKIE}=${issueSession(RB.adm)}`, 'content-type': 'application/json' };
+  const req = async (method, path, body) => { const r = await fetch(`${RBASE}${path}`, { method, headers: H, body: body ? JSON.stringify(body) : undefined }); return { status: r.status, body: await r.json() }; };
+  // One module changes; the others stay.
+  let r = await req('PATCH', `/api/members/${RB.multi}`, { modules: { inventory: null } });
+  if (r.status !== 200 || r.body.member.modules.inventory || r.body.member.modules.logistics !== 'operator' || r.body.member.modules.support !== 'agent') throw new Error(JSON.stringify(r.body));
+  r = await req('PATCH', `/api/members/${RB.multi}`, { modules: { inventory: 'manager' } });
+  if (r.body.member.modules.inventory !== 'manager' || r.body.member.modules.support !== 'agent') throw new Error('add one module');
+  // Invalid input refused.
+  for (const bad of [{ modules: { logistics: 'agent' } }, { modules: { finance: 'viewer' } }, { modules: 'x' }, { role: 'boss' }]) {
+    r = await req('PATCH', `/api/members/${RB.multi}`, bad);
+    if (r.status !== 400) throw new Error(`accepted ${JSON.stringify(bad)}`);
+  }
+  // The old single role still means what it meant (an old admin tab).
+  r = await req('PATCH', `/api/members/${RB.none}`, { role: 'logistics' });
+  if (JSON.stringify(r.body.member.modules) !== JSON.stringify({ logistics: 'operator', inventory: 'viewer' })) throw new Error(JSON.stringify(r.body.member.modules));
+  r = await req('PATCH', `/api/members/${RB.none}`, { role: 'caller' });
+  if (JSON.stringify(r.body.member.modules) !== JSON.stringify({ support: 'agent' })) throw new Error(JSON.stringify(r.body.member.modules));
+  r = await req('PATCH', `/api/members/${RB.none}`, { modules: { support: null } });
+  if (Object.keys(r.body.member.modules).length) throw new Error('could not remove the last module');
+  // Takes effect at once: the next request already sees it (membership cache invalidated).
+  const g = await fetch(`${RBASE}/api/carts?days=1`, { headers: { cookie: `${SESSION_COOKIE}=${issueSession(RB.none)}` } });
+  if (g.status !== 403) throw new Error(`cache not invalidated: ${g.status}`);
+  // New members: default is the call board, as before; or exactly the modules chosen.
+  await getPool().query('DELETE FROM allowed_users WHERE phone = $1', ['919000000211']);
+  r = await req('POST', '/api/members', { phone: '9000000211', name: 'RBAC new' });
+  if (JSON.stringify(r.body.member.modules) !== JSON.stringify({ support: 'agent' })) throw new Error(`default ${JSON.stringify(r.body.member.modules)}`);
+  await getPool().query('DELETE FROM allowed_users WHERE phone = $1', ['919000000211']);
+  r = await req('POST', '/api/members', { phone: '9000000211', name: 'RBAC new', modules: { logistics: 'viewer', inventory: 'operator' } });
+  if (JSON.stringify(Object.entries(r.body.member.modules).sort()) !== JSON.stringify([['inventory', 'operator'], ['logistics', 'viewer']])) throw new Error(JSON.stringify(r.body.member.modules));
+  await getPool().query('DELETE FROM allowed_users WHERE phone = $1', ['919000000211']);
+  // ADMIN_PHONES: cannot be demoted, deactivated or removed in-app; is admin whatever the table says.
+  if ((await req('PATCH', `/api/members/${RB.env}`, { isAdmin: false })).status !== 409) throw new Error('env admin demoted');
+  if ((await req('PATCH', `/api/members/${RB.env}`, { active: false })).status !== 409) throw new Error('env admin deactivated');
+  if ((await req('DELETE', `/api/members/${RB.env}`)).status !== 409) throw new Error('env admin removed');
+  // Logged.
+  const logged = (await getPool().query(`SELECT detail FROM member_log WHERE target_phone = $1 ORDER BY id`, [RB.multi])).rows.map((x) => x.detail).join(' | ');
+  if (!/inventory=none/.test(logged) || !/inventory=manager/.test(logged)) throw new Error(logged);
+  return 'one module removed/added without touching others; bad module/role/legacy refused; legacy role maps exactly; immediate effect; new-member default = Support agent; env admin protected; changes logged';
+});
+await step('rbac: the last admin cannot be demoted, deactivated or removed', async () => {
+  // Make RB.adm the only admin in the table (test database only), then try. The
+  // env admin making the request is admin through ADMIN_PHONES, not the table.
+  const { rows: others } = await getPool().query('SELECT phone FROM allowed_users WHERE active AND is_admin AND phone <> $1', [RB.adm]);
+  const H = { cookie: `${SESSION_COOKIE}=${issueSession(RB.env)}`, 'content-type': 'application/json' };
+  const send = (method, body) => fetch(`${RBASE}/api/members/${RB.adm}`, { method, headers: H, body: body ? JSON.stringify(body) : undefined });
+  try {
+    await getPool().query('UPDATE allowed_users SET is_admin = false WHERE phone = ANY($1)', [others.map((o) => o.phone)]);
+    for (const [m, body] of [['PATCH', { isAdmin: false }], ['PATCH', { active: false }], ['DELETE', null]]) {
+      const r = await send(m, body);
+      if (r.status !== 409) throw new Error(`${m} ${JSON.stringify(body)} → ${r.status}`);
+    }
+    // Module changes are not admin changes and stay allowed.
+    if ((await send('PATCH', { modules: { support: 'lead' } })).status !== 200) throw new Error('module change refused');
+  } finally {
+    await getPool().query('UPDATE allowed_users SET is_admin = true WHERE phone = ANY($1)', [others.map((o) => o.phone)]);
+  }
+  const still = (await getPool().query('SELECT is_admin, active FROM allowed_users WHERE phone = $1', [RB.adm])).rows[0];
+  if (!still.is_admin || !still.active) throw new Error('last admin changed');
+  return `sole table admin: demote / deactivate / remove all 409 (${others.length} other admin(s) restored after)`;
+});
+await step('rbac cleanup', async () => {
+  if (rbServer) { rbServer.kill(); await new Promise((r) => rbServer.once('exit', r)); }
+  await rbClean();
+  await getPool().query('DELETE FROM allowed_users WHERE phone = ANY($1)', [['919000000211', '919000000299']]);
+  const left = (await getPool().query('SELECT count(*)::int n FROM member_module_roles WHERE phone = ANY($1)', [RB_PHONES])).rows[0].n;
+  if (left) throw new Error('module roles left behind');
+  return 'server stopped; test members and their module roles removed';
 });
 
 console.log(failures === 0

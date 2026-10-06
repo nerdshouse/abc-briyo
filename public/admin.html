@@ -38,9 +38,10 @@
             <input id="mphone" type="tel" inputmode="numeric" placeholder="98765 43210" required />
           </div>
         </div>
+        <div id="addModules" class="module-selects"></div>
         <label class="checkline" for="madmin">
           <input id="madmin" type="checkbox" />
-          Can manage members
+          Admin (all modules, can manage members)
         </label>
         <button type="submit" class="primary" id="addBtn">Add member</button>
       </form>
@@ -54,7 +55,7 @@
       <table>
         <thead>
           <tr>
-            <th>Name</th><th>Mobile</th><th>Role</th>
+            <th>Name</th><th>Mobile</th><th>Access</th>
             <th>Last signed in</th><th>Added</th><th>Actions</th>
           </tr>
         </thead>

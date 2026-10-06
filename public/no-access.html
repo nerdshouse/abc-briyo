@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>No access yet — Briyo</title>
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body class="login-body">
+  <!-- A signed-in member with no module roles lands here instead of bouncing
+       between pages they cannot open. An admin grants access in Members. -->
+  <main class="login-card">
+    <h1>No module access yet</h1>
+    <p class="sub">You are signed in, but no module has been assigned to you yet.</p>
+    <p>Ask an admin to give you access to Logistics, Inventory or Customer Support in <b>Members</b>. Once they do, reload this page.</p>
+    <p><button type="button" id="reload">Reload</button> <button type="button" id="signOut">Sign out</button></p>
+  </main>
+  <script>
+    document.getElementById('reload').addEventListener('click', () => { window.location.href = '/'; });
+    document.getElementById('signOut').addEventListener('click', async () => {
+      await fetch('/auth/logout', { method: 'POST' });
+      window.location.href = '/login';
+    });
+  </script>
+</body>
+</html>

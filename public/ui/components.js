@@ -399,13 +399,16 @@ export function initShell(me, { onSearch } = {}) {
 
   // Admin-only destinations are hidden, not disabled: a link that 403s is noise.
   for (const el of document.querySelectorAll('[data-admin]')) el.hidden = !me?.isAdmin;
-  // Same rule by role. Pages without these attributes are unaffected.
-  for (const el of document.querySelectorAll('[data-recovery]')) el.hidden = me?.canRecovery === false;
-  if (me?.canOrders) renderOrdersNav().catch(() => {});
+  // Same rule by capability (lib/permissions.js): data-cap="a b" shows the
+  // element when the member has any of them. The server checks again.
+  for (const el of document.querySelectorAll('[data-cap]')) el.hidden = !el.dataset.cap.split(/\s+/).some((c) => hasCap(me, c));
+  // The call board is the Support module.
+  for (const el of document.querySelectorAll('[data-recovery]')) el.hidden = !hasCap(me, 'support.work');
+  renderOrdersNav(me).catch(() => {});
 
   if (me?.name) {
     $('#userName').textContent = me.name;
-    $('#userRole').textContent = me.isAdmin ? 'Admin' : me.role === 'logistics' ? 'Logistics' : 'Caller';
+    $('#userRole').textContent = roleSummary(me);
     $('#userAvatar').firstChild.textContent = initials(me.name);
   }
   syncSidebarActive();
@@ -435,15 +438,33 @@ export function ordersMeta() {
   return metaRequest;
 }
 
-async function renderOrdersNav() {
+/** True when the signed-in member holds a capability (admins hold all). */
+export const hasCap = (me, cap) => Boolean(me?.caps?.includes(cap));
+
+/** "Admin", or the member's module roles: "Logistics operator · Inventory viewer". */
+export function roleSummary(me) {
+  if (me?.isAdmin) return 'Admin';
+  const cat = me?.moduleCatalog || {};
+  const parts = Object.entries(me?.modules || {}).map(([m, r]) => {
+    const label = cat[m]?.roles?.find((x) => x.key === r)?.label || r;
+    return `${cat[m]?.label || m} ${label.toLowerCase()}`;
+  });
+  return parts.join(' · ') || 'No module access';
+}
+
+async function renderOrdersNav(me) {
   const host = document.getElementById('ordersNav');
   if (!host) return;
-  const meta = await ordersMeta();
+  const logistics = hasCap(me, 'logistics.view');
+  const inventory = hasCap(me, 'inventory.view');
+  if (!logistics && !inventory) { host.innerHTML = ''; host.dataset.html = ''; return; }
+  // Order counts come from the Orders API, which only Logistics may read.
+  const meta = logistics ? await ordersMeta() : { ok: true, dispatchTypes: [], views: {} };
   if (!meta.ok) return;
   const link = (href, label, ico, n) => `<a class="nav-item" href="${href}">`
     + `${ico ? `<i data-lucide="${ico}"></i>` : ''}${esc(label)}`
     + `${n ? `<span class="nav-count">${count(n)}</span>` : ''}</a>`;
-  const html = `
+  const html = `${logistics ? `
     <div class="nav-group">
       <div class="nav-caption">Orders</div>
       ${link('/orders', 'All orders', 'package')}
@@ -457,7 +478,7 @@ async function renderOrdersNav() {
         meta.viewCounts?.[k])).join('')}
       ${link('/couriers', 'Courier partners', 'building-2')}
       ${link('/destinations', 'Destinations', 'map-pin')}
-    </div>
+    </div>` : ''}${inventory ? `
     <div class="nav-group">
       <div class="nav-caption">Inventory</div>
       ${link('/inventory', 'Stock', 'boxes')}
@@ -466,7 +487,7 @@ async function renderOrdersNav() {
         ${link('/inventory?expiring=90', 'Expiring soon')}
         ${link('/inventory?view=unmapped', 'Unmapped SKUs', '', meta.inventory?.unmappedSkus)}
       </div>
-    </div>`;
+    </div>` : ''}`;
   // Re-rendered on every page; replaced only if something (a count) changed.
   if (host.dataset.html === html) return;
   host.dataset.html = html;

@@ -94,7 +94,8 @@ $('#destGroups').addEventListener('click', async (e) => {
 (async () => {
   try {
     const me = await api('/auth/me');
-    isAdmin = Boolean(me.isAdmin);
+    // "isAdmin" here means may change this list: Logistics managers and admins.
+    isAdmin = Boolean(me.caps?.includes('logistics.setup'));
     initShell(me);
     await load();
   } catch (err) { note(err.message); }

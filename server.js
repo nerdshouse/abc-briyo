@@ -8,7 +8,7 @@ import {
   isMockMode, ensureSchema, insertCart, listCarts, updateStatus, ping,
   matchOrderToCarts, reasonSummary, statsByCaller, staleCarts, searchCarts, conflictingUpdate,
   recordSystemEvent, getSystemState, recordWebhookFailure, webhookFailureCount, cartCount,
-  listMembers, upsertMember, updateMember, deleteMember, otherActiveAdminCount,
+  listMembers, upsertMember, updateMember, deleteMember, otherActiveAdminCount, setModuleRole, moduleRolesOf,
   recordMemberChange, recentMemberChanges, changeMemberPhone,
   adminOverview, whoIsOnline, periodReport, importCarts,
   actionQueue, cartsForBucket, cartsByStatus, ACTION_BUCKETS, dailySnapshot,
@@ -25,8 +25,9 @@ import {
 } from './lib/normalize.js';
 import {
   router as authRouter, requireAuth, requireAdmin, currentUserName, invalidateMembership,
-  requireOrders, requireRecovery,
+  requirePermission, requirePage,
 } from './lib/auth-routes.js';
+import { homeFor, MODULE_KEYS, isValidAssignment } from './lib/permissions.js';
 import { router as ordersRouter, courierRouter, destinationRouter } from './lib/orders-routes.js';
 import { router as inventoryRouter } from './lib/inventory-routes.js';
 import { ensureInventorySchema } from './lib/inventory.js';
@@ -394,17 +395,25 @@ app.use('/auth', authRouter);
 // --- everything below requires a session ------------------------------------
 app.use(requireAuth);
 
-// Roles: logistics staff reach orders only; the recovery board and its APIs
-// stay with callers and admins, exactly as before roles existed.
-app.get(['/', '/index.html'], requireRecovery);
-app.use(['/api/carts', '/api/status', '/api/reasons'], requireRecovery);
+// Module access: every area checks a capability (lib/permissions.js), never a
+// role name. Pages a member cannot use send them to one they can, or to the
+// "No module access yet" page; APIs answer 403.
+app.get(['/', '/index.html'], requirePage('support.work'));
+app.use(['/api/carts', '/api/status', '/api/reasons'], requirePermission('support.work'));
+app.get('/no-access', (req, res) => {
+  if ((req.session?.caps || []).length) return res.redirect(homeFor(req.session.caps));
+  return res.sendFile(path.join(PUBLIC, 'no-access.html'));
+});
 const ORDER_PAGES = { '/orders': 'orders.html', '/couriers': 'couriers.html', '/destinations': 'destinations.html', '/inventory': 'inventory.html' };
-app.get(['/orders', '/orders.html', '/couriers', '/couriers.html', '/destinations', '/destinations.html', '/inventory', '/inventory.html'], requireOrders, (req, res) =>
-  res.sendFile(path.join(PUBLIC, ORDER_PAGES[req.path.replace(/\.html$/, '')])));
-app.use('/api/orders', requireOrders, ordersRouter);
-app.use('/api/couriers', requireOrders, courierRouter);
-app.use('/api/destinations', requireOrders, destinationRouter);
-app.use('/api/inventory', requireOrders, inventoryRouter);
+const PAGE_CAP = { '/orders': 'logistics.view', '/couriers': 'logistics.view', '/destinations': 'logistics.view', '/inventory': 'inventory.view' };
+app.get(['/orders', '/orders.html', '/couriers', '/couriers.html', '/destinations', '/destinations.html', '/inventory', '/inventory.html'],
+  (req, res, next) => requirePage(PAGE_CAP[req.path.replace(/\.html$/, '')])(req, res, next),
+  (req, res) => res.sendFile(path.join(PUBLIC, ORDER_PAGES[req.path.replace(/\.html$/, '')])));
+app.use('/api/orders', requirePermission('logistics.view'), ordersRouter);
+app.use('/api/couriers', requirePermission('logistics.view'), courierRouter);
+app.use('/api/destinations', requirePermission('logistics.view'), destinationRouter);
+// Inventory serves both modules: its own pages, and the stock panel of a shipment.
+app.use('/api/inventory', requirePermission(['inventory.view', 'logistics.view']), inventoryRouter);
 
 app.use(express.static(PUBLIC));
 
@@ -588,7 +597,9 @@ app.get('/api/admin/events', requireAdmin, async (req, res) => {
   } catch (err) { return fail(res, err); }
 });
 
-app.get('/api/carts.csv', async (req, res) => {
+// Cart export: customer data from the call board, so Support only (before
+// module roles this sat outside the /api/carts gate and any member could reach it).
+app.get('/api/carts.csv', requirePermission('support.work'), async (req, res) => {
   try {
     if (!MOCK) await ensureSchema();
     const q = String(req.query.q ?? '').trim();
@@ -639,7 +650,7 @@ function requireAdminPage(req, res, next) {
   if (req.session?.isAdmin) return next();
   return res.status(403).send(
     '<p style="font:14px system-ui;padding:40px">Admins only. ' +
-    '<a href="/">Back to the board</a></p>');
+    `<a href="${homeFor(req.session?.caps || [])}">Back</a></p>`);
 }
 
 app.get('/dashboard', requireAdminPage, (_req, res) => res.sendFile(path.join(PUBLIC, 'dashboard.html')));
@@ -850,6 +861,38 @@ app.get('/api/members', requireAdmin, async (_req, res) => {
   } catch (err) { return fail(res, err); }
 });
 
+/**
+ * Module role changes from the Members panel: { module: role | null }, where
+ * null removes that module. Only the modules named change. Returns the parsed
+ * changes, or an error message.
+ */
+function parseModuleChanges(body) {
+  const out = {};
+  if (body?.modules !== undefined) {
+    if (!body.modules || typeof body.modules !== 'object' || Array.isArray(body.modules)) return { error: 'modules must be an object.' };
+    for (const [module, role] of Object.entries(body.modules)) {
+      if (!MODULE_KEYS.includes(module)) return { error: `Unknown module "${module}".` };
+      if (role !== null && role !== '' && !isValidAssignment(module, role)) return { error: `"${role}" is not a ${module} role.` };
+      out[module] = role || null;
+    }
+  }
+  // The old single role (one release): the same exclusive access it always meant.
+  if (body?.role !== undefined) {
+    if (!['caller', 'logistics'].includes(body.role)) return { error: 'Role must be caller or logistics.' };
+    Object.assign(out, body.role === 'logistics'
+      ? { logistics: 'operator', inventory: 'viewer', support: null }
+      : { support: 'agent', logistics: null, inventory: null });
+  }
+  return { changes: out };
+}
+
+async function applyModuleChanges(phone, changes, actor) {
+  let roles = null;
+  for (const [module, role] of Object.entries(changes)) roles = await setModuleRole(phone, module, role, { actor });
+  return roles ?? moduleRolesOf(phone);
+}
+const describeModules = (changes) => Object.entries(changes).map(([m, r]) => `${m}=${r || 'none'}`).join(', ');
+
 app.post('/api/members', requireAdmin, async (req, res) => {
   try {
     if (MOCK) return res.status(400).json({ ok: false, error: 'Member management needs a database.' });
@@ -858,13 +901,20 @@ app.post('/api/members', requireAdmin, async (req, res) => {
 
     const name = String(req.body?.name ?? '').trim().slice(0, 60) || 'Team';
     const isAdmin = Boolean(req.body?.isAdmin);
+    const parsed = parseModuleChanges(req.body);
+    if (parsed.error) return res.status(400).json({ ok: false, error: parsed.error });
     const actor = await currentUserName(req);
 
     const member = await upsertMember({ phone, name, isAdmin, addedBy: actor });
+    // With no modules chosen a new member gets what a new member always got:
+    // the call board (Support agent).
+    let changes = parsed.changes;
+    if (!Object.keys(changes).length && !Object.keys(await moduleRolesOf(phone)).length) changes = { support: 'agent' };
+    member.modules = await applyModuleChanges(phone, changes, actor);
     invalidateMembership(phone);
     await recordMemberChange({
       actor, action: 'add', targetPhone: phone,
-      detail: `${name}${isAdmin ? ' (admin)' : ''}`,
+      detail: `${name}${isAdmin ? ' (admin)' : ''}${Object.keys(changes).length ? ` · ${describeModules(changes)}` : ''}`,
     });
     console.log(`Member added by ${actor}: +${phone} (${name})${isAdmin ? ' [admin]' : ''}`);
     return res.json({ ok: true, member });
@@ -878,10 +928,9 @@ app.patch('/api/members/:phone', requireAdmin, async (req, res) => {
     if (!phone) return res.status(400).json({ ok: false, error: 'Invalid number.' });
 
     const actor = await currentUserName(req);
-    const { name, active, isAdmin, role } = req.body ?? {};
-    if (role !== undefined && !['caller', 'logistics'].includes(role)) {
-      return res.status(400).json({ ok: false, error: 'Role must be caller or logistics.' });
-    }
+    const { name, active, isAdmin } = req.body ?? {};
+    const parsed = parseModuleChanges(req.body);
+    if (parsed.error) return res.status(400).json({ ok: false, error: parsed.error });
     const losingAdmin = active === false || isAdmin === false;
 
     // A number in ADMIN_PHONES keeps admin rights no matter what this table
@@ -941,16 +990,17 @@ app.patch('/api/members/:phone', requireAdmin, async (req, res) => {
       name: name === undefined ? null : String(name).trim().slice(0, 60),
       active: active === undefined ? null : Boolean(active),
       isAdmin: isAdmin === undefined ? null : Boolean(isAdmin),
-      role: role ?? null,
     });
     if (!member) return res.status(404).json({ ok: false, error: 'No such member.' });
+    const changes = parsed.changes;
+    member.modules = await applyModuleChanges(phone, changes, actor);
 
     invalidateMembership(phone);
     const what = [
       name !== undefined ? `name="${member.name}"` : null,
       active !== undefined ? (active ? 'reactivated' : 'deactivated') : null,
       isAdmin !== undefined ? (isAdmin ? 'promoted to admin' : 'demoted') : null,
-      role !== undefined ? `role=${role}` : null,
+      Object.keys(changes).length ? describeModules(changes) : null,
     ].filter(Boolean).join(', ');
     await recordMemberChange({ actor, action: 'update', targetPhone: phone, detail: what });
     console.log(`Member updated by ${actor}: +${phone} — ${what}`);

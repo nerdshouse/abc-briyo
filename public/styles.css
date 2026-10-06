@@ -676,3 +676,11 @@ a.stat.stat-click:hover { border-color: var(--accent); background: #fbfdfc; }
    exactly how that bug stayed hidden. */
 .group.disabled { opacity: .45; pointer-events: none; }
 .cb.cb-due-now { background: var(--danger-soft); border-color: #fda29b; color: var(--danger); font-weight: 600; }
+
+/* Members: module access */
+.module-selects { display: flex; gap: 10px; flex-wrap: wrap; align-items: flex-end; }
+.module-selects .field select { padding: 7px 9px; font-size: 13px; }
+.chip.muted-chip { background: #F2F4F7; color: #667085; }
+tr.module-editor td { background: #FAFAFB; }
+.module-editor .module-selects { padding: 6px 0; }
+.module-editor .row-actions { display: flex; gap: 8px; align-items: center; margin-top: 8px; }

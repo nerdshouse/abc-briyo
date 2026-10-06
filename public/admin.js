@@ -5,6 +5,9 @@ const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => (
   { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 
 let bootstrapAdmins = [];
+// Modules and their roles, from the server (lib/permissions.js).
+let catalog = {};
+let editing = null;   // phone whose module access is open for editing
 
 function showError(msg) { $('#banner').textContent = msg; $('#banner').hidden = false; $('#ok').hidden = true; }
 function showOk(msg) { $('#ok').textContent = msg; $('#ok').hidden = false; $('#banner').hidden = true; }
@@ -26,9 +29,16 @@ async function api(url, options = {}) {
   return data;
 }
 
+let members = [];
 async function load() {
   try {
+    if (!Object.keys(catalog).length) {
+      const me = await fetch('/auth/me').then((r) => r.json()).catch(() => ({}));
+      catalog = me.moduleCatalog || {};
+      $('#addModules').innerHTML = moduleSelects({ support: 'agent' }, 'add-');
+    }
     const data = await api('/api/members');
+    members = data.members || [];
     bootstrapAdmins = data.bootstrapAdmins || [];
     renderMembers(data.members || []);
     renderLog(data.log || []);
@@ -63,8 +73,7 @@ function renderMembers(members) {
           ${locked ? '' : `<button class="linky" data-act="phone" data-phone="${esc(m.phone)}">Change</button>`}
         </td>
         <td>
-          ${m.is_admin ? '<span class="chip">Admin</span>'
-            : `<span class="muted">${m.role === 'logistics' ? 'Logistics' : 'Caller'}</span>`}
+          <div class="chips">${m.is_admin ? '<span class="chip">Admin · all modules</span>' : ''}${moduleChips(m)}</div>
           ${m.active ? '' : '<div class="muted">deactivated</div>'}
         </td>
         <td class="muted">${when(m.last_login)}</td>
@@ -73,13 +82,9 @@ function renderMembers(members) {
           ${locked ? '<span class="muted">—</span>' : `
             <button data-act="admin" data-phone="${esc(m.phone)}" data-to="${m.is_admin ? 'false' : 'true'}"
               ${lastAdmin ? 'disabled title="The last admin cannot be demoted"' : ''}>
-              ${m.is_admin ? 'Make caller' : 'Make admin'}
+              ${m.is_admin ? 'Remove admin' : 'Make admin'}
             </button>
-            ${m.is_admin ? '' : `<button data-act="role" data-phone="${esc(m.phone)}"
-              data-to="${m.role === 'logistics' ? 'caller' : 'logistics'}"
-              title="Logistics staff see Orders and Logistics only; callers see the recovery board only">
-              ${m.role === 'logistics' ? 'Make caller' : 'Make logistics'}
-            </button>`}
+            <button data-act="modules" data-phone="${esc(m.phone)}">Module access</button>
             <button data-act="active" data-phone="${esc(m.phone)}" data-to="${m.active ? 'false' : 'true'}"
               ${lastAdmin ? 'disabled title="The last admin cannot be deactivated"' : ''}>
               ${m.active ? 'Deactivate' : 'Reactivate'}
@@ -88,8 +93,46 @@ function renderMembers(members) {
               ${lastAdmin ? 'disabled title="The last admin cannot be removed"' : ''}>Remove</button>
           `}
         </td>
-      </tr>`;
+      </tr>${editing === m.phone ? editorRow(m) : ''}`;
   }).join('');
+}
+
+/** Chips for a member's module roles; members with none say so. */
+function moduleChips(m) {
+  const entries = Object.entries(m.modules || {});
+  if (!entries.length) return m.is_admin ? '' : '<span class="chip muted-chip">No module access</span>';
+  return entries.map(([mod, role]) => `<span class="chip">${esc(catalog[mod]?.label || mod)} · ${esc(roleLabel(mod, role))}</span>`).join('');
+}
+const roleLabel = (mod, role) => catalog[mod]?.roles?.find((r) => r.key === role)?.label || role;
+
+/** One select per module; "No access" removes that module only. */
+function moduleSelects(current = {}, prefix = '') {
+  return Object.entries(catalog).map(([mod, c]) => `<div class="field">
+      <label for="${prefix}${mod}">${esc(c.label)}</label>
+      <select id="${prefix}${mod}" data-module="${esc(mod)}">
+        <option value="">No access</option>
+        ${c.roles.map((r) => `<option value="${esc(r.key)}"${current[mod] === r.key ? ' selected' : ''}>${esc(r.label)}</option>`).join('')}
+      </select></div>`).join('');
+}
+
+function editorRow(m) {
+  return `<tr class="module-editor"><td colspan="6">
+    <div class="module-selects" data-editor="${esc(m.phone)}">${moduleSelects(m.modules || {}, `ed-${m.phone}-`)}</div>
+    ${m.is_admin ? '<p class="muted">Admins have every module while they are admin. These roles apply if admin is removed.</p>' : ''}
+    <div class="row-actions">
+      <button class="primary" data-act="save-modules" data-phone="${esc(m.phone)}">Save access</button>
+      <button data-act="cancel-modules">Cancel</button>
+    </div></td></tr>`;
+}
+
+/** The modules a set of selects now asks for, as changes against `current`. */
+function changesFrom(root, current = {}) {
+  const out = {};
+  for (const sel of root.querySelectorAll('select[data-module]')) {
+    const want = sel.value || null;
+    if ((current[sel.dataset.module] || null) !== want) out[sel.dataset.module] = want;
+  }
+  return out;
 }
 
 function renderLog(log) {
@@ -115,10 +158,15 @@ $('#addForm').addEventListener('submit', async (e) => {
         name: $('#mname').value.trim(),
         phone: $('#mphone').value.trim(),
         isAdmin: $('#madmin').checked,
+        // Every module, "No access" included, so an explicit none is not
+        // mistaken for "not chosen" (which defaults to Support agent).
+        modules: Object.fromEntries([...$('#addModules').querySelectorAll('select[data-module]')]
+          .map((sel) => [sel.dataset.module, sel.value || null])),
       }),
     });
     showOk(`${data.member.name} can now sign in with +${data.member.phone}.`);
     $('#addForm').reset();
+    $('#addModules').innerHTML = moduleSelects({ support: 'agent' }, 'add-');
     await load();
   } catch (err) {
     if (err.message !== 'forbidden') showError(err.message);
@@ -134,6 +182,25 @@ $('#memberRows').addEventListener('click', async (e) => {
   clearBanners();
 
   if (act === 'remove' && !confirm(`Remove +${phone}? They will lose access within a minute.`)) return;
+
+  if (act === 'modules') { editing = editing === phone ? null : phone; renderMembers(members); return; }
+  if (act === 'cancel-modules') { editing = null; renderMembers(members); return; }
+  if (act === 'save-modules') {
+    const m = members.find((x) => x.phone === phone);
+    const changes = changesFrom(document.querySelector(`[data-editor="${phone}"]`), m?.modules || {});
+    if (!Object.keys(changes).length) { editing = null; renderMembers(members); return; }
+    btn.disabled = true;
+    try {
+      await api(`/api/members/${phone}`, { method: 'PATCH', body: JSON.stringify({ modules: changes }) });
+      editing = null;
+      showOk('Module access saved. It applies on their next page load.');
+      await load();
+    } catch (err) {
+      if (err.message !== 'forbidden') showError(err.message);
+      btn.disabled = false;
+    }
+    return;
+  }
 
   if (act === 'phone') {
     const next = prompt(`New mobile number for +${phone}:`, '');
@@ -156,8 +223,7 @@ $('#memberRows').addEventListener('click', async (e) => {
       await api(`/api/members/${phone}`, { method: 'DELETE' });
       showOk(`+${phone} removed.`);
     } else {
-      const body = act === 'admin' ? { isAdmin: to === 'true' }
-        : act === 'role' ? { role: to } : { active: to === 'true' };
+      const body = act === 'admin' ? { isAdmin: to === 'true' } : { active: to === 'true' };
       await api(`/api/members/${phone}`, { method: 'PATCH', body: JSON.stringify(body) });
       showOk('Updated.');
     }

@@ -26,7 +26,9 @@ const api = async (url, opts = {}) => {
   if (!res.ok || data.ok === false) throw Object.assign(new Error(data.error || `HTTP ${res.status}`), { status: res.status, data });
   return data;
 };
-const isAdmin = () => Boolean(state.me?.isAdmin);
+// What this member may do here (lib/permissions.js); the server checks again.
+const canMove = () => Boolean(state.me?.caps?.includes('inventory.move'));
+const canCatalog = () => Boolean(state.me?.caps?.includes('inventory.catalog'));
 const opt = (value, text, selected) => `<option value="${esc(value)}"${selected ? ' selected' : ''}>${esc(text)}</option>`;
 // A batch date is a calendar day ('YYYY-MM-DD'): formatted in UTC from its own
 // parts, so the viewer's timezone can never move it to the day before.
@@ -126,7 +128,7 @@ function render() {
     ${unmapped.map((u) => `<tr><td class="mono">${esc(u.code)}${u.asin ? `<span class="cell-sub muted">ASIN ${esc(u.asin)}</span>` : ''}</td>
       <td>${esc(u.platform_label)}</td>
       <td><span class="cell-text">${esc(u.title || '—')}</span></td><td class="r num">${count(u.orders)}</td><td class="r num">${count(u.units)}</td>
-      <td class="r">${!isAdmin() ? '<span class="soft">Ask an admin</span>'
+      <td class="r">${!canCatalog() ? '<span class="soft">Ask an Inventory manager</span>'
         : u.mappable ? `<button class="btn" type="button" data-map="${esc(u.code)}" data-platform="${esc(u.channel)}" data-platform-label="${esc(u.platform_label)}" data-title="${esc(u.title || '')}" data-asin="${esc(u.asin || '')}">Map to master SKU</button>`
           : `<span class="soft" title="${esc(u.platform_label)} orders use master SKU codes directly. Create a master SKU with this code, or add ${esc(u.platform_label)} as a platform.">Not a mapped platform</span>`}</td></tr>`).join('')}
     </tbody></table></div></div></section>` : (state.view === 'unmapped' ? '<section class="card"><div class="pane"><div class="empty-note"><b>Every SKU on an order is mapped.</b>Nothing to resolve.</div></div></section>' : '');
@@ -136,7 +138,7 @@ function render() {
 
   if (!rows.length) {
     const empty = anyFilter() ? '<b>Nothing matches.</b>Try clearing a filter.'
-      : `<b>No SKUs yet.</b>${isAdmin() ? 'Create one with New SKU, then Add Inventory.' : 'An admin adds SKUs and stock.'}`;
+      : `<b>No SKUs yet.</b>${canCatalog() ? 'Create one with New SKU, then Add Inventory.' : 'An Inventory manager adds SKUs and stock.'}`;
     $('#rows').innerHTML = `<tr><td colspan="8"><div class="empty-note">${empty}</div></td></tr>`;
     $('#clist').innerHTML = `<li class="oitem"><div class="empty-note">${empty}</div></li>`;
     return renderIcons();
@@ -244,12 +246,12 @@ function renderSku() {
       <div class="batch-docs">${b.documents.length ? b.documents.map((d) => `<span class="doc-chip">${icon(d.document_type === 'coa' ? 'file-check' : 'file-text')}
           <b>${esc(d.document_type === 'coa' ? 'COA' : d.document_type.replaceAll('_', ' '))}</b> ${esc(d.original_filename)}
           <a href="${docUrl(d)}" target="_blank" rel="noopener">View</a><a href="${docUrl(d, true)}">Download</a>
-          ${isAdmin() ? `<button type="button" class="linkish" data-doc-remove="${d.id}" data-batch="${b.id}">Remove</button>` : ''}</span>`).join('')
+          ${canMove() ? `<button type="button" class="linkish" data-doc-remove="${d.id}" data-batch="${b.id}">Remove</button>` : ''}</span>`).join('')
         : '<span class="soft">No COA uploaded.</span>'}
-        ${isAdmin() ? `<label class="linkish upload-link">${icon('upload')}Upload COA / document<input type="file" hidden accept=".pdf,.png,.jpg,.jpeg" data-upload="${b.id}" /></label>
+        ${canMove() ? `<label class="linkish upload-link">${icon('upload')}Upload COA / document<input type="file" hidden accept=".pdf,.png,.jpg,.jpeg" data-upload="${b.id}" /></label>
           <select class="select mini-select" data-upload-type="${b.id}" aria-label="Document type">${state.meta.documentTypes.map((t) => opt(t, t === 'coa' ? 'COA' : t.replaceAll('_', ' '))).join('')}</select>` : ''}
       </div>
-      ${isAdmin() ? `<div class="batch-actions">
+      ${canMove() ? `<div class="batch-actions">
         <button type="button" class="linkish" data-act="adjust" data-batch="${b.id}">Adjust / write off</button>
         <button type="button" class="linkish" data-act="return" data-batch="${b.id}">Customer return</button>
         <button type="button" class="linkish" data-act="transfer" data-batch="${b.id}">Transfer</button>
@@ -274,8 +276,8 @@ function renderSku() {
       </div>
       <p class="imp-note">On hand = sellable + expired + quarantined + blocked. Available to dispatch = sellable − reserved.
         ${s.track_inventory ? '' : '<b>Not inventory-tracked:</b> orders for this SKU dispatch without a stock check. '}Reorder level ${count(s.reorder_level)}${s.reorder_quantity ? `, reorder quantity ${count(s.reorder_quantity)}` : ''}.</p>
-      ${isAdmin() ? `<div class="form-actions"><button class="btn primary" type="button" data-act="receive">${icon('plus')}Add inventory</button>
-        <button class="btn" type="button" data-act="edit-sku">${icon('pencil')}Edit master SKU</button></div>` : ''}
+      ${canMove() || canCatalog() ? `<div class="form-actions">${canMove() ? `<button class="btn primary" type="button" data-act="receive">${icon('plus')}Add inventory</button>` : ''}
+        ${canCatalog() ? `<button class="btn" type="button" data-act="edit-sku">${icon('pencil')}Edit master SKU</button>` : ''}</div>` : ''}
     </section>
 
     <section class="dsec">
@@ -344,10 +346,10 @@ function platformSection(s) {
             <span class="pf-code mono">${esc(m.platform_sku)}</span>
             ${m.duplicate_override ? `<span class="mini-tag warn" title="${esc(`Also mapped to another master SKU. Reason: ${m.duplicate_reason}`)}">Duplicate</span>` : ''}</div>
           <span class="pf-meta soft" title="${esc(`Added ${m.source === 'import' ? 'by import' : m.source === 'migrated' ? 'from the old Amazon field' : m.source === 'unmapped' ? 'from Unmapped platform SKUs' : 'by hand'}${m.created_by ? ` · ${m.created_by}` : ''}`)}">${usage[m.id] ? `${count(usage[m.id])} order line${usage[m.id] === 1 ? '' : 's'}` : ''}</span>
-          ${isAdmin() ? `<button type="button" class="linkish pf-remove" data-unmap="${m.id}" data-code="${esc(m.platform_sku)}" data-lines="${usage[m.id] || 0}" aria-label="Remove ${esc(g.label)} SKU ${esc(m.platform_sku)}">Remove</button>` : ''}
+          ${canCatalog() ? `<button type="button" class="linkish pf-remove" data-unmap="${m.id}" data-code="${esc(m.platform_sku)}" data-lines="${usage[m.id] || 0}" aria-label="Remove ${esc(g.label)} SKU ${esc(m.platform_sku)}">Remove</button>` : ''}
         </li>`).join('')).join('')}</ul>`
         : '<p class="soft" style="margin:0">No platform SKUs yet. Orders from marketplaces will not resolve to this product until they are added.</p>'}
-      ${isAdmin() ? `<div class="pf-add">
+      ${canCatalog() ? `<div class="pf-add">
         <label class="fld"><span>Platform</span><select class="select" id="pfPlatform">${platforms.filter((p) => p.active).map((p) => opt(p.key, p.label, p.key === state.pfPlatform)).join('')}</select></label>
         <label class="fld"><span>Platform SKU</span><div class="pf-entry">
           <input class="input mono" id="pfCode" placeholder="Enter platform SKU" maxlength="80" autocomplete="off" spellcheck="false" />
