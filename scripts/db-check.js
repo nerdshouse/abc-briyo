@@ -43,6 +43,12 @@ import { requireAuth, requirePermission, _setMembershipLookup, router as authRou
 import express from 'express';
 import cookieParser from 'cookie-parser';
 import { spawn } from 'node:child_process';
+import os from 'node:os';
+import path from 'node:path';
+import fsp from 'node:fs/promises';
+import http from 'node:http';
+import { ensureHrSchema, purgeTestHr, slugify, normalizePhone } from '../lib/hr.js';
+import { issueFormToken, verifyTurnstile } from '../lib/careers.js';
 import net from 'node:net';
 import {
   isIngestSilent, buildDailySummary, shouldSendSummary, boardDay,
@@ -3242,6 +3248,348 @@ await step('rbac cleanup', async () => {
   const left = (await getPool().query('SELECT count(*)::int n FROM member_module_roles WHERE phone = ANY($1)', [RB_PHONES])).rows[0].n;
   if (left) throw new Error('module roles left behind');
   return 'server stopped; test members and their module roles removed';
+});
+
+// ---- HR / recruitment ----------------------------------------------------------
+const HRT = 'DBCHECK-HR';
+const HRM = { mgr: '919000000301', multi: '919000000302', nonHr: '919000000303', adm: '919000000304' };
+const HRS = {};   // server, base, stub, dir, ids
+const hrPhones = Object.values(HRM);
+const hrCleanMembers = async () => {
+  await getPool().query('DELETE FROM member_log WHERE target_phone = ANY($1)', [hrPhones]);
+  await getPool().query('DELETE FROM allowed_users WHERE phone = ANY($1)', [hrPhones]);
+};
+const pdf = (n = 2000) => { const b = Buffer.alloc(n, 0x20); Buffer.from('%PDF-1.7\n').copy(b); return b; };
+const docx = () => Buffer.concat([Buffer.from([0x50, 0x4b, 0x03, 0x04]), Buffer.alloc(200, 0), Buffer.from('word/document.xml'), Buffer.alloc(200, 0)]);
+let ipSeq = 10;
+const nextIp = () => `198.51.100.${(ipSeq += 1) % 250}`;
+const internal = async (who, method, path, body) => {
+  const headers = { 'content-type': 'application/json' };
+  if (who) headers.cookie = `${SESSION_COOKIE}=${issueSession(HRM[who])}`;
+  const r = await fetch(`${HRS.base}${path}`, { method, headers, body: body ? JSON.stringify(body) : undefined, redirect: 'manual' });
+  const ct = r.headers.get('content-type') || '';
+  return { status: r.status, headers: r.headers, body: ct.includes('json') ? await r.json() : await r.text() };
+};
+// fetch() drops a custom Host header, so the careers host is reached with http.request.
+const careers = (method, p, { body, raw, headers = {}, ip = nextIp(), cookieAs } = {}) => new Promise((resolve, reject) => {
+  const h = { host: 'careers.test', 'x-forwarded-for': ip, ...headers };
+  if (body) h['content-type'] = 'application/json';
+  if (cookieAs) h.cookie = `${SESSION_COOKIE}=${issueSession(HRM[cookieAs])}`;
+  const payload = raw ?? (body ? JSON.stringify(body) : undefined);
+  const u = new URL(HRS.base);
+  const req = http.request({ hostname: u.hostname, port: u.port, path: p, method, headers: h }, (res) => {
+    const chunks = []; res.on('data', (c) => chunks.push(c)); res.on('end', () => {
+      const text = Buffer.concat(chunks).toString();
+      const hdrs = new Headers(Object.entries(res.headers).map(([k, v]) => [k, Array.isArray(v) ? v.join(', ') : String(v)]));
+      let parsed = text;
+      if ((res.headers['content-type'] || '').includes('json')) { try { parsed = JSON.parse(text); } catch { /* keep text */ } }
+      resolve({ status: res.statusCode, headers: hdrs, body: parsed });
+    });
+  });
+  req.on('error', reject);
+  if (payload !== undefined) req.write(payload);
+  req.end();
+});
+const goodApplication = (pid, over = {}) => ({
+  full_name: 'Test Candidate', email: 'dbcheck-hr-cand@example.test', phone: '+44 20 7946 0958', location: 'Pune',
+  linkedin_url: 'linkedin.com/in/test', relevant_experience: '3 years', notice_period: '30 days', work_authorization: 'Indian citizen',
+  consent: true, turnstile_token: 'pass', form_token: issueFormToken(pid, Date.now() - 5000), ...over,
+});
+const apply = (pid, over, opts) => careers('POST', `/jobs/${pid}/apply`, { body: goodApplication(pid, over), ...opts });
+const upload = (pid, token, buf, name = 'cv.pdf', opts = {}) => careers('POST', `/jobs/${pid}/apply/resume`, {
+  raw: buf, headers: { 'x-filename': encodeURIComponent(name), 'x-upload-token': token || '', 'content-type': 'application/octet-stream' }, ...opts });
+
+await step('hr: schema is additive and idempotent; HR role pair accepted, nothing granted', async () => {
+  await ensureHrSchema(); await ensureHrSchema();
+  const before = (await getPool().query('SELECT count(*)::int n FROM member_module_roles')).rows[0].n;
+  await hrCleanMembers();
+  await getPool().query(`INSERT INTO allowed_users (phone, name, is_admin, added_by) VALUES ($1,'HR mgr',false,'db-check'),($2,'HR multi',false,'db-check'),($3,'Not HR',false,'db-check'),($4,'HR admin',true,'db-check')`, hrPhones);
+  await setModuleRole(HRM.mgr, 'hr', 'manager', { actor: 'db-check' });
+  for (const [m, r] of [['logistics', 'operator'], ['inventory', 'viewer'], ['hr', 'manager']]) await setModuleRole(HRM.multi, m, r, { actor: 'db-check' });
+  await setModuleRole(HRM.nonHr, 'support', 'agent', { actor: 'db-check' });
+  await expectErr('hr viewer is not a role', () => getPool().query(`INSERT INTO member_module_roles (phone, module, role) VALUES ($1, 'hr', 'viewer')`, [HRM.nonHr]), (e) => e.code === '23514');
+  const after = (await getPool().query('SELECT count(*)::int n FROM member_module_roles WHERE phone <> ALL($1)', [hrPhones])).rows[0].n;
+  if (after !== before) throw new Error('other assignments changed');
+  const auto = (await getPool().query(`SELECT count(*)::int n FROM member_module_roles WHERE module = 'hr' AND phone <> ALL($1)`, [hrPhones])).rows[0].n;
+  if (auto) throw new Error('HR granted automatically');
+  const caps = capabilitiesOf({ allowed: true, admin: false, roles: { hr: 'manager' } });
+  if (caps.join() !== 'hr.view,hr.manage' || homeFor(caps) !== '/hr/jobs') throw new Error(caps.join());
+  if (normalizePhone('98765 43210') !== '+919876543210' || normalizePhone('+1 (415) 555-0100') !== '+14155550100' || normalizePhone('0044 20 7946 0958') !== '+442079460958') throw new Error('phone');
+  await expectErr('phone without code', () => normalizePhone('2079460958'), (e) => e.field === 'phone');
+  if (slugify('Performance Marketing Manager!') !== 'performance-marketing-manager') throw new Error('slug');
+  return 'tables idempotent; (hr, manager) allowed, (hr, viewer) refused; no automatic grants; E.164 + slug helpers';
+});
+
+await step('hr: server with careers host, Turnstile stub and throwaway storage', async () => {
+  HRS.dir = await fsp.mkdtemp(path.join(os.tmpdir(), 'hr-docs-'));
+  HRS.stub = http.createServer((req, res) => { let b = ''; req.on('data', (c) => { b += c; }); req.on('end', () => {
+    const ok = new URLSearchParams(b).get('response') === 'pass';
+    res.setHeader('content-type', 'application/json'); res.end(JSON.stringify({ success: ok }));
+  }); }).listen(0);
+  const port = await freePort();
+  HRS.server = spawn(process.execPath, ['server.js'], {
+    cwd: new URL('..', import.meta.url).pathname,
+    env: { ...process.env, PORT: String(port), APP_ENV: 'test', ADMIN_PHONES: '', ELEVENZA_AUTH_TOKEN: '', SHOPIFY_ACCESS_TOKEN: '',
+      SHOPIFY_POLL_ENABLED: 'false', SHOPIFY_POLL_MINUTES: '0', SLA_ALERTS_ENABLED: 'false', DAILY_SUMMARY_ENABLED: 'false', KEEPALIVE_URL: '', RENDER_EXTERNAL_URL: '',
+      CAREERS_HOST: 'careers.test', CAREERS_BASE_URL: 'https://careers.test', TURNSTILE_SECRET_KEY: 'test-secret', TURNSTILE_SITE_KEY: 'test-site',
+      TURNSTILE_VERIFY_URL: `http://127.0.0.1:${HRS.stub.address().port}/verify`, DOCUMENT_STORAGE: 'local', DOCUMENT_STORAGE_DIR: HRS.dir, HR_IP_HASH_SALT: 'db-check' },
+    stdio: ['ignore', 'ignore', 'pipe'],
+  });
+  let stderr = ''; HRS.server.stderr.on('data', (d) => { stderr += d; });
+  HRS.base = `http://127.0.0.1:${port}`;
+  for (let i = 0; i < 100; i++) {
+    try { if ((await fetch(`${HRS.base}/healthz`)).ok) break; } catch { /* starting */ }
+    await new Promise((r) => setTimeout(r, 150));
+    if (i === 99) throw new Error(`server did not start: ${stderr.slice(-400)}`);
+  }
+  return `listening; careers host = careers.test`;
+});
+
+await step('hr: RBAC — HR manager, admin and multi-module reach HR; others refused; no accidental access', async () => {
+  const M = [
+    ['GET', '/api/hr/jobs', null, { mgr: 200, multi: 200, adm: 200, nonHr: 403, '': 401 }],
+    ['GET', '/api/hr/applications', null, { mgr: 200, adm: 200, nonHr: 403, '': 401 }],
+    ['POST', '/api/hr/jobs', { title: `${HRT} rbac probe` }, { nonHr: 403, '': 401, mgr: 201 }],
+    ['GET', '/api/orders?limit=1', null, { mgr: 403, multi: 200 }],
+    ['GET', '/api/inventory', null, { mgr: 403, multi: 200 }],
+    ['POST', '/api/inventory/receive', {}, { multi: 403 }],
+    ['GET', '/api/carts?days=1', null, { mgr: 403, multi: 403, nonHr: 200 }],
+    ['GET', '/api/members', null, { mgr: 403, adm: 200 }],
+  ];
+  const bad = [];
+  for (const [m, p, b, exp] of M) for (const [who, want] of Object.entries(exp)) {
+    const r = await internal(who || null, m, p, b);
+    if (r.status !== want) bad.push(`${who || 'anon'} ${m} ${p}: ${r.status} ≠ ${want}`);
+  }
+  const page = await internal('mgr', 'GET', '/');
+  if (page.status !== 302 || page.headers.get('location') !== '/hr/jobs') bad.push(`HR-only home: ${page.status} ${page.headers.get('location')}`);
+  if (bad.length) throw new Error(bad.join(' | '));
+  return `${M.reduce((n, x) => n + Object.keys(x[3]).length, 0) + 1} checks`;
+});
+
+await step('hr: job lifecycle — draft, edit (version), publish, slug, close, reopen, archive, restore', async () => {
+  let r = await internal('mgr', 'POST', '/api/hr/jobs', { title: `${HRT} Performance Marketing Manager`, department: 'Marketing' });
+  if (r.status !== 201 || r.body.job.status !== 'draft' || r.body.job.slug !== null || r.body.job.public_url !== null) throw new Error(JSON.stringify(r.body));
+  let job = r.body.job; HRS.job = job;
+  const feed0 = await careers('GET', '/jobs');
+  if (feed0.body.jobs.some((j) => j.public_id === job.public_id)) throw new Error('draft in feed');
+  if ((await careers('GET', `/jobs/${job.public_id}`)).status !== 404) throw new Error('draft public');
+  r = await internal('mgr', 'POST', `/api/hr/jobs/${job.id}/publish`, { version: job.version });
+  if (r.status !== 400 || !/employment type/.test(r.body.error)) throw new Error(`incomplete publish: ${r.status} ${r.body.error}`);
+  r = await internal('mgr', 'PATCH', `/api/hr/jobs/${job.id}`, { version: job.version, employment_type: 'full_time', work_mode: 'hybrid', location: 'Mumbai',
+    summary: 'Own our paid growth.', experience_min: 3, experience_max: 6, salary_min: 1200000, salary_max: 1800000, salary_period: 'year',
+    sections: { about: 'You will run paid media.', responsibilities: '- Plan\n- Ship', bogus: 'dropped' } });
+  if (r.status !== 200 || r.body.job.sections.bogus || r.body.job.sections.responsibilities !== '- Plan\n- Ship') throw new Error(JSON.stringify(r.body));
+  const stale = await internal('mgr', 'PATCH', `/api/hr/jobs/${job.id}`, { version: job.version, department: 'x' });
+  if (stale.status !== 409) throw new Error(`stale edit ${stale.status}`);
+  if ((await internal('mgr', 'PATCH', `/api/hr/jobs/${job.id}`, { version: r.body.job.version, experience_min: 9 })).status !== 400) throw new Error('min > max accepted');
+  job = r.body.job;
+  r = await internal('mgr', 'POST', `/api/hr/jobs/${job.id}/publish`, { version: job.version });
+  job = r.body.job;
+  const slug = 'dbcheck-hr-performance-marketing-manager';
+  if (r.status !== 200 || job.status !== 'published' || job.slug !== slug || job.public_url !== `https://careers.test/${slug}/apply`) throw new Error(JSON.stringify(job));
+  const feed = await careers('GET', '/jobs');
+  const pub = feed.body.jobs.find((j) => j.public_id === job.public_id);
+  if (!pub || pub.public_url !== job.public_url || 'id' in pub || 'candidate_count' in pub || pub.salary.min !== 1200000) throw new Error(JSON.stringify(pub));
+  if ((await careers('GET', `/${slug}/apply`)).status !== 200) throw new Error('published page');
+  // Title edits keep the URL; an explicit slug change redirects the old one.
+  r = await internal('mgr', 'PATCH', `/api/hr/jobs/${job.id}`, { version: job.version, title: `${HRT} Growth Marketing Manager` });
+  if (r.body.job.slug !== slug || r.body.job.public_id !== job.public_id) throw new Error('slug followed the title');
+  r = await internal('mgr', 'PATCH', `/api/hr/jobs/${job.id}`, { version: r.body.job.version, slug: `${HRT} growth marketing` });
+  const newSlug = 'dbcheck-hr-growth-marketing';
+  const old = await careers('GET', `/${slug}/apply`);
+  if (r.body.job.slug !== newSlug || old.status !== 301 || old.headers.get('location') !== `/${newSlug}/apply`) throw new Error(`rename ${r.body.job.slug} ${old.status} ${old.headers.get('location')}`);
+  job = r.body.job; HRS.job = job;
+  // Close: public page stays (noindex), not in feed, no applications; reopen; archive; restore.
+  r = await internal('mgr', 'POST', `/api/hr/jobs/${job.id}/close`, { version: job.version }); job = r.body.job;
+  const closedPage = await careers('GET', `/${newSlug}/apply`);
+  const closedApi = await careers('GET', `/jobs/${job.public_id}`);
+  if (closedPage.status !== 200 || closedPage.headers.get('x-robots-tag') !== 'noindex' || closedApi.body.form !== null || closedApi.body.job.applications_open) throw new Error('closed page');
+  if ((await careers('GET', '/jobs')).body.jobs.some((j) => j.public_id === job.public_id)) throw new Error('closed in feed');
+  if ((await apply(job.public_id)).status !== 409) throw new Error('closed accepted an application');
+  r = await internal('mgr', 'POST', `/api/hr/jobs/${job.id}/publish`, { version: job.version }); job = r.body.job;
+  if (job.status !== 'published' || job.slug !== newSlug) throw new Error('reopen');
+  // A second job, archived and restored.
+  r = await internal('mgr', 'POST', '/api/hr/jobs', { title: `${HRT} Graphic Design Intern`, employment_type: 'internship', work_mode: 'remote', summary: 'Design with us.' });
+  let j2 = r.body.job;
+  j2 = (await internal('mgr', 'POST', `/api/hr/jobs/${j2.id}/publish`, { version: j2.version })).body.job;
+  HRS.job2 = j2;
+  const j3 = (await internal('mgr', 'POST', '/api/hr/jobs', { title: `${HRT} Archive Me`, employment_type: 'contract', work_mode: 'remote', summary: 'x' })).body.job;
+  let a3 = (await internal('mgr', 'POST', `/api/hr/jobs/${j3.id}/publish`, { version: j3.version })).body.job;
+  a3 = (await internal('mgr', 'POST', `/api/hr/jobs/${a3.id}/archive`, { version: a3.version })).body.job;
+  if ((await careers('GET', `/${a3.slug}/apply`)).status !== 404 || (await careers('GET', '/jobs')).body.jobs.some((j) => j.public_id === a3.public_id)) throw new Error('archived public');
+  const restored = (await internal('mgr', 'POST', `/api/hr/jobs/${a3.id}/restore`, { version: a3.version })).body.job;
+  if (restored.status !== 'draft' || (await internal('mgr', 'POST', `/api/hr/jobs/${a3.id}/close`, { version: restored.version })).status !== 409) throw new Error('restore / illegal close');
+  const ev = (await getPool().query('SELECT event_type FROM hr_events WHERE job_id = $1 ORDER BY id', [job.id])).rows.map((x) => x.event_type);
+  for (const t of ['job_created', 'job_updated', 'job_published', 'job_slug_set', 'job_closed']) if (!ev.includes(t)) throw new Error(`no ${t}`);
+  return 'draft private; incomplete publish refused; stale edit 409; publish → slug + URL; title edit keeps URL; rename 301s; close (noindex, no form, out of feed, 409 on apply); reopen; archive 404; restore → draft; events';
+});
+
+await step('hr: applications — create, reuse candidate, pending vs complete, duplicate, other job, validation', async () => {
+  const pid = HRS.job.public_id;
+  for (const [over, field] of [[{ full_name: '' }, 'full_name'], [{ email: 'nope' }, 'email'], [{ phone: '12345' }, 'phone'], [{ phone: '2079460958' }, 'phone'],
+    [{ linkedin_url: 'javascript:alert(1)' }, 'linkedin_url'], [{ consent: false }, 'consent'], [{ relevant_experience: ' ' }, 'relevant_experience']]) {
+    const r = await apply(pid, over);
+    if (r.status !== 400 || r.body.field !== field) throw new Error(`${JSON.stringify(over)} → ${r.status} ${r.body.field}`);
+  }
+  // Step 1 twice before a resume: one pending row, the first token dead.
+  const a1 = await apply(pid);
+  const a2 = await apply(pid, { email: '  DBCHECK-HR-CAND@Example.TEST ' });
+  if (a1.status !== 201 || a2.status !== 201 || !a2.body.uploadToken || a2.body.jobTitle !== HRS.job.title) throw new Error(`${a1.status} ${a2.status}`);
+  const pend = (await getPool().query(`SELECT count(*)::int n FROM hr_applications a JOIN hr_candidates c ON c.id = a.candidate_id WHERE c.email = 'dbcheck-hr-cand@example.test'`)).rows[0].n;
+  if (pend !== 1) throw new Error(`pending rows ${pend}`);
+  // Incomplete: invisible to HR, counted as incomplete.
+  if ((await internal('mgr', 'GET', `/api/hr/applications?job=${HRS.job.id}`)).body.applications.length) throw new Error('incomplete listed');
+  if ((await internal('mgr', 'GET', '/api/hr/jobs')).body.jobs.find((j) => j.id === HRS.job.id).incomplete_count !== 1) throw new Error('incomplete count');
+  if ((await upload(pid, a1.body.uploadToken, pdf())).status !== 401) throw new Error('superseded token worked');
+  const up = await upload(pid, a2.body.uploadToken, pdf(), 'Test CV.pdf');
+  if (up.status !== 201 || up.body.jobTitle !== HRS.job.title) throw new Error(`upload ${up.status} ${JSON.stringify(up.body)}`);
+  const list = (await internal('mgr', 'GET', `/api/hr/applications?job=${HRS.job.id}`)).body.applications;
+  if (list.length !== 1 || list[0].email !== 'dbcheck-hr-cand@example.test' || !list[0].has_resume || 'resume_storage_path' in list[0] && list[0].resume_storage_path) throw new Error(JSON.stringify(list));
+  HRS.app = list[0];
+  if ((await apply(pid)).status !== 409 || !(await apply(pid)).body.duplicate) throw new Error('duplicate accepted');
+  // Same person, another job: same candidate; a changed phone is kept in history.
+  const b1 = await apply(HRS.job2.public_id, { phone: '+91 98765 43210' });
+  if (b1.status !== 201 || (await upload(HRS.job2.public_id, b1.body.uploadToken, docx(), 'cv.docx')).status !== 201) throw new Error('second job');
+  const cands = (await getPool().query(`SELECT id, phone FROM hr_candidates WHERE email = 'dbcheck-hr-cand@example.test'`)).rows;
+  if (cands.length !== 1 || cands[0].phone !== '+919876543210') throw new Error(JSON.stringify(cands));
+  const ch = (await getPool().query(`SELECT metadata FROM hr_events WHERE candidate_id = $1 AND event_type = 'candidate_profile_updated' ORDER BY id DESC LIMIT 1`, [cands[0].id])).rows[0];
+  if (ch?.metadata?.changed?.phone?.from !== '+442079460958') throw new Error('previous phone not kept');
+  const row = (await getPool().query('SELECT consent_at, consent_text_version, submitted_ip_hash, completed_at, upload_token_hash FROM hr_applications WHERE id = $1', [HRS.app.id])).rows[0];
+  if (!row.consent_at || !row.consent_text_version || !row.submitted_ip_hash || row.submitted_ip_hash.includes('198.51') || !row.completed_at || row.upload_token_hash) throw new Error(JSON.stringify(row));
+  return '7 invalid inputs refused by field; pending resubmit reuses the row and kills the old token; incomplete hidden + counted; complete → listed; duplicate 409; other job reuses candidate (case/space-insensitive email) and logs the previous phone; consent + hashed IP stored';
+});
+
+await step('hr: resumes — PDF/DOCX, 10 MB boundary, bad files, tokens, private storage, HR-only download', async () => {
+  const pid = HRS.job2.public_id;
+  const fresh = async (email) => (await apply(pid, { email })).body.uploadToken;
+  let t = await fresh('dbcheck-hr-files@example.test');
+  const tenMb = pdf(10 * 1024 * 1024);
+  for (const [buf, name, why] of [[Buffer.from('not a pdf'), 'cv.pdf', 'fake PDF'], [Buffer.concat([Buffer.from([0x50, 0x4b, 0x03, 0x04]), Buffer.alloc(100)]), 'cv.docx', 'plain zip'],
+    [docx(), 'cv.docm', 'docm'], [Buffer.alloc(0), 'cv.pdf', 'empty'], [pdf(), 'cv.exe', 'exe']]) {
+    const r = await upload(pid, t, buf, name);
+    if (r.status !== 400) throw new Error(`${why}: ${r.status}`);
+  }
+  const big = await upload(pid, t, pdf(10 * 1024 * 1024 + 2048), 'big.pdf');
+  if (big.status !== 413) throw new Error(`oversized ${big.status}`);
+  const ok = await upload(pid, t, tenMb, 'exactly-10mb.pdf');   // the token survived every rejected try
+  if (ok.status !== 201) throw new Error(`10 MB ${ok.status} ${JSON.stringify(ok.body)}`);
+  if ((await upload(pid, t, pdf(), 'again.pdf')).status !== 401) throw new Error('token reused');
+  t = await fresh('dbcheck-hr-expired@example.test');
+  await getPool().query(`UPDATE hr_applications SET upload_token_expires = now() - interval '1 minute' WHERE upload_token_hash = encode(sha256($1::bytea), 'hex')`, [t]);
+  if ((await upload(pid, t, pdf())).status !== 401) throw new Error('expired token worked');
+  t = await fresh('dbcheck-hr-wrongjob@example.test');
+  if ((await upload(HRS.job.public_id, t, pdf())).status !== 401) throw new Error('token worked for another job');
+  // Stored privately, under hr/resumes, never named in any API answer.
+  const key = (await getPool().query('SELECT resume_storage_path FROM hr_applications WHERE id = $1', [HRS.app.id])).rows[0].resume_storage_path;
+  if (!/^hr\/resumes\/\d{4}-\d{2}\/[0-9a-f-]{36}\.pdf$/.test(key)) throw new Error(key);
+  const detail = await internal('mgr', 'GET', `/api/hr/applications/${HRS.app.id}`);
+  if (JSON.stringify(detail.body).includes(key) || JSON.stringify(await internal('mgr', 'GET', '/api/hr/applications')).includes('hr/resumes')) throw new Error('storage key leaked');
+  const dl = await fetch(`${HRS.base}/api/hr/applications/${HRS.app.id}/resume`, { headers: { cookie: `${SESSION_COOKIE}=${issueSession(HRM.mgr)}` } });
+  const bytes = Buffer.from(await dl.arrayBuffer());
+  if (dl.status !== 200 || !bytes.subarray(0, 4).equals(Buffer.from('%PDF')) || !/attachment/.test(dl.headers.get('content-disposition')) || dl.headers.get('x-content-type-options') !== 'nosniff') throw new Error(`download ${dl.status}`);
+  for (const [who, want] of [['nonHr', 403], ['', 401]]) {
+    const r = await internal(who || null, 'GET', `/api/hr/applications/${HRS.app.id}/resume`);
+    if (r.status !== want) throw new Error(`${who || 'anon'} download ${r.status}`);
+  }
+  if ((await careers('GET', `/${key}`)).status !== 404 || (await careers('GET', `/api/hr/applications/${HRS.app.id}/resume`, { cookieAs: 'mgr' })).status !== 404) throw new Error('resume reachable on careers host');
+  return 'fake PDF, plain ZIP, .docm, empty, .exe → 400 (token kept); 10 MB + 2 KB → 413; exactly 10 MB → 201; reuse/expired/other-job token → 401; key hr/resumes/YYYY-MM/<uuid> never in API output; download HR-only, attachment + nosniff';
+});
+
+await step('hr: status changes with history, notes, search and filters', async () => {
+  const id = HRS.app.id;
+  let d = (await internal('mgr', 'GET', `/api/hr/applications/${id}`)).body;
+  let r = await internal('mgr', 'PATCH', `/api/hr/applications/${id}/status`, { status: 'screening', version: d.application.version, note: 'Strong CV' });
+  if (r.status !== 200) throw new Error(`status ${r.status}`);
+  if ((await internal('mgr', 'PATCH', `/api/hr/applications/${id}/status`, { status: 'interview', version: d.application.version })).status !== 409) throw new Error('stale status');
+  d = (await internal('mgr', 'GET', `/api/hr/applications/${id}`)).body;
+  await internal('mgr', 'PATCH', `/api/hr/applications/${id}/status`, { status: 'interview', version: d.application.version });
+  if ((await internal('mgr', 'PATCH', `/api/hr/applications/${id}/status`, { status: 'promoted', version: 99 })).status !== 400) throw new Error('bad status');
+  if ((await internal('nonHr', 'PATCH', `/api/hr/applications/${id}/status`, { status: 'hired', version: 1 })).status !== 403) throw new Error('non-HR changed status');
+  if ((await internal('mgr', 'POST', `/api/hr/applications/${id}/notes`, { body: 'Call on Monday' })).status !== 201) throw new Error('note');
+  if ((await internal('mgr', 'POST', `/api/hr/applications/${id}/notes`, { body: '  ' })).status !== 400) throw new Error('empty note');
+  d = (await internal('adm', 'GET', `/api/hr/applications/${id}`)).body;
+  const h = d.history.map((x) => `${x.from_status}>${x.to_status}`).join(',');
+  if (h !== 'applied>screening,screening>interview' || d.history[0].note !== 'Strong CV' || !d.history[0].actor || d.notes[0].body !== 'Call on Monday') throw new Error(JSON.stringify({ h, notes: d.notes }));
+  if (d.application.status !== 'interview' || d.other_applications.length !== 1) throw new Error('detail');
+  const q = async (qs) => (await internal('mgr', 'GET', `/api/hr/applications?${qs}`)).body.applications.filter((a) => a.job_title.startsWith(HRT)).length;
+  const counts = [await q('q=Test%20Candidate'), await q('q=dbcheck-hr-cand'), await q('q=9876543210'), await q('status=interview'), await q(`job=${HRS.job2.id}`), await q('q=nobody-matches-this')];
+  if (counts.join() !== '3,2,2,1,2,0') /* the name also matches the resume test's application */ throw new Error(counts.join());
+  const ev = (await getPool().query('SELECT event_type FROM hr_events WHERE application_id = $1', [id])).rows.map((x) => x.event_type);
+  for (const t of ['application_started', 'resume_uploaded', 'application_submitted', 'status_changed', 'note_added']) if (!ev.includes(t)) throw new Error(`no ${t}`);
+  return 'applied→screening (note)→interview with history + actor; stale 409; unknown 400; non-HR 403; notes; search by name/email/phone; status + job filters; events';
+});
+
+await step('hr: spam layers — rate limit, Turnstile, honeypot, minimum fill time', async () => {
+  const pid = HRS.job2.public_id;
+  const ip = '203.0.113.77';
+  const codes = [];
+  for (let i = 0; i < 6; i++) codes.push((await apply(pid, { email: `dbcheck-hr-rl${i}@example.test` }, { ip })).status);
+  if (codes.slice(0, 3).some((c) => c !== 201) || codes.at(-1) !== 429) throw new Error(`rate limit ${codes}`);
+  const tf = await apply(pid, { email: 'dbcheck-hr-ts@example.test', turnstile_token: 'fail' });
+  if (tf.status !== 400 || tf.body.field !== 'turnstile') throw new Error(`turnstile ${tf.status}`);
+  const tm = await apply(pid, { email: 'dbcheck-hr-ts2@example.test', turnstile_token: '' });
+  if (tm.status !== 400) throw new Error('missing turnstile');
+  if ((await apply(pid, { email: 'dbcheck-hr-hp@example.test', website: 'http://spam' })).status !== 400) throw new Error('honeypot');
+  const fast = await apply(pid, { email: 'dbcheck-hr-fast@example.test', form_token: issueFormToken(pid, Date.now()) });
+  if (fast.status !== 400 || !/fast/.test(fast.body.error)) throw new Error(`fill time ${fast.status}`);
+  if ((await apply(pid, { email: 'dbcheck-hr-forged@example.test', form_token: `${Date.now() - 9000}.forged` })).status !== 400) throw new Error('forged form token');
+  if ((await apply(pid, { email: 'dbcheck-hr-other@example.test', form_token: issueFormToken(HRS.job.public_id, Date.now() - 5000) })).status !== 400) throw new Error('form token from another job');
+  const saved = process.env.TURNSTILE_SECRET_KEY; delete process.env.TURNSTILE_SECRET_KEY;
+  const nc = await verifyTurnstile('pass', '1.2.3.4');
+  if (saved) process.env.TURNSTILE_SECRET_KEY = saved;
+  if (nc.ok || nc.reason !== 'not_configured') throw new Error('no keys did not fail closed');
+  const malformed = await careers('POST', `/jobs/${pid}/apply`, { raw: '{bad json', headers: { 'content-type': 'application/json' } });
+  if (malformed.status !== 400) throw new Error(`malformed ${malformed.status}`);
+  const n = (await getPool().query(`SELECT count(*)::int n FROM hr_candidates WHERE email IN ('dbcheck-hr-ts@example.test','dbcheck-hr-hp@example.test','dbcheck-hr-fast@example.test')`)).rows[0].n;
+  if (n) throw new Error('rejected submissions stored data');
+  return `per-IP limit: ${codes.join(',')}; Turnstile fail/missing 400; no keys → fail closed; honeypot; < 3 s, forged and other-job form tokens refused; malformed JSON 400; nothing stored`;
+});
+
+await step('hr: public answers never leak candidate data, ids, counts or notes', async () => {
+  const bodies = [await careers('GET', '/jobs'), await careers('GET', `/jobs/${HRS.job.public_id}`), await careers('GET', `/${HRS.job.slug}/apply`), await apply(HRS.job.public_id)];
+  const all = bodies.map((b) => (typeof b.body === 'string' ? b.body : JSON.stringify(b.body))).join('\n');
+  for (const secret of ['dbcheck-hr-cand@example.test', 'Test Candidate', '9876543210', 'Call on Monday', 'Strong CV', 'hr/resumes', '"candidate_count"', '"incomplete_count"', '"created_by"', `"id":${HRS.job.id}`]) {
+    if (all.includes(secret)) throw new Error(`leaked ${secret}`);
+  }
+  if (bodies[3].status !== 409) throw new Error('duplicate expected');
+  return 'feed, job JSON, job page and an apply answer: no email/name/phone, notes, storage keys, counts, actors or database ids';
+});
+
+await step('hr: host isolation — the careers host serves careers routes only', async () => {
+  const paths = ['/', '/login', '/dashboard', '/orders', '/inventory', '/admin', '/members', '/hr/jobs', '/no-access', '/index.html', '/orders.js', '/ui/components.js',
+    '/auth/me', '/api/hr/jobs', '/api/hr/applications', '/api/orders', '/api/orders/meta', '/api/inventory', '/api/members', '/api/carts', '/api/carts.csv',
+    '/api/admin/overview', '/api/config', '/api/webhook/gokwik/abandoned-cart', '/readyz'];
+  const bad = [];
+  for (const p of paths) for (const as of [undefined, 'adm']) {
+    const r = await careers('GET', p, { cookieAs: as });
+    if (r.status !== 404 || r.headers.get('set-cookie')) bad.push(`${as || 'anon'} ${p}: ${r.status}`);
+  }
+  for (const [m, p] of [['POST', '/api/hr/jobs'], ['POST', '/auth/request-otp'], ['POST', '/api/status'], ['PATCH', '/api/members/919000000304'], ['POST', '/api/webhook/gokwik/abandoned-cart']]) {
+    const r = await careers(m, p, { body: { title: `${HRT} isolation probe`, phone: '9000000304' }, cookieAs: 'adm' });
+    if (r.status !== 404) bad.push(`${m} ${p}: ${r.status}`);
+  }
+  const ok = await careers('GET', '/jobs');
+  if (ok.status !== 200 || !/default-src 'self'/.test(ok.headers.get('content-security-policy') || '') || ok.headers.get('x-frame-options') !== 'DENY') bad.push('careers headers');
+  // The internal host has no careers routes.
+  for (const p of ['/jobs', `/${HRS.job.slug}/apply`, `/jobs/${HRS.job.public_id}`]) {
+    const r = await internal('adm', 'GET', p);
+    if (r.status === 200 && (typeof r.body === 'object' ? r.body.jobs || r.body.job : /Careers at Briyo/.test(r.body))) bad.push(`internal host served ${p}`);
+  }
+  if (bad.length) throw new Error(bad.join(' | '));
+  return `${paths.length * 2 + 5} internal paths on the careers host → 404 (no cookie set), with and without an admin session; careers headers; internal host serves no careers routes`;
+});
+
+await step('hr cleanup', async () => {
+  if (HRS.server) { HRS.server.kill(); await new Promise((r) => HRS.server.once('exit', r)); }
+  if (HRS.stub) HRS.stub.close();
+  const { jobs } = await purgeTestHr(HRT);
+  await getPool().query(`DELETE FROM hr_candidates c WHERE email LIKE 'dbcheck-hr-%' AND NOT EXISTS (SELECT 1 FROM hr_applications a WHERE a.candidate_id = c.id)`);
+  await hrCleanMembers();
+  if (HRS.dir) await fsp.rm(HRS.dir, { recursive: true, force: true });
+  const left = (await getPool().query(`SELECT (SELECT count(*) FROM hr_jobs WHERE title LIKE $1)::int + (SELECT count(*) FROM hr_candidates WHERE email LIKE 'dbcheck-hr-%')::int n`, [`${HRT}%`])).rows[0].n;
+  if (left) throw new Error('HR test rows left');
+  return `server stopped; ${jobs} test jobs and their candidates, applications, history, notes, events and files removed`;
 });
 
 console.log(failures === 0

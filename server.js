@@ -28,6 +28,9 @@ import {
   requirePermission, requirePage,
 } from './lib/auth-routes.js';
 import { homeFor, MODULE_KEYS, isValidAssignment } from './lib/permissions.js';
+import { careersHost } from './lib/careers.js';
+import { router as hrRouter } from './lib/hr-routes.js';
+import { ensureHrSchema } from './lib/hr.js';
 import { router as ordersRouter, courierRouter, destinationRouter } from './lib/orders-routes.js';
 import { router as inventoryRouter } from './lib/inventory-routes.js';
 import { ensureInventorySchema } from './lib/inventory.js';
@@ -50,6 +53,10 @@ const app = express();
 const MOCK = isMockMode();
 
 app.set('trust proxy', 1);
+// careers.briyo.xyz — the public Careers surface of this app. First, before any
+// parser, session or static file: that host gets only the careers routes, or a
+// 404 (lib/careers.js). Every other host continues to the app below.
+app.use(careersHost);
 
 /**
  * The webhook takes the body as raw text and parses it itself, so a malformed
@@ -414,6 +421,7 @@ app.use('/api/couriers', requirePermission('logistics.view'), courierRouter);
 app.use('/api/destinations', requirePermission('logistics.view'), destinationRouter);
 // Inventory serves both modules: its own pages, and the stock panel of a shipment.
 app.use('/api/inventory', requirePermission(['inventory.view', 'logistics.view']), inventoryRouter);
+app.use('/api/hr', requirePermission('hr.view'), hrRouter);
 
 app.use(express.static(PUBLIC));
 
@@ -1092,6 +1100,10 @@ app.listen(port, async () => {
       ensureInventorySchema()
         .then(() => console.log('Orders & inventory schema ready'))
         .catch((e) => console.error('Orders & inventory schema setup failed (will retry on first request):', e.message));
+      ensureHrSchema()
+        .then(() => console.log('HR schema ready'))
+        .catch((e) => console.error('HR schema setup failed (will retry on first request):', e.message));
+      console.log(process.env.CAREERS_HOST ? `Careers host: ${process.env.CAREERS_HOST} (public careers routes only)` : 'Careers host: not configured');
     } catch (err) {
       console.error(`\n  Postgres connection FAILED: ${err.message}\n  Check DATABASE_URL.\n`);
     }
