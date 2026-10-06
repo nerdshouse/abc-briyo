@@ -395,3 +395,5 @@ html.scroll-locked .drawer-scrim { touch-action: none; }
 .hr-confirm p { margin: 0 0 8px; }
 .hr-confirm .input { width: 100%; padding-left: 10px; background: var(--surface); }
 .btn.danger { background: var(--error, #D92D20); border-color: var(--error, #D92D20); color: #fff; }
+.alert.hr-ok { color: var(--text); background: var(--surface); }
+.alert.hr-ok .lucide { color: var(--success); }

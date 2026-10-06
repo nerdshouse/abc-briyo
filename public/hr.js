@@ -6,9 +6,11 @@
  * Every number and permission comes from /api/hr; the server checks again.
  */
 import {
-  $, $$, esc, count, icon, renderIcons, setTimezone, dateTime, relative, initShell, pageFetch,
+  $, $$, esc, count, icon, renderIcons, relative, initShell, pageFetch,
   pageSignal, onQueryChange,
 } from './ui/components.js';
+// Every HR time is shown in IST (Asia/Kolkata), whatever the board's timezone or the viewer's computer.
+import { istDateTime } from './ui/ist.js';
 
 const fetch = pageFetch();
 
@@ -171,7 +173,7 @@ function renderJobs() {
       <td>${tag(JOB_STATUS, j.status)}</td>
       <td class="r num"><a class="linkish" href="/hr/candidates?job=${j.id}" data-stop>${cands(j)}</a></td>
       <td>${esc([j.location, MODE[j.work_mode]].filter(Boolean).join(' · ') || '—')}</td>
-      <td><span title="${esc(dateTime(j.updated_at))}">${esc(relative(j.updated_at))}</span>${j.updated_by ? `<span class="cell-sub muted">${esc(j.updated_by)}</span>` : ''}</td>
+      <td><span title="${esc(istDateTime(j.updated_at))}">${esc(relative(j.updated_at))}</span>${j.updated_by ? `<span class="cell-sub muted">${esc(j.updated_by)}</span>` : ''}</td>
     </tr>`).join('');
   $('#clist').innerHTML = rows.map((j) => `
     <li class="oitem" data-job="${j.id}" tabindex="0">
@@ -209,7 +211,7 @@ function renderApps() {
       <td><span class="cell-main" style="font-weight:500">${esc(a.full_name)}</span><span class="cell-sub muted">${esc(a.email)}</span></td>
       <td><span class="cell-text">${esc(a.job_title)}</span>${a.location ? `<span class="cell-sub muted">${esc(a.location)}</span>` : ''}</td>
       <td>${tag(APP_STATUS, a.status)}</td>
-      <td><span title="${esc(dateTime(a.applied_at))}">${esc(relative(a.applied_at))}</span></td>
+      <td><span title="${esc(istDateTime(a.applied_at))}">${esc(relative(a.applied_at))}</span></td>
       <td>${a.has_resume ? `${icon('file-text', 'inline-ico')} On file` : `<span class="muted-cell">${a.resume_state === 'removing' ? 'Removal pending' : 'Removed'}</span>`}</td>
     </tr>`).join('');
   $('#clist').innerHTML = rows.map((a) => `
@@ -299,6 +301,53 @@ const CONFIRM = {
   archive: 'Archive this job? Its public page disappears. Candidates and history are kept.',
   restore: 'Restore this job as a private draft?',
 };
+
+/** When things happened to this job, in IST. */
+function jobHistoryBlock(j) {
+  if (!j) return '';
+  const row = (label, at, by) => (at ? `<div class="hr-kv"><span>${esc(label)}</span><span>${esc(istDateTime(at))}${by ? ` <span class="soft">· ${esc(by)}</span>` : ''}</span></div>` : '');
+  return `<section class="dsec"><h3 class="dsec-title">History</h3>
+    ${row('Created', j.created_at, j.created_by)}${row('Last updated', j.updated_at, j.updated_by)}${row('Published', j.published_at)}${row('Closed', j.closed_at)}${row('Archived', j.archived_at)}</section>`;
+}
+
+/**
+ * Permanent deletion, for jobs nobody has applied to. The server checks the
+ * permission, the applications rule and the typed title again.
+ */
+function deleteBlock(j) {
+  if (!j || !canManage()) return '';
+  const cc = state.jobs.find((x) => x.id === j.id);
+  const hasApps = cc ? (cc.candidate_count + cc.incomplete_count) > 0 : false;
+  return `<section class="dsec hr-danger"><h3 class="dsec-title">Delete job</h3>
+    ${hasApps ? '<p class="soft">This job cannot be permanently deleted because it has applications. Close or archive the job instead.</p>'
+      : `<p class="soft">Removes the job and its public link for good. Only possible while nobody has applied.</p>
+    <button class="btn" type="button" id="jobDelete">${icon('trash-2')}Delete job…</button>
+    <div class="hr-confirm" id="jobDeleteConfirm" hidden>
+      <p><b>Delete this job permanently?</b> This cannot be undone. Type the job title to confirm:</p>
+      <p class="mono">${esc(j.title)}</p>
+      <input class="input" id="jobDeleteTitle" autocomplete="off" aria-label="Type the job title to confirm deletion" />
+      <div class="form-actions"><button class="btn" type="button" id="jobDeleteCancel">Cancel</button>
+        <button class="btn danger" type="button" id="jobDeleteYes" disabled>Delete permanently</button></div>
+      <div id="jobDeleteErr"></div></div>`}</section>`;
+}
+
+async function deleteJob() {
+  const j = state.job;
+  $('#jobDeleteYes').disabled = true;
+  saved('Deleting…', 'saved pending');
+  try {
+    const out = await api(`/api/hr/jobs/${j.id}`, { method: 'DELETE', body: JSON.stringify({ version: j.version, confirm_title: $('#jobDeleteTitle').value }) });
+    state.dirty = false;
+    closeDrawer({ force: true });
+    $('#alerts').innerHTML = `<div class="alert ok hr-ok">${icon('check')}<span>Deleted “${esc(out.deleted.title)}” on ${esc(istDateTime(out.deleted.at))}.</span></div>`;
+    renderIcons();
+    await loadJobs(); renderJobs();
+  } catch (err) {
+    saved('Not deleted', 'saved failed');
+    $('#jobDeleteErr').innerHTML = `<div class="form-error">${conflictNote(err)}</div>`;
+    $('#jobDeleteYes').disabled = $('#jobDeleteTitle').value.trim() !== j.title.trim();
+  }
+}
 
 function publicLinkBlock(j) {
   if (!j) return '';
@@ -396,7 +445,7 @@ function renderJob() {
     ${cc ? `<a class="btn" href="/hr/candidates?job=${j.id}">${icon('users')}Candidates</a>` : ''}</div>` : '';
   // Unsaved edits survive a rebuild (e.g. publishing from the Preview tab): read them first, put them back after.
   const pending = state.dirty && $('#jobForm') ? readJobForm() : null;
-  $('#dBody').innerHTML = `${actions}<div class="dsec hr-tabbar">${tabs}</div><div id="jobErr"></div>${publicLinkBlock(j)}${jobForm(pending ? { ...j, ...pending } : j)}<div id="previewPane" hidden></div>`;
+  $('#dBody').innerHTML = `${actions}<div class="dsec hr-tabbar">${tabs}</div><div id="jobErr"></div>${publicLinkBlock(j)}${jobForm(pending ? { ...j, ...pending } : j)}<div id="previewPane" hidden></div>${jobHistoryBlock(j)}${deleteBlock(j)}`;
   showTab();
   $('#dButtons').innerHTML = canManage() ? `<button class="btn" type="button" data-close>${isNew ? 'Cancel' : 'Close'}</button>
     <button class="btn primary" type="button" id="jobSave">${isNew ? 'Create draft' : 'Save changes'}</button>` : '<button class="btn" type="button" data-close>Close</button>';
@@ -482,7 +531,7 @@ const sizeText = (b) => (b >= 1048576 ? `${(b / 1048576).toFixed(1)} MB` : `${Ma
 function renderApp() {
   const { application: a, history, notes, events, other_applications: others } = state.app;
   $('#dTitle').textContent = a.full_name;
-  $('#dSub').innerHTML = `${esc(a.job_title)} · applied ${esc(dateTime(a.applied_at))}`;
+  $('#dSub').innerHTML = `${esc(a.job_title)} · applied ${esc(istDateTime(a.applied_at))}`;
   const ans = a.answers || {};
   const statusCtl = canManage() ? `<section class="dsec"><h3 class="dsec-title">Status</h3>
     <div class="hr-status"><select class="select" id="appStatus" aria-label="Status">${state.meta.applicationStatuses.map((s) => opt(s, APP_STATUS[s][1], a.status === s)).join('')}</select>
@@ -491,7 +540,7 @@ function renderApp() {
     : `<section class="dsec"><h3 class="dsec-title">Status</h3>${tag(APP_STATUS, a.status)}</section>`;
   const resume = a.has_resume
     ? `<div class="hr-file">${icon('file-text')}<div style="min-width:0"><div class="cell-main">${esc(a.resume_filename || 'Resume')}</div>
-        <div class="cell-sub muted">${esc((a.resume_mime || '').includes('pdf') ? 'PDF' : 'Word document')}${a.resume_size ? ` · ${sizeText(a.resume_size)}` : ''} · ${esc(dateTime(a.resume_uploaded_at))}</div></div>
+        <div class="cell-sub muted">${esc((a.resume_mime || '').includes('pdf') ? 'PDF' : 'Word document')}${a.resume_size ? ` · ${sizeText(a.resume_size)}` : ''} · ${esc(istDateTime(a.resume_uploaded_at))}</div></div>
         <a class="btn" href="/api/hr/applications/${a.id}/resume" download data-full-nav>${icon('download')}Download</a>
         ${canManage() ? `<button class="btn" type="button" id="resumeRemove" title="Remove resume">${icon('trash-2')}<span class="sr-only">Remove resume</span></button>` : ''}</div>
       <div class="hr-confirm" id="resumeConfirm" hidden>
@@ -504,7 +553,7 @@ function renderApp() {
       ? `<div class="alert warn">${icon('triangle-alert')}<span>Removal not finished. The file may already be deleted; it is not available.</span>
           ${canManage() ? '<button class="alert-link" type="button" id="resumeRetry">Finish removal</button>' : ''}</div><div id="resumeErr"></div>`
     : (() => { const ev = [...events].reverse().find((e) => e.event_type === 'resume_removed');
-      return `<p class="soft">${ev ? `Removed by ${esc(ev.actor || '—')} on ${esc(dateTime(ev.at))}${ev.metadata?.reason ? ` — ${esc(ev.metadata.reason)}` : ''}.` : 'No resume on file.'}</p>`; })();
+      return `<p class="soft">${ev ? `Removed by ${esc(ev.actor || '—')} on ${esc(istDateTime(ev.at))}${ev.metadata?.reason ? ` — ${esc(ev.metadata.reason)}` : ''}.` : 'No resume on file.'}</p>`; })();
   $('#dBody').innerHTML = `
     ${statusCtl}
     <section class="dsec"><h3 class="dsec-title">Resume</h3>${resume}</section>
@@ -516,18 +565,18 @@ function renderApp() {
       ${kv('Notice period', esc(ans.notice_period))}${kv('Expected pay', esc(ans.expected_compensation))}${kv('Work authorization', esc(ans.work_authorization))}
       ${ans.relevant_experience ? `<div class="hr-answer"><span>Relevant experience</span><p>${esc(ans.relevant_experience)}</p></div>` : ''}
       ${a.cover_letter ? `<div class="hr-answer"><span>Cover letter</span><p>${esc(a.cover_letter)}</p></div>` : ''}
-      ${kv('Consent', `${esc(dateTime(a.consent_at))} <span class="soft">(${esc(a.consent_text_version)})</span>`)}</section>
+      ${kv('Consent', `${esc(istDateTime(a.consent_at))} <span class="soft">(${esc(a.consent_text_version)})</span>`)}</section>
     ${others.length ? `<section class="dsec"><h3 class="dsec-title">Other applications</h3>${others.map((o) => `<div class="hr-kv"><span><a class="linkish" href="/hr/candidates?app=${o.id}" data-app-link="${o.id}">${esc(o.job_title)}</a></span><span>${tag(APP_STATUS, o.status)}</span></div>`).join('')}</section>` : ''}
     <section class="dsec"><h3 class="dsec-title">Notes <span>${count(notes.length)}</span></h3>
       ${canManage() ? `<div class="hr-note-add"><textarea class="input" id="noteBody" rows="2" maxlength="4000" placeholder="Add an internal note. Candidates never see notes." aria-label="New note"></textarea>
         <button class="btn" type="button" id="noteSave" disabled>Add note</button></div><div id="noteErr"></div>` : ''}
-      ${notes.length ? `<ul class="hr-notes">${notes.map((n) => `<li><p>${esc(n.body)}</p><span class="soft">${esc(n.actor || '—')} · ${esc(dateTime(n.at))}</span></li>`).join('')}</ul>` : '<p class="soft">No notes yet.</p>'}</section>
+      ${notes.length ? `<ul class="hr-notes">${notes.map((n) => `<li><p>${esc(n.body)}</p><span class="soft">${esc(n.actor || '—')} · ${esc(istDateTime(n.at))}</span></li>`).join('')}</ul>` : '<p class="soft">No notes yet.</p>'}</section>
     <section class="dsec"><h3 class="dsec-title">Status history</h3>
       ${history.length ? `<ul class="hr-timeline">${history.map((h) => `<li>${tag(APP_STATUS, h.from_status)} → ${tag(APP_STATUS, h.to_status)}
-        <span class="soft">${esc(h.actor || '—')} · ${esc(dateTime(h.at))}</span>${h.note ? `<p>${esc(h.note)}</p>` : ''}</li>`).join('')}</ul>` : '<p class="soft">Still at Applied. Changes appear here with who made them.</p>'}</section>
+        <span class="soft">${esc(h.actor || '—')} · ${esc(istDateTime(h.at))}</span>${h.note ? `<p>${esc(h.note)}</p>` : ''}</li>`).join('')}</ul>` : '<p class="soft">Still at Applied. Changes appear here with who made them.</p>'}</section>
     <section class="dsec"><h3 class="dsec-title">Activity</h3>
       <ul class="hr-timeline">${events.map((e) => `<li>${esc(EVENT[e.event_type] || e.event_type)}${(e.event_type === 'resume_removed' || e.event_type === 'resume_removal_started') && e.metadata?.reason ? ` <span class="soft">— ${esc(e.metadata.reason)}</span>` : ''}${e.event_type === 'candidate_profile_updated' && e.metadata?.changed ? ` <span class="soft">(${esc(Object.keys(e.metadata.changed).join(', ').replace(/_/g, ' '))})</span>` : ''}
-        <span class="soft">${esc(e.actor || 'Candidate')} · ${esc(dateTime(e.at))}</span></li>`).join('')}</ul></section>`;
+        <span class="soft">${esc(e.actor || 'Candidate')} · ${esc(istDateTime(e.at))}</span></li>`).join('')}</ul></section>`;
   renderIcons();
 }
 
@@ -619,6 +668,7 @@ function bind() {
   }
 
   $('#dBody').addEventListener('input', (e) => {
+    if (e.target.id === 'jobDeleteTitle') { $('#jobDeleteYes').disabled = e.target.value.trim() !== state.job.title.trim(); return; }
     if (e.target.closest('#jobForm')) state.dirty = true;
     if (e.target.id === 'noteBody') $('#noteSave').disabled = !e.target.value.trim();
   });
@@ -631,6 +681,9 @@ function bind() {
     if (!t) return;
     if (t.dataset.tab) { state.jobTab = t.dataset.tab; showTab(); return; }
     if (t.dataset.action) { jobAction(t.dataset.action); return; }
+    if (t.id === 'jobDelete') { $('#jobDeleteConfirm').hidden = false; $('#jobDeleteTitle').focus(); return; }
+    if (t.id === 'jobDeleteCancel') { $('#jobDeleteConfirm').hidden = true; $('#jobDeleteTitle').value = ''; $('#jobDeleteYes').disabled = true; return; }
+    if (t.id === 'jobDeleteYes') { deleteJob(); return; }
     if (t.id === 'appStatusSave') { saveStatus(); return; }
     if (t.id === 'noteSave') { saveNote(); return; }
     if (t.id === 'resumeRemove') { $('#resumeConfirm').hidden = false; $('#resumeReason').focus(); return; }
@@ -673,7 +726,6 @@ function openFromUrl() {
   try {
     const [me, meta] = await Promise.all([api('/auth/me'), api('/api/hr/meta')]);
     state.me = me; state.meta = meta;
-    setTimezone(meta.timezone);
     initShell(me);
     readUrl();
     if (state.view === 'candidates') await loadJobs().catch(() => {});

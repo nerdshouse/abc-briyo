@@ -47,8 +47,9 @@ import os from 'node:os';
 import path from 'node:path';
 import fsp from 'node:fs/promises';
 import http from 'node:http';
-import { ensureHrSchema, purgeTestHr, slugify, normalizePhone, removeResume, retryPendingRemovals } from '../lib/hr.js';
+import { ensureHrSchema, purgeTestHr, slugify, normalizePhone, removeResume, retryPendingRemovals, istDayKey, HR_TIMEZONE } from '../lib/hr.js';
 import { jobPostingLd } from '../lib/careers-pages.js';
+import { istDateTime, istDate, istTime, istDayKey as uiIstDayKey } from '../public/ui/ist.js';
 import { issueFormToken, verifyTurnstile, normalizeHost, isCareersRequest } from '../lib/careers.js';
 import net from 'node:net';
 import {
@@ -3536,6 +3537,74 @@ await step('hr: status changes with history, notes, search and filters', async (
   const ev = (await getPool().query('SELECT event_type FROM hr_events WHERE application_id = $1', [id])).rows.map((x) => x.event_type);
   for (const t of ['application_started', 'resume_uploaded', 'application_submitted', 'status_changed', 'note_added']) if (!ev.includes(t)) throw new Error(`no ${t}`);
   return 'applied→screening (note)→interview with history + actor; stale 409; unknown 400; non-HR 403; notes; search by name/email/phone; status + job filters; events';
+});
+
+await step('hr: IST — UTC instants shown and bucketed as Asia/Kolkata days and times', async () => {
+  const bad = [];
+  // 20:00 UTC on 6 Oct is 01:30 IST on 7 Oct.
+  const t = '2026-10-06T20:00:00.000Z';
+  if (istDateTime(t) !== '7 Oct 2026, 1:30 am IST') bad.push(`istDateTime ${JSON.stringify(istDateTime(t))}`);
+  if (istDate(t) !== '7 Oct 2026' || istTime(t) !== '1:30 am' || uiIstDayKey(t) !== '2026-10-07' || istDayKey(t) !== '2026-10-07') bad.push('date/time/day key');
+  if (istDateTime('2026-10-06T06:29:00Z') !== '6 Oct 2026, 11:59 am IST') bad.push('morning UTC');
+  if (istDateTime('2026-12-31T18:30:00Z') !== '1 Jan 2027, 12:00 am IST') bad.push('year boundary');
+  if (istDateTime(null) !== '—' || istDateTime('nonsense') !== '—') bad.push('empty values');
+  if (HR_TIMEZONE !== 'Asia/Kolkata' || (await internal('mgr', 'GET', '/api/hr/meta')).body.timezone !== 'Asia/Kolkata') bad.push('meta timezone');
+  // JobPosting datePosted is the IST day.
+  if (jobPostingLd({ ...HRS.job, published_at: t, sections: {} }).datePosted !== '2026-10-07') bad.push('datePosted');
+  // The applied-date filter uses IST days, not the database session's.
+  const id = HRS.app.id;
+  const { rows: [orig] } = await getPool().query('SELECT applied_at FROM hr_applications WHERE id = $1', [id]);
+  await getPool().query('UPDATE hr_applications SET applied_at = $2 WHERE id = $1', [id, t]);
+  const has = async (qs) => (await internal('mgr', 'GET', `/api/hr/applications?${qs}`)).body.applications.some((a) => a.id === id);
+  const r = [await has('from=2026-10-07&to=2026-10-07'), await has('from=2026-10-06&to=2026-10-06'), await has('to=2026-10-06'), await has('from=2026-10-08')];
+  await getPool().query('UPDATE hr_applications SET applied_at = $2 WHERE id = $1', [id, orig.applied_at]);
+  if (r.join() !== 'true,false,false,false') bad.push(`filter ${r}`);
+  // The HR page has no other time formatter.
+  const src = await fsp.readFile(new URL('../public/hr.js', import.meta.url), 'utf8');
+  if (/\bsetTimezone\b|[^t]dateTime\(|toLocale|toISOString\(\)\.slice/.test(src)) bad.push('hr.js formats time another way');
+  if (bad.length) throw new Error(bad.join(' | '));
+  return '20:00Z → "7 Oct 2026, 1:30 am IST"; 06:29Z → 11:59 am; 31 Dec 18:30Z → 1 Jan 2027; day keys, meta, datePosted in IST; applied 01:30 IST on the 7th found under 7 Oct, not 6 Oct; hr.js uses only the IST formatter';
+});
+
+await step('hr: delete job — HR manager only, typed title, never with applications; public routes and feed gone; audit kept', async () => {
+  const pool = getPool();
+  const snap = async () => (await pool.query(`SELECT md5(string_agg(a.id||':'||a.job_id||':'||a.candidate_id||':'||a.status||':'||coalesce(a.resume_state,''), ',' ORDER BY a.id))
+    || (SELECT md5(string_agg(id||email||full_name, ',' ORDER BY id)) FROM hr_candidates)
+    || (SELECT count(*) FROM hr_application_notes) || (SELECT count(*) FROM hr_application_status_history) h FROM hr_applications a`)).rows[0].h;
+  const before = await snap();
+  // A published job with no applications.
+  let j = (await internal('mgr', 'POST', '/api/hr/jobs', { title: `${HRT} Delete Me`, employment_type: 'contract', work_mode: 'remote', summary: 'Temporary.' })).body.job;
+  j = (await internal('mgr', 'POST', `/api/hr/jobs/${j.id}/publish`, { version: j.version })).body.job;
+  if ((await careers('GET', `/${j.slug}/apply`)).status !== 200) throw new Error('fixture not public');
+  const del = (who, body) => internal(who, 'DELETE', `/api/hr/jobs/${j.id}`, body);
+  const bad = [];
+  if ((await del('nonHr', { version: j.version, confirm_title: j.title })).status !== 403) bad.push('non-HR');
+  if ((await del(null, { version: j.version, confirm_title: j.title })).status !== 401) bad.push('anonymous');
+  const ch = await careers('DELETE', `/api/hr/jobs/${j.id}`, { cookieAs: 'adm' });
+  if (ch.status !== 404) bad.push(`careers host ${ch.status} ${JSON.stringify(ch.body).slice(0, 120)}`);
+  if ((await del('mgr', { version: j.version, confirm_title: 'Delete Me' })).status !== 400) bad.push('wrong title');
+  if ((await del('mgr', { version: j.version - 1, confirm_title: j.title })).status !== 409) bad.push('stale version');
+  // A job with applications: refused, nothing touched.
+  const withApps = (await internal('mgr', 'GET', `/api/hr/jobs/${HRS.job.id}`)).body.job;
+  const refused = await internal('mgr', 'DELETE', `/api/hr/jobs/${withApps.id}`, { version: withApps.version, confirm_title: withApps.title });
+  if (refused.status !== 409 || !refused.body.hasApplications || refused.body.error !== 'This job cannot be permanently deleted because it has applications. Close or archive the job instead.') bad.push(`with applications: ${refused.status}`);
+  if ((await internal('mgr', 'GET', `/api/hr/jobs/${withApps.id}`)).status !== 200) bad.push('job with applications gone');
+  if (bad.length) throw new Error(bad.join(' | '));
+  // Delete.
+  const ok = await del('mgr', { version: j.version, confirm_title: `  ${j.title} ` });
+  if (ok.status !== 200 || ok.body.deleted.id !== j.id || ok.body.deleted.title !== j.title || !ok.body.deleted.at) throw new Error(`delete ${ok.status} ${JSON.stringify(ok.body)}`);
+  if ((await internal('mgr', 'GET', '/api/hr/jobs')).body.jobs.some((x) => x.id === j.id) || (await internal('mgr', 'GET', `/api/hr/jobs/${j.id}`)).status !== 404) bad.push('still in HR');
+  for (const p of [`/${j.slug}/apply`, `/${j.slug}`, `/jobs/${j.public_id}`]) if ((await careers('GET', p)).status !== 404) bad.push(`public ${p}`);
+  if ((await careers('GET', '/jobs')).body.jobs.some((x) => x.public_id === j.public_id) || (await careers('GET', '/sitemap.xml')).body.includes(j.slug) || (await careers('GET', '/')).body.includes(j.title)) bad.push('feed/sitemap/home');
+  if ((await pool.query('SELECT count(*)::int n FROM hr_job_slugs WHERE slug = $1', [j.slug])).rows[0].n) bad.push('slug left');
+  const ev = (await pool.query(`SELECT event_type, actor, at, job_id, metadata FROM hr_events WHERE metadata->>'job_id' = $1 ORDER BY id`, [String(j.id)])).rows;
+  const d = ev.find((e) => e.event_type === 'job_deleted');
+  if (!d || d.actor !== 'HR mgr' || !d.at || d.metadata.title !== j.title || d.metadata.public_id !== j.public_id || d.job_id !== null) bad.push(`audit ${JSON.stringify(d)}`);
+  if (!ev.some((e) => e.event_type === 'job_created') || !ev.some((e) => e.event_type === 'job_published')) bad.push('earlier events lost');
+  if ((await del('mgr', { version: j.version, confirm_title: j.title })).status !== 404) bad.push('second delete');
+  if (await snap() !== before) bad.push('candidate/application data changed');
+  if (bad.length) throw new Error(bad.join(' | '));
+  return `non-HR 403, anon 401, careers host 404, wrong title 400, stale 409; job with applications 409 with the exact message, kept; delete → gone from HR list/detail, public page, short link, JSON, feed, sitemap, home; slug freed; job_deleted event (id, title, public id, actor, time ${istDateTime(d.at)}); earlier events kept; candidates/applications/notes/history unchanged`;
 });
 
 await step('hr: remove resume — state machine across storage + database: normal, storage failure, finalize failure + retry, idempotent', async () => {
