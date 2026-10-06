@@ -3761,6 +3761,18 @@ await step('careers host detection behind a proxy — the Host header decides, n
     const r = await careers('GET', path_, { headers: { host, ...headers } });
     if (!check(r)) bad.push(`${label}: ${r.status} ${r.headers.get('location') || ''}`);
   }
+  // Health check on the careers host: up, the time, nothing else, never cached.
+  for (const host of ['careers.test', 'careers.test:443']) {
+    const h = await careers('GET', '/healthz', { headers: { host, ...xfh('abc.briyo.xyz') } });
+    if (h.status !== 200 || h.body?.ok !== true || Object.keys(h.body).join() !== 'ok,ts' || h.headers.get('cache-control') !== 'no-store' || h.headers.get('set-cookie')) bad.push(`careers healthz (${host}): ${h.status} ${JSON.stringify(h.body)}`);
+  }
+  for (const p of ['/login', '/dashboard', '/api/orders', '/auth/me']) {
+    const r = await careers('GET', p, { headers: { host: 'careers.test' } });
+    if (r.status !== 404 || r.headers.get('location')) bad.push(`careers ${p} (no session): ${r.status}`);
+  }
+  // Internal host: its own /healthz unchanged.
+  const ih = await careers('GET', '/healthz', { headers: { host: '127.0.0.1', ...xfh('careers.test') } });
+  if (ih.status !== 200 || ih.body?.ok !== true) bad.push(`internal healthz: ${ih.status}`);
   for (const p of ['/api/orders', '/api/hr/jobs', '/auth/me']) {
     const r = await careers('GET', p, { headers: { host: 'careers.test:443', ...xfh('abc.briyo.xyz') }, cookieAs: 'adm' });
     if (r.status !== 404) bad.push(`careers ${p}: ${r.status}`);
@@ -3770,7 +3782,7 @@ await step('careers host detection behind a proxy — the Host header decides, n
   const app = await careers('GET', '/api/hr/jobs', { headers: { host: '127.0.0.1', ...xfh('careers.test') }, cookieAs: 'adm' });
   if (app.status !== 200 || !Array.isArray(app.body.jobs)) bad.push(`internal API with forwarded careers host: ${app.status}`);
   if (bad.length) throw new Error(bad.join(' | '));
-  return 'unit: 10 Host forms + forwarded-host both ways; server: careers with :443 and a different forwarded host → careers (home 200, /login /dashboard 404, APIs 404 with an admin session); internal Host + forwarded careers → internal app (login redirect, API 200, no careers feed)';
+  return 'unit: 10 Host forms + forwarded-host both ways; careers /healthz 200 {ok,ts} no-store (with :443); careers /login /dashboard /api/orders /auth/me 404 without a session; internal /healthz unchanged; server: careers with :443 and a different forwarded host → careers (home 200, /login /dashboard 404, APIs 404 with an admin session); internal Host + forwarded careers → internal app (login redirect, API 200, no careers feed)';
 });
 
 await step('hr cleanup', async () => {
