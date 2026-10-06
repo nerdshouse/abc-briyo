@@ -31,7 +31,10 @@ const NO_SHIPMENT = '<span class="status none" title="Not in any shipment yet"><
 const shipIndicator = (o) => (o.shipment_id ? indicator(o.shipment_status) : NO_SHIPMENT);
 // Only an order with no shipment, not cancelled, can be ticked for a new one.
 const pickable = (o) => !o.shipment_id && o.order_status !== 'cancelled';
-const pickBox = (o) => (pickable(o) ? `<label class="pick" title="Choose for a shipment"><input type="checkbox" data-pick="${o.id}"${state.sel.has(o.id) ? ' checked' : ''} aria-label="Choose order ${esc(o.source_order_id)}" /></label>` : '');
+// A Logistics viewer sees every order and shipment detail but no controls that
+// change them (the server refuses those anyway). Operators and managers: unchanged.
+const canEdit = () => Boolean(state.me?.caps?.includes('logistics.edit'));
+const pickBox = (o) => (canEdit() && pickable(o) ? `<label class="pick" title="Choose for a shipment"><input type="checkbox" data-pick="${o.id}"${state.sel.has(o.id) ? ' checked' : ''} aria-label="Choose order ${esc(o.source_order_id)}" /></label>` : '');
 
 // The usual next move from each shipment state. Anything else is in the select.
 const NEXT_STEPS = {
@@ -365,7 +368,7 @@ function docRows(o, list) {
         <div class="doc-meta">${list.some((x) => x.document_type !== d.document_type) ? `${esc(label(d.document_type))} · ` : ''}${esc(bytes(d.file_size))} · ${esc(d.uploaded_by || 'Someone')}, ${esc(dateTime(d.uploaded_at))}
           ${d.removed_at ? ` · removed by ${esc(d.removed_by || 'someone')}` : ''}</div>
       </div>
-      ${d.removed_at ? '' : `<button class="icon-btn bare" type="button" data-remove-doc="${d.id}" data-doc-order="${d.order_id}" title="Remove" aria-label="Remove ${esc(d.original_filename)}">${icon('trash-2')}</button>`}
+      ${d.removed_at || !canEdit() ? '' : `<button class="icon-btn bare" type="button" data-remove-doc=""${d.id}" data-doc-order="${d.order_id}" title="Remove" aria-label="Remove ${esc(d.original_filename)}">${icon('trash-2')}</button>`}
     </li>`).join('')}</ul>`;
 }
 
@@ -377,7 +380,7 @@ function proofSection(o, documents) {
   const removedPhotos = documents.filter((d) => d.removed_at && d.document_type === 'dispatch_product_image');
   const ofType = (t) => documents.filter((d) => d.document_type === t);
   const others = documents.filter((d) => !['dispatch_product_image', 'tax_invoice', 'courier_receipt'].includes(d.document_type));
-  const canUpload = !m.storage.error;
+  const canUpload = !m.storage.error && canEdit();
   const group = (title, list) => `<div class="proof-group"><div class="proof-h">${esc(title)}</div>
     ${list.length ? docRows(o, list) : '<p class="muted proof-none">Not uploaded</p>'}</div>`;
   return `
@@ -387,7 +390,7 @@ function proofSection(o, documents) {
         <figure class="thumb">
           <a href="${docUrl(o, d)}" target="_blank" rel="noopener" title="${esc(d.original_filename)} · ${esc(d.uploaded_by || 'Someone')}, ${esc(dateTime(d.uploaded_at))}">
             <img src="${docUrl(o, d)}" alt="Dispatch photo ${esc(d.original_filename)}" loading="lazy" /></a>
-          <button class="thumb-x" type="button" data-remove-doc="${d.id}" data-doc-order="${d.order_id}" title="Remove photo" aria-label="Remove ${esc(d.original_filename)}">${icon('x')}</button>
+          ${canEdit() ? `<button class="thumb-x" type="button" data-remove-doc="${d.id}" data-doc-order="${d.order_id}" title="Remove photo" aria-label="Remove ${esc(d.original_filename)}">${icon('x')}</button>` : ''}
         </figure>`).join('')}</div>` : '<p class="muted proof-none">No dispatch photos yet.</p>'}
       ${canUpload ? `<label class="btn add-photos">${icon('camera')}Add photos
         <input type="file" id="dPhotos" multiple accept="${esc(acceptFor('dispatch_product_image'))}" hidden /></label>
@@ -397,7 +400,7 @@ function proofSection(o, documents) {
     ${group('Tax Invoice', ofType('tax_invoice'))}
     ${group('Courier Receipt', ofType('courier_receipt'))}
     ${others.length ? group('Other documents', others) : ''}
-    ${m.storage.error ? `<div class="storage-note">${esc(m.storage.error)}</div>` : `<form class="upload" id="uploadForm">
+    ${!canEdit() ? '' : m.storage.error ? `<div class="storage-note">${esc(m.storage.error)}</div>` : `<form class="upload" id="uploadForm">
       <select class="select" name="type" aria-label="Document type">${m.documentTypes.filter((t) => t !== 'dispatch_product_image')
         .map((t) => opt(t, label(t), t === (ofType('tax_invoice').some((d) => !d.removed_at) ? 'courier_receipt' : 'tax_invoice'))).join('')}</select>
       <input type="file" name="file" accept="${esc(acceptFor('tax_invoice'))}" aria-label="File" />
@@ -415,7 +418,7 @@ function proofSection(o, documents) {
  */
 function sharedBlock(o, ship) {
   const members = state.detail.members?.[ship.id] || [];
-  const canAdd = o.channel === 'amazon';
+  const canAdd = o.channel === 'amazon' && canEdit();
   if (members.length < 2 && !canAdd) return '';
   const total = members.reduce((sum, x) => sum + (x.order_value || 0), 0);
   const unknown = members.filter((x) => x.order_value === null).length;
@@ -430,7 +433,7 @@ function sharedBlock(o, ship) {
           <span class="soft">${esc(day(x.order_date))}</span>
           <span class="num">${esc(amount(x.order_value))}</span>
           ${x.order_status === 'cancelled' ? '<span class="mini-tag warn">Cancelled</span>' : ''}
-          ${x.role === 'member' ? `<button type="button" class="icon-btn bare" data-detach="${x.id}" title="Take out of this shipment" aria-label="Take order ${esc(x.source_order_id)} out of this shipment">${icon('x')}</button>` : ''}
+          ${x.role === 'member' && canEdit() ? `<button type="button" class="icon-btn bare" data-detach=""${x.id}" title="Take out of this shipment" aria-label="Take order ${esc(x.source_order_id)} out of this shipment">${icon('x')}</button>` : ''}
         </li>`).join('')}</ul>
       ${state.detail.sharedWith ? '<p class="soft shared-note">Shared shipment: courier, AWB, status and photos apply to every order in it.</p>' : ''}` : ''}
     ${canAdd ? `<button type="button" class="btn" id="dAttachOpen">${icon('plus')}Add orders to this shipment</button>
@@ -491,7 +494,13 @@ function renderDrawer() {
       ${shipments.length > 1 ? `<div class="ship-tabs" role="tablist" aria-label="Shipments">${shipments.map((x, i) => `
         <button type="button" role="tab" class="pill${x.id === ship.id ? ' on' : ''}" data-ship="${x.id}" aria-selected="${x.id === ship.id}">
           ${i + 1} · ${esc(x.tracking_id || 'no AWB')}</button>`).join('')}</div>` : ''}
-      <form id="shipForm" class="form-grid" novalidate>
+      ${!canEdit() ? `<dl class="kv">
+        <dt>Courier</dt><dd>${esc(courier?.name || '—')}</dd>
+        <dt>AWB / Tracking ID</dt><dd class="mono">${esc(ship.tracking_id || '—')}</dd>
+        <dt>Tracking Link</dt><dd>${ship.tracking_url ? `<a class="track-link" href="${esc(ship.tracking_url)}" target="_blank" rel="noopener noreferrer">Open tracking</a>` : '—'}</dd>
+        <dt>Shipment Status</dt><dd>${indicator(ship.shipment_status)}</dd>
+        <dt>Expected Delivery</dt><dd>${esc(ship.expected_delivery_date ? day(ship.expected_delivery_date) : '—')}</dd>
+      </dl>` : `<form id="shipForm" class="form-grid" novalidate>
         <label class="fld"><span>Courier</span>
           <select class="select" name="courier_partner_id">${opt('', 'Choose courier', !ship.courier_partner_id)}
             ${m.couriers.filter((c) => c.active || c.id === ship.courier_partner_id).map((c) => opt(c.id, c.name, c.id === ship.courier_partner_id)).join('')}
@@ -505,15 +514,15 @@ function renderDrawer() {
         <label class="fld"><span>Shipment Status</span>
           <select class="select" name="shipment_status">${m.shipmentStatuses.map((s) => opt(s, label(s), s === ship.shipment_status)).join('')}</select></label>
         <label class="fld"><span>Expected Delivery</span><input class="input" type="date" name="expected_delivery_date" value="${esc(ship.expected_delivery_date || '')}" /></label>
-      </form>
+      </form>`}
       <dl class="kv" style="margin-top:12px">
         <dt>Dispatch Date</dt><dd>${ship.dispatch_date ? esc(dateTime(ship.dispatch_date)) : '—'}</dd>
         <dt>Delivered</dt><dd>${ship.delivered_at ? esc(dateTime(ship.delivered_at)) : '—'}</dd>
       </dl>
       <div id="dStock" class="stock-block"></div>
-      <div class="form-actions"><button class="btn primary" type="button" id="dShipSave">Save shipment</button>
-        ${(NEXT_STEPS[ship.shipment_status] || []).map((s) => `<button class="btn" type="button" data-step="${s}">${esc(STEP_TEXT[s])}</button>`).join('')}</div>
-      ${!['dispatched', 'in_transit', 'out_for_delivery', 'delivered', 'delivery_failed', 'rto'].includes(ship.shipment_status)
+      ${canEdit() ? `<div class="form-actions"><button class="btn primary" type="button" id="dShipSave">Save shipment</button>
+        ${(NEXT_STEPS[ship.shipment_status] || []).map((s) => `<button class="btn" type="button" data-step="${s}">${esc(STEP_TEXT[s])}</button>`).join('')}</div>` : ''}
+      ${canEdit() && !['dispatched', 'in_transit', 'out_for_delivery', 'delivered', 'delivery_failed', 'rto'].includes(ship.shipment_status)
         && !proofDocs.some((d) => !d.removed_at && d.document_type === 'dispatch_product_image')
         ? `<p class="photo-needed">${icon('camera')}Add a dispatch product photo (below) before marking it dispatched.</p>` : ''}
     </section>
@@ -615,8 +624,8 @@ function drawerCommon(o, documents, proofDocs, events, notes) {
 
     <section class="dsec">
       <h3 class="dsec-title">Notes</h3>
-      <textarea class="input" id="dNote" placeholder="Add a note — it is saved to the activity and cannot be edited" maxlength="2000"></textarea>
-      <div class="form-actions"><button class="btn" type="button" id="dNoteAdd">Add note</button></div>
+      ${canEdit() ? `<textarea class="input" id="dNote" placeholder="Add a note — it is saved to the activity and cannot be edited" maxlength="2000"></textarea>
+      <div class="form-actions"><button class="btn" type="button" id="dNoteAdd">Add note</button></div>` : (notes.length ? '' : '<p class="muted" style="margin:0">No notes.</p>')}
       ${notes.length ? `<ul class="d-history" style="margin-top:12px">${notes.slice(0, 5).map((n) => `
         <li><span style="min-width:0;white-space:pre-wrap">${esc(n.metadata.note)}</span><span class="d-when">${esc(n.actor || 'Someone')}, ${esc(dateTime(n.at))}</span></li>`).join('')}</ul>` : ''}
     </section>
@@ -637,11 +646,12 @@ function drawerCommon(o, documents, proofDocs, events, notes) {
         <dt>Entered</dt><dd>${esc(o.created_by || 'System')}, ${esc(dateTime(o.created_at))}${o.source === 'amazon_import' ? ' · Amazon import' : ''}</dd>
         ${amazonDetails(o.source_payload?.amazon)}
       </dl>
-      <div class="d-row" style="margin-top:12px">
+      ${canEdit() ? `<div class="d-row" style="margin-top:12px">
         <label class="d-label" for="dOrderStatus">Order status</label>
         <select class="select" id="dOrderStatus">${m.orderStatuses.map((s) => opt(s, label(s), s === o.order_status)).join('')}</select>
       </div>
-      <div class="form-actions"><button class="btn" type="button" id="dEdit">${icon('pencil')}Edit order details</button></div>
+      <div class="form-actions"><button class="btn" type="button" id="dEdit">${icon('pencil')}Edit order details</button></div>`
+        : `<dl class="kv" style="margin-top:10px"><dt>Order Status</dt><dd>${indicator(o.order_status)}</dd></dl>`}
     </details>
 
     <section class="dsec">
@@ -668,7 +678,7 @@ function renderDrawerNoShipment() {
     <section class="dsec">
       <h3 class="dsec-title">Shipment <span class="dsec-meta">${NO_SHIPMENT}</span></h3>
       <p class="imp-note" style="margin:0 0 12px">Nothing has been shipped for this order. When it is packed, create a shipment — several orders can share one parcel and AWB.</p>
-      ${o.order_status === 'cancelled' ? '' : `<div class="form-actions" style="margin-top:0"><button class="btn primary" type="button" id="dShipNew">${icon('package-plus')}Create shipment</button>
+      ${o.order_status === 'cancelled' || !canEdit() ? '' : `<div class="form-actions" style="margin-top:0"><button class="btn primary" type="button" id="dShipNew">${icon('package-plus')}Create shipment</button>
         <button class="btn" type="button" id="dShipPick">${icon('list-checks')}Choose more orders for it</button></div>`}
     </section>
     ${drawerCommon(o, documents, documents, events, notes)}`;
@@ -1320,12 +1330,12 @@ function renderStock() {
     // Set aside for orders that no longer need it (e.g. cancelled): release it.
     host.innerHTML = `<div class="stock-head bad">${icon('triangle-alert')}Stock is reserved but no order in this shipment needs it</div>
       <div class="soft stock-from">${st.stranded_reservations.map((r) => `<span class="mono">${esc(r.batch_number)}</span> × ${count(r.quantity)}`).join(', ')}</div>
-      <div class="form-actions"><button class="btn" type="button" id="dRelease">Release</button></div>`;
+      ${canEdit() ? '<div class="form-actions"><button class="btn" type="button" id="dRelease">Release</button></div>' : ''}`;
     renderIcons();
     return;
   }
   const done = st.state === 'dispatched';
-  const editable = !done && !['dispatched', 'in_transit', 'out_for_delivery', 'delivered', 'delivery_failed', 'rto', 'cancelled'].includes(st.status);
+  const editable = canEdit() && !done && !['dispatched', 'in_transit', 'out_for_delivery', 'delivered', 'delivery_failed', 'rto', 'cancelled'].includes(st.status);
   const head = {
     reserved: `${icon('circle-check')}Stock reserved — ready to dispatch`,
     needs_reservation: `${icon('package-search')}Confirm the batches to reserve stock before dispatch`,
@@ -1725,6 +1735,7 @@ function bind() {
     firstOrders.catch(() => {});
     const [me, meta] = await Promise.all([api('/auth/me'), ordersMeta()]);
     state.meta = meta;
+    state.me = me;
     setTimezone(meta.timezone);
     for (const el of $$('.tz-note')) el.textContent = meta.timezone === 'Asia/Kolkata' ? '(IST)' : `(${meta.timezone})`;
     initShell(me);
