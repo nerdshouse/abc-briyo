@@ -96,7 +96,8 @@
         <div class="page-actions">
           <button class="icon-btn" id="refresh" type="button" title="Refresh" aria-label="Refresh"><i data-lucide="refresh-cw"></i></button>
           <button class="btn" id="places" type="button" data-admin hidden><i data-lucide="warehouse"></i>Warehouses &amp; suppliers</button>
-          <button class="btn" id="newSku" type="button" data-admin hidden><i data-lucide="tag"></i>New SKU</button>
+          <button class="btn" id="importSkus" type="button" data-admin hidden><i data-lucide="file-up"></i>Import master SKUs</button>
+          <button class="btn" id="newSku" type="button" data-admin hidden><i data-lucide="tag"></i>New master SKU</button>
           <button class="btn primary" id="addInventory" type="button" data-admin hidden><i data-lucide="plus"></i>Add Inventory</button>
         </div>
       </div>
@@ -111,7 +112,7 @@
           <div class="board-filters">
             <label class="search">
               <i data-lucide="search"></i>
-              <input class="input" id="q" type="search" autocomplete="off" spellcheck="false" placeholder="SKU, product, batch, ASIN" aria-label="Search stock" />
+              <input class="input" id="q" type="search" autocomplete="off" spellcheck="false" placeholder="Master or platform SKU, product, batch" aria-label="Search stock" />
             </label>
             <select class="select" id="fwarehouse" aria-label="Warehouse"><option value="">All warehouses</option></select>
             <input class="input inv-loc" id="flocation" type="search" placeholder="Location" aria-label="Location" autocomplete="off" />
@@ -133,7 +134,7 @@
           <div class="table-wrap">
             <table class="table inv-table">
               <thead><tr>
-                <th>SKU</th><th>Product</th><th class="r" title="Sellable − reserved">Available to dispatch</th><th class="r">Reserved</th><th>Batch</th>
+                <th>Master SKU</th><th>Product</th><th class="r" title="Sellable − reserved">Available to dispatch</th><th class="r">Reserved</th><th>Batch</th>
                 <th>Expiry</th><th>Location</th><th>Status</th>
               </tr></thead>
               <tbody id="rows"></tbody>

@@ -121,11 +121,14 @@ function render() {
 
   // Unmapped seller SKUs: orders that cannot be dispatched until mapped.
   $('#unmapped').innerHTML = unmapped.length ? `<section class="card unmapped-card${state.view === 'unmapped' ? ' focus' : ''}" id="unmappedCard">
-    <header class="card-head"><h2 class="card-title">${icon('triangle-alert')}Unmapped SKUs <span class="card-meta">${count(unmapped.length)} code${unmapped.length > 1 ? 's' : ''} · their orders cannot be dispatched until mapped</span></h2></header>
-    <div class="pane"><div class="table-wrap"><table class="table"><thead><tr><th>Channel code</th><th>Item</th><th class="r">Orders</th><th class="r">Units</th><th class="r"></th></tr></thead><tbody>
-    ${unmapped.map((u) => `<tr><td class="mono">${esc(u.code)}<span class="cell-sub muted">${esc(u.channel === 'amazon' ? 'Amazon seller SKU' : u.channel)}${u.asin ? ` · ASIN ${esc(u.asin)}` : ''}</span></td>
+    <header class="card-head"><h2 class="card-title">${icon('triangle-alert')}Unmapped platform SKUs <span class="card-meta">${count(unmapped.length)} code${unmapped.length > 1 ? 's' : ''} on orders that match no master SKU · those orders cannot be dispatched until mapped</span></h2></header>
+    <div class="pane"><div class="table-wrap"><table class="table"><thead><tr><th>Platform SKU</th><th>Platform</th><th>Item</th><th class="r">Orders</th><th class="r">Units</th><th class="r"></th></tr></thead><tbody>
+    ${unmapped.map((u) => `<tr><td class="mono">${esc(u.code)}${u.asin ? `<span class="cell-sub muted">ASIN ${esc(u.asin)}</span>` : ''}</td>
+      <td>${esc(u.platform_label)}</td>
       <td><span class="cell-text">${esc(u.title || '—')}</span></td><td class="r num">${count(u.orders)}</td><td class="r num">${count(u.units)}</td>
-      <td class="r">${isAdmin() ? `<button class="btn" type="button" data-map="${esc(u.code)}" data-title="${esc(u.title || '')}" data-asin="${esc(u.asin || '')}">Map to SKU</button>` : '<span class="soft">Ask an admin</span>'}</td></tr>`).join('')}
+      <td class="r">${!isAdmin() ? '<span class="soft">Ask an admin</span>'
+        : u.mappable ? `<button class="btn" type="button" data-map="${esc(u.code)}" data-platform="${esc(u.channel)}" data-platform-label="${esc(u.platform_label)}" data-title="${esc(u.title || '')}" data-asin="${esc(u.asin || '')}">Map to master SKU</button>`
+          : `<span class="soft" title="${esc(u.platform_label)} orders use master SKU codes directly. Create a master SKU with this code, or add ${esc(u.platform_label)} as a platform.">Not a mapped platform</span>`}</td></tr>`).join('')}
     </tbody></table></div></div></section>` : (state.view === 'unmapped' ? '<section class="card"><div class="pane"><div class="empty-note"><b>Every SKU on an order is mapped.</b>Nothing to resolve.</div></div></section>' : '');
 
   $('#resultNote').textContent = `${count(rows.length)} ${rows.length === 1 ? 'row' : 'rows'}${anyFilter() ? ' matching the filters' : ''} · one row per batch, earliest expiry first`;
@@ -243,7 +246,7 @@ function renderSku() {
       <p class="imp-note">On hand = sellable + expired + quarantined + blocked. Available to dispatch = sellable − reserved.
         ${s.track_inventory ? '' : '<b>Not inventory-tracked:</b> orders for this SKU dispatch without a stock check. '}Reorder level ${count(s.reorder_level)}${s.reorder_quantity ? `, reorder quantity ${count(s.reorder_quantity)}` : ''}.</p>
       ${isAdmin() ? `<div class="form-actions"><button class="btn primary" type="button" data-act="receive">${icon('plus')}Add inventory</button>
-        <button class="btn" type="button" data-act="edit-sku">${icon('pencil')}Edit SKU</button></div>` : ''}
+        <button class="btn" type="button" data-act="edit-sku">${icon('pencil')}Edit master SKU</button></div>` : ''}
     </section>
 
     <section class="dsec">
@@ -262,24 +265,21 @@ function renderSku() {
         <span class="d-when">${count(r.quantity)} · ${esc(r.created_by || '')}</span></li>`).join('')}</ul>
     </section>` : ''}
 
-    <details class="dsec more-sec" open>
-      <summary class="dsec-title">Product &amp; channels</summary>
-      <dl class="kv" style="margin-top:10px">
-        <dt>Briyo SKU</dt><dd class="mono"><b>${esc(s.sku)}</b> <span class="soft">internal, canonical</span></dd>
+    <section class="dsec">
+      <h3 class="dsec-title">Master SKU <span class="dsec-meta soft">Briyo's internal identifier · holds the stock</span></h3>
+      <dl class="kv">
+        <dt>Master Briyo SKU</dt><dd class="mono"><b>${esc(s.sku)}</b></dd>
         <dt>Product</dt><dd>${esc(s.product_name)}</dd>
-        <dt>Variant</dt><dd>${esc(s.variant_name || '—')}</dd>
-        <dt>Category</dt><dd>${esc(s.category || '—')}</dd>
+        ${s.variant_name ? `<dt>Variant</dt><dd>${esc(s.variant_name)}</dd>` : ''}
+        ${s.category ? `<dt>Category</dt><dd>${esc(s.category)}</dd>` : ''}
         <dt>Unit</dt><dd>${esc(s.unit_type)}</dd>
         <dt>Inventory</dt><dd>${s.track_inventory ? 'Tracked — stock is reserved and deducted at dispatch' : 'Not tracked — no stock check at dispatch'}</dd>
-        <dt>Shopify SKU</dt><dd class="mono">${esc(s.sku)} <span class="soft">same as the Briyo SKU</span></dd>
-        <dt>Amazon SKU</dt><dd class="mono">${s.amazon_seller_sku ? `${esc(s.amazon_seller_sku)} <span class="soft">external · maps to ${esc(s.sku)}</span>` : '<span class="soft">Not set — Amazon orders match the Briyo SKU itself</span>'}</dd>
-        <dt>ASIN</dt><dd class="mono">${esc(s.asin || '—')}</dd>
-        <dt>Amazon listing ID</dt><dd class="mono">${esc(s.amazon_listing_id || '—')}</dd>
-        <dt>Amazon product ID</dt><dd class="mono">${esc(s.amazon_product_id || '—')}</dd>
-        ${s.amazon_item_name ? `<dt>Amazon item name</dt><dd>${esc(s.amazon_item_name)}</dd>` : ''}
+        <dt>Website / Shopify</dt><dd>Uses the master SKU <span class="mono">${esc(s.sku)}</span> as is</dd>
         <dt>On orders</dt><dd>${count(orderLines.orders)} orders · ${count(orderLines.units)} units</dd>
       </dl>
-    </details>
+    </section>
+
+    ${platformSection(s)}
 
     <section class="dsec">
       <h3 class="dsec-title">Stock movements <span class="dsec-meta soft">${movements.length >= 200 ? 'latest 200' : count(movements.length)}</span></h3>
@@ -294,6 +294,38 @@ function renderSku() {
       </tbody></table></div>` : '<p class="soft" style="margin:0">No movements yet.</p>'}
     </section>`;
   renderIcons();
+}
+
+/**
+ * Platform SKUs: each marketplace's own identifier(s) for this product. They
+ * all point at the one master SKU and share its stock — none is a product of
+ * its own.
+ */
+function platformSection(s) {
+  const usage = state.detail.mappingUsage || {};
+  const platforms = state.meta.platforms || [];
+  const groups = platforms.map((p) => ({ ...p, list: s.platform_skus.filter((m) => m.platform === p.key) })).filter((g) => g.list.length);
+  return `<section class="dsec">
+      <h3 class="dsec-title">Platform SKUs <span class="dsec-meta soft">${count(s.platform_skus.length)} mapping${s.platform_skus.length === 1 ? '' : 's'}</span></h3>
+      <p class="imp-note" style="margin:0 0 10px">Marketplace identifiers for this product. An order from a platform with one of these codes resolves to master SKU
+        <b class="mono">${esc(s.sku)}</b> and uses its stock. They are not separate products and hold no stock of their own.</p>
+      ${groups.length ? `<div class="pf-groups">${groups.map((g) => `<div class="pf-group"><div class="pf-label">${esc(g.label)}</div><div class="pf-codes">${g.list.map((m) => `
+        <span class="pf-chip"><span class="mono">${esc(m.platform_sku)}</span>
+          <span class="soft" title="${esc(`Added ${m.source === 'import' ? 'by import' : m.source === 'migrated' ? 'from the old Amazon field' : 'by hand'}${m.created_by ? ` · ${m.created_by}` : ''}`)}">${usage[m.id] ? `${count(usage[m.id])} order line${usage[m.id] === 1 ? '' : 's'}` : ''}</span>
+          ${isAdmin() ? `<button type="button" class="icon-btn bare pf-remove" data-unmap="${m.id}" data-code="${esc(m.platform_sku)}" data-lines="${usage[m.id] || 0}" title="Remove this mapping" aria-label="Remove ${esc(g.label)} SKU ${esc(m.platform_sku)}">${icon('x')}</button>` : ''}
+        </span>`).join('')}</div></div>`).join('')}</div>`
+        : '<p class="soft" style="margin:0">No platform SKUs yet. Orders from marketplaces will not resolve to this product until they are added.</p>'}
+      ${isAdmin() ? `<div class="pf-add">
+        <select class="select" id="pfPlatform" aria-label="Platform">${platforms.filter((p) => p.active).map((p) => opt(p.key, p.label)).join('')}</select>
+        <textarea class="input mono" id="pfCodes" rows="2" placeholder="One or more platform SKUs — one per line, or separated by /"></textarea>
+        <button type="button" class="btn" id="pfAdd">${icon('plus')}Add platform SKU</button>
+      </div>` : ''}
+      ${s.asin || s.amazon_listing_id || s.amazon_product_id || s.amazon_item_name ? `<dl class="kv" style="margin-top:12px">
+        ${s.asin ? `<dt>ASIN</dt><dd class="mono">${esc(s.asin)}</dd>` : ''}
+        ${s.amazon_listing_id ? `<dt>Amazon listing ID</dt><dd class="mono">${esc(s.amazon_listing_id)}</dd>` : ''}
+        ${s.amazon_product_id ? `<dt>Amazon product ID</dt><dd class="mono">${esc(s.amazon_product_id)}</dd>` : ''}
+        ${s.amazon_item_name ? `<dt>Amazon item name</dt><dd>${esc(s.amazon_item_name)}</dd>` : ''}</dl>` : ''}
+    </section>`;
 }
 
 // ------------------------------------------------------------------ forms
@@ -311,12 +343,12 @@ function openForm(kind, ctx = {}) {
   let title = ''; let sub = ''; let submit = 'Save'; let body = '';
 
   if (kind === 'sku' || kind === 'edit-sku') {
-    title = kind === 'sku' ? 'New SKU' : `Edit ${s.sku}`;
-    sub = 'One SKU per physical sellable variant, used on every channel.';
-    submit = kind === 'sku' ? 'Create SKU' : 'Save SKU';
+    title = kind === 'sku' ? 'New master SKU' : `Edit ${s.sku}`;
+    sub = 'One master SKU per physical sellable product. Marketplace SKUs are added on its page and point back to it.';
+    submit = kind === 'sku' ? 'Create master SKU' : 'Save';
     body = `<section class="dsec"><div class="form-grid">
-      <label class="fld"><span>SKU</span><input class="input mono" name="sku" value="${esc(s.sku || '')}" ${kind === 'edit-sku' ? 'readonly' : 'required'} maxlength="64" placeholder="BRI-D3-60" autocomplete="off" />
-        <span class="help">${kind === 'edit-sku' ? 'A SKU code never changes.' : 'Letters, numbers, - _ . / — no spaces. The same code on Shopify and Amazon.'}</span></label>
+      <label class="fld"><span>Master Briyo SKU</span><input class="input mono" name="sku" value="${esc(s.sku || '')}" ${kind === 'edit-sku' ? 'readonly' : 'required'} maxlength="64" placeholder="BS002E90" autocomplete="off" />
+        <span class="help">${kind === 'edit-sku' ? 'A master SKU code never changes.' : "Briyo's internal code: letters, numbers, - _ . / — no spaces. The website/Shopify uses it as is."}</span></label>
       <label class="fld"><span>Product name</span><input class="input" name="product_name" value="${esc(s.product_name || '')}" required maxlength="200" placeholder="Vitamin D3 2000 IU" /></label>
       <label class="fld"><span>Variant</span><input class="input" name="variant_name" value="${esc(s.variant_name || '')}" maxlength="120" placeholder="60 Capsules" /></label>
       <label class="fld"><span>Category</span><input class="input" name="category" value="${esc(s.category || '')}" maxlength="120" /></label>
@@ -327,22 +359,22 @@ function openForm(kind, ctx = {}) {
       <label class="fld"><span>Reorder level</span><input class="input" name="reorder_level" inputmode="numeric" value="${esc(s.reorder_level ?? '')}" placeholder="0" /></label>
       <label class="fld"><span>Reorder quantity</span><input class="input" name="reorder_quantity" inputmode="numeric" value="${esc(s.reorder_quantity ?? '')}" placeholder="0" /></label>
     </div></section>
-    <section class="dsec"><h3 class="dsec-title">Amazon</h3><div class="form-grid">
-      <label class="fld"><span>Amazon SKU (seller SKU)</span><input class="input mono" name="amazon_seller_sku" value="${esc(s.amazon_seller_sku || '')}" maxlength="80" placeholder="e.g. WF-IATY-Z4SW" />
-        <span class="help">The SKU as it is in Seller Central. An external identifier that maps to this Briyo SKU; Seller Central is not changed.</span></label>
+    <section class="dsec"><h3 class="dsec-title">Amazon listing details <span class="dsec-meta soft">optional</span></h3>
+      <p class="imp-note" style="margin:0 0 10px">Amazon seller SKUs, like every platform's SKUs, are added under <b>Platform SKUs</b> on this product's page.</p>
+      <div class="form-grid">
       <label class="fld"><span>ASIN</span><input class="input mono" name="asin" value="${esc(s.asin || '')}" maxlength="40" /></label>
       <label class="fld"><span>Listing ID</span><input class="input mono" name="amazon_listing_id" value="${esc(s.amazon_listing_id || '')}" maxlength="80" /></label>
       <label class="fld"><span>Product ID</span><input class="input mono" name="amazon_product_id" value="${esc(s.amazon_product_id || '')}" maxlength="80" /></label>
       <label class="fld wide"><span>Amazon item name</span><input class="input" name="amazon_item_name" value="${esc(s.amazon_item_name || '')}" maxlength="500" /></label>
     </div></section>`;
   } else if (kind === 'map') {
-    title = 'Map Amazon SKU';
-    sub = `Amazon seller SKU ${ctx.code} → a Briyo SKU. Orders with this code then show the canonical SKU.`;
-    submit = 'Map';
-    body = `<section class="dsec"><dl class="kv"><dt>Amazon seller SKU</dt><dd class="mono">${esc(ctx.code)}</dd><dt>Item</dt><dd>${esc(ctx.title || '—')}</dd>${ctx.asin ? `<dt>ASIN</dt><dd class="mono">${esc(ctx.asin)}</dd>` : ''}</dl>
+    title = `Map ${ctx.platformLabel} SKU`;
+    sub = `${ctx.platformLabel} SKU ${ctx.code} → a master Briyo SKU. Its orders then resolve to that product and its stock.`;
+    submit = 'Map to master SKU';
+    body = `<section class="dsec"><dl class="kv"><dt>Platform</dt><dd>${esc(ctx.platformLabel)}</dd><dt>Platform SKU</dt><dd class="mono">${esc(ctx.code)}</dd><dt>Item on the order</dt><dd>${esc(ctx.title || '—')}</dd>${ctx.asin ? `<dt>ASIN</dt><dd class="mono">${esc(ctx.asin)}</dd>` : ''}</dl>
       <div class="form-grid" style="margin-top:12px">
-        <label class="fld wide"><span>Briyo SKU</span><select class="select" name="sku_id" required>${skuOptions('')}</select>
-          <span class="help">No new SKU is created. If the product is not in the master yet, create it with New SKU first (use the Briyo code), then map.</span></label>
+        <label class="fld wide"><span>Master Briyo SKU</span><select class="select" name="sku_id" required>${skuOptions('')}</select>
+          <span class="help">No new SKU is created. If the product is not in the master list yet, create it with New master SKU first, then map.</span></label>
       </div></section>`;
   } else if (kind === 'receive') {
     title = 'Add Inventory';
@@ -411,6 +443,16 @@ function openForm(kind, ctx = {}) {
       <label class="fld"><span>GRN number</span><input class="input mono" name="grn_number" value="${esc(batch.grn_number || '')}" /></label>
       <label class="fld wide"><span>Notes</span><textarea class="input" name="notes" maxlength="1000">${esc(batch.notes || '')}</textarea></label>
     </div></section>`;
+  } else if (kind === 'import') {
+    title = 'Import master SKUs';
+    sub = 'A sheet with one row per master SKU, its product name and a column per platform. Preview first; nothing is saved until you import.';
+    submit = 'Import';
+    state.importFile = null; state.importPreview = null;
+    body = `<section class="dsec"><div class="form-grid">
+      <label class="fld wide"><span>Sheet (.csv or .xlsx)</span><input class="input" type="file" id="impFile" accept=".csv,.xlsx,.txt,text/csv" />
+        <span class="help">Columns: Briyo SKU (or Parent Briyo SKU Code), Product Name, then one column per platform — ${esc((m.platforms || []).map((p) => p.label).join(', '))}.
+        A cell may list several SKUs separated by new lines or "/". "NA" means none. A platform SKU already mapped to a different master is a conflict and is never reassigned.</span></label>
+    </div></section><div id="impResult"></div>`;
   } else if (kind === 'places') {
     title = 'Warehouses & suppliers';
     sub = 'Lists used when receiving stock. Nothing is deleted; switch off what is no longer used.';
@@ -450,6 +492,38 @@ async function uploadDoc(batchId, file, type = 'coa') {
   if (!res.ok || data.ok === false) throw new Error(data.error || `HTTP ${res.status}`);
 }
 
+async function sendSheet(step, file) {
+  const res = await fetch(`/api/inventory/import/skus/${step}`, { method: 'POST', body: file, headers: { 'x-filename': encodeURIComponent(file.name) } });
+  const data = await res.json().catch(() => ({ ok: false, error: `HTTP ${res.status}` }));
+  if (!res.ok || data.ok === false) throw Object.assign(new Error(data.error || `HTTP ${res.status}`), { data });
+  return data;
+}
+
+function renderImportPreview(p) {
+  const s = p.summary;
+  const stat = (n, label, tone = '') => `<div class="imp-stat ${tone}"><b>${count(n)}</b><span>${esc(label)}</span></div>`;
+  const rowsTable = (list, cols) => `<div class="imp-scroll"><table class="imp-errors"><thead><tr>${cols.map((c) => `<th>${esc(c[0])}</th>`).join('')}</tr></thead><tbody>
+    ${list.map((r) => `<tr>${cols.map((c) => `<td${c[2] ? ' class="mono"' : ''}>${esc(c[1](r) ?? '—')}</td>`).join('')}</tr>`).join('')}</tbody></table></div>`;
+  $('#impResult').innerHTML = `
+    <section class="dsec"><h3 class="dsec-title">Preview <span class="dsec-meta soft">nothing saved yet</span></h3>
+      <div class="imp-stats">
+        ${stat(s.rows, 'Master SKUs in sheet')}${stat(s.mastersNew, 'New master SKUs')}${stat(s.mastersRenamed, 'Product names changed', s.mastersRenamed ? 'warn' : '')}
+        ${stat(s.mappingsInSheet, 'Platform SKUs in sheet')}${stat(s.mappingsNew, 'New platform SKUs')}${stat(s.mappingsUnchanged, 'Already mapped')}
+        ${stat(s.conflicts, 'Conflicts', s.conflicts ? 'bad' : '')}${stat(s.errorCount, 'Problems', s.errorCount ? 'bad' : '')}${stat(s.warningCount, 'Warnings', s.warningCount ? 'warn' : '')}
+      </div>
+      <p class="imp-note">Columns read as: ${s.platformColumns.map((c) => `"${esc(c.header)}" → ${esc(c.label)}`).join(', ')}.
+        ${s.duplicateMappings ? `${count(s.duplicateMappings)} repeated platform SKU${s.duplicateMappings > 1 ? 's' : ''} listed once. ` : ''}
+        ${s.storedMappingsNotInSheet ? `${count(s.storedMappingsNotInSheet)} stored platform SKU${s.storedMappingsNotInSheet > 1 ? 's are' : ' is'} not in the sheet; they are kept, not removed.` : ''}</p>
+      ${s.errorCount ? '<p class="imp-note warn-text"><b>Nothing can be imported until every problem below is fixed in the sheet.</b> The import is all-or-nothing.</p>' : ''}
+    </section>
+    ${p.errors.length ? `<section class="dsec"><h3 class="dsec-title">Problems <span class="dsec-meta soft">${count(s.errorCount)}</span></h3>${rowsTable(p.errors, [['Row', (r) => r.row], ['Platform', (r) => r.platform], ['Value', (r) => r.value, true], ['Problem', (r) => r.reason]])}</section>` : ''}
+    ${p.warnings.length ? `<section class="dsec"><h3 class="dsec-title">Warnings</h3>${rowsTable(p.warnings, [['Row', (r) => r.row], ['Note', (r) => r.reason]])}</section>` : ''}
+    ${p.renamed.length ? `<section class="dsec"><h3 class="dsec-title">Product names that will change</h3>${rowsTable(p.renamed, [['Master SKU', (r) => r.sku, true], ['Now', (r) => r.from], ['Sheet', (r) => r.to]])}</section>` : ''}
+    ${p.newMappings.length ? `<section class="dsec"><h3 class="dsec-title">New platform SKUs <span class="dsec-meta soft">first ${count(Math.min(p.newMappings.length, 500))}</span></h3>${rowsTable(p.newMappings.slice(0, 500), [['Platform', (r) => r.platform], ['Platform SKU', (r) => r.platform_sku, true], ['→ Master SKU', (r) => r.master, true]])}</section>` : ''}`;
+  $('#fSubmit').disabled = Boolean(s.errorCount) || !(s.mastersNew + s.mastersRenamed + s.mappingsNew);
+  $('#fSubmit').textContent = s.errorCount ? 'Fix the problems first' : (s.mastersNew + s.mastersRenamed + s.mappingsNew) ? 'Import' : 'Nothing new to import';
+}
+
 async function refreshMeta() { state.meta = await api('/api/inventory/meta'); }
 
 async function submitForm(e) {
@@ -471,14 +545,14 @@ async function submitForm(e) {
       await api(`/api/inventory/skus/${state.detail.sku.id}`, { method: 'PATCH', body: JSON.stringify({ ...rest, version: state.detail.sku.version }) });
       openAfter = state.detail.sku.id;
     } else if (kind === 'map') {
-      if (!v.sku_id) throw new Error('Choose the Briyo SKU.');
-      const cur = await api(`/api/inventory/skus/${v.sku_id}`);
-      if (cur.sku.amazon_seller_sku && cur.sku.amazon_seller_sku.toLowerCase() !== ctx.code.toLowerCase()
-          && !window.confirm(`${cur.sku.sku} already has Amazon seller SKU ${cur.sku.amazon_seller_sku}. Replace it with ${ctx.code}?`)) throw new Error('Not changed.');
-      await api(`/api/inventory/skus/${v.sku_id}`, { method: 'PATCH', body: JSON.stringify({
-        amazon_seller_sku: ctx.code, ...(cur.sku.asin || !ctx.asin ? {} : { asin: ctx.asin }),
-        ...(cur.sku.amazon_item_name || !ctx.title ? {} : { amazon_item_name: ctx.title }), version: cur.sku.version,
-      }) });
+      if (!v.sku_id) throw new Error('Choose the master Briyo SKU.');
+      await api(`/api/inventory/skus/${v.sku_id}/platform-skus`, { method: 'POST', body: JSON.stringify({ platform: ctx.platform, platform_skus: [ctx.code] }) });
+      openAfter = Number(v.sku_id);
+    } else if (kind === 'import') {
+      if (!state.importFile || !state.importPreview || state.importPreview.summary.errorCount) throw new Error('Choose a sheet with no problems in its preview first.');
+      const r = await sendSheet('commit', state.importFile);
+      state.importResult = r;
+      $('#alerts').innerHTML = `<div class="alert ok">${icon('circle-check')}<span>Imported: ${count(r.summary.mastersNew)} new master SKUs, ${count(r.summary.mastersRenamed)} renamed, ${count(r.summary.mappingsNew)} new platform SKUs (${count(r.summary.mappingsUnchanged)} already there). ${count(r.summary.orderItemsMapped)} order lines now resolve.</span></div>`;
     } else if (kind === 'receive') {
       const r = await api('/api/inventory/receive', { method: 'POST', body: JSON.stringify({ ...v, request_id: state.form.requestId }) });
       const file = f.coa?.files?.[0];
@@ -552,12 +626,23 @@ function bind() {
   }
   $('#unmapped').addEventListener('click', (e) => {
     const b = e.target.closest('[data-map]');
-    if (b) openForm('map', { code: b.dataset.map, title: b.dataset.title, asin: b.dataset.asin });
+    if (b) openForm('map', { code: b.dataset.map, platform: b.dataset.platform, platformLabel: b.dataset.platformLabel, title: b.dataset.title, asin: b.dataset.asin });
   });
   $('#refresh').addEventListener('click', () => { load(); if (state.openSku) openSku(state.openSku); });
   $('#addInventory').addEventListener('click', () => openForm('receive'));
   $('#newSku').addEventListener('click', () => openForm('sku'));
   $('#places').addEventListener('click', () => openForm('places'));
+  $('#importSkus').addEventListener('click', () => openForm('import'));
+  $('#invForm').addEventListener('change', async (e) => {
+    if (e.target.id !== 'impFile') return;
+    state.importFile = e.target.files[0] || null;
+    state.importPreview = null;
+    $('#impResult').innerHTML = state.importFile ? '<p class="soft">Reading the sheet…</p>' : '';
+    formError('');
+    if (!state.importFile) return;
+    try { state.importPreview = await sendSheet('preview', state.importFile); renderImportPreview(state.importPreview); }
+    catch (err) { $('#impResult').innerHTML = ''; formError(err.message); }
+  });
   $('#dClose').addEventListener('click', closeSku);
   $('#fClose').addEventListener('click', closeForm);
   $('#fCancel').addEventListener('click', closeForm);
@@ -586,6 +671,28 @@ function bind() {
     if (a) {
       const batchId = a.dataset.batch ? Number(a.dataset.batch) : null;
       return openForm(a.dataset.act === 'receive' ? 'receive' : a.dataset.act, { batchId, skuId: state.detail.sku.id });
+    }
+    if (e.target.closest('#pfAdd')) {
+      try {
+        const r = await api(`/api/inventory/skus/${state.detail.sku.id}/platform-skus`, { method: 'POST',
+          body: JSON.stringify({ platform: $('#pfPlatform').value, platform_skus: $('#pfCodes').value }) });
+        await openSku(state.detail.sku.id);
+        $('#dSaved').className = 'saved';
+        $('#dSaved').textContent = `${r.added.length ? `Added ${r.added.join(', ')}` : 'Already mapped'}${r.orderItemsMapped ? ` · ${r.orderItemsMapped} order lines now resolve` : ''}`;
+        load();
+      } catch (err) { $('#dSaved').className = 'saved failed'; $('#dSaved').textContent = err.message; }
+      return null;
+    }
+    const un = e.target.closest('[data-unmap]');
+    if (un) {
+      const lines = Number(un.dataset.lines);
+      if (!window.confirm(`Remove platform SKU ${un.dataset.code} from ${state.detail.sku.sku}?${lines ? ` ${lines} order line${lines > 1 ? 's' : ''} will become unmapped again.` : ''}`)) return null;
+      try {
+        await api(`/api/inventory/platform-skus/${un.dataset.unmap}`, { method: 'DELETE' });
+        await openSku(state.detail.sku.id);
+        load();
+      } catch (err) { $('#dSaved').className = 'saved failed'; $('#dSaved').textContent = err.message; }
+      return null;
     }
     const rm = e.target.closest('[data-doc-remove]');
     if (rm && window.confirm('Remove this document from the batch? It stays in the audit record.')) {

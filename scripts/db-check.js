@@ -29,7 +29,9 @@ import {
   ensureInventorySchema, createSku, updateSku, getSku, skuDetail, receiveInventory, adjustStock, transferStock, updateBatch,
   uploadBatchDocument, getBatchDocument, shipmentStock, reserveShipmentStock, releaseShipmentStock, dispatchShipmentStock,
   inventoryOverview, resolveSkuIds, purgeTestInventory, saveWarehouse, unmappedSkus, fefoSuggest,
+  addPlatformMappings, removePlatformMapping, savePlatform, listPlatforms, splitPlatformCell, migrateLegacyAmazonSkus, mappingUsage,
 } from '../lib/inventory.js';
+import { planSkuSheet, previewSkuImport, commitSkuImport } from '../lib/sku-master-import.js';
 import { DOCUMENT_FORMATS } from '../lib/orders.js';
 import {
   validateDocument, storage, signV4, _resetStorage, StorageNotConfigured,
@@ -2465,6 +2467,207 @@ await step('orders list: fixed number of queries whatever the page size (no N+1)
   if (unm.code !== `${TS}-NOT-A-SKU` || unm.sku_id !== null || unm.briyo_sku !== null) throw new Error(JSON.stringify(unm));
   return `${n} queries for 1 row and for a full page; rows list each line's channel SKU + Briyo SKU`;
 });
+
+// ---- master SKU + platform SKUs ----------------------------------------------------
+// Test platforms are created with a key from the test prefix so the purge removes them.
+const PF = { amazon: 'amazon', blinkit: 'blinkit', zepto: 'zepto' };
+const lineOn = async (channel, number, code, qty = 1) => {
+  const id = await createOrder({ ...R(channel), channel, source_order_id: `${TEST_ORDER}-${number}`, order_date: NOW(), order_value: 100 }, { actor: ACTOR });
+  // Resolved the way the importers do: master code, or this channel's platform SKU; else unmapped.
+  const c = await getPool().connect();
+  let skuId;
+  try { skuId = (await resolveSkuIds(c, channel, [code])).get(code.toLowerCase()) ?? null; } finally { c.release(); }
+  await getPool().query(
+    `INSERT INTO order_items (order_id, source_line_item_id, sku, title, quantity, item_price, sku_id)
+     VALUES ($1, 'L1', $2, 'Test line', $3, 100, $4)`, [id, code, qty, skuId]);
+  return id;
+};
+const lineOf = async (orderId) => (await getPool().query('SELECT sku, sku_id FROM order_items WHERE order_id = $1', [orderId])).rows[0];
+
+await step('platform SKUs: one master, several platform SKUs (two Amazon, one Blinkit), listed on the master', async () => {
+  INV.m = (await createSku({ sku: `${TS}-BS002E90`, product_name: 'Briyo Vitamin D3 2000 IU Capsules' }, { actor: ACTOR })).id;
+  INV.m2 = (await createSku({ sku: `${TS}-BS003R90`, product_name: 'Briyo Vitamin D3 1000 IU Capsules' }, { actor: ACTOR })).id;
+  const a = await addPlatformMappings(INV.m, PF.amazon, `${TS}-WF-IATY\n${TS}-ABC-123 / ${TS}-XYZ-456`, { actor: ACTOR });
+  const b = await addPlatformMappings(INV.m, PF.blinkit, [`${TS}10190237`], { actor: ACTOR });
+  if (a.added.length !== 3 || b.added.length !== 1) throw new Error(JSON.stringify({ a, b }));
+  const again = await addPlatformMappings(INV.m, PF.amazon, [`${TS}-wf-iaty`], { actor: ACTOR });   // any letter case
+  if (again.added.length || again.existing.length !== 1) throw new Error('re-adding the same mapping should be a no-op');
+  const m = await getSku(INV.m);
+  const got = m.platform_skus.map((x) => `${x.platform}:${x.platform_sku}`).sort().join(' ');
+  if (got !== [`amazon:${TS}-ABC-123`, `amazon:${TS}-WF-IATY`, `amazon:${TS}-XYZ-456`, `blinkit:${TS}10190237`].sort().join(' ')) throw new Error(got);
+  return 'multiline + "/" cell → 3 Amazon SKUs; 1 Blinkit SKU; all on the one master; re-adding is a no-op';
+});
+await step('platform SKUs: duplicates and conflicts are refused, never reassigned', async () => {
+  await expectErr('same Blinkit SKU to another master', () => addPlatformMappings(INV.m2, PF.blinkit, [`${TS}10190237`], { actor: ACTOR }),
+    (e) => e.status === 409 && e.mappingConflict?.existing_master === `${TS}-BS002E90`);
+  await expectErr('platform SKU = another master code', () => addPlatformMappings(INV.m, PF.zepto, [`${TS}-BS003R90`], { actor: ACTOR }), (e) => e.status === 409);
+  await expectErr('master code = an existing platform SKU', () => createSku({ sku: `${TS}-WF-IATY`, product_name: 'x' }, { actor: ACTOR }), (e) => e.status === 409);
+  await expectErr('tab inside', () => addPlatformMappings(INV.m, PF.zepto, ['3d99d620\t950d'], { actor: ACTOR }), (e) => e.status === 400);
+  // A real Amazon seller SKU with inner spaces maps and resolves exactly.
+  const mel = await addPlatformMappings(INV.m2, PF.amazon, ['Melatonin_60  Tablet'.replace('Melatonin', `${TS}-Melatonin`)], { actor: ACTOR });
+  const c0 = await getPool().connect();
+  try {
+    if (mel.added.length !== 1 || (await resolveSkuIds(c0, 'amazon', [`${TS}-Melatonin_60  Tablet`])).get(`${TS}-melatonin_60  tablet`.toLowerCase()) !== INV.m2) throw new Error('spaced SKU');
+  } finally { c0.release(); }
+  await expectErr('placeholder only', () => addPlatformMappings(INV.m, PF.zepto, 'NA', { actor: ACTOR }), (e) => e.status === 400);
+  await expectErr('unknown platform', () => addPlatformMappings(INV.m, 'nope', ['X1'], { actor: ACTOR }), (e) => e.status === 400);
+  // The same code on a different platform is a different identifier and is allowed.
+  const z = await addPlatformMappings(INV.m2, PF.zepto, [`${TS}10190237`], { actor: ACTOR });
+  if (z.added.length !== 1) throw new Error('same code on another platform refused');
+  const unique = (await getPool().query(`SELECT count(*)::int n FROM sku_platform_mappings WHERE platform = 'blinkit' AND lower(platform_sku) = lower($1)`, [`${TS}10190237`])).rows[0].n;
+  if (unique !== 1) throw new Error('duplicate stored');
+  return 'Blinkit SKU on a 2nd master, master-code clash, tab, NA, unknown platform: refused; "Melatonin_60  Tablet" (inner spaces) maps; same code on Zepto is separate';
+});
+await step('platform SKUs: resolution — Amazon and Blinkit codes reach the same master; website uses master codes', async () => {
+  const c = await getPool().connect();
+  try {
+    const amz = await resolveSkuIds(c, 'amazon', [`${TS}-XYZ-456`, `${TS}-wf-iaty`, `${TS}-UNKNOWN`]);
+    const bl = await resolveSkuIds(c, 'blinkit', [`${TS}10190237`, `${TS}-BS002E90`]);
+    const web = await resolveSkuIds(c, 'website', [`${TS}-BS002E90`, `${TS}10190237`]);
+    if (amz.get(`${TS}-xyz-456`.toLowerCase()) !== INV.m || amz.get(`${TS}-wf-iaty`.toLowerCase()) !== INV.m || amz.has(`${TS}-unknown`.toLowerCase())) throw new Error('amazon');
+    if (bl.get(`${TS}10190237`.toLowerCase()) !== INV.m || bl.get(`${TS}-bs002e90`.toLowerCase()) !== INV.m) throw new Error('blinkit');
+    if (web.get(`${TS}-bs002e90`.toLowerCase()) !== INV.m || web.has(`${TS}10190237`.toLowerCase())) throw new Error('website');
+    const z = await resolveSkuIds(c, 'zepto', [`${TS}10190237`]);
+    if (z.get(`${TS}10190237`.toLowerCase()) !== INV.m2) throw new Error('platform-scoped lookup');
+  } finally { c.release(); }
+  return 'Amazon SKU → master; Blinkit SKU → same master; master code works on any channel; a Blinkit code means nothing on the website; Zepto code of the same digits → its own master';
+});
+await step('platform SKUs: unmapped lines stay unmapped (code kept, nothing created) until mapped, then resolve', async () => {
+  const before = (await getPool().query('SELECT count(*)::int n FROM skus')).rows[0].n;
+  INV.blOrder = await lineOn('blinkit', 'PF-BL1', `${TS}20000001`, 2);
+  let l = await lineOf(INV.blOrder);
+  if (l.sku_id !== null || l.sku !== `${TS}20000001`) throw new Error(JSON.stringify(l));
+  if (!(await unmappedSkus()).some((u) => u.code === `${TS}20000001` && u.channel === 'blinkit' && u.platform_label === 'Blinkit' && u.mappable)) throw new Error('not listed as unmapped Blinkit SKU');
+  const r = await addPlatformMappings(INV.m, PF.blinkit, [`${TS}20000001`], { actor: ACTOR });
+  l = await lineOf(INV.blOrder);
+  if (r.orderItemsMapped !== 1 || l.sku_id !== INV.m || l.sku !== `${TS}20000001`) throw new Error(JSON.stringify({ r, l }));
+  if ((await getPool().query('SELECT count(*)::int n FROM skus')).rows[0].n !== before) throw new Error('a SKU was created');
+  return 'Blinkit line kept its code, listed as unmapped, no SKU made; mapping resolved it at once (no re-import)';
+});
+await step('platform SKUs: Amazon and Blinkit orders draw on one stock pool', async () => {
+  const b = (await receiveInventory({ sku_id: INV.m, batch_number: 'PF-POOL', expiry_date: '12/2030', quantity: 10, unit_cost: 50, request_id: rid() }, { actor: ACTOR })).batchId;
+  const amzOrder2 = await lineOn('amazon', 'PF-AMZ1', `${TS}-ABC-123`, 3);
+  const dl = (await listCouriers()).find((x) => x.name === 'Delhivery');
+  const s1 = (await createShipment({ ...R('amazon'), channel: 'amazon', source_order_id: `${TEST_ORDER}-PF-AMZ1`, courier_partner_id: dl.id, tracking_id: 'AWB-PF-1', shipment_status: 'packed' }, { actor: ACTOR, addToExisting: true })).shipmentId;
+  const s2 = (await createShipment({ ...R('blinkit'), channel: 'blinkit', source_order_id: `${TEST_ORDER}-PF-BL1`, courier_partner_id: dl.id, tracking_id: 'AWB-PF-2', shipment_status: 'packed' }, { actor: ACTOR, addToExisting: true })).shipmentId;
+  const st1 = await shipmentStock(s1); const st2 = await shipmentStock(s2);
+  if (st1.lines[0]?.sku_id !== INV.m || st2.lines[0]?.sku_id !== INV.m) throw new Error('not resolved to the master');
+  await reserveShipmentStock(s1, [{ batch_id: b, quantity: 3 }], { actor: ACTOR });
+  await reserveShipmentStock(s2, [{ batch_id: b, quantity: 2 }], { actor: ACTOR });
+  const m = await getSku(INV.m);
+  if (m.on_hand !== 10 || m.reserved !== 5 || m.available !== 5) throw new Error(JSON.stringify({ on: m.on_hand, res: m.reserved, av: m.available }));
+  const third = await lineOn('amazon', 'PF-AMZ2', `${TS}-XYZ-456`, 6);
+  const s3 = (await createShipment({ ...R('amazon'), channel: 'amazon', source_order_id: `${TEST_ORDER}-PF-AMZ2`, courier_partner_id: dl.id, tracking_id: 'AWB-PF-3', shipment_status: 'packed' }, { actor: ACTOR, addToExisting: true })).shipmentId;
+  await expectErr('pool exhausted', () => reserveShipmentStock(s3, [{ batch_id: b, quantity: 6 }], { actor: ACTOR }), (e) => e.insufficientStock);
+  INV.pf = { s1, s2, s3, amzOrder2, third };
+  return 'master stock 10: Amazon (ABC-123) reserves 3, Blinkit reserves 2 → 5 left; another Amazon code wanting 6 is refused';
+});
+await step('platform SKUs: removing a mapping unmaps its lines, but not while stock is reserved for them', async () => {
+  const m = await getSku(INV.m);
+  const xyz = m.platform_skus.find((x) => x.platform_sku === `${TS}-XYZ-456`);
+  const abc = m.platform_skus.find((x) => x.platform_sku === `${TS}-ABC-123`);
+  const usage = await mappingUsage(INV.m);
+  if (usage[abc.id] !== 1) throw new Error(`usage ${JSON.stringify(usage)}`);
+  await expectErr('reserved', () => removePlatformMapping(abc.id, { actor: ACTOR }), (e) => e.status === 409);
+  const r = await removePlatformMapping(xyz.id, { actor: ACTOR });
+  if (r.orderItemsUnmapped !== 1 || (await lineOf(INV.pf.third)).sku_id !== null) throw new Error(JSON.stringify(r));
+  if ((await getSku(INV.m)).platform_skus.some((x) => x.platform_sku === `${TS}-XYZ-456`)) throw new Error('still listed');
+  await releaseShipmentStock(INV.pf.s1, { actor: ACTOR }); await releaseShipmentStock(INV.pf.s2, { actor: ACTOR });
+  return 'mapping used by a reserved line: refused; unused-by-stock mapping removed → its 1 line back to unmapped';
+});
+await step('platform SKUs: a new platform is a row, not a migration', async () => {
+  const p = await savePlatform({ label: `${TS} Clinic Shop` }, { actor: ACTOR });
+  if (!p.key.startsWith('dbcheck_inv') || !(await listPlatforms()).some((x) => x.key === p.key)) throw new Error(JSON.stringify(p));
+  const r = await addPlatformMappings(INV.m2, p.key, ['CLIN-001'], { actor: ACTOR });
+  if (r.added[0] !== 'CLIN-001') throw new Error('mapping on the new platform');
+  const seeded = (await listPlatforms()).map((x) => x.key);
+  for (const k of ['amazon', 'blinkit', 'zepto', 'tata_1mg', 'netmeds', 'clinikally']) if (!seeded.includes(k)) throw new Error(`missing platform ${k}`);
+  return `added "${p.label}" (${p.key}) and mapped to it with no schema change; the 6 standard platforms are seeded`;
+});
+await step('platform SKUs: historical Amazon orders keep their master SKU through the move off the old column', async () => {
+  // A master set up the old way (code in skus.amazon_seller_sku) with an order line already resolved through it.
+  const legacy = (await createSku({ sku: `${TS}-LEGACY`, product_name: 'Legacy mapped' }, { actor: ACTOR })).id;
+  await getPool().query('UPDATE skus SET amazon_seller_sku = $2 WHERE id = $1', [legacy, `${TS}-OLDAMZ`]);
+  const oldOrder = await lineOn('amazon', 'PF-OLD', `${TS}-OLDAMZ`, 1);
+  await getPool().query('UPDATE order_items SET sku_id = $2 WHERE order_id = $1', [oldOrder, legacy]);
+  const waiting = await lineOn('amazon', 'PF-OLD2', `${TS}-OLDAMZ`, 1);   // arrived but not yet resolved
+  const r1 = await migrateLegacyAmazonSkus(getPool());
+  const r2 = await migrateLegacyAmazonSkus(getPool());   // idempotent
+  const row = (await getPool().query('SELECT amazon_seller_sku FROM skus WHERE id = $1', [legacy])).rows[0];
+  const maps = (await getSku(legacy)).platform_skus;
+  if (r1.moved < 1 || r2.moved !== 0 || row.amazon_seller_sku !== null || maps.length !== 1 || maps[0].platform_sku !== `${TS}-OLDAMZ` || maps[0].source !== 'migrated') throw new Error(JSON.stringify({ r1, r2, row, maps }));
+  if ((await lineOf(oldOrder)).sku_id !== legacy) throw new Error('historical line lost its master');
+  const c = await getPool().connect();
+  try { if ((await resolveSkuIds(c, 'amazon', [`${TS}-OLDAMZ`])).get(`${TS}-oldamz`.toLowerCase()) !== legacy) throw new Error('not resolvable'); } finally { c.release(); }
+  const { remapOrderItems } = await import('../lib/inventory.js');
+  const c2 = await getPool().connect();
+  try { await remapOrderItems(c2, legacy); } finally { c2.release(); }
+  if ((await lineOf(waiting)).sku_id !== legacy) throw new Error('waiting line not resolved via migrated mapping');
+  return 'old column → Amazon mapping (source "migrated"), column cleared, re-run moves 0; resolved line unchanged; waiting line resolves';
+});
+await step('master SKU import: parser — multiline, "/", NA, duplicates, conflicts, ASIN, spaces, unknown columns', async () => {
+  const platforms = [['amazon', 'Amazon'], ['blinkit', 'Blinkit'], ['zepto', 'Zepto'], ['tata_1mg', 'Tata 1mg'], ['netmeds', 'Netmeds'], ['clinikally', 'Clinikally']].map(([key, label]) => ({ key, label }));
+  const head = ['PARENT BRIYO SKU CODE', 'PRODUCT NAME', 'Blinkit Sku ID', 'Zepto Sku ID', 'Tata 1mg', 'Netmeds', 'Clinikally', 'Amazon'];
+  const ok = planSkuSheet([head,
+    ['A1', 'Alpha', '101', '', '671650', 'NA', 'CL-A1', '\nWF-1/\r\nWF-2'],
+    ['A2', 'Beta', '', '', '201', '301/302', 'N/A', 'KT-1 / \nNI-2\r\n'],
+    ['A3', 'Gamma', '', '', '', '', '', ''],
+    ['A4', 'Delta', '101', '', '', '', '', 'WF-1'],   // same Blinkit + Amazon SKU as A1 → conflicts
+  ], platforms);
+  const codes = ok.mappings.filter((m) => m.master === 'A1' || m.master === 'A2').map((m) => `${m.platform}:${m.code}`).sort().join(' ');
+  // WF-1 and Blinkit 101 are left out: each is claimed by two masters (A1 and A4).
+  const want = ['amazon:KT-1', 'amazon:NI-2', 'amazon:WF-2', 'clinikally:CL-A1', 'netmeds:301', 'netmeds:302', 'tata_1mg:201', 'tata_1mg:671650'].sort().join(' ');
+  if (codes !== want) throw new Error(`${codes} ≠ ${want}`);
+  if (ok.errors.filter((e) => e.conflict).length !== 4) throw new Error(JSON.stringify(ok.errors));
+  if (!ok.warnings.some((w) => /A3 has no platform SKUs/.test(w.reason))) throw new Error('empty row warning');
+  const bad = planSkuSheet([[...head, 'Myntra'],
+    ['B1', 'x', '', '3d99d620-2aff-4c7d- 950d-7003be9c7f1', '', '', '', 'B0C3R3CCNX', 'M-1'],
+    ['B1', 'dup', '', '', '', '', '', '', ''],
+    ['', 'no code', '', '', '', '', '', '', ''],
+    ['bad code!', 'x', '', '', '', '', '', '', ''],
+    ['B5', '', '', '', '', '', '', '', ''],
+    ['B6', 'y', '', '0ff', '', '', '', '', ''],
+    ['B7', 'z', '', 'b484552c-3205-4459-8a68-4fa1e15d605', '', '', '', '', ''],
+  ], platforms);
+  const reasons = bad.errors.map((e) => e.reason).join(' | ');
+  for (const re of [/"Myntra" does not match any platform/, /contains a space\. Confirm/, /looks like an ASIN/, /appears again/, /Master SKU is missing/, /not valid/, /Product name is missing/, /malformed/]) {
+    if (!re.test(reasons)) throw new Error(`missing ${re}: ${reasons}`);
+  }
+  if (splitPlatformCell(' \nIV-AUCJ-WJO6/\r\nRE-5EKW-7QHD').join('|') !== 'IV-AUCJ-WJO6|RE-5EKW-7QHD' || splitPlatformCell('N/A').length || splitPlatformCell('a, b').join('|') !== 'a|b') throw new Error('split');
+  return 'multiline/"/"/"," split per SKU; NA and N/A skipped; same SKU on 2 masters → conflict; ASIN, space, malformed UUID, unknown column, duplicate/missing/invalid master, missing name: all reported';
+});
+await step('master SKU import: preview writes nothing; errors block the whole import; clean sheet imports; re-import changes nothing', async () => {
+  const csv = (rows) => Buffer.from(rows.map((r) => r.map((c) => (/[",\n\r]/.test(c) ? `"${c.replace(/"/g, '""')}"` : c)).join(',')).join('\r\n'));
+  const head = ['Briyo SKU', 'Product Name', 'Amazon SKU', 'Blinkit Sku ID', 'Zepto Sku ID'];
+  // Existing data: TS-BS002E90 has Amazon TS-WF-IATY and Blinkit TS10190237 from earlier steps.
+  const conflict = csv([head, [`${TS}-IMP1`, 'Imported one', `${TS}-WF-IATY`, '', '']]);
+  const p1 = await previewSkuImport(conflict, 'conflict.csv');
+  if (p1.summary.conflicts !== 1 || !/already maps to master SKU/.test(p1.errors[0].reason)) throw new Error(JSON.stringify(p1.errors));
+  await expectErr('commit with errors', () => commitSkuImport(conflict, 'conflict.csv', { actor: ACTOR }), (e) => e.status === 400 && e.importErrors?.length === 1);
+  if ((await getPool().query('SELECT count(*)::int n FROM skus WHERE sku = $1', [`${TS}-IMP1`])).rows[0].n) throw new Error('blocked import wrote a master');
+  // A clean sheet: one new master (multi Amazon SKUs, a Blinkit SKU an order is waiting on), one existing master renamed + a new SKU.
+  const waitingOrder = await lineOn('blinkit', 'PF-IMP', `${TS}30000001`, 1);
+  const clean = csv([head,
+    [`${TS}-IMP2`, 'Imported two', `\n${TS}-IMPA/\r\n${TS}-IMPB`, `${TS}30000001`, 'NA'],
+    [`${TS}-BS002E90`, 'Briyo Vitamin D3 2000 IU Capsules (90)', `${TS}-WF-IATY`, `${TS}10190237`, `${TS}-ZP-1`],
+  ]);
+  const p2 = await previewSkuImport(clean, 'clean.csv');
+  const s2 = p2.summary;
+  if (s2.errorCount || s2.mastersNew !== 1 || s2.mastersRenamed !== 1 || s2.mappingsNew !== 4 || s2.mappingsUnchanged !== 2) throw new Error(JSON.stringify(s2));
+  if ((await getPool().query('SELECT count(*)::int n FROM skus WHERE sku = $1', [`${TS}-IMP2`])).rows[0].n) throw new Error('preview wrote');
+  const c1 = await commitSkuImport(clean, 'clean.csv', { actor: ACTOR });
+  if (c1.summary.mastersNew !== 1 || c1.summary.mappingsNew !== 4 || c1.summary.orderItemsMapped < 1) throw new Error(JSON.stringify(c1.summary));
+  const imp2 = (await getPool().query('SELECT id, product_name FROM skus WHERE sku = $1', [`${TS}-IMP2`])).rows[0];
+  if ((await lineOf(waitingOrder)).sku_id !== imp2.id) throw new Error('waiting Blinkit line not resolved by the import');
+  if ((await getSku(INV.m)).product_name !== 'Briyo Vitamin D3 2000 IU Capsules (90)') throw new Error('rename');
+  const c2 = await commitSkuImport(clean, 'clean.csv', { actor: ACTOR });
+  if (c2.summary.mastersNew || c2.summary.mastersRenamed || c2.summary.mappingsNew || c2.summary.mappingsUnchanged !== 6) throw new Error(`re-import: ${JSON.stringify(c2.summary)}`);
+  // Stored mappings missing from a sheet are kept and reported, never removed.
+  const p3 = await previewSkuImport(csv([head, [`${TS}-BS002E90`, 'Briyo Vitamin D3 2000 IU Capsules (90)', '', '', '']]), 'partial.csv');
+  if (p3.summary.storedMappingsNotInSheet < 4 || (await getSku(INV.m)).platform_skus.length < 4) throw new Error('kept');
+  return 'conflict → preview flags, commit refused, nothing written; clean sheet: 1 new master, 1 renamed, 4 new platform SKUs, waiting order line resolved; re-import: 0 changes; omitted mappings kept';
+});
+
 await step('inventory: every change is attributed (user, time, reason, reference)', async () => {
   const { rows } = await getPool().query(
     `SELECT count(*) FILTER (WHERE actor IS NULL OR reason IS NULL OR at IS NULL)::int AS missing, count(*)::int AS n

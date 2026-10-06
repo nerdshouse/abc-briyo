@@ -522,19 +522,25 @@ function renderDrawer() {
   renderIcons();
 }
 
+/** Channels whose orders carry Briyo's own master SKU codes. Every other channel is a marketplace. */
+const OWN_STORE_CHANNELS = new Set(['website']);
+const isMarketplace = (channel) => Boolean(channel) && !OWN_STORE_CHANNELS.has(channel);
+
 /**
  * The one SKU staff use to identify a product on this order's channel:
- *   Amazon   → SKU = the Amazon seller SKU (what Seller Central shows),
- *              with the Briyo SKU beside it, labelled, and the ASIN.
- *   Website and other channels → SKU = the Briyo SKU (Shopify uses it as is).
- * Only an Amazon code with no Briyo SKU is flagged; it blocks dispatch until mapped.
+ *   Marketplaces (Amazon, Blinkit, Zepto, Tata 1mg…) → SKU = the platform's
+ *     own SKU (what its seller panel shows), with the master Briyo SKU beside
+ *     it, labelled, and Amazon's ASIN where known.
+ *   Website / Shopify → SKU = the master Briyo SKU (Shopify uses it as is).
+ * A marketplace SKU with no master SKU is flagged; it blocks dispatch until mapped.
  */
 function skuIdentity({ channel, code, briyo, briyoId, asin = null, compact = false }) {
   const link = (text) => (briyoId ? `<a class="mono" href="/inventory?sku=${briyoId}">${esc(text)}</a>` : `<span class="mono">${esc(text)}</span>`);
-  if (channel === 'amazon') {
+  const sameAsMaster = briyoId && code && briyo && code.toLowerCase() === briyo.toLowerCase();
+  if (isMarketplace(channel) && !sameAsMaster) {
     const primary = code ? `SKU <b class="mono">${esc(code)}</b>` : 'SKU <span class="soft">none</span>';
     const second = briyoId ? `Briyo SKU ${link(briyo)}`
-      : '<span class="mini-tag warn" title="This Amazon SKU is not mapped to a Briyo SKU yet. Stock cannot be reserved or dispatched until an admin maps it in Inventory → Unmapped SKUs.">Briyo SKU not mapped</span>';
+      : '<span class="mini-tag warn" title="This platform SKU is not mapped to a master Briyo SKU yet. Stock cannot be reserved or dispatched until an admin maps it in Inventory → Unmapped platform SKUs.">Briyo SKU not mapped</span>';
     return [primary, second, !compact && asin ? `ASIN <span class="mono">${esc(asin)}</span>` : ''].filter(Boolean).join(' · ');
   }
   const own = briyo || code;
@@ -552,10 +558,11 @@ function lineSkus(o) {
   const lines = o.line_skus || [];
   if (!lines.length) return '';
   const qty = (l) => (l.quantity > 1 ? ` ×${l.quantity}` : '');
-  const rows = lines.slice(0, 2).flatMap((l) => (o.channel === 'amazon'
-    ? [`<span class="ls" title="Amazon SKU ${esc(l.code || '')}">SKU <b>${esc(l.code || '—')}</b>${qty(l)}</span>`,
-      l.sku_id ? `<span class="ls" title="Briyo SKU ${esc(l.briyo_sku)}">Briyo SKU ${esc(l.briyo_sku)}</span>`
-        : '<span class="ls warn-text" title="This Amazon SKU is not mapped to a Briyo SKU yet">Briyo SKU not mapped</span>']
+  const own = (l) => l.sku_id && l.code && l.briyo_sku && l.code.toLowerCase() === l.briyo_sku.toLowerCase();
+  const rows = lines.slice(0, 2).flatMap((l) => (isMarketplace(o.channel) && !own(l)
+    ? [`<span class="ls" title="${esc(o.channel_label)} SKU ${esc(l.code || '')}">SKU <b>${esc(l.code || '—')}</b>${qty(l)}</span>`,
+      l.sku_id ? `<span class="ls" title="Master Briyo SKU ${esc(l.briyo_sku)}">Briyo SKU ${esc(l.briyo_sku)}</span>`
+        : '<span class="ls warn-text" title="This platform SKU is not mapped to a master Briyo SKU yet">Briyo SKU not mapped</span>']
     : [`<span class="ls" title="SKU ${esc(l.briyo_sku || l.code || '')}">SKU <b>${esc(l.briyo_sku || l.code || '—')}</b>${qty(l)}</span>`]));
   return `<span class="cell-sub line-skus">${rows.join('')}${lines.length > 2 ? `<span class="ls">+${lines.length - 2} more</span>` : ''}</span>`;
 }
@@ -1325,10 +1332,10 @@ function renderStock() {
     <div class="stock-head ${tone}">${head}${st.orders.length > 1 ? `<span class="soft"> · ${st.orders.length} orders</span>` : ''}</div>
     ${st.unmapped.length ? `<ul class="stock-unmapped">${st.unmapped.map((u) => `<li>SKU <b class="mono">${esc(u.code || '—')}</b> × ${esc(u.quantity)} · <span class="mini-tag warn">Briyo SKU not mapped</span>
       <span class="soft">order ${esc(u.order_number)}</span></li>`).join('')}</ul>
-      <p class="imp-note">An admin maps these in <a href="/inventory?view=unmapped">Inventory → Unmapped SKUs</a>. No stock is guessed or deducted.</p>` : ''}
+      <p class="imp-note">An admin maps these to a master SKU in <a href="/inventory?view=unmapped">Inventory → Unmapped platform SKUs</a>. No stock is guessed or deducted.</p>` : ''}
     ${st.lines.map((l) => `<div class="stock-line" data-line="${l.sku_id}">
       <div class="stock-line-head">
-        <span>${st.channel === 'amazon'
+        <span>${isMarketplace(st.channel) && (l.codes || []).some((c) => c.toLowerCase() !== l.sku.toLowerCase())
           ? `SKU <b class="mono">${esc((l.codes || []).join(', ') || '—')}</b> · Briyo SKU <a class="mono" href="/inventory?sku=${l.sku_id}">${esc(l.sku)}</a>`
           : `SKU <b><a class="mono" href="/inventory?sku=${l.sku_id}">${esc(l.sku)}</a></b>`}
           <span class="soft">${esc(l.product_name)}${l.variant_name ? ` · ${esc(l.variant_name)}` : ''}</span></span>
