@@ -731,6 +731,8 @@ function describeEvent(e) {
       return ['file-down', 'info', `Updated from Amazon import${parts.length ? `: ${parts.join('; ')}` : ''}`];
     }
     case 'note_added': return ['message-square-text', '', `Note: ${esc(md.note)}`];
+    case 'stock_released': return ['package-open', 'warn', `Reserved stock released${md.reason === 'order cancelled' ? ' — order cancelled' : ''}`];
+    case 'amazon_import_lines_locked': return ['lock', 'warn', `Amazon import did not change ${md.lines} item${md.lines > 1 ? 's' : ''}: stock for this order has already been dispatched`];
     default: return ['activity', '', esc(label(e.event_type))];
   }
 }
@@ -1314,6 +1316,14 @@ function renderStock() {
   const st = state.stock;
   const host = $('#dStock');
   if (!host || !st || st.state === 'no_items') { if (host) host.innerHTML = ''; return; }
+  if (st.state === 'stranded') {
+    // Set aside for orders that no longer need it (e.g. cancelled): release it.
+    host.innerHTML = `<div class="stock-head bad">${icon('triangle-alert')}Stock is reserved but no order in this shipment needs it</div>
+      <div class="soft stock-from">${st.stranded_reservations.map((r) => `<span class="mono">${esc(r.batch_number)}</span> × ${count(r.quantity)}`).join(', ')}</div>
+      <div class="form-actions"><button class="btn" type="button" id="dRelease">Release</button></div>`;
+    renderIcons();
+    return;
+  }
   const done = st.state === 'dispatched';
   const editable = !done && !['dispatched', 'in_transit', 'out_for_delivery', 'delivered', 'delivery_failed', 'rto', 'cancelled'].includes(st.status);
   const head = {
@@ -1339,7 +1349,9 @@ function renderStock() {
           ? `SKU <b class="mono">${esc((l.codes || []).join(', ') || '—')}</b> · Briyo SKU <a class="mono" href="/inventory?sku=${l.sku_id}">${esc(l.sku)}</a>`
           : `SKU <b><a class="mono" href="/inventory?sku=${l.sku_id}">${esc(l.sku)}</a></b>`}
           <span class="soft">${esc(l.product_name)}${l.variant_name ? ` · ${esc(l.variant_name)}` : ''}</span></span>
-        <span class="stock-nums"><b>${count(l.required)}</b> needed${done ? '' : ` · ${count(l.available)} available to dispatch ${l.enough ? '<span class="ok-mark">✓</span>' : '<span class="mini-tag warn">Insufficient</span>'}`}</span>
+        <span class="stock-nums">${st.split && !done
+          ? `<b>${count(l.required)}</b> left to send of ${count(l.ordered)} ordered`
+          : `<b>${count(l.required)}</b> needed`}${done ? '' : ` · ${count(l.available)} available to dispatch ${l.enough ? '<span class="ok-mark">✓</span>' : '<span class="mini-tag warn">Insufficient</span>'}`}</span>
       </div>
       ${done ? `<div class="soft stock-from">Deducted from ${l.dispatched.map((d) => `<span class="mono">${esc(d.batch_number)}</span> −${count(d.quantity)}`).join(', ')}</div>`
         : editable ? `<div class="alloc">${allocFor(l).map((a) => `<div class="alloc-row"><select class="select" data-alloc-batch aria-label="Batch for ${esc(l.sku)}">${batchOpts(l, a.batch_id)}</select>
@@ -1348,6 +1360,7 @@ function renderStock() {
           : `<div class="soft stock-from">${l.reserved.map((r) => `<span class="mono">${esc(r.batch_number)}</span> × ${count(r.quantity)}`).join(', ') || 'Nothing reserved'}</div>`}
       ${!done && l.suggestion.short && !l.reserved_quantity ? `<div class="warn-text stock-from">Short by ${count(l.suggestion.short)}</div>` : ''}
     </div>`).join('')}
+    ${st.split && !done ? '<p class="imp-note">This order is split across several shipments. Reserve only what goes in this parcel; the rest stays for the others.</p>' : ''}
     ${st.untracked?.length ? `<p class="imp-note">${st.untracked.map((u) => `<span class="mono">${esc(u.sku)}</span>`).join(', ')} not inventory-tracked — no stock needed.</p>` : ''}
     ${editable && st.lines.length && !st.unmapped.length ? `<div class="form-actions">
       <button class="btn" type="button" id="dReserve">${st.state === 'reserved' ? 'Update reservation' : 'Reserve stock'}</button>
@@ -1555,6 +1568,7 @@ async function previewImport() {
         <p class="imp-note">${[
           s.promotionRows && `${count(s.promotionRows)} promotion row${s.promotionRows > 1 ? 's' : ''} folded into their items.`,
           s.skippedOrders && `${count(s.skippedOrders)} order${s.skippedOrders > 1 ? 's' : ''} will be skipped because of errors.`,
+          s.lockedLineItems && `${count(s.lockedLineItems)} item change${s.lockedLineItems > 1 ? 's' : ''} on ${count(s.lockedOrders)} already-dispatched order${s.lockedOrders > 1 ? 's' : ''} will not be applied: their stock has left and their lines are kept as dispatched.`,
           'Order value is what buyers paid: items with tax, plus shipping, less discounts.',
         ].filter(Boolean).map(esc).join(' ')}</p>
       </section>

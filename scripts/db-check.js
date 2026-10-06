@@ -2704,6 +2704,156 @@ await step('master SKU import: preview writes nothing; errors block all; masters
   return 'error row → whole sheet refused, nothing written; master = existing platform SKU refused; 2 new masters (one with no platform SKU) + 1 renamed; platform columns ignored, mappings untouched; re-import: 0 changes';
 });
 
+// ---- Phase 1 stock integrity: split shipments, cancellation, re-import after dispatch
+const P1 = {};
+const ezShip = (n, awb) => ({ dispatch_type: 'easy_ship', destination_id: null, channel: 'amazon', source_order_id: AZ(n), tracking_id: awb });
+const shipOf = async (orderId, shipmentId) => (await orderShipments(orderId)).find((x) => x.id === shipmentId);
+const dispatchShip = async (orderId, shipmentId) => {
+  const sh = await shipOf(orderId, shipmentId);
+  return updateShipment(orderId, shipmentId, { shipment_status: 'dispatched' }, { actor: ACTOR, version: sh.version });
+};
+const dispatchedFor = async (shipmentId) => (await getPool().query(
+  `SELECT coalesce(-sum(quantity), 0)::int n FROM inventory_movements WHERE shipment_id = $1 AND movement_type = 'shipment_dispatched'`, [shipmentId])).rows[0].n;
+await step('phase 1 setup: a stocked master SKU and an Amazon order for 10 units', async () => {
+  P1.sku = (await createSku({ sku: `${TS}-SPLIT`, product_name: 'Split test' }, { actor: ACTOR })).id;
+  P1.batch = (await receiveInventory({ sku_id: P1.sku, batch_number: 'SPLIT-1', expiry_date: dayOffset(400), quantity: 50, unit_cost: 10, request_id: rid() }, { actor: ACTOR })).batchId;
+  await invOrders([amzRow({ 'order-id': AZ(80), 'order-item-id': 'I80', sku: `${TS}-SPLIT`, 'quantity-purchased': '10' })]);
+  P1.order = (await amzOrder(80)).id;
+  P1.dl = (await listCouriers()).find((x) => x.name === 'Delhivery');
+  return 'SKU with 50 in stock; order for 10 resolved to it';
+});
+await step('split shipments: an order sent in two parcels deducts its quantity once, split as packed', async () => {
+  const a = (await createShipment({ ...ezShip(80, 'AWB-SPLIT-A'), courier_partner_id: P1.dl.id }, { actor: ACTOR, addToExisting: true })).shipmentId;
+  const b = (await createShipment({ ...ezShip(80, 'AWB-SPLIT-B'), courier_partner_id: P1.dl.id }, { actor: ACTOR, addToExisting: true })).shipmentId;
+  let st = await shipmentStock(a);
+  if (!st.split || st.lines[0].required !== 10 || st.lines[0].ordered !== 10) throw new Error(JSON.stringify({ split: st.split, l: st.lines[0] }));
+  // More than the order holds is refused; nothing at all is refused.
+  await expectErr('over-reserve', () => reserveShipmentStock(a, [{ batch_id: P1.batch, quantity: 11 }], { actor: ACTOR }), (e) => e.status === 400);
+  // Parcel A carries 6: parcel B now has only 4 left, and cannot take more.
+  await reserveShipmentStock(a, [{ batch_id: P1.batch, quantity: 6 }], { actor: ACTOR });
+  st = await shipmentStock(b);
+  if (st.lines[0].required !== 4 || st.state !== 'needs_reservation') throw new Error(JSON.stringify({ req: st.lines[0].required, state: st.state }));
+  await expectErr('B over remainder', () => reserveShipmentStock(b, [{ batch_id: P1.batch, quantity: 5 }], { actor: ACTOR }), (e) => e.status === 400 && /only 4 left/.test(e.message));
+  await reserveShipmentStock(b, [{ batch_id: P1.batch, quantity: 4 }], { actor: ACTOR });
+  await addPhoto(P1.order);
+  await dispatchShip(P1.order, a);
+  await dispatchShip(P1.order, b);
+  // Repeat dispatch of both, and a direct retry: nothing more leaves.
+  await dispatchShip(P1.order, a);
+  await dispatchShip(P1.order, b);
+  const c = await getPool().connect();
+  try { await c.query('BEGIN'); const again = await dispatchShipmentStock(c, b, { actor: ACTOR }); await c.query('COMMIT'); if (!again.repeated) throw new Error('not idempotent'); } finally { c.release(); }
+  const total = await dispatchedFor(a) + await dispatchedFor(b);
+  if (await dispatchedFor(a) !== 6 || await dispatchedFor(b) !== 4 || total !== 10) throw new Error(`deducted ${await dispatchedFor(a)} + ${await dispatchedFor(b)}`);
+  if ((await stockOf(P1.sku)).on !== 40) throw new Error(JSON.stringify(await stockOf(P1.sku)));
+  // A third parcel has nothing left to carry.
+  const third = (await createShipment({ ...ezShip(80, 'AWB-SPLIT-C'), courier_partner_id: P1.dl.id }, { actor: ACTOR, addToExisting: true })).shipmentId;
+  if ((await shipmentStock(third)).state !== 'no_items') throw new Error('third parcel still needs stock');
+  P1.splitShips = [a, b, third];
+  return 'qty 10 in two parcels: reserve 6 + 4 (11, and 5 on the second, refused); dispatch twice each + direct retry → exactly 10 deducted (was 20); third parcel needs nothing';
+});
+await step('split shipments: a single-shipment order must still reserve its full quantity', async () => {
+  await invOrders([amzRow({ 'order-id': AZ(81), 'order-item-id': 'I81', sku: `${TS}-SPLIT`, 'quantity-purchased': '3' })]);
+  const o = (await amzOrder(81)).id;
+  const s1 = (await createShipmentForOrders([o], { courier_partner_id: P1.dl.id, tracking_id: 'AWB-ONE-81' }, { actor: ACTOR })).shipmentId;
+  const st = await shipmentStock(s1);
+  if (st.split || st.lines[0].required !== 3) throw new Error(JSON.stringify(st));
+  await expectErr('partial on a single shipment', () => reserveShipmentStock(s1, [{ batch_id: P1.batch, quantity: 2 }], { actor: ACTOR }), (e) => e.status === 400 && /needs 3; 2 chosen/.test(e.message));
+  await releaseShipmentStock(s1, { actor: ACTOR });
+  P1.single = { o, s1 };
+  return 'not a split; 2 of 3 refused as before';
+});
+await step('split shipments: a split order\'s parcel cannot be shared, nor a shared order split', async () => {
+  // Order 80 is split: another order with items cannot join one of its parcels.
+  await invOrders([amzRow({ 'order-id': AZ(82), 'order-item-id': 'I82', sku: `${TS}-SPLIT`, 'quantity-purchased': '1' })]);
+  const o82 = (await amzOrder(82)).id;
+  await expectErr('join a split parcel', () => attachToShipment(P1.splitShips[2], { orderIds: [o82] }, { actor: ACTOR }), (e) => e.splitShipment || e.alreadyShipped);
+  // An order with items in a shared parcel cannot get a second shipment of its own.
+  await invOrders([amzRow({ 'order-id': AZ(83), 'order-item-id': 'I83', sku: `${TS}-SPLIT`, 'quantity-purchased': '1' })]);
+  const o83 = (await amzOrder(83)).id;
+  await createShipmentForOrders([o82, o83], { courier_partner_id: P1.dl.id, tracking_id: 'AWB-SHARED-8283' }, { actor: ACTOR });
+  await expectErr('split a shared order', () => createShipment({ ...ezShip(83, 'AWB-SPLIT-83'), courier_partner_id: P1.dl.id }, { actor: ACTOR, addToExisting: true }), (e) => e.splitShipment);
+  return 'both refused (409)';
+});
+await step('cancellation: cancelling an order releases its reserved stock in the same step', async () => {
+  await invOrders([amzRow({ 'order-id': AZ(84), 'order-item-id': 'I84', sku: `${TS}-SPLIT`, 'quantity-purchased': '5' })]);
+  const o = (await amzOrder(84)).id;
+  const sid = (await createShipmentForOrders([o], { courier_partner_id: P1.dl.id, tracking_id: 'AWB-CANCEL-84' }, { actor: ACTOR })).shipmentId;
+  await reserveShipmentStock(sid, [{ batch_id: P1.batch, quantity: 5 }], { actor: ACTOR });
+  const before = await stockOf(P1.sku);
+  const ord = await getOrder(o);
+  await updateOrder(o, { order_status: 'cancelled' }, { actor: ACTOR, version: ord.version });
+  const after = await stockOf(P1.sku);
+  if (after.res !== before.res - 5 || after.av !== before.av + 5 || after.on !== before.on) throw new Error(JSON.stringify({ before, after }));
+  const active = (await getPool().query(`SELECT count(*)::int n FROM inventory_reservations WHERE shipment_id = $1 AND status = 'active'`, [sid])).rows[0].n;
+  if (active) throw new Error('reservation still active');
+  if (!(await orderEvents(o)).some((e) => e.event_type === 'stock_released' && e.metadata.reason === 'order cancelled')) throw new Error('not logged');
+  if ((await shipmentStock(sid)).state !== 'no_items') throw new Error('shipment still shows stock');
+  // Nothing left reserved, so the empty parcel can still move without touching stock.
+  await addPhoto(o);
+  await dispatchShip(o, sid);
+  if (await dispatchedFor(sid) !== 0 || (await stockOf(P1.sku)).on !== before.on) throw new Error('stock moved for a cancelled order');
+  return `5 reserved → released on cancel (reserved ${before.res}→${after.res}, available ${before.av}→${after.av}); event logged; nothing deducted afterwards`;
+});
+await step('cancellation: one cancelled order in a shared parcel releases the parcel for re-confirmation', async () => {
+  await invOrders([
+    amzRow({ 'order-id': AZ(85), 'order-item-id': 'I85', sku: `${TS}-SPLIT`, 'quantity-purchased': '2' }),
+    amzRow({ 'order-id': AZ(86), 'order-item-id': 'I86', sku: `${TS}-SPLIT`, 'quantity-purchased': '3' }),
+  ]);
+  const o85 = (await amzOrder(85)).id; const o86 = (await amzOrder(86)).id;
+  const sid = (await createShipmentForOrders([o85, o86], { courier_partner_id: P1.dl.id, tracking_id: 'AWB-SHARED-8586' }, { actor: ACTOR })).shipmentId;
+  await reserveShipmentStock(sid, [{ batch_id: P1.batch, quantity: 5 }], { actor: ACTOR });
+  const ord = await getOrder(o86);
+  await updateOrder(o86, { order_status: 'cancelled' }, { actor: ACTOR, version: ord.version });
+  const st = await shipmentStock(sid);
+  if (st.lines[0].required !== 2 || st.lines[0].reserved_quantity !== 0 || st.state !== 'needs_reservation') throw new Error(JSON.stringify({ l: st.lines[0], state: st.state }));
+  await reserveShipmentStock(sid, [{ batch_id: P1.batch, quantity: 2 }], { actor: ACTOR });
+  await releaseShipmentStock(sid, { actor: ACTOR });
+  return 'cancelled member: all 5 released; parcel now needs 2 and re-reserves cleanly';
+});
+await step('cancellation: dispatch refuses to leave stock reserved behind a parcel nobody needs', async () => {
+  // Simulates a reservation stranded before this fix (e.g. legacy data): dispatch must not keep it silently.
+  await invOrders([amzRow({ 'order-id': AZ(87), 'order-item-id': 'I87', sku: `${TS}-SPLIT`, 'quantity-purchased': '1' })]);
+  const o = (await amzOrder(87)).id;
+  const sid = (await createShipmentForOrders([o], { courier_partner_id: P1.dl.id, tracking_id: 'AWB-STRAND-87' }, { actor: ACTOR })).shipmentId;
+  await reserveShipmentStock(sid, [{ batch_id: P1.batch, quantity: 1 }], { actor: ACTOR });
+  await getPool().query(`UPDATE orders SET order_status = 'cancelled' WHERE id = $1`, [o]);   // the old path: no release
+  if ((await shipmentStock(sid)).state !== 'stranded') throw new Error('stranded reservation not reported');
+  await addPhoto(o);
+  await expectErr('dispatch with stranded stock', () => dispatchShip(o, sid), (e) => e.needsStock);
+  await releaseShipmentStock(sid, { actor: ACTOR });
+  await dispatchShip(o, sid);
+  return 'shown as "stranded" with Release; dispatch refused until released, then fine';
+});
+await step('re-import: a dispatched order\'s lines are never rewritten; an undispatched one still updates', async () => {
+  // Order 81 (3 units) dispatched; order 82 not dispatched.
+  const { o, s1 } = P1.single;
+  await reserveShipmentStock(s1, [{ batch_id: P1.batch, quantity: 3 }], { actor: ACTOR });
+  await addPhoto(o);
+  await dispatchShip(o, s1);
+  const onBefore = (await stockOf(P1.sku)).on;
+  const file = [
+    amzRow({ 'order-id': AZ(81), 'order-item-id': 'I81', sku: `${TS}-SPLIT`, 'quantity-purchased': '7' }),      // changed qty
+    amzRow({ 'order-id': AZ(81), 'order-item-id': 'I81b', sku: `${TS}-SPLIT`, 'quantity-purchased': '2' }),     // new line
+  ];
+  const p = await previewAmazonImport(amzCsv(file), 'reimport.csv');
+  if (p.summary.lockedOrders !== 1 || p.summary.lockedLineItems !== 2 || p.summary.newLineItems || p.summary.changedLineItems) throw new Error(JSON.stringify(p.summary));
+  const r = await invOrders(file);
+  if (r.summary.lineItemsAdded || r.summary.lineItemsUpdated || r.summary.lockedLineItems !== 2) throw new Error(JSON.stringify(r.summary));
+  const lines = (await getPool().query('SELECT source_line_item_id, quantity, sku_id FROM order_items WHERE order_id = $1 ORDER BY id', [o])).rows;
+  if (lines.length !== 1 || lines[0].quantity !== 3 || lines[0].sku_id !== P1.sku) throw new Error(JSON.stringify(lines));
+  if (await dispatchedFor(s1) !== 3 || (await stockOf(P1.sku)).on !== onBefore) throw new Error('ledger changed');
+  if (!(await orderEvents(o)).some((e) => e.event_type === 'amazon_import_lines_locked' && e.metadata.lines === 2)) throw new Error('not logged');
+  // The same file again: still nothing written, nothing deducted.
+  await invOrders(file);
+  if ((await getPool().query('SELECT count(*)::int n FROM order_items WHERE order_id = $1', [o])).rows[0].n !== 1) throw new Error('second import wrote');
+  // An order that has not left still takes the new quantity.
+  await invOrders([amzRow({ 'order-id': AZ(82), 'order-item-id': 'I82', sku: `${TS}-SPLIT`, 'quantity-purchased': '4' })]);
+  const q82 = (await getPool().query('SELECT quantity FROM order_items WHERE order_id = (SELECT id FROM orders WHERE source_order_id = $1)', [AZ(82)])).rows[0].quantity;
+  if (q82 !== 4) throw new Error(`undispatched order not updated: ${q82}`);
+  return 'dispatched order: qty 3→7 and a new line both refused (preview + commit report 2 locked), lines and ledger unchanged, event logged, repeat import idem; undispatched order 1→4 applied';
+});
+
 await step('inventory: every change is attributed (user, time, reason, reference)', async () => {
   const { rows } = await getPool().query(
     `SELECT count(*) FILTER (WHERE actor IS NULL OR reason IS NULL OR at IS NULL)::int AS missing, count(*)::int AS n
