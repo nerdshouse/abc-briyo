@@ -163,6 +163,33 @@ function render() {
   renderIcons();
 }
 
+// ------------------------------------------------------------------ scroll lock
+
+/**
+ * While a drawer is open the page behind it must not move. The window is the
+ * scroller here (the sidebar is sticky to it), so the lock hides overflow on
+ * <html> — which keeps the sidebar in place, unlike position:fixed on body —
+ * pads for the vanished scrollbar so nothing shifts sideways, and puts the
+ * exact scroll position back on unlock.
+ */
+let lockedAt = null;
+function syncScrollLock() {
+  const open = !$('#drawer').hidden || !$('#formDrawer').hidden;
+  const root = document.documentElement;
+  if (open && lockedAt === null) {
+    lockedAt = window.scrollY;
+    const bar = window.innerWidth - root.clientWidth;
+    root.classList.add('scroll-locked');
+    if (bar > 0) root.style.paddingRight = `${bar}px`;
+  } else if (!open && lockedAt !== null) {
+    const y = lockedAt;
+    lockedAt = null;
+    root.classList.remove('scroll-locked');
+    root.style.paddingRight = '';
+    window.scrollTo(0, y);
+  }
+}
+
 // ------------------------------------------------------------------ SKU drawer
 
 async function openSku(id) {
@@ -171,6 +198,7 @@ async function openSku(id) {
   $$('.orow').forEach((r) => r.classList.toggle('open', Number(r.dataset.sku) === id));
   $('#drawer').hidden = false;
   $('#drawerScrim').hidden = false;
+  syncScrollLock();
   $('#dSaved').textContent = '';
   if (!state.detail || state.detail.sku.id !== id) { $('#dTitle').textContent = 'Loading…'; $('#dSub').textContent = ''; $('#dBody').innerHTML = ''; }
   try {
@@ -183,6 +211,7 @@ async function openSku(id) {
 function closeSku() {
   $('#drawer').hidden = true;
   if ($('#formDrawer').hidden) $('#drawerScrim').hidden = true;
+  syncScrollLock();
   state.openSku = null;
   writeUrl();
   $$('.orow.open').forEach((r) => r.classList.remove('open'));
@@ -309,16 +338,21 @@ function platformSection(s) {
       <h3 class="dsec-title">Platform SKUs <span class="dsec-meta soft">${count(s.platform_skus.length)} mapping${s.platform_skus.length === 1 ? '' : 's'}</span></h3>
       <p class="imp-note" style="margin:0 0 10px">Marketplace identifiers for this product. An order from a platform with one of these codes resolves to master SKU
         <b class="mono">${esc(s.sku)}</b> and uses its stock. They are not separate products and hold no stock of their own.</p>
-      ${groups.length ? `<div class="pf-groups">${groups.map((g) => `<div class="pf-group"><div class="pf-label">${esc(g.label)}</div><div class="pf-codes">${g.list.map((m) => `
-        <span class="pf-chip"><span class="mono">${esc(m.platform_sku)}</span>${m.duplicate_override ? `<span class="mini-tag warn" title="${esc(`Also mapped to another master SKU. Reason: ${m.duplicate_reason}`)}">Duplicate</span>` : ''}
-          <span class="soft" title="${esc(`Added ${m.source === 'import' ? 'by import' : m.source === 'migrated' ? 'from the old Amazon field' : m.source === 'unmapped' ? 'from Unmapped platform SKUs' : 'by hand'}${m.created_by ? ` · ${m.created_by}` : ''}`)}">${usage[m.id] ? `${count(usage[m.id])} order line${usage[m.id] === 1 ? '' : 's'}` : ''}</span>
-          ${isAdmin() ? `<button type="button" class="icon-btn bare pf-remove" data-unmap="${m.id}" data-code="${esc(m.platform_sku)}" data-lines="${usage[m.id] || 0}" title="Remove this mapping" aria-label="Remove ${esc(g.label)} SKU ${esc(m.platform_sku)}">${icon('x')}</button>` : ''}
-        </span>`).join('')}</div></div>`).join('')}</div>`
+      ${s.platform_skus.length ? `<ul class="pf-list">${groups.map((g) => g.list.map((m) => `
+        <li class="pf-row">
+          <div class="pf-main"><span class="pf-label">${esc(g.label)}</span>
+            <span class="pf-code mono">${esc(m.platform_sku)}</span>
+            ${m.duplicate_override ? `<span class="mini-tag warn" title="${esc(`Also mapped to another master SKU. Reason: ${m.duplicate_reason}`)}">Duplicate</span>` : ''}</div>
+          <span class="pf-meta soft" title="${esc(`Added ${m.source === 'import' ? 'by import' : m.source === 'migrated' ? 'from the old Amazon field' : m.source === 'unmapped' ? 'from Unmapped platform SKUs' : 'by hand'}${m.created_by ? ` · ${m.created_by}` : ''}`)}">${usage[m.id] ? `${count(usage[m.id])} order line${usage[m.id] === 1 ? '' : 's'}` : ''}</span>
+          ${isAdmin() ? `<button type="button" class="linkish pf-remove" data-unmap="${m.id}" data-code="${esc(m.platform_sku)}" data-lines="${usage[m.id] || 0}" aria-label="Remove ${esc(g.label)} SKU ${esc(m.platform_sku)}">Remove</button>` : ''}
+        </li>`).join('')).join('')}</ul>`
         : '<p class="soft" style="margin:0">No platform SKUs yet. Orders from marketplaces will not resolve to this product until they are added.</p>'}
       ${isAdmin() ? `<div class="pf-add">
-        <select class="select" id="pfPlatform" aria-label="Platform">${platforms.filter((p) => p.active).map((p) => opt(p.key, p.label)).join('')}</select>
-        <textarea class="input mono" id="pfCodes" rows="2" placeholder="One or more platform SKUs, exactly as the platform shows them (no spaces) — one per line, or separated by /"></textarea>
-        <button type="button" class="btn" id="pfAdd">${icon('plus')}Add platform SKU</button>
+        <label class="fld"><span>Platform</span><select class="select" id="pfPlatform">${platforms.filter((p) => p.active).map((p) => opt(p.key, p.label, p.key === state.pfPlatform)).join('')}</select></label>
+        <label class="fld"><span>Platform SKU</span><div class="pf-entry">
+          <input class="input mono" id="pfCode" placeholder="Enter platform SKU" maxlength="80" autocomplete="off" spellcheck="false" />
+          <button type="button" class="btn" id="pfAdd">Add</button></div></label>
+        <p class="pf-error" id="pfError" role="alert" hidden></p>
       </div>` : ''}
       ${s.asin || s.amazon_listing_id || s.amazon_product_id || s.amazon_item_name ? `<dl class="kv" style="margin-top:12px">
         ${s.asin ? `<dt>ASIN</dt><dd class="mono">${esc(s.asin)}</dd>` : ''}
@@ -378,16 +412,14 @@ function openForm(kind, ctx = {}) {
       </div></section>`;
   } else if (kind === 'dup-map') {
     const d = ctx.dup;
-    title = `Duplicate ${d.platform_label} SKU detected`;
-    sub = 'A platform SKU normally belongs to one master SKU. Adding it to a second one needs a reason, which is kept in the audit record.';
+    title = 'SKU already mapped';
+    sub = `${d.platform_label} · adding to ${d.target.sku}`;
     submit = 'Add anyway';
-    body = `<section class="dsec">${d.duplicates.map((x) => `<dl class="kv" style="margin-bottom:12px">
-        <dt>${esc(d.platform_label)} SKU</dt><dd class="mono">${esc(x.platform_sku)}</dd>
-        <dt>Currently mapped to</dt><dd>${x.mapped_to.map((o) => `<b class="mono">${esc(o.sku)}</b> ${esc(o.product_name)}`).join('<br>')}</dd>
-        <dt>You are adding it to</dt><dd><b class="mono">${esc(d.target.sku)}</b> ${esc(d.target.product_name)}</dd></dl>`).join('')}
-      <p class="imp-note warn-text" style="margin:0">This SKU is already mapped to another master SKU. Orders with it keep resolving to
-        <b class="mono">${esc(d.duplicates[0].mapped_to[0].sku)}</b> (the first mapping) and use its stock.</p>
-      <label class="fld wide" id="dupReasonFld" hidden style="margin-top:12px"><span>Why are you adding the same platform SKU to multiple master SKUs?</span>
+    body = `<section class="dsec">${d.duplicates.map((x) => `<p class="dup-lead"><b class="mono">${esc(x.platform_sku)}</b> is currently mapped to:</p>
+        <ul class="dup-list">${x.mapped_to.map((o) => `<li><b class="mono">${esc(o.sku)}</b> — ${esc(o.product_name)}</li>`).join('')}</ul>`).join('')}
+      <p class="soft" style="margin:12px 0 0">Adding it to <b class="mono">${esc(d.target.sku)}</b> — ${esc(d.target.product_name)} as well. Orders with this SKU keep resolving to
+        <b class="mono">${esc(d.duplicates[0].mapped_to[0].sku)}</b> and use its stock.</p>
+      <label class="fld wide" id="dupReasonFld" hidden style="margin-top:14px"><span>Why are you adding the same platform SKU to multiple master SKUs?</span>
         <textarea class="input" id="dupReason" name="duplicate_reason" rows="3" maxlength="1000" placeholder="Required"></textarea>
         <span class="help">Required. Stored with the mapping and in the audit record.</span></label>
     </section>`;
@@ -489,12 +521,14 @@ function openForm(kind, ctx = {}) {
   $('#fSaved').textContent = '';
   $('#formDrawer').hidden = false;
   $('#drawerScrim').hidden = false;
+  syncScrollLock();
   renderIcons();
   f.querySelector('input:not([readonly]):not([type=file]), select')?.focus();
 }
 function closeForm() {
   $('#formDrawer').hidden = true;
   if ($('#drawer').hidden) $('#drawerScrim').hidden = true;
+  syncScrollLock();
   state.form = null;
 }
 const formError = (msg) => { const e = $('#fError'); e.textContent = msg; e.hidden = !msg; };
@@ -537,6 +571,34 @@ function renderImportPreview(p) {
 }
 
 async function refreshMeta() { state.meta = await api('/api/inventory/meta'); }
+
+/**
+ * Manual entry: one platform SKU at a time. The server applies every rule
+ * (trim, no inner spaces, idempotent, duplicate confirmation); the space
+ * check here only gives the same answer without a round trip.
+ */
+async function addPlatformSku() {
+  const input = $('#pfCode');
+  const code = input.value.trim();
+  const showError = (msg) => { if (msg) $('#dSaved').textContent = ''; $('#pfError').textContent = msg; $('#pfError').hidden = !msg; input.classList.toggle('invalid', Boolean(msg)); };
+  showError('');
+  if (!code) return showError('Enter the platform SKU.');
+  if (/\s/.test(code)) return showError('SKU cannot contain spaces.');
+  state.pfPlatform = $('#pfPlatform').value;
+  const req = { skuId: state.detail.sku.id, platform: state.pfPlatform, codes: [code] };
+  $('#pfAdd').disabled = true;
+  try {
+    const r = await addMapping(req);
+    await openSku(req.skuId);
+    $('#dSaved').className = 'saved';
+    $('#dSaved').textContent = r.added.length ? `Added ${r.added[0]}${r.orderItemsMapped ? ` · ${r.orderItemsMapped} order line${r.orderItemsMapped > 1 ? 's' : ''} now resolve` : ''}` : 'Already mapped to this Master SKU.';
+    load();
+  } catch (err) {
+    if (err.data?.duplicateMapping) return openForm('dup-map', { ...req, dup: err.data.duplicateMapping });
+    showError(err.data?.invalidPlatformSku ? 'SKU cannot contain spaces.' : err.message);
+  } finally { if ($('#pfAdd')) $('#pfAdd').disabled = false; }
+  return null;
+}
 
 /** Adds platform SKUs to a master; a duplicate comes back as err.data.duplicateMapping. */
 const addMapping = ({ skuId, platform, codes, fromOrder = false, confirmDuplicate = false, reason = '' }) =>
@@ -647,6 +709,8 @@ function bind() {
     $(id).addEventListener('input', (e) => { clearTimeout(t); t = setTimeout(() => { state.f[k] = e.target.value.trim(); writeUrl(); load(); }, 250); });
   }
   onLeave(() => clearTimeout(t));
+  // Leaving the page with a drawer open must not leave the next page locked.
+  onLeave(() => { document.documentElement.classList.remove('scroll-locked'); document.documentElement.style.paddingRight = ''; lockedAt = null; });
   $('#fclear').addEventListener('click', () => { for (const k of FILTERS) state.f[k] = ''; fillFilters(); writeUrl(); load(); });
   $('#cards').addEventListener('click', (e) => {
     const c = e.target.closest('[data-filter]');
@@ -669,6 +733,12 @@ function bind() {
   $('#newSku').addEventListener('click', () => openForm('sku'));
   $('#places').addEventListener('click', () => openForm('places'));
   $('#importSkus').addEventListener('click', () => openForm('import'));
+  $('#dBody').addEventListener('keydown', (e) => {
+    if (e.target.id === 'pfCode' && e.key === 'Enter') { e.preventDefault(); addPlatformSku(); }
+  });
+  $('#dBody').addEventListener('input', (e) => {
+    if (e.target.id === 'pfCode' && !$('#pfError').hidden) { $('#pfError').hidden = true; e.target.classList.remove('invalid'); }
+  });
   $('#invForm').addEventListener('input', (e) => {
     if (e.target.id === 'dupReason') $('#fSubmit').disabled = !e.target.value.trim();
   });
@@ -711,20 +781,7 @@ function bind() {
       const batchId = a.dataset.batch ? Number(a.dataset.batch) : null;
       return openForm(a.dataset.act === 'receive' ? 'receive' : a.dataset.act, { batchId, skuId: state.detail.sku.id });
     }
-    if (e.target.closest('#pfAdd')) {
-      const req = { skuId: state.detail.sku.id, platform: $('#pfPlatform').value, codes: $('#pfCodes').value };
-      try {
-        const r = await addMapping(req);
-        await openSku(req.skuId);
-        $('#dSaved').className = 'saved';
-        $('#dSaved').textContent = `${r.added.length ? `Added ${r.added.join(', ')}` : 'Already mapped to this Master SKU.'}${r.added.length && r.existing.length ? ` · ${r.existing.join(', ')} already mapped to this Master SKU` : ''}${r.orderItemsMapped ? ` · ${r.orderItemsMapped} order lines now resolve` : ''}`;
-        load();
-      } catch (err) {
-        if (err.data?.duplicateMapping) return openForm('dup-map', { ...req, dup: err.data.duplicateMapping });
-        $('#dSaved').className = 'saved failed'; $('#dSaved').textContent = err.message;
-      }
-      return null;
-    }
+    if (e.target.closest('#pfAdd')) { addPlatformSku(); return null; }
     const un = e.target.closest('[data-unmap]');
     if (un) {
       const lines = Number(un.dataset.lines);
