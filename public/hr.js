@@ -49,7 +49,7 @@ const APP_STATUS = {
 const tag = (map, s) => `<span class="status ${map[s]?.[0] || ''}"><span class="dot"></span>${esc(map[s]?.[1] || s)}</span>`;
 const EVENT = {
   application_started: 'Started the application', resume_uploaded: 'Uploaded a resume', application_submitted: 'Application submitted',
-  status_changed: 'Status changed', note_added: 'Note added', resume_removed: 'Resume removed', candidate_profile_updated: 'Candidate updated their details',
+  status_changed: 'Status changed', note_added: 'Note added', resume_removed: 'Resume removed', resume_removal_started: 'Resume removal started', resume_removal_failed: 'Resume removal did not finish', candidate_profile_updated: 'Candidate updated their details',
 };
 
 const num = (v) => (v === null || v === undefined || v === '' ? null : Number(v));
@@ -210,7 +210,7 @@ function renderApps() {
       <td><span class="cell-text">${esc(a.job_title)}</span>${a.location ? `<span class="cell-sub muted">${esc(a.location)}</span>` : ''}</td>
       <td>${tag(APP_STATUS, a.status)}</td>
       <td><span title="${esc(dateTime(a.applied_at))}">${esc(relative(a.applied_at))}</span></td>
-      <td>${a.has_resume ? `${icon('file-text', 'inline-ico')} On file` : '<span class="muted-cell">Removed</span>'}</td>
+      <td>${a.has_resume ? `${icon('file-text', 'inline-ico')} On file` : `<span class="muted-cell">${a.resume_state === 'removing' ? 'Removal pending' : 'Removed'}</span>`}</td>
     </tr>`).join('');
   $('#clist').innerHTML = rows.map((a) => `
     <li class="oitem" data-app="${a.id}" tabindex="0">
@@ -499,6 +499,10 @@ function renderApp() {
         <input class="input" id="resumeReason" maxlength="300" placeholder="Reason (optional)" aria-label="Reason for removing the resume" />
         <div class="form-actions"><button class="btn" type="button" id="resumeCancel">Cancel</button><button class="btn danger" type="button" id="resumeConfirmBtn">Remove permanently</button></div>
         <div id="resumeErr"></div></div>`
+    : a.resume_state === 'removing'
+      // The database says a removal started and has not finished: never offer the file.
+      ? `<div class="alert warn">${icon('triangle-alert')}<span>Removal not finished. The file may already be deleted; it is not available.</span>
+          ${canManage() ? '<button class="alert-link" type="button" id="resumeRetry">Finish removal</button>' : ''}</div><div id="resumeErr"></div>`
     : (() => { const ev = [...events].reverse().find((e) => e.event_type === 'resume_removed');
       return `<p class="soft">${ev ? `Removed by ${esc(ev.actor || '—')} on ${esc(dateTime(ev.at))}${ev.metadata?.reason ? ` — ${esc(ev.metadata.reason)}` : ''}.` : 'No resume on file.'}</p>`; })();
   $('#dBody').innerHTML = `
@@ -522,7 +526,7 @@ function renderApp() {
       ${history.length ? `<ul class="hr-timeline">${history.map((h) => `<li>${tag(APP_STATUS, h.from_status)} → ${tag(APP_STATUS, h.to_status)}
         <span class="soft">${esc(h.actor || '—')} · ${esc(dateTime(h.at))}</span>${h.note ? `<p>${esc(h.note)}</p>` : ''}</li>`).join('')}</ul>` : '<p class="soft">Still at Applied. Changes appear here with who made them.</p>'}</section>
     <section class="dsec"><h3 class="dsec-title">Activity</h3>
-      <ul class="hr-timeline">${events.map((e) => `<li>${esc(EVENT[e.event_type] || e.event_type)}${e.event_type === 'resume_removed' && e.metadata?.reason ? ` <span class="soft">— ${esc(e.metadata.reason)}</span>` : ''}${e.event_type === 'candidate_profile_updated' && e.metadata?.changed ? ` <span class="soft">(${esc(Object.keys(e.metadata.changed).join(', ').replace(/_/g, ' '))})</span>` : ''}
+      <ul class="hr-timeline">${events.map((e) => `<li>${esc(EVENT[e.event_type] || e.event_type)}${(e.event_type === 'resume_removed' || e.event_type === 'resume_removal_started') && e.metadata?.reason ? ` <span class="soft">— ${esc(e.metadata.reason)}</span>` : ''}${e.event_type === 'candidate_profile_updated' && e.metadata?.changed ? ` <span class="soft">(${esc(Object.keys(e.metadata.changed).join(', ').replace(/_/g, ' '))})</span>` : ''}
         <span class="soft">${esc(e.actor || 'Candidate')} · ${esc(dateTime(e.at))}</span></li>`).join('')}</ul></section>`;
   renderIcons();
 }
@@ -546,17 +550,21 @@ async function saveStatus() {
 
 async function removeResume() {
   const id = state.app.application.id;
-  $('#resumeConfirmBtn').disabled = true;
+  const btn = $('#resumeConfirmBtn') || $('#resumeRetry');
+  btn.disabled = true;
   saved('Removing…', 'saved pending');
   try {
-    await api(`/api/hr/applications/${id}/resume`, { method: 'DELETE', body: JSON.stringify({ reason: $('#resumeReason').value.trim() || null }) });
+    await api(`/api/hr/applications/${id}/resume`, { method: 'DELETE', body: JSON.stringify({ reason: $('#resumeReason')?.value.trim() || null }) });
     await openApp(id);
     saved('Resume removed');
     loadApps().then(renderApps).catch(() => {});
   } catch (err) {
     saved('Not removed', 'saved failed');
-    $('#resumeErr').innerHTML = `<div class="form-error">${esc(err.message)}</div>`;
-    $('#resumeConfirmBtn').disabled = false;
+    // Whatever happened, show what the database now says.
+    if (err.status >= 500) await openApp(id).catch(() => {});
+    if ($('#resumeErr')) $('#resumeErr').innerHTML = `<div class="form-error">${esc(err.message)}</div>`;
+    if ($('#resumeConfirm')) $('#resumeConfirm').hidden = false;
+    const again = $('#resumeConfirmBtn') || $('#resumeRetry'); if (again) again.disabled = false;
   }
 }
 
@@ -627,7 +635,7 @@ function bind() {
     if (t.id === 'noteSave') { saveNote(); return; }
     if (t.id === 'resumeRemove') { $('#resumeConfirm').hidden = false; $('#resumeReason').focus(); return; }
     if (t.id === 'resumeCancel') { $('#resumeConfirm').hidden = true; return; }
-    if (t.id === 'resumeConfirmBtn') { removeResume(); return; }
+    if (t.id === 'resumeConfirmBtn' || t.id === 'resumeRetry') { removeResume(); return; }
     if (t.dataset.reload !== undefined) { state.dirty = false; if (state.openJob) openJob(state.openJob); else if (state.openApp) openApp(state.openApp); return; }
     if (t.dataset.appLink) { e.preventDefault(); openApp(Number(t.dataset.appLink)); return; }
     if (t.dataset.copy !== undefined) {

@@ -30,7 +30,7 @@ import {
 import { homeFor, MODULE_KEYS, isValidAssignment } from './lib/permissions.js';
 import { careersHost } from './lib/careers.js';
 import { router as hrRouter } from './lib/hr-routes.js';
-import { ensureHrSchema } from './lib/hr.js';
+import { ensureHrSchema, retryPendingRemovals } from './lib/hr.js';
 import { router as ordersRouter, courierRouter, destinationRouter } from './lib/orders-routes.js';
 import { router as inventoryRouter } from './lib/inventory-routes.js';
 import { ensureInventorySchema } from './lib/inventory.js';
@@ -1105,6 +1105,10 @@ app.listen(port, async () => {
         .catch((e) => console.error('Orders & inventory schema setup failed (will retry on first request):', e.message));
       ensureHrSchema()
         .then(() => console.log('HR schema ready'))
+        // Resume removals interrupted after the file was deleted are finished here.
+        .then(() => retryPendingRemovals()
+          .then((r) => { if (r.pending) console.log(`Resume removals: ${r.finished} of ${r.pending} pending finished`); })
+          .catch((e) => console.error('Pending resume removals not retried:', e.message)))
         .catch((e) => console.error('HR schema setup failed (will retry on first request):', e.message));
       console.log(process.env.CAREERS_HOST ? `Careers host: ${process.env.CAREERS_HOST} (public careers routes only)` : 'Careers host: not configured');
     } catch (err) {

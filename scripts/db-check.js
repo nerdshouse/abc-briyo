@@ -47,7 +47,7 @@ import os from 'node:os';
 import path from 'node:path';
 import fsp from 'node:fs/promises';
 import http from 'node:http';
-import { ensureHrSchema, purgeTestHr, slugify, normalizePhone, removeResume } from '../lib/hr.js';
+import { ensureHrSchema, purgeTestHr, slugify, normalizePhone, removeResume, retryPendingRemovals } from '../lib/hr.js';
 import { jobPostingLd } from '../lib/careers-pages.js';
 import { issueFormToken, verifyTurnstile } from '../lib/careers.js';
 import net from 'node:net';
@@ -3538,33 +3538,83 @@ await step('hr: status changes with history, notes, search and filters', async (
   return 'applied→screening (note)→interview with history + actor; stale 409; unknown 400; non-HR 403; notes; search by name/email/phone; status + job filters; events';
 });
 
-await step('hr: remove resume — permanent, audited, HR manager only; candidate and application stay', async () => {
+await step('hr: remove resume — state machine across storage + database: normal, storage failure, finalize failure + retry, idempotent', async () => {
+  const pool = getPool();
+  const st = async (id) => (await pool.query('SELECT resume_state, resume_storage_path, resume_filename, resume_size, resume_uploaded_at, status, candidate_id FROM hr_applications WHERE id = $1', [id])).rows[0];
+  const evs = async (id) => (await pool.query('SELECT event_type, actor, at, metadata FROM hr_events WHERE application_id = $1 ORDER BY id', [id])).rows;
+  const exists = (key) => fsp.access(path.join(HRS.dir, key)).then(() => true, () => false);
+  const localStore = { remove: (key) => fsp.rm(path.join(HRS.dir, key), { force: true }) };
+  const brokenStore = { remove: async () => { throw new Error('R2 unavailable'); } };
+  const failFinalize = { beforeFinalize: async () => { throw new Error('simulated database failure'); } };
+  const hasResume = async (id) => (await internal('mgr', 'GET', `/api/hr/applications/${id}`)).body.application.has_resume;
+  const others = (await pool.query(`SELECT a.id FROM hr_applications a JOIN hr_candidates c ON c.id = a.candidate_id
+    WHERE a.resume_state = 'present' AND c.email LIKE 'dbcheck-hr-%' AND a.id <> $1 ORDER BY a.id`, [HRS.app.id])).rows.map((r) => Number(r.id));
+  if (others.length < 2) throw new Error('need two more applications with resumes');
+  const [b, c] = others;
+
+  // 2. Storage refuses on a fresh removal → back to present, metadata intact, still downloadable.
   const id = HRS.app.id;
-  const key = (await getPool().query('SELECT resume_storage_path FROM hr_applications WHERE id = $1', [id])).rows[0].resume_storage_path;
-  const file = path.join(HRS.dir, key);
-  await fsp.access(file);
-  // Storage refuses → nothing changes.
-  await expectErr('storage failure', () => removeResume(id, { actor: 'db-check', store: { remove: async () => { throw new Error('R2 down'); } } }), (e) => e.status === 502);
-  const still = (await getPool().query('SELECT resume_storage_path, version FROM hr_applications WHERE id = $1', [id])).rows[0];
-  if (still.resume_storage_path !== key || (await getPool().query(`SELECT count(*)::int n FROM hr_events WHERE application_id = $1 AND event_type = 'resume_removed'`, [id])).rows[0].n) throw new Error('failed removal changed the row');
+  const before = await st(id);
+  if (before.resume_state !== 'present' || !(await exists(before.resume_storage_path))) throw new Error('fixture');
+  await expectErr('storage failure', () => removeResume(id, { actor: 'db-check', store: brokenStore }), (e) => e.status === 502);
+  const afterFail = await st(id);
+  if (afterFail.resume_state !== 'present' || afterFail.resume_storage_path !== before.resume_storage_path || afterFail.resume_filename !== before.resume_filename) throw new Error('storage failure changed metadata');
+  if (!(await hasResume(id)) || (await internal('mgr', 'GET', `/api/hr/applications/${id}/resume`)).status !== 200) throw new Error('resume not available after a failed removal');
+  if (!(await evs(id)).some((e) => e.event_type === 'resume_removal_failed' && e.metadata.stage === 'storage')) throw new Error('storage failure not recorded');
+
+  // Permissions.
   for (const [who, want] of [['nonHr', 403], ['', 401]]) {
     const r = await internal(who || null, 'DELETE', `/api/hr/applications/${id}/resume`, { reason: 'x' });
     if (r.status !== want) throw new Error(`${who || 'anon'} remove ${r.status}`);
   }
+
+  // 1. Normal removal through the API.
   const r = await internal('mgr', 'DELETE', `/api/hr/applications/${id}/resume`, { reason: 'Candidate asked' });
-  if (r.status !== 200) throw new Error(`remove ${r.status} ${JSON.stringify(r.body)}`);
-  if (await fsp.access(file).then(() => true, () => false)) throw new Error('file still in storage');
-  const row = (await getPool().query('SELECT resume_storage_path, resume_filename, resume_mime, resume_size, resume_uploaded_at, status, candidate_id FROM hr_applications WHERE id = $1', [id])).rows[0];
-  if (row.resume_storage_path || row.resume_filename || row.resume_mime || row.resume_size || row.resume_uploaded_at) throw new Error('resume fields not cleared');
-  if (!(await getPool().query('SELECT 1 FROM hr_candidates WHERE id = $1', [row.candidate_id])).rows.length) throw new Error('candidate deleted');
-  const ev = (await getPool().query(`SELECT actor, at, metadata FROM hr_events WHERE application_id = $1 AND event_type = 'resume_removed'`, [id])).rows;
-  if (ev.length !== 1 || !ev[0].actor || !ev[0].at || ev[0].metadata.reason !== 'Candidate asked' || ev[0].metadata.filename !== 'Test CV.pdf') throw new Error(JSON.stringify(ev));
-  const d = await internal('mgr', 'GET', `/api/hr/applications/${id}`);
-  if (d.status !== 200 || d.body.application.has_resume || d.body.application.status !== 'interview') throw new Error('application detail');
-  if ((await internal('mgr', 'GET', `/api/hr/applications/${id}/resume`)).status !== 404) throw new Error('download after removal');
-  if ((await internal('mgr', 'DELETE', `/api/hr/applications/${id}/resume`, {})).status !== 404) throw new Error('second removal');
-  if (!(await internal('mgr', 'GET', '/api/hr/applications')).body.applications.some((a) => a.id === id)) throw new Error('application no longer listed');
-  return 'storage failure → 502, nothing changed; non-HR 403, anon 401; manager: object deleted, 5 resume fields cleared, event with actor + time + reason + filename; candidate, application and status kept; download 404; repeat 404';
+  if (r.status !== 200 || r.body.already) throw new Error(`remove ${r.status} ${JSON.stringify(r.body)}`);
+  const done = await st(id);
+  if (await exists(before.resume_storage_path)) throw new Error('file still in storage');
+  if (done.resume_state !== 'removed' || done.resume_storage_path || done.resume_filename || done.resume_size || done.resume_uploaded_at) throw new Error('fields not cleared');
+  if (done.status !== 'interview' || !(await pool.query('SELECT 1 FROM hr_candidates WHERE id = $1', [done.candidate_id])).rows.length) throw new Error('application or candidate changed');
+  // The failed attempt above has its own started + failed events; this removal adds the last two.
+  const ev = (await evs(id)).filter((e) => e.event_type === 'resume_removal_started' || e.event_type === 'resume_removed').slice(-2);
+  if (ev.map((e) => e.event_type).join() !== 'resume_removal_started,resume_removed' || ev.some((e) => !e.actor || !e.at) || ev[1].metadata.reason !== 'Candidate asked' || ev[1].metadata.filename !== 'Test CV.pdf') throw new Error(JSON.stringify(ev));
+  if ((await hasResume(id)) || (await internal('mgr', 'GET', `/api/hr/applications/${id}/resume`)).status !== 404) throw new Error('removed resume offered');
+
+  // 4. Repeating is not an error and records nothing new.
+  const n = (await evs(id)).length;
+  const again = await internal('mgr', 'DELETE', `/api/hr/applications/${id}/resume`, {});
+  if (again.status !== 200 || !again.body.already || (await evs(id)).length !== n) throw new Error(`repeat ${again.status}`);
+
+  // 3. File deleted, database finalize fails → "removing", key kept, nothing offered; retry finishes.
+  const keyB = (await st(b)).resume_storage_path;
+  await expectErr('finalize failure', () => removeResume(b, { actor: 'db-check', reason: 'Retention', store: localStore, hooks: failFinalize }), (e) => e.status === 503 && e.retry);
+  const mid = await st(b);
+  if (mid.resume_state !== 'removing' || mid.resume_storage_path !== keyB || await exists(keyB)) throw new Error(`after finalize failure: ${JSON.stringify(mid)}`);
+  const midDetail = (await internal('mgr', 'GET', `/api/hr/applications/${b}`)).body.application;
+  const midList = (await internal('mgr', 'GET', '/api/hr/applications')).body.applications.find((x) => x.id === b);
+  if (midDetail.has_resume || midDetail.resume_state !== 'removing' || midList.has_resume || (await internal('mgr', 'GET', `/api/hr/applications/${b}/resume`)).status !== 404) throw new Error('pending removal offered as available');
+  if (!(await evs(b)).some((e) => e.event_type === 'resume_removal_failed' && e.metadata.stage === 'finalize')) throw new Error('finalize failure not recorded');
+  // A retry whose storage call fails must NOT go back to "present" (the file is gone).
+  await expectErr('retry, storage down', () => removeResume(b, { actor: 'db-check', store: brokenStore }), (e) => e.status === 502);
+  if ((await st(b)).resume_state !== 'removing') throw new Error('retry with storage down reverted to present');
+  // Retry through the API: the object is already gone, which is fine.
+  const fin = await internal('mgr', 'DELETE', `/api/hr/applications/${b}/resume`, {});
+  const end = await st(b);
+  if (fin.status !== 200 || end.resume_state !== 'removed' || end.resume_storage_path) throw new Error(`retry ${fin.status} ${JSON.stringify(end)}`);
+  if ((await evs(b)).filter((e) => e.event_type === 'resume_removal_started').length !== 1) throw new Error('retry re-started the removal');
+  if ((await evs(b)).find((e) => e.event_type === 'resume_removed')?.metadata.reason !== 'Retention') throw new Error('retry lost the reason');
+
+  // The boot-time sweep finishes an interrupted removal on its own.
+  const keyC = (await st(c)).resume_storage_path;
+  await expectErr('finalize failure (c)', () => removeResume(c, { actor: 'db-check', store: localStore, hooks: failFinalize }), (e) => e.status === 503);
+  const sweep = await retryPendingRemovals({ store: localStore });
+  if (sweep.finished < 1 || (await st(c)).resume_state !== 'removed' || await exists(keyC)) throw new Error(`sweep ${JSON.stringify(sweep)}`);
+  const sysEv = (await evs(c)).find((e) => e.event_type === 'resume_removed');
+  if (sysEv?.actor !== 'system: removal retry') throw new Error('sweep not attributed');
+
+  // The database refuses an inconsistent row.
+  await expectErr('removed with a key', () => pool.query(`UPDATE hr_applications SET resume_storage_path = 'x' WHERE id = $1`, [id]), (e) => e.code === '23514');
+  return 'storage failure → present, metadata + download intact, event; normal → file gone, fields cleared, started+removed events with actor/time/reason, status + candidate kept; repeat → 200 already, no new events; finalize failure → removing (key kept, file gone, never offered), retry with storage down stays removing, API retry finishes, one start event; boot sweep finishes; CHECK refuses inconsistent rows';
 });
 
 await step('careers pages — home, job page, closed, draft/archived, SEO and JobPosting data', async () => {
