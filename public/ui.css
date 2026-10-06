@@ -912,3 +912,106 @@ main.page[aria-busy="true"] { opacity: .6; transition: opacity .15s .1s; }
    cart import/export) step aside on the Orders pages. The shell is shared;
    the page says which section it belongs to. Role visibility is separate. */
 .app:has(main.page[data-section="orders"]) .sidebar [data-context="recovery"] { display: none; }
+
+/* --------------------------------------------------------------------------
+   Admin dashboard — operations first, recovery below
+   -------------------------------------------------------------------------- */
+.btn.spin .lucide { animation: spin .8s linear infinite; }
+.status.none .dot { background: transparent; border: 1px dashed var(--text-3); }
+.status.none { color: var(--text-3); }
+
+/* B. four current-state numbers, one row, each a way in */
+.okpis {
+  display: grid; grid-template-columns: repeat(4, minmax(0, 1fr));
+  background: var(--surface); border: 1px solid var(--border-frame); border-radius: var(--r-card);
+  box-shadow: var(--shadow); margin-bottom: 16px; overflow: hidden;
+}
+.okpi {
+  display: flex; flex-direction: column; gap: 2px; padding: 14px 16px; min-width: 0;
+  border-right: 1px solid var(--border-soft); color: inherit; text-decoration: none;
+}
+.okpi:last-child { border-right: 0; }
+a.okpi:hover { background: #FCFCFD; }
+a.okpi:focus-visible { outline: 2px solid var(--focus, #84ADFF); outline-offset: -2px; }
+.okpi-label { font-size: 12.5px; font-weight: 500; color: var(--text-2); }
+.okpi-value { font-size: 26px; font-weight: 500; letter-spacing: -0.02em; line-height: 1.2; font-variant-numeric: tabular-nums; margin-top: 4px; }
+.okpi-sub { font-size: 12px; color: var(--text-3); font-variant-numeric: tabular-nums; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.okpi.is-off .okpi-value { color: var(--text-3); }
+
+/* C. needs attention + quick status */
+.dash-split { grid-template-columns: minmax(0, 1.5fr) minmax(0, 1fr); }
+.worklist { list-style: none; margin: 0; padding: 0; }
+.worklist li + li { border-top: 1px solid var(--border-soft); }
+.wl-row {
+  display: grid; grid-template-columns: 8px 52px minmax(0, 1fr) 16px; align-items: center; gap: 12px;
+  width: 100%; padding: 10px 14px; background: none; border: 0; font: inherit; text-align: left;
+  color: inherit; text-decoration: none; cursor: pointer;
+}
+.wl-row:hover { background: #FCFCFD; }
+.wl-row .lucide { width: 15px; height: 15px; color: var(--text-3); }
+.wl-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--border); }
+.wl-dot.error { background: var(--error); }
+.wl-dot.warn { background: var(--warning); }
+.wl-n { font-size: 17px; font-weight: 500; text-align: right; font-variant-numeric: tabular-nums; }
+.wl-text { display: flex; flex-direction: column; min-width: 0; }
+.wl-text b { font-weight: 500; font-size: 13px; }
+.wl-text span { font-size: 12px; color: var(--text-3); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.wl-empty { padding: 20px 16px; color: var(--text-3); font-size: 13px; list-style: none; }
+.qstat { margin: 0; }
+.qstat > div { display: flex; justify-content: space-between; gap: 12px; padding: 9px 16px; font-size: 13px; }
+.qstat > div + div { border-top: 1px solid var(--border-soft); }
+.qstat dt { color: var(--text-2); }
+.qstat dd { margin: 0; font-weight: 500; font-variant-numeric: tabular-nums; text-align: right; }
+
+/* D. recent orders (a row grid, so phones get a list, not a squeezed table) + activity */
+.dash-wide { grid-template-columns: minmax(0, 1fr) 360px; }
+.dash-wide .activity { max-height: 420px; }
+.rorders { font-size: 13px; }
+.ro-row {
+  display: grid; grid-template-columns: minmax(90px, 1fr) minmax(0, 1.3fr) 90px 110px 130px 90px; gap: 12px; align-items: center;
+  padding: 9px 14px; color: inherit; text-decoration: none; border-top: 1px solid var(--border-soft);
+}
+.ro-head { border-top: 0; font-size: 12px; color: var(--text-3); font-weight: 500; background: var(--surface-2); }
+a.ro-row:hover { background: #FCFCFD; }
+.ro-row .r { text-align: right; }
+.ro-order { display: flex; flex-direction: column; min-width: 0; }
+.ro-order b { font-weight: 500; }
+.ro-order .soft { font-size: 11.5px; color: var(--text-3); }
+.ro-cust { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.ro-when { font-size: 12px; white-space: nowrap; }
+
+/* F. recovery is one area of the business: a quiet section break */
+.dash-section { margin: 28px 0 14px; padding-top: 20px; border-top: 1px solid var(--border); }
+.dash-section-title { display: flex; align-items: center; gap: 8px; margin: 0; font-size: 15px; font-weight: 600; }
+.dash-section-title .lucide { width: 16px; height: 16px; color: var(--text-2); }
+.dash-section-sub { margin: 2px 0 0; font-size: 12.5px; color: var(--text-3); }
+
+@media (max-width: 1200px) {
+  .dash-wide { grid-template-columns: minmax(0, 1fr); }
+  .ro-row { grid-template-columns: minmax(90px, 1fr) minmax(0, 1.3fr) 90px 110px 130px 80px; }
+}
+@media (max-width: 900px) {
+  .dash-split { grid-template-columns: minmax(0, 1fr); }
+  .okpis { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .okpi:nth-child(2) { border-right: 0; }
+  .okpi:nth-child(n+3) { border-top: 1px solid var(--border-soft); }
+  /* recent orders become a two-line list */
+  .ro-head { display: none; }
+  .ro-row { grid-template-columns: minmax(0, 1fr) auto; grid-template-areas: "order val" "cust when" "status ship"; row-gap: 4px; }
+  .ro-order { grid-area: order; flex-direction: row; gap: 8px; align-items: baseline; }
+  .ro-val { grid-area: val; font-weight: 500; }
+  .ro-cust { grid-area: cust; color: var(--text-2); }
+  .ro-when { grid-area: when; }
+  .ro-status { grid-area: status; }
+  .ro-ship { grid-area: ship; justify-self: end; }
+}
+@media (max-width: 640px) {
+  .okpi { padding: 12px 14px; }
+  .okpi-value { font-size: 22px; }
+  .wl-row { grid-template-columns: 8px 40px minmax(0, 1fr) 14px; gap: 10px; padding: 10px 12px; }
+  .page-actions .btn { flex: none; }
+}
+.wl-clear { display: flex; gap: 8px; align-items: flex-start; padding: 10px 14px; font-size: 12px; color: var(--text-3); line-height: 1.5; }
+.wl-clear .lucide { width: 14px; height: 14px; color: var(--success); flex: none; margin-top: 2px; }
+/* The cart table's visually-hidden header escaped its scroll box and widened the page. */
+main.page[data-section="overview"] .table-wrap { position: relative; }

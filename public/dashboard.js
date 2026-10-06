@@ -1,14 +1,15 @@
 /**
- * Owner dashboard (v2 shell).
+ * Admin dashboard: operations first, recovery below.
  *
- * Reads only existing endpoints — /api/admin/overview, /api/admin/report,
- * /api/admin/events, /api/admin/carts, /api/carts, /api/reasons/summary — so the
- * redesign changes nothing about the API or the data. Every panel loads and
- * fails independently: one slow or broken endpoint never blanks the page.
+ * Reads only existing endpoints — /api/orders, /api/inventory for the
+ * operational view; /api/admin/overview, /api/admin/report, /api/admin/events,
+ * /api/admin/carts, /api/carts, /api/reasons/summary for recovery — so it
+ * changes nothing about the API or the data. Every panel loads and fails
+ * independently: one slow or broken endpoint never blanks the page.
  */
 import {
   $, $$, esc, money, count, pct, icon, renderIcons, setTimezone, dayKey, lastDays,
-  clock, dateShort, dateTime, relative, duration, delta, metricCard, barChart,
+  clock, dateShort, dateTime, relative, duration, delta, metricCard, barChart, keyLabel,
   statusOf, statusIndicator, followUp, hbars, initials, initShell, setNavCount, STATUS_LABELS,
   pageSignal, onLeave, pageFetch,
 } from './ui/components.js';
@@ -30,6 +31,9 @@ const state = {
   sort: { key: 'received_at', dir: -1 },
   shown: 12,
   period: 'day',
+  ops: null,               // { orders, total, viewCounts, todayTotal, complete }
+  inv: null,               // /api/inventory: cards + unmapped
+  allCarts: null,          // all-time cart count (overview with days=0)
 };
 
 const SOURCE_NAME = { gokwik: 'GoKwik', shopify: 'Shopify (live)', 'shopify-csv': 'Shopify (CSV)' };
@@ -78,8 +82,8 @@ function greet(me) {
   const hour = Number(new Intl.DateTimeFormat('en-GB', { hour: 'numeric', hour12: false, timeZone: 'Asia/Kolkata' }).format(new Date()));
   const part = hour < 12 ? 'Good morning' : hour < 17 ? 'Good afternoon' : 'Good evening';
   const first = String(me?.name || '').split(' ')[0];
-  $('#hello').textContent = first ? `${part}, ${first} 👋` : 'Recovery dashboard';
-  $('#helloSub').textContent = 'Here is what needs doing, and how recovery is going.';
+  $('#hello').textContent = first ? `${part}, ${first}` : 'Dashboard';
+  $('#helloSub').textContent = 'Here’s what needs attention today.';
 }
 
 /**
@@ -96,6 +100,189 @@ function renderAlerts(h) {
   }
   $('#alerts').innerHTML = items.map(([tone, text]) => `
     <div class="alert${tone === 'warn' ? ' warn' : ''}" role="alert">${icon('triangle-alert')}<p>${esc(text)}</p></div>`).join('');
+}
+
+/* ------------------------------------------------------------------ operations
+   Order numbers here are the channel's own (#2753), never the internal ID.
+   Totals that need every order (lines, shipments, documents, "no shipment
+   yet") are shown only when the list fetched really is every order. */
+
+const ORDER_LIST_MAX = 500;
+const LABELS = { rto: 'RTO', not_ready: 'Not ready', out_for_delivery: 'Out for delivery', delivery_failed: 'Delivery failed', in_transit: 'In transit' };
+const labelOf = (v) => (v ? LABELS[v] || (v[0].toUpperCase() + v.slice(1)).replaceAll('_', ' ') : '—');
+// Same dot palette as the Orders page.
+const DOT = {
+  new: 'new', confirmed: 'callback', completed: 'recovered', cancelled: 'lost',
+  not_ready: 'new', packed: 'noresp', dispatched: 'callback', in_transit: 'callback',
+  out_for_delivery: 'callback', delivered: 'recovered', delivery_failed: 'lost', rto: 'lost',
+};
+const dot = (v) => `<span class="status ${DOT[v] || ''}"><span class="dot"></span>${esc(labelOf(v))}</span>`;
+const orderDay = (o) => dayKey(o.order_date || o.created_at);
+
+async function loadOps() {
+  const today = dayKey(new Date());
+  const [list, todays, inv, all] = await Promise.allSettled([
+    getJSON(`/api/orders?limit=${ORDER_LIST_MAX}`),
+    getJSON(`/api/orders?from=${today}&to=${today}&limit=1`),
+    getJSON('/api/inventory'),
+    state.days === 0 ? Promise.resolve(null) : getJSON('/api/admin/overview?days=0'),
+  ]);
+  if (list.status === 'fulfilled') {
+    const d = list.value;
+    state.ops = {
+      orders: d.orders, total: d.total, viewCounts: d.viewCounts,
+      todayTotal: todays.status === 'fulfilled' ? todays.value.total : null,
+      complete: d.orders.length === d.total,
+    };
+  } else {
+    state.ops = { error: list.reason.message };
+  }
+  state.inv = inv.status === 'fulfilled' ? inv.value : null;
+  if (all.status === 'fulfilled' && all.value) state.allCarts = all.value.totals.carts;
+  renderOps2();
+}
+
+function renderOps2() {
+  renderOpsKpis();
+  renderWorklist();
+  renderQuickStatus();
+  renderRecentOrders();
+  renderOrdersChart();
+  renderStagesOps();
+  renderIcons();
+}
+
+function renderOpsKpis() {
+  const o = state.ops;
+  const v = o?.viewCounts;
+  const todayCarts = Number(state.daily.get(dayKey(new Date()))?.carts || 0);
+  const kpi = (label, value, sub, href, tip = '') => `<a class="okpi" href="${href}" title="${esc(tip)}">
+      <span class="okpi-label">${esc(label)}</span>
+      <span class="okpi-value">${value}</span>
+      <span class="okpi-sub">${sub || '&nbsp;'}</span></a>`;
+  const noOrders = (label) => `<div class="okpi is-off"><span class="okpi-label">${esc(label)}</span><span class="okpi-value">—</span><span class="okpi-sub">${esc(o?.error || 'Loading…')}</span></div>`;
+  const noShipment = o?.complete
+    ? o.orders.filter((x) => !x.shipment_id && ['new', 'confirmed'].includes(x.order_status)).length : null;
+  const rangeLabel = state.days === 1 ? 'today' : state.days ? `last ${state.days} days` : 'all time';
+  $('#okpis').innerHTML = [
+    v ? kpi('Orders', count(o.total), o.todayTotal !== null ? `${count(o.todayTotal)} today` : '', '/orders', 'Every order, all channels.') : noOrders('Orders'),
+    v ? kpi('Pending dispatch', count(v.pending_dispatch), noShipment !== null ? `${count(noShipment)} without a shipment yet` : '', '/orders?view=pending_dispatch',
+      'New or confirmed orders whose shipment is not ready or packed, or that have no shipment yet.') : noOrders('Pending dispatch'),
+    v ? kpi('In transit', count(v.in_transit), `${count(v.delivered)} delivered`, '/orders?view=in_transit', 'Dispatched, in transit or out for delivery.') : noOrders('In transit'),
+    state.overview ? kpi('Carts', count(state.overview.totals.carts), `${rangeLabel}${state.days !== 1 ? ` · ${count(todayCarts)} today` : ''}`, '/?mode=all',
+      'Abandoned carts received in the selected range.') : noOrders('Carts'),
+  ].join('');
+}
+
+function renderWorklist() {
+  const rows = [];
+  const v = state.ops?.viewCounts;
+  const c = state.inv?.cards;
+  const q = state.overview?.queue;
+  const add = (n, tone, title, sub, target) => { if (n !== undefined && n !== null) rows.push({ n: Number(n), tone, title, sub, target }); };
+  if (v) {
+    add(v.failed, 'error', 'Failed / RTO', 'Delivery failed or returned to origin', { href: '/orders?view=failed' });
+    add(v.pending_dispatch, 'warn', 'Pending dispatch', 'Orders waiting to be packed or dispatched', { href: '/orders?view=pending_dispatch' });
+  }
+  if (q) {
+    const sla = state.overview.health.slaHours;
+    add(q.callbacks_overdue, 'error', 'Callbacks missed', 'Promised call time has passed', { bucket: 'callbacks_overdue', label: 'Callbacks missed' });
+    add(q.stale, 'error', `Carts uncalled ${sla}h+`, `${money(q.stale_value)} waiting`, { bucket: 'stale', label: `Uncalled ${sla}h+` });
+    add(q.callbacks_today, 'warn', 'Callbacks today', 'Promised for today', { bucket: 'callbacks_today', label: 'Callbacks today' });
+    add(q.unassigned, 'warn', 'Unassigned carts', `${money(q.unassigned_value)} with no owner`, { bucket: 'unassigned', label: 'Unassigned' });
+  }
+  if (state.inv) {
+    add(state.inv.unmapped?.length, 'warn', 'Unmapped platform SKUs', 'Marketplace SKUs on orders with no Master SKU', { href: '/inventory?view=unmapped' });
+    add(c.expired, 'error', 'Expired batches with stock', 'Still on hand past expiry', { href: '/inventory?expiring=expired' });
+    add(c.outOfStock, 'warn', 'Out of stock', 'Active Master SKUs with nothing available to dispatch', { href: '/inventory?stock=out' });
+    add(c.lowStock, 'warn', 'Low stock', 'At or under the reorder level', { href: '/inventory?stock=low' });
+  }
+  if (!rows.length) {
+    $('#worklist').innerHTML = `<li class="wl-empty">${esc(state.ops?.error || 'Nothing to show yet.')}</li>`;
+    return;
+  }
+  // Work first, most severe first. Anything at zero is listed once, quietly, so
+  // the reader can see it was checked without it taking a row.
+  const open = rows.filter((r) => r.n).sort((a, b) => (a.tone === 'error' ? 0 : 1) - (b.tone === 'error' ? 0 : 1));
+  const clear = rows.filter((r) => !r.n);
+  $('#worklist').innerHTML = open.map((r) => {
+    const inner = `<span class="wl-dot ${r.tone}"></span>
+      <span class="wl-n">${count(r.n)}</span>
+      <span class="wl-text"><b>${esc(r.title)}</b><span>${esc(r.sub)}</span></span>
+      ${icon('chevron-right')}`;
+    return `<li>${r.target.href
+      ? `<a class="wl-row" href="${r.target.href}">${inner}</a>`
+      : `<button type="button" class="wl-row" data-bucket="${r.target.bucket}" data-label="${esc(r.target.label)}">${inner}</button>`}</li>`;
+  }).join('') + (clear.length ? `<li class="wl-clear">${icon('circle-check')}<span>${open.length ? 'Also clear' : 'All clear'}: ${clear.map((r) => esc(r.title)).join(' · ')}</span></li>` : '');
+}
+
+function renderQuickStatus() {
+  const o = state.ops;
+  const all = o?.complete ? o.orders : null;
+  const sum = (f) => all.reduce((n, x) => n + f(x), 0);
+  const carts = state.days === 0 ? state.overview?.totals.carts : state.allCarts;
+  const row = (label, value, tip = '') => (value === null || value === undefined ? ''
+    : `<div title="${esc(tip)}"><dt>${esc(label)}</dt><dd>${value}</dd></div>`);
+  const html = [
+    row('Orders', o?.viewCounts ? count(o.total) : null),
+    row('Order lines', all ? count(sum((x) => (x.line_skus || []).length)) : null, 'Product lines across every order.'),
+    row('Shipments', all ? count(sum((x) => x.shipment_count || 0)) : null, 'Every shipment record, including several on one order.'),
+    row('Documents', all ? count(sum((x) => x.document_count || 0)) : null, 'Documents attached to orders. Removed documents are not counted.'),
+    row('Master SKUs', state.inv ? count(state.inv.cards.totalSkus) : null, 'Active master SKUs.'),
+    row('Carts', carts !== null && carts !== undefined ? count(carts) : null, 'Every abandoned cart received.'),
+    row('Team', state.overview ? `${count(state.overview.team)} member${state.overview.team === 1 ? '' : 's'} · ${count(state.overview.online.length)} online` : null),
+  ].join('');
+  $('#qstat').innerHTML = html || '<div class="wl-empty">Nothing to show yet.</div>';
+}
+
+function renderRecentOrders() {
+  const o = state.ops;
+  if (!o?.orders) {
+    $('#recentOrders').innerHTML = `<div class="empty-note">${esc(o?.error || 'Loading…')}</div>`;
+    return;
+  }
+  const list = o.orders.slice(0, 8);
+  if (!list.length) { $('#recentOrders').innerHTML = '<div class="empty-note"><b>No orders yet</b>New orders appear here.</div>'; return; }
+  $('#recentOrders').innerHTML = `<div class="rorders" role="table" aria-label="Recent orders">
+    <div class="ro-row ro-head" role="row"><span role="columnheader">Order</span><span role="columnheader">Customer</span><span role="columnheader" class="r">Value</span>
+      <span role="columnheader">Status</span><span role="columnheader">Shipment</span><span role="columnheader" class="r">Updated</span></div>
+    ${list.map((x) => `<a class="ro-row" role="row" href="/orders?open=${x.id}">
+      <span class="ro-order"><b class="mono">${x.source_order_id ? `#${esc(String(x.source_order_id).replace(/^#/, ''))}` : '—'}</b><span class="soft">${esc(x.channel_label || x.channel || '')}</span></span>
+      <span class="ro-cust">${esc(x.customer_name || '—')}</span>
+      <span class="ro-val r num">${x.order_value === null ? '<span class="muted">—</span>' : money(x.order_value)}</span>
+      <span class="ro-status">${dot(x.order_status)}</span>
+      <span class="ro-ship">${x.shipment_id ? dot(x.shipment_status) : '<span class="status none"><span class="dot"></span>No shipment yet</span>'}</span>
+      <span class="ro-when r soft" title="${esc(dateTime(x.updated_at))}">${esc(relative(x.updated_at))}</span>
+    </a>`).join('')}</div>`;
+}
+
+function renderOrdersChart() {
+  const o = state.ops;
+  const n = state.days === 1 ? 14 : state.days || 60;
+  $('#ordersChartMeta').textContent = `last ${n} days · by order date`;
+  if (!o?.orders) { $('#ordersChart').innerHTML = `<div class="empty-note">${esc(o?.error || 'Loading…')}</div>`; return; }
+  const keys = lastDays(n);
+  const by = new Map(keys.map((k) => [k, 0]));
+  for (const x of o.orders) { const k = orderDay(x); if (by.has(k)) by.set(k, by.get(k) + 1); }
+  // If the list was capped, only trust it back to the oldest order it holds.
+  const oldest = o.orders.length ? orderDay(o.orders[o.orders.length - 1]) : null;
+  const partial = !o.complete && oldest && oldest > keys[0];
+  const total = [...by.values()].reduce((a, b) => a + b, 0);
+  $('#ordersChartTotal').textContent = count(total);
+  $('#ordersChartNote').className = 'delta';
+  $('#ordersChartNote').textContent = partial ? `complete from ${keyLabel(oldest)} only` : `orders in ${n} days`;
+  barChart($('#ordersChart'), { points: keys.map((key) => ({ key, value: by.get(key) })), format: (v) => count(Math.round(v)), labelStyle: n <= 7 ? 'weekday' : 'short' });
+}
+
+function renderStagesOps() {
+  const v = state.ops?.viewCounts;
+  if (!v) { $('#stagesOps').innerHTML = `<div class="empty-note">${esc(state.ops?.error || 'Loading…')}</div>`; return; }
+  $('#stagesOps').innerHTML = hbars([
+    { label: 'Pending dispatch', n: v.pending_dispatch },
+    { label: 'In transit', n: v.in_transit },
+    { label: 'Delivered', n: v.delivered },
+    { label: 'Failed / RTO', n: v.failed },
+  ], { ink: true }) + '<p class="hint">Each order counted by its shipment’s current stage. Cancelled and completed orders without a shipment stage are not shown.</p>';
 }
 
 /* ------------------------------------------------------------------ needs attention */
@@ -507,6 +694,7 @@ async function loadAll({ quiet = false } = {}) {
   $('#refresh').classList.add('spin');
   if (!quiet) tableSkeleton();
 
+  const opsLoaded = loadOps().catch(() => {});
   const [overview, report, carts, events] = await Promise.allSettled([
     getJSON(`/api/admin/overview?days=${state.days}`),
     getJSON('/api/admin/report?period=day&limit=60'),
@@ -538,6 +726,8 @@ async function loadAll({ quiet = false } = {}) {
     $('#cartRows').innerHTML = `<tr><td colspan="10"><div class="empty-note">${esc(carts.reason.message)}</div></td></tr>`;
   }
   if (state.overview) { renderKpis(); renderOps(); }
+  await opsLoaded;
+  renderOps2();
   renderChart();
   if (events.status === 'fulfilled') { state.events = events.value.events; renderActivity(); }
 
@@ -560,6 +750,10 @@ $('#chartMetric').addEventListener('change', (e) => { state.metric = e.target.va
 $('#attention').addEventListener('click', (e) => {
   const b = e.target.closest('[data-bucket]');
   if (b) openDrawer(b.dataset.bucket, b.querySelector('.att-label').textContent.trim());
+});
+$('#worklist').addEventListener('click', (e) => {
+  const b = e.target.closest('button[data-bucket]');
+  if (b) openDrawer(b.dataset.bucket, b.dataset.label);
 });
 $('#drawerClose').addEventListener('click', closeDrawer);
 $('#drawerScrim').addEventListener('click', closeDrawer);

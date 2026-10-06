@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Dashboard — Briyo Recovery</title>
+  <title>Dashboard — Briyo</title>
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap" rel="stylesheet" />
@@ -16,10 +16,10 @@
   <!-- ============================== sidebar ============================== -->
   <aside class="sidebar" id="sidebar" aria-label="Main navigation">
     <div class="brand">
-      <span class="brand-mark"><i data-lucide="shopping-cart"></i></span>
+      <span class="brand-mark"><i data-lucide="layout-grid"></i></span>
       <div>
-        <div class="brand-name">Briyo Recovery</div>
-        <div class="brand-sub">Abandoned carts</div>
+        <div class="brand-name">Briyo Operations</div>
+        <div class="brand-sub">Overview</div>
       </div>
     </div>
 
@@ -81,18 +81,18 @@
       <span class="topbar-title" id="topTitle">Dashboard</span>
     </header>
 
-    <main class="page" data-section="recovery">
+    <main class="page" data-section="overview">
       <div class="crumbs">
         <i data-lucide="layout-grid"></i><span>Overview</span><span class="sep">/</span><span class="here">Dashboard</span>
       </div>
 
       <div class="page-head">
         <div>
-          <h1 class="page-title" id="hello">Recovery dashboard</h1>
-          <p class="page-sub" id="helloSub">What needs doing, and how recovery is going.</p>
+          <h1 class="page-title" id="hello">Dashboard</h1>
+          <p class="page-sub" id="helloSub">Here’s what needs attention today.</p>
         </div>
         <div class="page-actions">
-          <label class="range-pick">
+          <label class="range-pick" title="Applies to carts, recovery and the order trend. Order and stock states are always current.">
             <i data-lucide="calendar"></i>
             <select id="range" class="select" aria-label="Date range">
               <option value="1">Today</option>
@@ -101,26 +101,92 @@
               <option value="0">All time</option>
             </select>
           </label>
-          <button class="icon-btn" id="refresh" type="button" title="Refresh" aria-label="Refresh"><i data-lucide="refresh-cw"></i></button>
-          <details class="menu">
-            <summary class="icon-btn" aria-label="More"><i data-lucide="ellipsis-vertical"></i></summary>
-            <div class="menu-list">
-              <a href="/api/admin/report.csv?period=day" download><i data-lucide="download"></i>Daily report (CSV)</a>
-              <a href="/api/admin/report.csv?period=week" download><i data-lucide="download"></i>Weekly report (CSV)</a>
-              <div class="menu-sep"></div>
-              <a href="/import"><i data-lucide="upload"></i>Import carts</a>
-              <a href="/admin"><i data-lucide="users"></i>Members</a>
-            </div>
-          </details>
+          <button class="btn" id="refresh" type="button" title="Refresh"><i data-lucide="refresh-cw"></i>Refresh</button>
         </div>
       </div>
 
       <div id="alerts"></div>
 
-      <!-- Work first: anything that needs a call outranks any number below. -->
+      <!-- B. Operations at a glance: current states, not the date range. -->
+      <div class="okpis" id="okpis">
+        <div class="okpi"><span class="sk w50"></span><span class="sk lg"></span></div>
+        <div class="okpi"><span class="sk w50"></span><span class="sk lg"></span></div>
+        <div class="okpi"><span class="sk w50"></span><span class="sk lg"></span></div>
+        <div class="okpi"><span class="sk w50"></span><span class="sk lg"></span></div>
+      </div>
+
+      <!-- C. Work first. -->
+      <div class="grid dash-split">
+        <section class="card">
+          <header class="card-head">
+            <h2 class="card-title"><i data-lucide="siren"></i>Needs attention <span class="card-meta" title="Counts ignore the date range: a callback missed last month is still urgent.">right now</span></h2>
+          </header>
+          <div class="pane"><ul class="worklist" id="worklist">
+            <li class="wl-row"><span class="sk w70"></span></li><li class="wl-row"><span class="sk w70"></span></li>
+            <li class="wl-row"><span class="sk w70"></span></li><li class="wl-row"><span class="sk w70"></span></li>
+          </ul></div>
+        </section>
+        <section class="card">
+          <header class="card-head"><h2 class="card-title"><i data-lucide="activity"></i>Quick status <span class="card-meta">all time</span></h2></header>
+          <div class="pane"><dl class="qstat" id="qstat"><div><dt><span class="sk w50"></span></dt><dd></dd></div></dl></div>
+        </section>
+      </div>
+
+      <!-- D. What just happened. -->
+      <div class="grid dash-wide">
+        <section class="card">
+          <header class="card-head">
+            <h2 class="card-title"><i data-lucide="package"></i>Recent orders</h2>
+            <a class="linkish" href="/orders">View all orders →</a>
+          </header>
+          <div class="pane" id="recentOrders"><div class="empty-note"><span class="sk w70"></span></div></div>
+        </section>
+        <section class="card">
+          <header class="card-head">
+            <h2 class="card-title"><i data-lucide="history"></i>Recovery activity</h2>
+            <span class="card-meta" title="Only cart changes are recorded centrally; order and shipment history lives on each order.">carts only</span>
+          </header>
+          <div class="pane">
+            <div class="act-tabs" id="actTabs" role="tablist">
+              <button type="button" data-tab="today" class="active" role="tab">Today</button>
+              <button type="button" data-tab="yesterday" role="tab">Yesterday</button>
+              <button type="button" data-tab="week" role="tab">This week</button>
+            </div>
+            <div class="act-search search">
+              <i data-lucide="search"></i>
+              <input class="input" id="actSearch" type="search" placeholder="Search activity" autocomplete="off" aria-label="Search activity" />
+            </div>
+            <div class="act-count" id="actCount"><span class="sk w50"></span></div>
+            <div class="activity" id="activity"></div>
+          </div>
+        </section>
+      </div>
+
+      <!-- E. Operational trends. -->
+      <div class="grid grid-2">
+        <section class="card">
+          <header class="card-head"><h2 class="card-title"><i data-lucide="chart-column"></i>Orders per day <span class="card-meta" id="ordersChartMeta"></span></h2></header>
+          <div class="pane">
+            <div class="chart-head"><span class="chart-total" id="ordersChartTotal">—</span><span class="delta" id="ordersChartNote"></span></div>
+            <div class="chart" id="ordersChart"></div>
+          </div>
+        </section>
+        <section class="card">
+          <header class="card-head"><h2 class="card-title"><i data-lucide="truck"></i>Logistics stages <span class="card-meta">orders, now</span></h2></header>
+          <div class="pane pad" id="stagesOps"></div>
+        </section>
+      </div>
+
+      <!-- F. Recovery: one area of the business, below the operational view. -->
+      <div class="dash-section" id="recovery">
+        <h2 class="dash-section-title"><i data-lucide="phone-call"></i>Recovery</h2>
+        <p class="dash-section-sub">Abandoned-cart recovery for the selected date range.</p>
+      </div>
+
+      <!-- The recovery queue: click a tile for the carts behind it. -->
       <section class="card" style="margin-bottom:16px">
         <header class="card-head">
-          <h2 class="card-title"><i data-lucide="siren"></i>Needs attention <span class="card-meta" title="These counts deliberately ignore the date range: a callback missed last month is the most urgent thing on the page.">all time</span></h2>
+          <h2 class="card-title"><i data-lucide="siren"></i>Recovery queue <span class="card-meta" title="These counts deliberately ignore the date range: a callback missed last month is the most urgent thing on the page.">all time</span></h2>
         </header>
         <div class="pane"><div class="attention" id="attention">
           <div class="att"><span class="sk w50"></span><span class="sk lg"></span></div>
@@ -139,12 +205,12 @@
 
       <section class="card" style="margin-bottom:16px">
         <header class="card-head">
-          <h2 class="card-title"><i data-lucide="gauge"></i>Operations <span class="card-meta" id="opsMeta"></span></h2>
+          <h2 class="card-title"><i data-lucide="gauge"></i>Recovery operations <span class="card-meta" id="opsMeta"></span></h2>
         </header>
         <div class="pane"><div class="ops" id="ops"></div></div>
       </section>
 
-      <div class="grid grid-main">
+      <div class="grid">
         <section class="card">
           <header class="card-head">
             <h2 class="card-title"><i data-lucide="chart-column"></i>Recovery trend <span class="card-meta" id="chartMeta"></span></h2>
@@ -163,26 +229,6 @@
               <span class="delta" id="chartDelta"></span>
             </div>
             <div class="chart" id="chart"></div>
-          </div>
-        </section>
-
-        <section class="card">
-          <header class="card-head">
-            <h2 class="card-title">Latest activity</h2>
-            <i data-lucide="history"></i>
-          </header>
-          <div class="pane">
-            <div class="act-tabs" id="actTabs" role="tablist">
-              <button type="button" data-tab="today" class="active" role="tab">Today</button>
-              <button type="button" data-tab="yesterday" role="tab">Yesterday</button>
-              <button type="button" data-tab="week" role="tab">This week</button>
-            </div>
-            <div class="act-search search">
-              <i data-lucide="search"></i>
-              <input class="input" id="actSearch" type="search" placeholder="Search activity" autocomplete="off" aria-label="Search activity" />
-            </div>
-            <div class="act-count" id="actCount"><span class="sk w50"></span></div>
-            <div class="activity" id="activity"></div>
           </div>
         </section>
       </div>
