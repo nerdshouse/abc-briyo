@@ -310,14 +310,14 @@ function platformSection(s) {
       <p class="imp-note" style="margin:0 0 10px">Marketplace identifiers for this product. An order from a platform with one of these codes resolves to master SKU
         <b class="mono">${esc(s.sku)}</b> and uses its stock. They are not separate products and hold no stock of their own.</p>
       ${groups.length ? `<div class="pf-groups">${groups.map((g) => `<div class="pf-group"><div class="pf-label">${esc(g.label)}</div><div class="pf-codes">${g.list.map((m) => `
-        <span class="pf-chip"><span class="mono">${esc(m.platform_sku)}</span>
-          <span class="soft" title="${esc(`Added ${m.source === 'import' ? 'by import' : m.source === 'migrated' ? 'from the old Amazon field' : 'by hand'}${m.created_by ? ` · ${m.created_by}` : ''}`)}">${usage[m.id] ? `${count(usage[m.id])} order line${usage[m.id] === 1 ? '' : 's'}` : ''}</span>
+        <span class="pf-chip"><span class="mono">${esc(m.platform_sku)}</span>${m.duplicate_override ? `<span class="mini-tag warn" title="${esc(`Also mapped to another master SKU. Reason: ${m.duplicate_reason}`)}">Duplicate</span>` : ''}
+          <span class="soft" title="${esc(`Added ${m.source === 'import' ? 'by import' : m.source === 'migrated' ? 'from the old Amazon field' : m.source === 'unmapped' ? 'from Unmapped platform SKUs' : 'by hand'}${m.created_by ? ` · ${m.created_by}` : ''}`)}">${usage[m.id] ? `${count(usage[m.id])} order line${usage[m.id] === 1 ? '' : 's'}` : ''}</span>
           ${isAdmin() ? `<button type="button" class="icon-btn bare pf-remove" data-unmap="${m.id}" data-code="${esc(m.platform_sku)}" data-lines="${usage[m.id] || 0}" title="Remove this mapping" aria-label="Remove ${esc(g.label)} SKU ${esc(m.platform_sku)}">${icon('x')}</button>` : ''}
         </span>`).join('')}</div></div>`).join('')}</div>`
         : '<p class="soft" style="margin:0">No platform SKUs yet. Orders from marketplaces will not resolve to this product until they are added.</p>'}
       ${isAdmin() ? `<div class="pf-add">
         <select class="select" id="pfPlatform" aria-label="Platform">${platforms.filter((p) => p.active).map((p) => opt(p.key, p.label)).join('')}</select>
-        <textarea class="input mono" id="pfCodes" rows="2" placeholder="One or more platform SKUs — one per line, or separated by /"></textarea>
+        <textarea class="input mono" id="pfCodes" rows="2" placeholder="One or more platform SKUs, exactly as the platform shows them (no spaces) — one per line, or separated by /"></textarea>
         <button type="button" class="btn" id="pfAdd">${icon('plus')}Add platform SKU</button>
       </div>` : ''}
       ${s.asin || s.amazon_listing_id || s.amazon_product_id || s.amazon_item_name ? `<dl class="kv" style="margin-top:12px">
@@ -376,6 +376,21 @@ function openForm(kind, ctx = {}) {
         <label class="fld wide"><span>Master Briyo SKU</span><select class="select" name="sku_id" required>${skuOptions('')}</select>
           <span class="help">No new SKU is created. If the product is not in the master list yet, create it with New master SKU first, then map.</span></label>
       </div></section>`;
+  } else if (kind === 'dup-map') {
+    const d = ctx.dup;
+    title = `Duplicate ${d.platform_label} SKU detected`;
+    sub = 'A platform SKU normally belongs to one master SKU. Adding it to a second one needs a reason, which is kept in the audit record.';
+    submit = 'Add anyway';
+    body = `<section class="dsec">${d.duplicates.map((x) => `<dl class="kv" style="margin-bottom:12px">
+        <dt>${esc(d.platform_label)} SKU</dt><dd class="mono">${esc(x.platform_sku)}</dd>
+        <dt>Currently mapped to</dt><dd>${x.mapped_to.map((o) => `<b class="mono">${esc(o.sku)}</b> ${esc(o.product_name)}`).join('<br>')}</dd>
+        <dt>You are adding it to</dt><dd><b class="mono">${esc(d.target.sku)}</b> ${esc(d.target.product_name)}</dd></dl>`).join('')}
+      <p class="imp-note warn-text" style="margin:0">This SKU is already mapped to another master SKU. Orders with it keep resolving to
+        <b class="mono">${esc(d.duplicates[0].mapped_to[0].sku)}</b> (the first mapping) and use its stock.</p>
+      <label class="fld wide" id="dupReasonFld" hidden style="margin-top:12px"><span>Why are you adding the same platform SKU to multiple master SKUs?</span>
+        <textarea class="input" id="dupReason" name="duplicate_reason" rows="3" maxlength="1000" placeholder="Required"></textarea>
+        <span class="help">Required. Stored with the mapping and in the audit record.</span></label>
+    </section>`;
   } else if (kind === 'receive') {
     title = 'Add Inventory';
     sub = 'Goods in: creates the batch if it is new and records +quantity in the ledger.';
@@ -444,14 +459,14 @@ function openForm(kind, ctx = {}) {
       <label class="fld wide"><span>Notes</span><textarea class="input" name="notes" maxlength="1000">${esc(batch.notes || '')}</textarea></label>
     </div></section>`;
   } else if (kind === 'import') {
-    title = 'Import master SKUs';
-    sub = 'A sheet with one row per master SKU, its product name and a column per platform. Preview first; nothing is saved until you import.';
+    title = 'Import Master SKUs';
+    sub = 'Import one row per Master SKU and Product Name. Preview first; nothing is saved until you import.';
     submit = 'Import';
     state.importFile = null; state.importPreview = null;
     body = `<section class="dsec"><div class="form-grid">
       <label class="fld wide"><span>Sheet (.csv or .xlsx)</span><input class="input" type="file" id="impFile" accept=".csv,.xlsx,.txt,text/csv" />
-        <span class="help">Columns: Briyo SKU (or Parent Briyo SKU Code), Product Name, then one column per platform — ${esc((m.platforms || []).map((p) => p.label).join(', '))}.
-        A cell may list several SKUs separated by new lines or "/". "NA" means none. A platform SKU already mapped to a different master is a conflict and is never reassigned.</span></label>
+        <span class="help">Two columns: <b>Briyo SKU</b> and <b>Product Name</b>. New master SKUs are created and changed product names updated.
+        Platform SKUs (Amazon, Blinkit, Zepto…) are not imported — add them on each master SKU afterwards. Any other column is ignored.</span></label>
     </div></section><div id="impResult"></div>`;
   } else if (kind === 'places') {
     title = 'Warehouses & suppliers';
@@ -504,31 +519,41 @@ function renderImportPreview(p) {
   const stat = (n, label, tone = '') => `<div class="imp-stat ${tone}"><b>${count(n)}</b><span>${esc(label)}</span></div>`;
   const rowsTable = (list, cols) => `<div class="imp-scroll"><table class="imp-errors"><thead><tr>${cols.map((c) => `<th>${esc(c[0])}</th>`).join('')}</tr></thead><tbody>
     ${list.map((r) => `<tr>${cols.map((c) => `<td${c[2] ? ' class="mono"' : ''}>${esc(c[1](r) ?? '—')}</td>`).join('')}</tr>`).join('')}</tbody></table></div>`;
+  const changes = s.mastersNew + s.mastersRenamed;
   $('#impResult').innerHTML = `
     <section class="dsec"><h3 class="dsec-title">Preview <span class="dsec-meta soft">nothing saved yet</span></h3>
       <div class="imp-stats">
         ${stat(s.rows, 'Master SKUs in sheet')}${stat(s.mastersNew, 'New master SKUs')}${stat(s.mastersRenamed, 'Product names changed', s.mastersRenamed ? 'warn' : '')}
-        ${stat(s.mappingsInSheet, 'Platform SKUs in sheet')}${stat(s.mappingsNew, 'New platform SKUs')}${stat(s.mappingsUnchanged, 'Already mapped')}
-        ${stat(s.conflicts, 'Conflicts', s.conflicts ? 'bad' : '')}${stat(s.errorCount, 'Problems', s.errorCount ? 'bad' : '')}${stat(s.warningCount, 'Warnings', s.warningCount ? 'warn' : '')}
+        ${stat(s.mastersUnchanged, 'Unchanged')}${stat(s.errorCount, 'Errors', s.errorCount ? 'bad' : '')}${stat(s.warningCount, 'Warnings', s.warningCount ? 'warn' : '')}
       </div>
-      <p class="imp-note">Columns read as: ${s.platformColumns.map((c) => `"${esc(c.header)}" → ${esc(c.label)}`).join(', ')}.
-        ${s.duplicateMappings ? `${count(s.duplicateMappings)} repeated platform SKU${s.duplicateMappings > 1 ? 's' : ''} listed once. ` : ''}
-        ${s.storedMappingsNotInSheet ? `${count(s.storedMappingsNotInSheet)} stored platform SKU${s.storedMappingsNotInSheet > 1 ? 's are' : ' is'} not in the sheet; they are kept, not removed.` : ''}</p>
-      ${s.errorCount ? '<p class="imp-note warn-text"><b>Nothing can be imported until every problem below is fixed in the sheet.</b> The import is all-or-nothing.</p>' : ''}
+      ${s.errorCount ? '<p class="imp-note warn-text"><b>Nothing can be imported until every error below is fixed in the sheet.</b> The import is all-or-nothing. Warnings do not block it.</p>' : ''}
     </section>
-    ${p.errors.length ? `<section class="dsec"><h3 class="dsec-title">Problems <span class="dsec-meta soft">${count(s.errorCount)}</span></h3>${rowsTable(p.errors, [['Row', (r) => r.row], ['Platform', (r) => r.platform], ['Value', (r) => r.value, true], ['Problem', (r) => r.reason]])}</section>` : ''}
-    ${p.warnings.length ? `<section class="dsec"><h3 class="dsec-title">Warnings</h3>${rowsTable(p.warnings, [['Row', (r) => r.row], ['Note', (r) => r.reason]])}</section>` : ''}
+    ${p.errors.length ? `<section class="dsec"><h3 class="dsec-title">Errors <span class="dsec-meta soft">${count(s.errorCount)} · block the import</span></h3>${rowsTable(p.errors, [['Row', (r) => r.row], ['Value', (r) => r.value, true], ['Problem', (r) => r.reason]])}</section>` : ''}
+    ${p.warnings.length ? `<section class="dsec"><h3 class="dsec-title">Warnings <span class="dsec-meta soft">do not block the import</span></h3>${rowsTable(p.warnings, [['Row', (r) => r.row], ['Note', (r) => r.reason]])}</section>` : ''}
     ${p.renamed.length ? `<section class="dsec"><h3 class="dsec-title">Product names that will change</h3>${rowsTable(p.renamed, [['Master SKU', (r) => r.sku, true], ['Now', (r) => r.from], ['Sheet', (r) => r.to]])}</section>` : ''}
-    ${p.newMappings.length ? `<section class="dsec"><h3 class="dsec-title">New platform SKUs <span class="dsec-meta soft">first ${count(Math.min(p.newMappings.length, 500))}</span></h3>${rowsTable(p.newMappings.slice(0, 500), [['Platform', (r) => r.platform], ['Platform SKU', (r) => r.platform_sku, true], ['→ Master SKU', (r) => r.master, true]])}</section>` : ''}`;
-  $('#fSubmit').disabled = Boolean(s.errorCount) || !(s.mastersNew + s.mastersRenamed + s.mappingsNew);
-  $('#fSubmit').textContent = s.errorCount ? 'Fix the problems first' : (s.mastersNew + s.mastersRenamed + s.mappingsNew) ? 'Import' : 'Nothing new to import';
+    ${p.newMasters.length ? `<section class="dsec"><h3 class="dsec-title">New master SKUs <span class="dsec-meta soft">${count(s.mastersNew)}</span></h3>${rowsTable(p.newMasters, [['Row', (r) => r.row], ['Master SKU', (r) => r.sku, true], ['Product name', (r) => r.name]])}</section>` : ''}`;
+  $('#fSubmit').disabled = Boolean(s.errorCount) || !changes;
+  $('#fSubmit').textContent = s.errorCount ? 'Fix the errors first' : changes ? 'Import' : 'Nothing new to import';
 }
 
 async function refreshMeta() { state.meta = await api('/api/inventory/meta'); }
 
+/** Adds platform SKUs to a master; a duplicate comes back as err.data.duplicateMapping. */
+const addMapping = ({ skuId, platform, codes, fromOrder = false, confirmDuplicate = false, reason = '' }) =>
+  api(`/api/inventory/skus/${skuId}/platform-skus`, { method: 'POST', body: JSON.stringify({
+    platform, platform_skus: codes, from_order: fromOrder, confirm_duplicate: confirmDuplicate, duplicate_reason: reason }) });
+
 async function submitForm(e) {
   e.preventDefault();
   const { kind, ctx } = state.form;
+  // Duplicate platform SKU: "Add anyway" first asks why; it cannot be sent without a reason.
+  if (kind === 'dup-map' && $('#dupReasonFld').hidden) {
+    $('#dupReasonFld').hidden = false;
+    $('#fSubmit').textContent = 'Add with this reason';
+    $('#fSubmit').disabled = true;
+    $('#dupReason').focus();
+    return;
+  }
   const f = $('#invForm');
   const v = Object.fromEntries(new FormData(f).entries());
   delete v.coa;
@@ -546,13 +571,23 @@ async function submitForm(e) {
       openAfter = state.detail.sku.id;
     } else if (kind === 'map') {
       if (!v.sku_id) throw new Error('Choose the master Briyo SKU.');
-      await api(`/api/inventory/skus/${v.sku_id}/platform-skus`, { method: 'POST', body: JSON.stringify({ platform: ctx.platform, platform_skus: [ctx.code] }) });
-      openAfter = Number(v.sku_id);
+      const req = { skuId: Number(v.sku_id), platform: ctx.platform, codes: [ctx.code], fromOrder: true };
+      try { await addMapping(req); } catch (err) {
+        if (!err.data?.duplicateMapping) throw err;
+        return openForm('dup-map', { ...req, dup: err.data.duplicateMapping });
+      }
+      openAfter = req.skuId;
+    } else if (kind === 'dup-map') {
+      const reason = String(v.duplicate_reason || '').trim();
+      if (!reason) throw new Error('Give a reason before adding the duplicate.');
+      const r = await addMapping({ ...ctx, confirmDuplicate: true, reason });
+      state.notice = `Added ${r.added.join(', ')} to ${ctx.dup.target.sku} as a duplicate (reason recorded).`;
+      openAfter = ctx.skuId;
     } else if (kind === 'import') {
       if (!state.importFile || !state.importPreview || state.importPreview.summary.errorCount) throw new Error('Choose a sheet with no problems in its preview first.');
       const r = await sendSheet('commit', state.importFile);
       state.importResult = r;
-      $('#alerts').innerHTML = `<div class="alert ok">${icon('circle-check')}<span>Imported: ${count(r.summary.mastersNew)} new master SKUs, ${count(r.summary.mastersRenamed)} renamed, ${count(r.summary.mappingsNew)} new platform SKUs (${count(r.summary.mappingsUnchanged)} already there). ${count(r.summary.orderItemsMapped)} order lines now resolve.</span></div>`;
+      $('#alerts').innerHTML = `<div class="alert ok">${icon('circle-check')}<span>Imported: ${count(r.summary.mastersNew)} new master SKUs, ${count(r.summary.mastersRenamed)} product names updated, ${count(r.summary.mastersUnchanged)} unchanged. Add each product's platform SKUs on its master SKU.</span></div>`;
     } else if (kind === 'receive') {
       const r = await api('/api/inventory/receive', { method: 'POST', body: JSON.stringify({ ...v, request_id: state.form.requestId }) });
       const file = f.coa?.files?.[0];
@@ -581,10 +616,11 @@ async function submitForm(e) {
     await refreshMeta();
     await load();
     if (openAfter) await openSku(openAfter);
+    if (state.notice) { $('#dSaved').className = 'saved'; $('#dSaved').textContent = state.notice; state.notice = null; }
   } catch (err) {
     formError(err.message);
   } finally {
-    $('#fSubmit').disabled = false;
+    $('#fSubmit').disabled = state.form?.kind === 'dup-map' && !$('#dupReason')?.value.trim();
     $('#fSaved').textContent = '';
   }
 }
@@ -633,6 +669,9 @@ function bind() {
   $('#newSku').addEventListener('click', () => openForm('sku'));
   $('#places').addEventListener('click', () => openForm('places'));
   $('#importSkus').addEventListener('click', () => openForm('import'));
+  $('#invForm').addEventListener('input', (e) => {
+    if (e.target.id === 'dupReason') $('#fSubmit').disabled = !e.target.value.trim();
+  });
   $('#invForm').addEventListener('change', async (e) => {
     if (e.target.id !== 'impFile') return;
     state.importFile = e.target.files[0] || null;
@@ -673,14 +712,17 @@ function bind() {
       return openForm(a.dataset.act === 'receive' ? 'receive' : a.dataset.act, { batchId, skuId: state.detail.sku.id });
     }
     if (e.target.closest('#pfAdd')) {
+      const req = { skuId: state.detail.sku.id, platform: $('#pfPlatform').value, codes: $('#pfCodes').value };
       try {
-        const r = await api(`/api/inventory/skus/${state.detail.sku.id}/platform-skus`, { method: 'POST',
-          body: JSON.stringify({ platform: $('#pfPlatform').value, platform_skus: $('#pfCodes').value }) });
-        await openSku(state.detail.sku.id);
+        const r = await addMapping(req);
+        await openSku(req.skuId);
         $('#dSaved').className = 'saved';
-        $('#dSaved').textContent = `${r.added.length ? `Added ${r.added.join(', ')}` : 'Already mapped'}${r.orderItemsMapped ? ` · ${r.orderItemsMapped} order lines now resolve` : ''}`;
+        $('#dSaved').textContent = `${r.added.length ? `Added ${r.added.join(', ')}` : 'Already mapped to this Master SKU.'}${r.added.length && r.existing.length ? ` · ${r.existing.join(', ')} already mapped to this Master SKU` : ''}${r.orderItemsMapped ? ` · ${r.orderItemsMapped} order lines now resolve` : ''}`;
         load();
-      } catch (err) { $('#dSaved').className = 'saved failed'; $('#dSaved').textContent = err.message; }
+      } catch (err) {
+        if (err.data?.duplicateMapping) return openForm('dup-map', { ...req, dup: err.data.duplicateMapping });
+        $('#dSaved').className = 'saved failed'; $('#dSaved').textContent = err.message;
+      }
       return null;
     }
     const un = e.target.closest('[data-unmap]');
