@@ -493,7 +493,7 @@ button { font: inherit; color: inherit; }
 .linkish { background: none; border: 0; padding: 0; cursor: pointer; font-size: 12.5px; color: var(--text-2); text-decoration: underline; text-underline-offset: 2px; text-decoration-color: var(--border); }
 .linkish:hover { color: var(--text); }
 
-.table-wrap { overflow-x: auto; }
+.table-wrap { overflow-x: auto; position: relative; }  /* relative: keeps visually hidden labels inside the scroll area */
 .table { width: 100%; border-collapse: separate; border-spacing: 0; font-size: 13px; }
 .table th {
   height: 36px; padding: 0 12px; text-align: left; white-space: nowrap;
@@ -1253,3 +1253,11 @@ a.ov-metric:hover { background: var(--surface-2); }
 .banner.success { background: var(--success-soft); border-color: #ABEFC6; color: var(--success-text); }
 .banner.mock { background: var(--warning-soft); border-color: #FEDF89; color: var(--warning-text); }
 .banner code { font-size: 12px; }
+
+/* Phones: every control at least 40 px tall, so it can be tapped reliably. */
+@media (max-width: 760px) {
+  .page .btn, .page .tab, .page .seg button, .page .select, .page .input, .page .status-btn, .drawer .btn, .drawer .select, .drawer .input, .modal .btn { min-height: 40px; }
+  .page .icon-btn, .drawer .icon-btn { min-width: 40px; min-height: 40px; }
+  .page .alert-link, .page .linkish { display: inline-flex; align-items: center; min-height: 40px; }
+  .page input[type=checkbox], .drawer input[type=checkbox] { width: 20px; height: 20px; }
+}
