@@ -72,7 +72,7 @@ $('#otpForm').addEventListener('submit', async (e) => {
   btn.textContent = 'Verifying…';
   try {
     await post('/auth/verify-otp', { phone: currentPhone, code: $('#code').value });
-    window.location.href = '/';
+    window.location.href = '/overview';  // Briyo OS starts on the overview; the server sends members without a department to /no-access
   } catch (err) {
     showError(err.message);
     $('#code').select();

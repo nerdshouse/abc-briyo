@@ -31,6 +31,7 @@ import { homeFor, MODULE_KEYS, isValidAssignment } from './lib/permissions.js';
 import { careersHost } from './lib/careers.js';
 import { router as hrRouter } from './lib/hr-routes.js';
 import { ensureHrSchema, retryPendingRemovals } from './lib/hr.js';
+import { overviewFor } from './lib/overview.js';
 import { router as ordersRouter, courierRouter, destinationRouter } from './lib/orders-routes.js';
 import { router as inventoryRouter } from './lib/inventory-routes.js';
 import { ensureInventorySchema } from './lib/inventory.js';
@@ -422,6 +423,20 @@ app.use('/api/destinations', requirePermission('logistics.view'), destinationRou
 // Inventory serves both modules: its own pages, and the stock panel of a shipment.
 app.use('/api/inventory', requirePermission(['inventory.view', 'logistics.view']), inventoryRouter);
 app.use('/api/hr', requirePermission('hr.view'), hrRouter);
+// Briyo OS overview: every signed-in member with a department. The API returns
+// only the departments the caller may see (lib/overview.js); nothing else.
+app.get('/overview', (req, res) => ((req.session?.caps || []).length
+  ? res.sendFile(path.join(PUBLIC, 'overview.html')) : res.redirect('/no-access')));
+app.get('/api/overview', async (req, res) => {
+  try {
+    res.set('Cache-Control', 'private, no-store');
+    res.json({ ok: true, ...(await overviewFor(req.session, { slaHours: SLA_HOURS })) });
+  } catch (err) {
+    console.error('Overview failed:', err.message?.slice(0, 200));
+    res.status(500).json({ ok: false, error: 'The overview could not be loaded. Try again in a moment.' });
+  }
+});
+
 // HR pages: one page, two views (jobs, candidates). The careers host never gets here.
 app.get('/hr', requirePage('hr.view'), (_req, res) => res.redirect('/hr/jobs'));
 app.get(['/hr/jobs', '/hr/candidates'], requirePage('hr.view'), (_req, res) => res.sendFile(path.join(PUBLIC, 'hr.html')));

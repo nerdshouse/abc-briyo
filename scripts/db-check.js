@@ -3860,6 +3860,40 @@ await step('careers host detection behind a proxy — the Host header decides, n
   return 'unit: 10 Host forms + forwarded-host both ways; careers /healthz 200 {ok,ts} no-store (with :443); careers /login /dashboard /api/orders /auth/me 404 without a session; internal /healthz unchanged; server: careers with :443 and a different forwarded host → careers (home 200, /login /dashboard 404, APIs 404 with an admin session); internal Host + forwarded careers → internal app (login redirect, API 200, no careers feed)';
 });
 
+await step('overview: each member sees only their departments; numbers match the records; signed out refused', async () => {
+  const bad = [];
+  const keys = async (who) => { const r = await internal(who, 'GET', '/api/overview'); return r.status === 200 ? Object.keys(r.body.sections).sort().join() : `HTTP ${r.status}`; };
+  const want = { mgr: 'hr', multi: 'hr,inventory,logistics', nonHr: 'support', adm: 'hr,ingest,inventory,logistics,people,support' };
+  for (const [who, k] of Object.entries(want)) { const got = await keys(who); if (got !== k) bad.push(`${who}: ${got} ≠ ${k}`); }
+  if ((await internal(null, 'GET', '/api/overview')).status !== 401) bad.push('signed out not refused');
+  const page = await internal(null, 'GET', '/overview');
+  if (page.status !== 302 || page.headers.get('location') !== '/login') bad.push('page signed out');
+  if ((await internal('mgr', 'GET', '/overview')).status !== 200) bad.push('page for HR manager');
+  if ((await careers('GET', '/api/overview', { cookieAs: 'adm' })).status !== 404 || (await careers('GET', '/overview', { cookieAs: 'adm' })).status !== 404) bad.push('careers host');
+  // Numbers come from the records, with the department pages' predicates.
+  const ov = (await internal('adm', 'GET', '/api/overview')).body;
+  const one = async (q) => (await getPool().query(q)).rows[0].n;
+  const S = ov.sections; const pool = getPool();
+  const cmp = [
+    ['support not called', S.support.not_called, await one("SELECT count(*)::int n FROM abandoned_carts WHERE status = 'Not called'")],
+    ['hr open jobs', S.hr.open_jobs, await one("SELECT count(*)::int n FROM hr_jobs WHERE status = 'published'")],
+    ['hr awaiting review', S.hr.awaiting_review, await one("SELECT count(*)::int n FROM hr_applications WHERE completed_at IS NOT NULL AND status = 'applied'")],
+    ['people active', S.people.active, await one('SELECT count(*)::int n FROM allowed_users WHERE active')],
+    ['inventory skus', S.inventory.master_skus, await one('SELECT count(*)::int n FROM skus WHERE active')],
+  ];
+  const meta = (await internal('adm', 'GET', '/api/orders/meta')).body;
+  for (const k of ['pending_dispatch', 'in_transit', 'delivered', 'failed']) cmp.push([`logistics ${k}`, S.logistics[k], meta.viewCounts[k]]);
+  for (const [label, a, b] of cmp) if (a !== b) bad.push(`${label}: ${a} vs ${b}`);
+  // Attention: only non-zero items, sorted critical → warning → attention, each with a link.
+  const order = ['critical', 'warning', 'attention'];
+  if (ov.attention.some((a) => a.count === 0 || !a.href)) bad.push('zero or unlinked attention item');
+  if (ov.attention.some((a, i) => i && order.indexOf(a.severity) < order.indexOf(ov.attention[i - 1].severity))) bad.push('attention not sorted');
+  if (ov.timezone !== (process.env.BOARD_TIMEZONE || process.env.BOARD_TZ || 'Asia/Kolkata')) bad.push('timezone');
+  void pool;
+  if (bad.length) throw new Error(bad.join(' | '));
+  return `HR manager → hr; multi-module → hr, inventory, logistics; support → support; admin → all + people + ingest; signed out 401 / login; careers host 404; ${cmp.length} numbers equal their source counts; ${ov.attention.length} attention items, non-zero, sorted, linked`;
+});
+
 await step('hr cleanup', async () => {
   if (HRS.server) { HRS.server.kill(); await new Promise((r) => HRS.server.once('exit', r)); }
   if (HRS.stub) HRS.stub.close();

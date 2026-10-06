@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Overview — Briyo OS</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/ui.css" />
+  <!-- The page script imports these; preloading fetches them in parallel instead of one after another. -->
+  <link rel="modulepreload" href="/ui/components.js" />
+  <link rel="modulepreload" href="/ui/nav.js" />
+  <link rel="modulepreload" href="/overview.js" />
+  <script src="https://cdn.jsdelivr.net/npm/lucide@0.469.0/dist/umd/lucide.min.js" defer></script>
+</head>
+<body>
+<div class="app">
+
+  <aside class="sidebar" id="sidebar" aria-label="Main navigation"></aside>
+  <div class="scrim" id="scrim"></div>
+
+  <div class="main">
+    <header class="topbar">
+      <button class="icon-btn" id="navOpen" type="button" aria-label="Open navigation"><i data-lucide="menu"></i></button>
+      <span class="topbar-title" id="topTitle">Overview</span>
+    </header>
+
+    <main class="page ov" data-section="overview">
+      <div class="page-head">
+        <div>
+          <p class="ov-eyebrow" id="ovDate">&nbsp;</p>
+          <h1 class="page-title" id="ovHello">Overview</h1>
+          <p class="page-sub" id="ovSub">Loading the state of the business…</p>
+        </div>
+        <div class="page-actions">
+          <span class="ov-updated" id="ovUpdated" aria-live="polite"></span>
+          <button class="btn" id="ovRefresh" type="button"><i data-lucide="refresh-cw"></i>Refresh</button>
+        </div>
+      </div>
+
+      <section class="card ov-attention" aria-labelledby="ovAttnTitle">
+        <header class="card-head"><h2 class="card-title" id="ovAttnTitle"><i data-lucide="siren"></i>Needs attention</h2><span class="card-meta" id="ovAttnMeta"></span></header>
+        <div id="ovAttention"><div class="state loading" aria-busy="true"><b>Checking every department…</b></div></div>
+      </section>
+
+      <div class="ov-grid" id="ovDepts"></div>
+      <p class="footnote">Every number is counted from live records when this page loads; nothing is estimated. Times are in India Standard Time.</p>
+    </main>
+  </div>
+</div>
+
+<script type="module" src="/overview.js"></script>
+</body>
+</html>

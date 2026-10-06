@@ -1110,3 +1110,46 @@ html.drawer-open { overflow: hidden; }
 .drawer:focus { outline: none; }
 .nav-dept:not(.open) > .nav-tree { display: none; }
 .nav-dept.open > .nav-item:not(.active) { color: var(--text); }
+
+/* --------------------------------------------------------------------------
+   Overview (command centre)
+   -------------------------------------------------------------------------- */
+.ov-eyebrow { margin: 0 0 4px; font-size: var(--fs-label); font-weight: 500; letter-spacing: .04em; text-transform: uppercase; color: var(--text-3); }
+.ov-updated { font-size: var(--fs-meta); color: var(--text-3); align-self: center; }
+.ov-attention { margin-bottom: var(--sp-4); }
+.ov-attn { list-style: none; margin: 0; padding: 0; }
+.ov-attn li + li { border-top: 1px solid var(--border-soft); }
+.ov-attn a { display: grid; grid-template-columns: 96px minmax(0, 1fr) auto 16px; align-items: center; gap: var(--sp-3); padding: 11px 16px; color: var(--text); }
+.ov-attn a:hover { background: var(--surface-2); }
+.ov-attn-text { font-size: var(--fs-body); min-width: 0; }
+.ov-chev { color: var(--text-3); }
+.ov-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: var(--sp-4); }
+.ov-dept { display: flex; flex-direction: column; }
+.ov-dept-head { display: flex; align-items: center; gap: var(--sp-3); padding: 12px 16px; border-bottom: 1px solid var(--border-soft); background-image: var(--pattern); }
+.ov-dept-head h2 { margin: 0; font-size: var(--fs-section); font-weight: 600; }
+.ov-dept-head h2 a { display: inline-flex; align-items: center; gap: 8px; color: var(--text); }
+.ov-dept-head h2 .lucide { color: var(--text-2); }
+.ov-open { margin-left: auto; display: inline-flex; align-items: center; gap: 4px; font-size: var(--fs-meta); color: var(--text-2); }
+.ov-open:hover { color: var(--text); }
+.ov-metrics { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.ov-metric { display: flex; flex-direction: column; gap: 2px; padding: 12px 16px; border-bottom: 1px solid var(--border-soft); color: var(--text); min-width: 0; }
+.ov-metric:not(:nth-child(3n)) { border-right: 1px solid var(--border-soft); }
+a.ov-metric:hover { background: var(--surface-2); }
+.ov-m-label { font-size: var(--fs-meta); color: var(--text-2); }
+.ov-m-value { font-size: 22px; font-weight: 600; letter-spacing: -0.02em; line-height: 1.2; }
+.ov-m-value.bad { color: var(--error-text); }
+.ov-m-value.warn { color: var(--warning-text); }
+.ov-m-value.info { color: var(--info-text); }
+.ov-m-note { font-size: var(--fs-label); color: var(--text-3); }
+.ov-foot { margin: 0; padding: 10px 16px; font-size: var(--fs-meta); color: var(--text-2); }
+.ov-chips { display: flex; flex-wrap: wrap; gap: 6px; padding: 10px 16px; }
+.ov-chips .badge b { font-weight: 600; color: var(--text); }
+@media (max-width: 1100px) { .ov-grid { grid-template-columns: minmax(0, 1fr); } }
+@media (max-width: 640px) {
+  .ov-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .ov-metric:not(:nth-child(3n)) { border-right: 0; }
+  .ov-metric:nth-child(odd) { border-right: 1px solid var(--border-soft); }
+  .ov-attn a { grid-template-columns: minmax(0, 1fr) 16px; grid-template-areas: "sev chev" "text chev" "dept chev"; gap: 4px 8px; }
+  .ov-attn a .health { grid-area: sev; } .ov-attn-text { grid-area: text; } .ov-attn a .badge { grid-area: dept; justify-self: start; } .ov-chev { grid-area: chev; }
+  .ov-m-value { font-size: 20px; }
+}
