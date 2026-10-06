@@ -1157,6 +1157,7 @@ onLeave(() => { clearInterval(poll); clearTimeout(searchTimer); clearTimeout(ins
   skeleton();
   try {
     const me = await (await fetch('/auth/me')).json();
+    byCallerForbidden = !me.isAdmin;  // per-caller stats are an admin report; don't ask for it otherwise
     if (!me.authenticated) { window.location.href = '/login'; return; }
     initShell(me, {
       // The sidebar search is the board's own search here, not a page change.

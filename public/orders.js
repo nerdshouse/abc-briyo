@@ -497,26 +497,26 @@ function renderDrawer() {
       ${!canEdit() ? `<dl class="kv">
         <dt>Courier</dt><dd>${esc(courier?.name || '—')}</dd>
         <dt>AWB / Tracking ID</dt><dd class="mono">${esc(ship.tracking_id || '—')}</dd>
-        <dt>Tracking Link</dt><dd>${ship.tracking_url ? `<a class="track-link" href="${esc(ship.tracking_url)}" target="_blank" rel="noopener noreferrer">Open tracking</a>` : '—'}</dd>
-        <dt>Shipment Status</dt><dd>${indicator(ship.shipment_status)}</dd>
-        <dt>Expected Delivery</dt><dd>${esc(ship.expected_delivery_date ? day(ship.expected_delivery_date) : '—')}</dd>
+        <dt>Tracking link</dt><dd>${ship.tracking_url ? `<a class="track-link" href="${esc(ship.tracking_url)}" target="_blank" rel="noopener noreferrer">Open tracking</a>` : '—'}</dd>
+        <dt>Shipment status</dt><dd>${indicator(ship.shipment_status)}</dd>
+        <dt>Expected delivery</dt><dd>${esc(ship.expected_delivery_date ? day(ship.expected_delivery_date) : '—')}</dd>
       </dl>` : `<form id="shipForm" class="form-grid" novalidate>
         <label class="fld"><span>Courier</span>
           <select class="select" name="courier_partner_id">${opt('', 'Choose courier', !ship.courier_partner_id)}
             ${m.couriers.filter((c) => c.active || c.id === ship.courier_partner_id).map((c) => opt(c.id, c.name, c.id === ship.courier_partner_id)).join('')}
           </select></label>
         <label class="fld"><span>AWB / Tracking ID</span><input class="input mono" name="tracking_id" value="${esc(ship.tracking_id || '')}" maxlength="80" autocomplete="off" /></label>
-        <label class="fld wide"><span>Tracking Link</span>
+        <label class="fld wide"><span>Tracking link</span>
           <input class="input" name="tracking_url" value="${esc(ship.tracking_url || '')}" ${autoLink ? 'readonly' : ''}
                  placeholder="${autoLink ? 'Filled from the courier and AWB' : 'Paste a link, if the courier gives one'}" maxlength="500" autocomplete="off" />
           <span class="help" id="trackHelp">${trackHelp(courier)}</span>
           ${ship.tracking_url ? `<span class="help"><a class="track-link" href="${esc(ship.tracking_url)}" target="_blank" rel="noopener noreferrer">Open tracking</a></span>` : ''}</label>
-        <label class="fld"><span>Shipment Status</span>
+        <label class="fld"><span>Shipment status</span>
           <select class="select" name="shipment_status">${m.shipmentStatuses.map((s) => opt(s, label(s), s === ship.shipment_status)).join('')}</select></label>
-        <label class="fld"><span>Expected Delivery</span><input class="input" type="date" name="expected_delivery_date" value="${esc(ship.expected_delivery_date || '')}" /></label>
+        <label class="fld"><span>Expected delivery</span><input class="input" type="date" name="expected_delivery_date" value="${esc(ship.expected_delivery_date || '')}" /></label>
       </form>`}
       <dl class="kv" style="margin-top:12px">
-        <dt>Dispatch Date</dt><dd>${ship.dispatch_date ? esc(dateTime(ship.dispatch_date)) : '—'}</dd>
+        <dt>Dispatch date</dt><dd>${ship.dispatch_date ? esc(dateTime(ship.dispatch_date)) : '—'}</dd>
         <dt>Delivered</dt><dd>${ship.delivered_at ? esc(dateTime(ship.delivered_at)) : '—'}</dd>
       </dl>
       <div id="dStock" class="stock-block"></div>
@@ -636,9 +636,9 @@ function drawerCommon(o, documents, proofDocs, events, notes) {
       <dl class="kv" style="margin-top:10px">
         <dt>Order Number</dt><dd class="mono">${esc(o.source_order_id)}</dd>
         <dt>Channel</dt><dd>${esc(o.channel_label)}</dd>
-        <dt>Dispatch Type</dt><dd>${o.dispatch_type ? esc(typeLabel(o.dispatch_type)) : '<span class="muted">Not set</span>'}</dd>
+        <dt>Dispatch type</dt><dd>${o.dispatch_type ? esc(typeLabel(o.dispatch_type)) : '<span class="muted">Not set</span>'}</dd>
         ${o.destination_name ? `<dt>Destination</dt><dd>${esc(o.destination_name)}</dd>` : ''}
-        <dt>Order Date</dt><dd>${o.order_date ? esc(dateTime(o.order_date)) : '<span class="muted">Not entered</span>'}</dd>
+        <dt>Order date</dt><dd>${o.order_date ? esc(dateTime(o.order_date)) : '<span class="muted">Not entered</span>'}</dd>
         <dt>Order Value</dt><dd>${o.order_value === null ? '<span class="muted">Not entered</span>' : esc(`${money(o.order_value)}${o.currency && o.currency !== 'INR' ? ` ${o.currency}` : ''}`)}</dd>
         <dt>Customer</dt><dd>${esc([o.customer_name, o.customer_phone, o.customer_email].filter(Boolean).join(' · ') || '—')}</dd>
         <dt>Payment</dt><dd>${esc([o.payment_method && label(o.payment_method), o.payment_status && label(o.payment_status)].filter(Boolean).join(' · ') || 'Not known')}</dd>
@@ -1004,7 +1004,7 @@ function openForm(order) {
   $('#moreDetails').open = ['customer_name', 'customer_phone', 'customer_email', 'payment_method',
     'payment_status', 'fulfillment_type'].some((k) => order[k]);
   $('#fTitle').textContent = `Edit order ${order.source_order_id}`;
-  $('#fSubmit').textContent = 'Save Changes';
+  $('#fSubmit').textContent = 'Save changes';
   $('#formDrawer').hidden = false;
   $('#drawerScrim').hidden = false;
   form.source_order_id.focus();
@@ -1102,7 +1102,7 @@ function openCreate() {
   $('#cError').hidden = true;
   $('#cExists').hidden = true;
   $('#cSaved').textContent = '';
-  $('#cSubmit').textContent = 'Create Shipment';
+  $('#cSubmit').textContent = 'Create shipment';
   const m = state.meta;
   fillRoute(f, '#cDestField', { type: state.type === 'none' ? '' : state.type, channel: state.f.channel });
   $('#cExtras').innerHTML = '';
@@ -1170,7 +1170,7 @@ $('#createForm').addEventListener('change', (e) => {
 const orderFieldsReset = () => {
   state.addToExisting = false;
   $('#cExists').hidden = true;
-  $('#cSubmit').textContent = 'Create Shipment';
+  $('#cSubmit').textContent = 'Create shipment';
 };
 
 $('#createForm').addEventListener('input', (e) => {
@@ -1440,7 +1440,7 @@ function openShipNew() {
   $('#sSaved').textContent = '';
   f.courier_partner_id.innerHTML = opt('', 'Choose courier', true)
     + state.meta.couriers.filter((c) => c.active).map((c) => opt(c.id, c.name)).join('');
-  $('#sTitle').textContent = list.length > 1 ? `Create Shipment · ${list.length} orders` : 'Create Shipment';
+  $('#sTitle').textContent = list.length > 1 ? `Create shipment · ${list.length} orders` : 'Create shipment';
   const total = list.reduce((n, o) => n + (o.order_value || 0), 0);
   $('#sTotal').textContent = `${list[0].channel_label}${list[0].dispatch_type ? ` · ${typeLabel(list[0].dispatch_type)}` : ''} · ${money(total)}`;
   $('#sOrders').innerHTML = list.map((o, i) => `<li><span class="mono">${esc(o.source_order_id)}</span>

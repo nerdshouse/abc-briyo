@@ -373,7 +373,7 @@ function openForm(kind, ctx = {}) {
   const skus = (state.skus || []).map((x) => ({ sku_id: x.id, sku: x.sku, product_name: x.product_name, variant_name: x.variant_name, sku_active: x.active }));
   const batch = ctx.batchId ? state.detail?.batches.find((b) => b.id === ctx.batchId) : null;
   const wh = (sel) => m.warehouses.filter((w) => w.active).map((w) => opt(w.id, w.name, String(w.id) === String(sel))).join('');
-  const skuOptions = (sel) => opt('', 'Choose SKU', !sel) + skus.filter((r) => r.sku_active !== false)
+  const skuOptions = (sel) => opt('', 'Choose a SKU', !sel) + skus.filter((r) => r.sku_active !== false)
     .map((r) => opt(r.sku_id, `${r.sku} — ${r.product_name}${r.variant_name ? ` (${r.variant_name})` : ''}`, String(r.sku_id) === String(sel))).join('');
   const s = kind === 'edit-sku' ? state.detail.sku : (ctx.prefill || {});
   let title = ''; let sub = ''; let submit = 'Save'; let body = '';
@@ -426,9 +426,9 @@ function openForm(kind, ctx = {}) {
         <span class="help">Required. Stored with the mapping and in the audit record.</span></label>
     </section>`;
   } else if (kind === 'receive') {
-    title = 'Add Inventory';
+    title = 'Add inventory';
     sub = 'Goods in: creates the batch if it is new and records +quantity in the ledger.';
-    submit = 'Add Inventory';
+    submit = 'Add inventory';
     const sup = m.suppliers.map((x) => `<option value="${esc(x.name)}"></option>`).join('');
     body = `<section class="dsec"><div class="form-grid">
       <label class="fld wide"><span>SKU</span><select class="select" name="sku_id" required>${skuOptions(ctx.skuId || '')}</select></label>
@@ -493,13 +493,13 @@ function openForm(kind, ctx = {}) {
       <label class="fld wide"><span>Notes</span><textarea class="input" name="notes" maxlength="1000">${esc(batch.notes || '')}</textarea></label>
     </div></section>`;
   } else if (kind === 'import') {
-    title = 'Import Master SKUs';
+    title = 'Import master SKUs';
     sub = 'Import one row per Master SKU and Product Name. Preview first; nothing is saved until you import.';
     submit = 'Import';
     state.importFile = null; state.importPreview = null;
     body = `<section class="dsec"><div class="form-grid">
       <label class="fld wide"><span>Sheet (.csv or .xlsx)</span><input class="input" type="file" id="impFile" accept=".csv,.xlsx,.txt,text/csv" />
-        <span class="help">Two columns: <b>Briyo SKU</b> and <b>Product Name</b>. New master SKUs are created and changed product names updated.
+        <span class="help">Two columns: <b>Briyo SKU</b> and <b>Product name</b>. New master SKUs are created and changed product names updated.
         Platform SKUs (Amazon, Blinkit, Zepto…) are not imported — add them on each master SKU afterwards. Any other column is ignored.</span></label>
     </div></section><div id="impResult"></div>`;
   } else if (kind === 'places') {
@@ -834,7 +834,7 @@ function bind() {
     const [me, meta] = await Promise.all([api('/auth/me'), api('/api/inventory/meta')]);
     state.me = me;
     state.meta = meta;
-    try { const om = await api('/api/orders/meta'); setTimezone(om.timezone); } catch { /* timezone stays default */ }
+    setTimezone(meta.timezone);  // from the inventory meta: Inventory-only members cannot read the Orders API
     initShell(me);
     readUrl();
     fillFilters();

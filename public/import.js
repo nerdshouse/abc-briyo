@@ -111,7 +111,7 @@ fetch('/api/config').then((r) => r.json()).then((cfg) => {
   const el = $('#shopifyState');
   if (cfg.shopifyAuthorized) {
     el.textContent = 'connected';
-    el.style.color = 'var(--accent)';
+    el.style.color = "var(--success-text)";
   } else if (cfg.shopifyConnected) {
     // Credentials are in place but the store has never authorised us. One
     // browser round-trip fixes it, so offer the button rather than an error.

@@ -1,14 +1,16 @@
 :root {
-  --bg: #f5f6f8;
+  /* Briyo OS tokens (ui.css). This sheet now serves only the pages shown
+     before sign-in or without a department: login and no-access. */
+  --bg: #FAFAFA;
   --panel: #fff;
-  --border: #e4e7ec;
-  --border-strong: #d0d5dd;
-  --text: #101828;
+  --border: #E7E9ED;
+  --border-strong: #D0D5DD;
+  --text: #182230;
   --text-soft: #475467;
   --muted: #667085;
-  --accent: #1f6f4a;
-  --accent-hover: #1a5c3e;
-  --accent-soft: #e8f3ed;
+  --accent: #202B3C;
+  --accent-hover: #2B384C;
+  --accent-soft: #F2F4F7;
   --danger: #b42318;
   --danger-soft: #fef3f2;
   --warn: #b54708;
@@ -684,3 +686,10 @@ a.stat.stat-click:hover { border-color: var(--accent); background: #fbfdfc; }
 tr.module-editor td { background: #FAFAFB; }
 .module-editor .module-selects { padding: 6px 0; }
 .module-editor .row-actions { display: flex; gap: 8px; align-items: center; margin-top: 8px; }
+
+/* Briyo OS brand on the sign-in and no-access cards */
+.login-brand { display: flex; align-items: center; gap: 10px; margin-bottom: 18px; }
+.login-brand .mark { width: 32px; height: 32px; border-radius: 8px; display: grid; place-items: center; background: #202B3C; color: #fff; font-weight: 700; font-size: 15px; letter-spacing: -0.02em; }
+.login-brand h1 { margin: 0; }
+.login-brand .sub { margin: 2px 0 0 !important; }
+:where(a, button, input, select):focus-visible { outline: 2px solid #3978F6; outline-offset: 2px; }

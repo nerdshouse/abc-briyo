@@ -4,85 +4,92 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Import carts — Briyo OS</title>
-  <link rel="stylesheet" href="/styles.css" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/ui.css" />
+  <!-- The page script imports these; preloading fetches them in parallel instead of one after another. -->
+  <link rel="modulepreload" href="/ui/components.js" />
+  <link rel="modulepreload" href="/ui/nav.js" />
+  <script src="https://cdn.jsdelivr.net/npm/lucide@0.469.0/dist/umd/lucide.min.js" defer></script>
 </head>
 <body>
-  <div class="wrap">
-    <header class="page">
-      <div>
-        <h1>Import a Shopify export</h1>
-        <p class="sub">
-          Upload the CSV from Shopify → Orders → Abandoned checkouts → Export.
-          Only the columns this board uses are kept; the rest are ignored.
-        </p>
-      </div>
-      <div class="session">
-        <a class="btnlink" href="/dashboard">Dashboard</a>
-        <a class="btnlink" href="/">← Board</a>
-      </div>
+<div class="app">
+
+  <aside class="sidebar" id="sidebar" aria-label="Main navigation"></aside>
+  <div class="scrim" id="scrim"></div>
+
+  <div class="main">
+    <header class="topbar">
+      <button class="icon-btn" id="navOpen" type="button" aria-label="Open navigation"><i data-lucide="menu"></i></button>
+      <span class="topbar-title" id="topTitle">Import carts</span>
     </header>
 
-    <div id="banner" class="banner error" hidden></div>
-    <div id="ok" class="banner success" hidden></div>
-
-    <section class="panel insight">
-      <header><h2>Choose a file</h2></header>
-      <div class="addrow">
-        <div class="field">
-          <label for="file">Shopify checkouts CSV</label>
-          <input id="file" type="file" accept=".csv,text/csv" />
+    <main class="page legacy" data-section="import">
+      <div class="crumbs"><i data-lucide="upload"></i><span>Admin</span><span class="sep">/</span><span class="here">Import carts</span></div>
+      <div class="page-head">
+        <div>
+          <h1 class="page-title">Import carts</h1>
+          <p class="page-sub">Upload the CSV from Shopify → Orders → Abandoned checkouts → Export. Only the columns Support uses are kept.</p>
         </div>
-        <div class="field">
-          <label for="assignTo">Assign these carts to</label>
-          <select id="assignTo"><option value="">Nobody</option></select>
+      </div>
+
+      <div id="banner" class="banner error" role="alert" hidden></div>
+      <div id="ok" class="banner success" role="status" hidden></div>
+
+      <section class="card panel">
+        <header class="card-head"><h2 class="card-title"><i data-lucide="file-up"></i>Choose a file</h2></header>
+        <div class="pane pad">
+          <div class="addrow">
+            <label class="fld"><span>Shopify checkouts CSV</span><input id="file" type="file" accept=".csv,text/csv" class="file" /></label>
+            <label class="fld"><span>Assign these carts to</span><select id="assignTo" class="select"><option value="">Nobody</option></select></label>
+            <button type="button" class="btn primary" id="previewBtn" disabled>Preview</button>
+          </div>
+          <p class="hint">Nothing is written until you confirm. Re-importing the same file is safe — matching checkouts are updated, and call statuses, notes and owners are never overwritten.</p>
         </div>
-        <button type="button" class="primary" id="previewBtn" disabled>Preview</button>
-      </div>
-      <p class="hint">
-        Nothing is written until you confirm. Re-importing the same file is safe — matching
-        checkouts are updated, and call statuses, notes and owners are never overwritten.
-      </p>
-    </section>
+      </section>
 
-    <section class="panel insight" id="previewPanel" hidden style="margin-top:18px">
-      <header><h2>Preview</h2><span class="muted" id="previewMeta"></span></header>
-      <div id="previewStats" class="stats"></div>
-      <div id="warnings"></div>
-      <div class="panel" style="box-shadow:none;border:none;overflow-x:auto">
-        <table class="mini">
-          <thead><tr><th>Checkout</th><th>Customer</th><th>Phone</th><th>Email</th><th class="right">Value</th><th class="right">Items</th><th>Abandoned</th></tr></thead>
-          <tbody id="sampleRows"></tbody>
-        </table>
-      </div>
-      <div class="addrow" style="margin-top:14px">
-        <button type="button" class="primary" id="applyBtn">Import these checkouts</button>
-        <button type="button" id="cancelBtn">Cancel</button>
-      </div>
-    </section>
+      <section class="card panel" id="previewPanel" hidden>
+        <header class="card-head"><h2 class="card-title"><i data-lucide="eye"></i>Preview</h2><span class="card-meta" id="previewMeta"></span></header>
+        <div class="pane pad">
+          <div id="previewStats" class="stats"></div>
+          <div id="warnings"></div>
+          <div class="table-wrap">
+            <table class="table mini">
+              <thead><tr><th>Checkout</th><th>Customer</th><th>Phone</th><th>Email</th><th class="r">Value</th><th class="r">Items</th><th>Abandoned</th></tr></thead>
+              <tbody id="sampleRows"></tbody>
+            </table>
+          </div>
+          <div class="form-actions"><button type="button" class="btn primary" id="applyBtn">Import these checkouts</button><button type="button" class="btn" id="cancelBtn">Cancel</button></div>
+        </div>
+      </section>
 
-    <section class="panel insight" style="margin-top:18px">
-      <header><h2>Live Shopify sync</h2><span class="muted" id="shopifyState">checking…</span></header>
-      <p class="hint" style="margin-top:0">
-        Shopify has no abandoned-checkout webhook — it decides a checkout is abandoned only
-        after time passes — so the board <strong>polls</strong> Shopify instead of being pushed
-        to. Once connected it pulls automatically; this button is for when you don't want to
-        wait for the next run. Carts pulled this way <em>do</em> carry a working recovery link,
-        which the CSV export does not.
-      </p>
-      <div class="addrow">
-        <a class="primary" id="connectBtn" href="/auth/shopify/install" hidden>Connect Shopify</a>
-        <button type="button" class="primary" id="pullBtn">Pull from Shopify now</button>
-      </div>
-      <div id="pullResult"></div>
-    </section>
+      <section class="card panel">
+        <header class="card-head"><h2 class="card-title"><i data-lucide="refresh-cw"></i>Live Shopify sync</h2><span class="card-meta" id="shopifyState">checking…</span></header>
+        <div class="pane pad">
+          <p class="hint">Shopify has no abandoned-checkout webhook, so Briyo OS <strong>polls</strong> Shopify instead. Once connected it pulls automatically; use this button when you don't want to wait for the next run. Carts pulled this way carry a working recovery link, which the CSV export does not.</p>
+          <div class="form-actions">
+            <a class="btn primary" id="connectBtn" href="/auth/shopify/install" hidden>Connect Shopify</a>
+            <button type="button" class="btn primary" id="pullBtn">Pull from Shopify now</button>
+          </div>
+          <div id="pullResult"></div>
+        </div>
+      </section>
 
-    <p class="note">
+      <p class="footnote">
       Shopify's export carries no recovery link, so the <strong>Cart link</strong> button will be
       empty on imported rows — callers can still phone and WhatsApp. Shopify also has no
       equivalent of GoKwik's drop stage or RTO risk flag, so those stay blank rather than being
       invented.
     </p>
+    </main>
   </div>
-  <script src="/import.js"></script>
+</div>
+
+<script type="module">
+  import { initShell } from '/ui/components.js';
+  fetch('/auth/me').then((r) => r.json()).then((me) => initShell(me)).catch(() => {});
+</script>
+<script src="/import.js"></script>
 </body>
 </html>

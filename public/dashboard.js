@@ -78,12 +78,10 @@ function windowOf(n, offset = 0) {
 
 /* ------------------------------------------------------------------ header + alerts */
 
-function greet(me) {
-  const hour = Number(new Intl.DateTimeFormat('en-GB', { hour: 'numeric', hour12: false, timeZone: 'Asia/Kolkata' }).format(new Date()));
-  const part = hour < 12 ? 'Good morning' : hour < 17 ? 'Good afternoon' : 'Good evening';
-  const first = String(me?.name || '').split(' ')[0];
-  $('#hello').textContent = first ? `${part}, ${first}` : 'Dashboard';
-  $('#helloSub').textContent = 'Here’s what needs attention today.';
+function greet() {
+  // The greeting and "what needs attention" live on the Overview; this is the in-depth view.
+  $('#hello').textContent = 'Analytics';
+  $('#helloSub').textContent = 'Operations and cart recovery in depth: trends, stages, callers, sources and reports.';
 }
 
 /**

@@ -1235,3 +1235,21 @@ a.ov-metric:hover { background: var(--surface-2); }
 .mb-table .cell-main, .mb-table .cell-sub { display: block; max-width: 260px; white-space: nowrap; }
 /* Any table with a phone list beside it gives way to the list on phones. */
 @media (max-width: 760px) { .table-wrap:has(~ .clist) { display: none; } }
+
+/* Pages whose script predates the shell (Import carts) use these few classes. */
+.legacy .card { margin-bottom: var(--sp-4); }
+.legacy .pane.pad { padding: var(--sp-4); }
+.legacy .addrow { display: flex; flex-wrap: wrap; gap: var(--sp-3); align-items: flex-end; }
+.legacy .addrow .fld { min-width: 220px; }
+.legacy .hint { font-size: var(--fs-meta); color: var(--text-2); margin: var(--sp-3) 0 0; line-height: 1.5; }
+.legacy .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: var(--sp-3); margin-bottom: var(--sp-3); }
+.legacy .stat { border: 1px solid var(--border-soft); border-radius: var(--r-input); padding: 10px 12px; }
+.legacy .stat .label { font-size: var(--fs-meta); color: var(--text-2); }
+.legacy .stat .value { font-weight: 600; }
+.legacy .table.mini td, .legacy .table.mini th { font-size: var(--fs-meta); }
+.legacy .r, .legacy .right { text-align: right; }
+.banner { margin: 0 0 var(--sp-3); padding: 10px 14px; border-radius: var(--r-input); font-size: 13px; border: 1px solid var(--border); background: var(--surface-2); color: var(--text); }
+.banner.error { background: var(--error-soft); border-color: #FECDCA; color: var(--error-text); }
+.banner.success { background: var(--success-soft); border-color: #ABEFC6; color: var(--success-text); }
+.banner.mock { background: var(--warning-soft); border-color: #FEDF89; color: var(--warning-text); }
+.banner code { font-size: 12px; }
