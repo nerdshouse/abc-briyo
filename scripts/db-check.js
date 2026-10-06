@@ -47,7 +47,8 @@ import os from 'node:os';
 import path from 'node:path';
 import fsp from 'node:fs/promises';
 import http from 'node:http';
-import { ensureHrSchema, purgeTestHr, slugify, normalizePhone } from '../lib/hr.js';
+import { ensureHrSchema, purgeTestHr, slugify, normalizePhone, removeResume } from '../lib/hr.js';
+import { jobPostingLd } from '../lib/careers-pages.js';
 import { issueFormToken, verifyTurnstile } from '../lib/careers.js';
 import net from 'node:net';
 import {
@@ -3537,6 +3538,90 @@ await step('hr: status changes with history, notes, search and filters', async (
   return 'applied→screening (note)→interview with history + actor; stale 409; unknown 400; non-HR 403; notes; search by name/email/phone; status + job filters; events';
 });
 
+await step('hr: remove resume — permanent, audited, HR manager only; candidate and application stay', async () => {
+  const id = HRS.app.id;
+  const key = (await getPool().query('SELECT resume_storage_path FROM hr_applications WHERE id = $1', [id])).rows[0].resume_storage_path;
+  const file = path.join(HRS.dir, key);
+  await fsp.access(file);
+  // Storage refuses → nothing changes.
+  await expectErr('storage failure', () => removeResume(id, { actor: 'db-check', store: { remove: async () => { throw new Error('R2 down'); } } }), (e) => e.status === 502);
+  const still = (await getPool().query('SELECT resume_storage_path, version FROM hr_applications WHERE id = $1', [id])).rows[0];
+  if (still.resume_storage_path !== key || (await getPool().query(`SELECT count(*)::int n FROM hr_events WHERE application_id = $1 AND event_type = 'resume_removed'`, [id])).rows[0].n) throw new Error('failed removal changed the row');
+  for (const [who, want] of [['nonHr', 403], ['', 401]]) {
+    const r = await internal(who || null, 'DELETE', `/api/hr/applications/${id}/resume`, { reason: 'x' });
+    if (r.status !== want) throw new Error(`${who || 'anon'} remove ${r.status}`);
+  }
+  const r = await internal('mgr', 'DELETE', `/api/hr/applications/${id}/resume`, { reason: 'Candidate asked' });
+  if (r.status !== 200) throw new Error(`remove ${r.status} ${JSON.stringify(r.body)}`);
+  if (await fsp.access(file).then(() => true, () => false)) throw new Error('file still in storage');
+  const row = (await getPool().query('SELECT resume_storage_path, resume_filename, resume_mime, resume_size, resume_uploaded_at, status, candidate_id FROM hr_applications WHERE id = $1', [id])).rows[0];
+  if (row.resume_storage_path || row.resume_filename || row.resume_mime || row.resume_size || row.resume_uploaded_at) throw new Error('resume fields not cleared');
+  if (!(await getPool().query('SELECT 1 FROM hr_candidates WHERE id = $1', [row.candidate_id])).rows.length) throw new Error('candidate deleted');
+  const ev = (await getPool().query(`SELECT actor, at, metadata FROM hr_events WHERE application_id = $1 AND event_type = 'resume_removed'`, [id])).rows;
+  if (ev.length !== 1 || !ev[0].actor || !ev[0].at || ev[0].metadata.reason !== 'Candidate asked' || ev[0].metadata.filename !== 'Test CV.pdf') throw new Error(JSON.stringify(ev));
+  const d = await internal('mgr', 'GET', `/api/hr/applications/${id}`);
+  if (d.status !== 200 || d.body.application.has_resume || d.body.application.status !== 'interview') throw new Error('application detail');
+  if ((await internal('mgr', 'GET', `/api/hr/applications/${id}/resume`)).status !== 404) throw new Error('download after removal');
+  if ((await internal('mgr', 'DELETE', `/api/hr/applications/${id}/resume`, {})).status !== 404) throw new Error('second removal');
+  if (!(await internal('mgr', 'GET', '/api/hr/applications')).body.applications.some((a) => a.id === id)) throw new Error('application no longer listed');
+  return 'storage failure → 502, nothing changed; non-HR 403, anon 401; manager: object deleted, 5 resume fields cleared, event with actor + time + reason + filename; candidate, application and status kept; download 404; repeat 404';
+});
+
+await step('careers pages — home, job page, closed, draft/archived, SEO and JobPosting data', async () => {
+  const bad = [];
+  const home = await careers('GET', '/');
+  const titles = [...home.body.matchAll(/class="job-card-title">([^<]*)</g)].map((m) => m[1]);
+  if (!titles.includes(HRS.job.title) || !titles.includes(HRS.job2.title) || titles.some((t) => /Archive Me/.test(t))) bad.push(`home lists ${titles}`);
+  if (!home.body.includes('<link rel="canonical" href="https://careers.test/">') || /noindex/.test(home.body)) bad.push('home canonical/index');
+  const pg = await careers('GET', `/${HRS.job.slug}/apply`);
+  const ldm = pg.body.match(/<script type="application\/ld\+json">([^<]*)<\/script>/);
+  const ld = ldm && JSON.parse(ldm[1]);
+  if (pg.status !== 200 || !pg.body.includes('id="applyForm"') || /noindex/.test(pg.body) || pg.headers.get('cache-control') !== 'no-store') bad.push('published page');
+  if (!pg.body.includes(`<link rel="canonical" href="${HRS.job.public_url}">`)) bad.push('job canonical');
+  if (!ld || ld['@type'] !== 'JobPosting' || ld.title !== HRS.job.title || ld.employmentType !== 'FULL_TIME' || ld.baseSalary?.value?.minValue !== 1200000 || ld.identifier.value !== HRS.job.public_id || ld.url !== HRS.job.public_url) bad.push(`ld ${JSON.stringify(ld)}`);
+  if (!/<button class="submit" type="submit" id="submitBtn" disabled>/.test(pg.body) || !/method="post"/.test(pg.body)) bad.push('form must not submit without the script');
+  if (!/<input id="f-website" name="website"/.test(pg.body) || !/data-form-token="\d+\.[\w-]+"/.test(pg.body) || !/data-sitekey="test-site"/.test(pg.body)) bad.push('honeypot / form token / site key');
+  if (/candidate_count|incomplete|created_by|updated_by|hr\/resumes/.test(pg.body)) bad.push('internal fields on the page');
+  const asset = pg.body.match(/src="(\/assets\/careers\.js\?v=\w+)"/)?.[1];
+  const a = asset && await careers('GET', asset);
+  if (!a || a.status !== 200 || !/immutable/.test(a.headers.get('cache-control') || '')) bad.push('versioned asset');
+  // One value of salary: no salary in the page or the structured data.
+  const j2 = (await internal('mgr', 'GET', `/api/hr/jobs/${HRS.job2.id}`)).body.job;
+  const one = await internal('mgr', 'PATCH', `/api/hr/jobs/${j2.id}`, { version: j2.version, salary_min: 50000 });
+  const p2 = await careers('GET', `/${HRS.job2.slug}/apply`);
+  if (/50,000/.test(p2.body) || /baseSalary/.test(p2.body)) bad.push('single salary value shown');
+  HRS.job2 = one.body.job;
+  // JSON-LD cannot break out of its script tag.
+  const evil = jobPostingLd({ ...HRS.job, title: '</script><script>alert(1)</script>', sections: {} });
+  const evilHtml = JSON.stringify(evil).replace(/</g, '\\u003c');
+  if (evilHtml.includes('</script>')) bad.push('ld escaping');
+  // Closed: page stays, says so, no form, noindex, no JobPosting.
+  let j3 = (await internal('mgr', 'GET', `/api/hr/jobs/${HRS.job2.id}`)).body.job;
+  j3 = (await internal('mgr', 'POST', `/api/hr/jobs/${j3.id}/close`, { version: j3.version })).body.job;
+  const cl = await careers('GET', `/${j3.slug}/apply`);
+  if (cl.status !== 200 || !/Applications for this role are closed/.test(cl.body) || /id="applyForm"/.test(cl.body) || /application\/ld\+json/.test(cl.body)
+    || !/<meta name="robots" content="noindex">/.test(cl.body) || cl.headers.get('x-robots-tag') !== 'noindex') bad.push('closed page');
+  if ((await careers('GET', '/')).body.includes(j3.title) || (await careers('GET', '/sitemap.xml')).body.includes(j3.slug)) bad.push('closed job listed');
+  j3 = (await internal('mgr', 'POST', `/api/hr/jobs/${j3.id}/publish`, { version: j3.version })).body.job;
+  HRS.job2 = j3;
+  // Draft, archived, unknown: the same 404 page. /<slug> → 301 to /<slug>/apply.
+  const draft = (await internal('mgr', 'POST', '/api/hr/jobs', { title: `${HRT} Hidden Draft` })).body.job;
+  for (const p of ['/dbcheck-hr-hidden-draft/apply', '/dbcheck-hr-archive-me/apply', '/no-such-role/apply', '/dbcheck-hr-archive-me']) {
+    const r = await careers('GET', p);
+    if (r.status !== 404 || !/Page not found/.test(r.body) || !/noindex/.test(r.body)) bad.push(`${p}: ${r.status}`);
+  }
+  if ((await careers('GET', `/jobs/${draft.public_id}`)).status !== 404) bad.push('draft in API');
+  const short = await careers('GET', `/${HRS.job.slug}`);
+  if (short.status !== 301 || short.headers.get('location') !== `/${HRS.job.slug}/apply`) bad.push(`short link ${short.status}`);
+  const sm = (await careers('GET', '/sitemap.xml')).body;
+  const rb = (await careers('GET', '/robots.txt')).body;
+  if (!sm.includes(HRS.job.public_url) || sm.includes('hidden-draft') || sm.includes('archive-me') || !rb.includes('Sitemap: https://careers.test/sitemap.xml')) bad.push('sitemap/robots');
+  // A plain form POST to the page (no script) is a 404, never a GET with the fields in the URL.
+  if ((await careers('POST', `/${HRS.job.slug}/apply`, { raw: 'full_name=x', headers: { 'content-type': 'application/x-www-form-urlencoded' } })).status !== 404) bad.push('native form post');
+  if (bad.length) throw new Error(bad.join(' | '));
+  return 'home: published only, canonical; job: form, canonical, no-store, JobPosting (type, salary, id, url), button disabled until script, honeypot + signed token + site key, no internal fields, versioned immutable asset; single salary hidden; LD escaping; closed: notice, no form, noindex (meta + header), no LD, off home + sitemap; draft/archived/unknown → 404 page; /<slug> → 301; sitemap + robots';
+});
+
 await step('hr: spam layers — rate limit, Turnstile, honeypot, minimum fill time', async () => {
   const pid = HRS.job2.public_id;
   const ip = '203.0.113.77';
@@ -3574,7 +3659,7 @@ await step('hr: public answers never leak candidate data, ids, counts or notes',
 });
 
 await step('hr: host isolation — the careers host serves careers routes only', async () => {
-  const paths = ['/', '/login', '/dashboard', '/orders', '/inventory', '/admin', '/members', '/hr/jobs', '/no-access', '/index.html', '/orders.js', '/ui/components.js',
+  const paths = ['/login', '/dashboard', '/orders', '/inventory', '/admin', '/members', '/hr/jobs', '/no-access', '/index.html', '/orders.js', '/ui/components.js',
     '/auth/me', '/api/hr/jobs', '/api/hr/applications', '/api/orders', '/api/orders/meta', '/api/inventory', '/api/members', '/api/carts', '/api/carts.csv',
     '/api/admin/overview', '/api/config', '/api/webhook/gokwik/abandoned-cart', '/readyz'];
   const bad = [];
@@ -3586,6 +3671,8 @@ await step('hr: host isolation — the careers host serves careers routes only',
     const r = await careers(m, p, { body: { title: `${HRT} isolation probe`, phone: '9000000304' }, cookieAs: 'adm' });
     if (r.status !== 404) bad.push(`${m} ${p}: ${r.status}`);
   }
+  const home = await careers('GET', '/', { cookieAs: 'adm' });
+  if (home.status !== 200 || home.headers.get('set-cookie') || !/Careers at Briyo/.test(home.body) || /Dashboard|Call board|sidebar/.test(home.body)) bad.push('careers home');
   const ok = await careers('GET', '/jobs');
   if (ok.status !== 200 || !/default-src 'self'/.test(ok.headers.get('content-security-policy') || '') || ok.headers.get('x-frame-options') !== 'DENY') bad.push('careers headers');
   // The internal host has no careers routes.
@@ -3594,7 +3681,7 @@ await step('hr: host isolation — the careers host serves careers routes only',
     if (r.status === 200 && (typeof r.body === 'object' ? r.body.jobs || r.body.job : /Careers at Briyo/.test(r.body))) bad.push(`internal host served ${p}`);
   }
   if (bad.length) throw new Error(bad.join(' | '));
-  return `${paths.length * 2 + 5} internal paths on the careers host → 404 (no cookie set), with and without an admin session; careers headers; internal host serves no careers routes`;
+  return `${paths.length * 2 + 5} internal paths on the careers host (pages answer the careers 404 page) → 404 (no cookie set), with and without an admin session; careers headers; internal host serves no careers routes`;
 });
 
 await step('hr cleanup', async () => {

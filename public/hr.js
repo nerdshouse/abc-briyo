@@ -492,8 +492,15 @@ function renderApp() {
   const resume = a.has_resume
     ? `<div class="hr-file">${icon('file-text')}<div style="min-width:0"><div class="cell-main">${esc(a.resume_filename || 'Resume')}</div>
         <div class="cell-sub muted">${esc((a.resume_mime || '').includes('pdf') ? 'PDF' : 'Word document')}${a.resume_size ? ` · ${sizeText(a.resume_size)}` : ''} · ${esc(dateTime(a.resume_uploaded_at))}</div></div>
-        <a class="btn" href="/api/hr/applications/${a.id}/resume" download data-full-nav>${icon('download')}Download</a></div>`
-    : '<p class="soft">The resume was removed.</p>';
+        <a class="btn" href="/api/hr/applications/${a.id}/resume" download data-full-nav>${icon('download')}Download</a>
+        ${canManage() ? `<button class="btn" type="button" id="resumeRemove" title="Remove resume">${icon('trash-2')}<span class="sr-only">Remove resume</span></button>` : ''}</div>
+      <div class="hr-confirm" id="resumeConfirm" hidden>
+        <p><b>Permanently remove this resume?</b> The file is deleted from storage and cannot be recovered. The candidate and application stay.</p>
+        <input class="input" id="resumeReason" maxlength="300" placeholder="Reason (optional)" aria-label="Reason for removing the resume" />
+        <div class="form-actions"><button class="btn" type="button" id="resumeCancel">Cancel</button><button class="btn danger" type="button" id="resumeConfirmBtn">Remove permanently</button></div>
+        <div id="resumeErr"></div></div>`
+    : (() => { const ev = [...events].reverse().find((e) => e.event_type === 'resume_removed');
+      return `<p class="soft">${ev ? `Removed by ${esc(ev.actor || '—')} on ${esc(dateTime(ev.at))}${ev.metadata?.reason ? ` — ${esc(ev.metadata.reason)}` : ''}.` : 'No resume on file.'}</p>`; })();
   $('#dBody').innerHTML = `
     ${statusCtl}
     <section class="dsec"><h3 class="dsec-title">Resume</h3>${resume}</section>
@@ -515,7 +522,7 @@ function renderApp() {
       ${history.length ? `<ul class="hr-timeline">${history.map((h) => `<li>${tag(APP_STATUS, h.from_status)} → ${tag(APP_STATUS, h.to_status)}
         <span class="soft">${esc(h.actor || '—')} · ${esc(dateTime(h.at))}</span>${h.note ? `<p>${esc(h.note)}</p>` : ''}</li>`).join('')}</ul>` : '<p class="soft">Still at Applied. Changes appear here with who made them.</p>'}</section>
     <section class="dsec"><h3 class="dsec-title">Activity</h3>
-      <ul class="hr-timeline">${events.map((e) => `<li>${esc(EVENT[e.event_type] || e.event_type)}${e.event_type === 'candidate_profile_updated' && e.metadata?.changed ? ` <span class="soft">(${esc(Object.keys(e.metadata.changed).join(', ').replace(/_/g, ' '))})</span>` : ''}
+      <ul class="hr-timeline">${events.map((e) => `<li>${esc(EVENT[e.event_type] || e.event_type)}${e.event_type === 'resume_removed' && e.metadata?.reason ? ` <span class="soft">— ${esc(e.metadata.reason)}</span>` : ''}${e.event_type === 'candidate_profile_updated' && e.metadata?.changed ? ` <span class="soft">(${esc(Object.keys(e.metadata.changed).join(', ').replace(/_/g, ' '))})</span>` : ''}
         <span class="soft">${esc(e.actor || 'Candidate')} · ${esc(dateTime(e.at))}</span></li>`).join('')}</ul></section>`;
   renderIcons();
 }
@@ -534,6 +541,22 @@ async function saveStatus() {
     saved('Not saved', 'saved failed');
     $('#statusErr').innerHTML = `<div class="form-error">${conflictNote(err)}</div>`;
     $('#appStatusSave').disabled = false;
+  }
+}
+
+async function removeResume() {
+  const id = state.app.application.id;
+  $('#resumeConfirmBtn').disabled = true;
+  saved('Removing…', 'saved pending');
+  try {
+    await api(`/api/hr/applications/${id}/resume`, { method: 'DELETE', body: JSON.stringify({ reason: $('#resumeReason').value.trim() || null }) });
+    await openApp(id);
+    saved('Resume removed');
+    loadApps().then(renderApps).catch(() => {});
+  } catch (err) {
+    saved('Not removed', 'saved failed');
+    $('#resumeErr').innerHTML = `<div class="form-error">${esc(err.message)}</div>`;
+    $('#resumeConfirmBtn').disabled = false;
   }
 }
 
@@ -602,6 +625,9 @@ function bind() {
     if (t.dataset.action) { jobAction(t.dataset.action); return; }
     if (t.id === 'appStatusSave') { saveStatus(); return; }
     if (t.id === 'noteSave') { saveNote(); return; }
+    if (t.id === 'resumeRemove') { $('#resumeConfirm').hidden = false; $('#resumeReason').focus(); return; }
+    if (t.id === 'resumeCancel') { $('#resumeConfirm').hidden = true; return; }
+    if (t.id === 'resumeConfirmBtn') { removeResume(); return; }
     if (t.dataset.reload !== undefined) { state.dirty = false; if (state.openJob) openJob(state.openJob); else if (state.openApp) openApp(state.openApp); return; }
     if (t.dataset.appLink) { e.preventDefault(); openApp(Number(t.dataset.appLink)); return; }
     if (t.dataset.copy !== undefined) {
