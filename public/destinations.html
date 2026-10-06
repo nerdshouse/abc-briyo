@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Destinations — Briyo</title>
+  <title>Destinations — Briyo OS</title>
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap" rel="stylesheet" />
@@ -14,64 +14,7 @@
 <body>
 <div class="app">
 
-  <aside class="sidebar" id="sidebar" aria-label="Main navigation">
-    <div class="brand">
-      <span class="brand-mark"><i data-lucide="package"></i></span>
-      <div>
-        <div class="brand-name">Briyo Operations</div>
-        <div class="brand-sub">Orders &amp; logistics</div>
-      </div>
-    </div>
-
-    <form class="side-search" id="sideSearchForm" role="search" data-recovery data-context="recovery">
-      <i data-lucide="search"></i>
-      <input id="sideSearch" type="search" placeholder="Find a customer" autocomplete="off"
-             aria-label="Search every cart by name, phone or email" />
-      <kbd>⌘ K</kbd>
-    </form>
-
-    <nav>
-      <div class="nav-group" data-admin hidden>
-        <div class="nav-caption">Overview</div>
-        <a class="nav-item" href="/dashboard"><i data-lucide="layout-grid"></i>Dashboard</a>
-      </div>
-
-      <div class="nav-group" data-recovery>
-        <div class="nav-caption">Carts</div>
-        <a class="nav-item" href="/?mode=all" data-view-link="board"><i data-lucide="shopping-bag"></i>Call board</a>
-        <div class="nav-tree">
-          <a class="nav-item" href="/?mode=tocall" data-view-link="tocall">To call<span class="nav-count" id="countToCall" hidden></span></a>
-          <a class="nav-item" href="/?mode=callbacks" data-view-link="callbacks">Callbacks<span class="nav-count" id="countCallbacks" hidden></span></a>
-          <a class="nav-item" href="/?mode=mine" data-view-link="mine">My queue</a>
-          <a class="nav-item" href="/?mode=all" data-view-link="all">All carts</a>
-        </div>
-      </div>
-
-      <div id="ordersNav"></div>
-
-      <div class="nav-group" data-admin hidden>
-        <div class="nav-caption">Team</div>
-        <a class="nav-item" href="/admin"><i data-lucide="users"></i>Members</a>
-      </div>
-
-      <div class="nav-group" data-admin data-context="recovery" hidden>
-        <div class="nav-caption">Data</div>
-        <a class="nav-item" href="/import"><i data-lucide="upload"></i>Import carts</a>
-        <a class="nav-item" href="/api/admin/report.csv?period=day" download><i data-lucide="download"></i>Export report</a>
-      </div>
-    </nav>
-
-    <div class="sidebar-foot">
-      <div class="user-card">
-        <span class="avatar" id="userAvatar">·<span class="live"></span></span>
-        <div style="min-width:0">
-          <div class="user-name" id="userName">Signed in</div>
-          <div class="user-role" id="userRole"></div>
-        </div>
-        <button class="icon-btn bare" id="signOut" type="button" title="Sign out" aria-label="Sign out"><i data-lucide="log-out"></i></button>
-      </div>
-    </div>
-  </aside>
+  <aside class="sidebar" id="sidebar" aria-label="Main navigation"></aside>
   <div class="scrim" id="scrim"></div>
 
   <div class="main">

@@ -108,7 +108,7 @@ function frame() {
   $('#crumbHere').textContent = jobs ? 'Jobs' : 'Candidates';
   $('#pageTitle').textContent = jobs ? 'Jobs' : 'Candidates';
   $('#topTitle').textContent = jobs ? 'Jobs' : 'Candidates';
-  document.title = `${jobs ? 'Jobs' : 'Candidates'} — HR — Briyo`;
+  document.title = `${jobs ? 'Jobs' : 'Candidates'} — HR — Briyo OS`;
   $('#newJob').hidden = !(jobs && canManage());
   $('#footnote').textContent = jobs
     ? 'A job is private until it is published. Its public link is fixed at first publish; editing the title never changes it.'

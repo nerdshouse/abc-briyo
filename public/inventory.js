@@ -98,7 +98,7 @@ function render() {
   $('#pageTitle').textContent = title;
   $('#crumbHere').textContent = title === 'Inventory' ? 'Stock' : title;
   $('#topTitle').textContent = title;
-  document.title = `${title} — Briyo`;
+  document.title = `${title} — Briyo OS`;
   $('#pageSub').textContent = `${count(c.totalSkus)} active SKUs · ${count(c.availableUnits)} available to dispatch of ${count(c.onHandUnits)} on hand · ${money(c.inventoryValue)} at cost`
     + (c.unitsWithoutCost ? ` · ${count(c.unitsWithoutCost)} units without a cost` : '');
 

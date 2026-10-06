@@ -167,7 +167,7 @@ function renderHead(data) {
   $('#crumbGroup').textContent = view ? 'Logistics' : 'Orders';
   $('#crumbHere').textContent = here || 'All orders';
   $('#topTitle').textContent = title;
-  document.title = `${title} — Briyo`;
+  document.title = `${title} — Briyo OS`;
   // Only entered values are summed; say how many have none rather than imply ₹0.
   const valued = data.total - data.withoutValue;
   $('#pageSub').textContent = `${count(data.total)} ${data.total === 1 ? 'order' : 'orders'}`

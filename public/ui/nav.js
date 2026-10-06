@@ -103,6 +103,10 @@ export function syncSidebarActive() {
     a.classList.toggle('active', on);
     if (on) a.setAttribute('aria-current', 'page'); else a.removeAttribute('aria-current');
   }
+  // Only the department you are in shows its pages; the others fold to one line.
+  for (const dept of document.querySelectorAll('.sidebar .nav-dept')) {
+    dept.classList.toggle('open', Boolean(target && dept.contains(target)));
+  }
 }
 
 /* ------------------------------------------------------------------ swap */

@@ -1,5 +1,5 @@
 /**
- * Briyo Recovery — UI components (v2 design system)
+ * Briyo OS — UI components (shared design system)
  *
  * Plain functions that return HTML strings or draw into an element, in the same
  * template-string idiom as the rest of the front end. No framework and no build
@@ -350,27 +350,88 @@ export const initials = (name) => String(name || '?').split(/\s+/).filter(Boolea
 /* ------------------------------------------------------------------ shell */
 
 /**
- * Sidebar behaviour shared by every page on the new shell: the off-canvas toggle
- * below 1024px, the ⌘K search (which hands off to the board's global search —
- * the only search in the app — or, given `onSearch`, runs it in place), the
- * signed-in user card, admin-only links, and sign-out.
+ * The Briyo OS sidebar, one definition for every page.
+ *
+ * Pages ship an empty <aside id="sidebar">; it is built here once from the
+ * signed-in member's capabilities (lib/permissions.js) and stays mounted across
+ * client-side navigation. Links a member cannot use are not shown — the server
+ * still checks every page and API. Department counts arrive afterwards.
+ *
+ * Briyo OS
+ *   Overview
+ *   OPERATIONS  Logistics · Inventory
+ *   CUSTOMER    Support (cart recovery)
+ *   PEOPLE      HR
+ *   ADMIN       Members · Import carts · Export report
  */
+const navLink = (href, label, ico, { count: n = null, id = '', view = '', alert = false, download = false } = {}) => `<a class="nav-item" href="${href}"${view ? ` data-view-link="${view}"` : ''}${download ? ' download' : ''}>`
+  + `${ico ? `<i data-lucide="${ico}"></i>` : ''}<span class="nav-label">${esc(label)}</span>`
+  + `${id ? `<span class="nav-count${alert ? ' alert' : ''}" id="${id}" hidden></span>` : n ? `<span class="nav-count">${count(n)}</span>` : ''}</a>`;
+const navDept = (label, ico, href, body = '') => `<div class="nav-dept">${navLink(href, label, ico)}${body ? `<div class="nav-tree">${body}</div>` : ''}</div>`;
+const navSection = (caption, body) => (body ? `<div class="nav-group"><div class="nav-caption">${caption}</div>${body}</div>` : '');
+
+function sidebarHtml(me) {
+  const has = (c) => hasCap(me, c);
+  const admin = Boolean(me?.isAdmin);
+  const support = has('support.work');
+  return `
+    <a class="brand" href="/overview" aria-label="Briyo OS — overview">
+      <span class="brand-mark" aria-hidden="true">B</span>
+      <div><div class="brand-name">Briyo OS</div><div class="brand-sub">Operating system</div></div>
+    </a>
+    ${support ? `<form class="side-search" id="sideSearchForm" role="search" data-context="recovery">
+      <i data-lucide="search"></i>
+      <input id="sideSearch" type="search" placeholder="Find a customer" autocomplete="off" aria-label="Search every cart by name, phone or email" />
+      <kbd>⌘ K</kbd>
+    </form>` : ''}
+    <nav aria-label="Departments">
+      <div class="nav-group nav-top">${navLink('/overview', 'Overview', 'layout-dashboard')}</div>
+      ${navSection('Operations', '<div id="opsNav"></div>')}
+      ${navSection('Customer', support ? navDept('Support', 'headset', '/?mode=tocall',
+        navLink('/?mode=tocall', 'To call', '', { id: 'countToCall', view: 'tocall' })
+        + navLink('/?mode=callbacks', 'Callbacks', '', { id: 'countCallbacks', view: 'callbacks' })
+        + navLink('/?mode=mine', 'My queue', '', { view: 'mine' })
+        + navLink('/?mode=all', 'All carts', '', { view: 'all' })) : '')}
+      ${navSection('People', has('hr.view') ? navDept('HR', 'briefcase', '/hr/jobs',
+        navLink('/hr/jobs', 'Jobs') + navLink('/hr/candidates', 'Candidates')) : '')}
+      ${navSection('Admin', admin ? navLink('/admin', 'Members', 'users')
+        + navLink('/dashboard', 'Analytics', 'chart-no-axes-column')
+        + navLink('/import', 'Import carts', 'upload')
+        + navLink('/api/admin/report.csv?period=day', 'Export report', 'download', { download: true }) : '')}
+    </nav>
+    <div class="sidebar-foot">
+      <a class="user-card" href="/profile" title="Your profile">
+        <span class="avatar" id="userAvatar">·<span class="live"></span></span>
+        <div style="min-width:0">
+          <div class="user-name" id="userName">Signed in</div>
+          <div class="user-role" id="userRole"></div>
+        </div>
+      </a>
+      <button class="icon-btn bare sign-out" id="signOut" type="button" title="Sign out" aria-label="Sign out"><i data-lucide="log-out"></i></button>
+    </div>`;
+}
+
 let shellBound = false;
 let shellSearch = null;
 
 export function initShell(me, { onSearch } = {}) {
-  // The shell survives client-side navigation, so its listeners are bound once;
-  // each page only swaps in its own search behaviour.
+  // The shell survives client-side navigation: built and bound once; each page
+  // only swaps in its own search behaviour.
   shellSearch = onSearch || null;
   if (!shellBound) {
     shellBound = true;
+    const side = $('#sidebar');
+    if (side && !side.dataset.built) { side.innerHTML = sidebarHtml(me); side.dataset.built = '1'; }
     const app = $('.app');
-    const open = () => app.classList.add('nav-open');
-    const close = () => app.classList.remove('nav-open');
-    $('#navOpen')?.addEventListener('click', open);
+    const toggle = $('#navOpen');
+    const open = () => { app.classList.add('nav-open'); toggle?.setAttribute('aria-expanded', 'true'); };
+    const close = () => { app.classList.remove('nav-open'); toggle?.setAttribute('aria-expanded', 'false'); };
+    toggle?.setAttribute('aria-controls', 'sidebar');
+    toggle?.setAttribute('aria-expanded', 'false');
+    toggle?.addEventListener('click', open);
     $('#scrim')?.addEventListener('click', close);
     document.addEventListener('keydown', (e) => {
-      if (e.key === 'Escape') close();
+      if (e.key === 'Escape' && app.classList.contains('nav-open')) { close(); toggle?.focus(); }
       // ⌘K only where the customer search is actually shown.
       const search = $('#sideSearch');
       if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k' && search?.offsetParent) {
@@ -395,30 +456,112 @@ export function initShell(me, { onSearch } = {}) {
       window.location.href = '/login';
     });
     startRouter();
+    enhanceDrawers();
+    if (!document.querySelector('.skip-link')) {
+      document.body.insertAdjacentHTML('afterbegin', '<a class="skip-link" href="#main">Skip to content</a>');
+    }
   }
+  document.querySelector('main.page')?.setAttribute('id', 'main');
 
-  // Admin-only destinations are hidden, not disabled: a link that 403s is noise.
+  // Page-level elements still follow the same rules: admin-only and
+  // capability-gated controls are hidden, not disabled (the server checks again).
   for (const el of document.querySelectorAll('[data-admin]')) el.hidden = !me?.isAdmin;
-  // Same rule by capability (lib/permissions.js): data-cap="a b" shows the
-  // element when the member has any of them. The server checks again.
   for (const el of document.querySelectorAll('[data-cap]')) el.hidden = !el.dataset.cap.split(/\s+/).some((c) => hasCap(me, c));
-  // The call board is the Support module.
   for (const el of document.querySelectorAll('[data-recovery]')) el.hidden = !hasCap(me, 'support.work');
   renderOrdersNav(me).catch(() => {});
 
   if (me?.name) {
     $('#userName').textContent = me.name;
     $('#userRole').textContent = roleSummary(me);
-    $('#userAvatar').firstChild.textContent = initials(me.name);
+    setAvatar($('#userAvatar'), me);
   }
   syncSidebarActive();
+  renderIcons();
 }
 
 /**
- * Orders + Logistics sidebar groups, built from the server's dispatch types so
- * nothing here is hard-coded. Needs an empty
- * <div id="ordersNav"></div> in the sidebar; pages without one are untouched.
+ * Every drawer on every page, without touching page code: announced as a
+ * dialog, focus moves in when it opens and returns to where it was when it
+ * closes, and the page behind stops scrolling. Watches the `hidden` attribute,
+ * which is how all pages open and close their drawers.
  */
+function enhanceDrawers() {
+  const returnTo = new WeakMap();
+  const prepare = (d) => {
+    if (d.dataset.dialog) return;
+    d.dataset.dialog = '1';
+    d.setAttribute('role', 'dialog');
+    d.setAttribute('aria-modal', 'true');
+    const title = d.querySelector('.drawer-title');
+    if (title) { if (!title.id) title.id = `${d.id || 'drawer'}-title`; d.setAttribute('aria-labelledby', title.id); }
+  };
+  const sync = () => {
+    const open = [...document.querySelectorAll('.drawer')].filter((d) => !d.hidden);
+    document.documentElement.classList.toggle('drawer-open', open.length > 0);
+  };
+  const onChange = (d) => {
+    prepare(d);
+    if (!d.hidden) {
+      returnTo.set(d, document.activeElement);
+      requestAnimationFrame(() => {
+        if (d.hidden || d.contains(document.activeElement)) return;
+        const target = d.querySelector('[autofocus], .drawer-body input:not([type=hidden]):not([disabled]), .drawer-body select, .drawer-body textarea, .drawer-head button')
+          || d;
+        if (target === d) d.setAttribute('tabindex', '-1');
+        target.focus({ preventScroll: true });
+      });
+    } else {
+      const back = returnTo.get(d);
+      if (back && document.contains(back) && !document.querySelector('.drawer:not([hidden])')) back.focus({ preventScroll: true });
+    }
+    sync();
+  };
+  document.querySelectorAll('.drawer').forEach(prepare);
+  new MutationObserver((list) => {
+    for (const m of list) {
+      if (m.type === 'attributes' && m.target.classList?.contains('drawer')) onChange(m.target);
+      if (m.type === 'childList') m.addedNodes.forEach((n) => { if (n.nodeType === 1) { if (n.classList.contains('drawer')) prepare(n); n.querySelectorAll?.('.drawer').forEach(prepare); } });
+    }
+    if (list.some((m) => m.type === 'childList')) sync();
+  }).observe(document.body, { attributes: true, attributeFilter: ['hidden'], subtree: true, childList: true });
+}
+
+/** A short confirmation that does not need an answer. `tone`: 'ok' (default) or 'bad'. */
+export function toast(message, { tone = 'ok', ms = 3200 } = {}) {
+  let host = document.querySelector('.toast-host');
+  if (!host) {
+    host = document.createElement('div');
+    host.className = 'toast-host';
+    host.setAttribute('role', 'status');
+    host.setAttribute('aria-live', 'polite');
+    document.body.appendChild(host);
+  }
+  const el = document.createElement('div');
+  el.className = `toast ${tone === 'bad' ? 'bad' : ''}`;
+  el.innerHTML = `${icon(tone === 'bad' ? 'circle-alert' : 'check')}<span>${esc(message)}</span>`;
+  host.appendChild(el);
+  renderIcons();
+  setTimeout(() => el.remove(), ms);
+}
+
+/** One loading / empty / error block for every page. */
+export function stateBlock(kind, title, detail = '', { action = '', iconName = '' } = {}) {
+  const ico = iconName || { loading: 'loader', empty: 'inbox', error: 'circle-alert' }[kind] || 'info';
+  return `<div class="state ${kind}"${kind === 'loading' ? ' aria-busy="true"' : ''}>${icon(ico)}<b>${esc(title)}</b>${detail ? `<span>${esc(detail)}</span>` : ''}${action}</div>`;
+}
+
+/** An avatar: the member's photo when they have one, initials until then. */
+export function setAvatar(el, person) {
+  if (!el) return;
+  const live = el.querySelector('.live');
+  if (person?.photoUrl) {
+    el.innerHTML = `<img src="${esc(person.photoUrl)}" alt="" loading="lazy" decoding="async" />`;
+  } else {
+    el.textContent = initials(person?.name);
+  }
+  if (live) el.appendChild(live);
+}
+
 /**
  * /api/orders/meta, shared: the page and the sidebar ask for it at the same
  * moment, so they share one request instead of making two.
@@ -452,48 +595,27 @@ export function roleSummary(me) {
   return parts.join(' · ') || 'No module access';
 }
 
+/** Operations: Logistics and Inventory, with live counts from the server's dispatch types and views. */
 async function renderOrdersNav(me) {
-  const host = document.getElementById('ordersNav');
+  const host = document.getElementById('opsNav');
   if (!host) return;
   const logistics = hasCap(me, 'logistics.view');
   const inventory = hasCap(me, 'inventory.view');
-  const hr = hasCap(me, 'hr.view');
-  if (!logistics && !inventory && !hr) { host.innerHTML = ''; host.dataset.html = ''; return; }
+  const group = host.closest('.nav-group');
+  if (group) group.hidden = !logistics && !inventory;
+  if (!logistics && !inventory) { host.innerHTML = ''; host.dataset.html = ''; return; }
   // Order counts come from the Orders API, which only Logistics may read.
   const meta = logistics ? await ordersMeta() : { ok: true, dispatchTypes: [], views: {} };
   if (!meta.ok) return;
-  const link = (href, label, ico, n) => `<a class="nav-item" href="${href}">`
-    + `${ico ? `<i data-lucide="${ico}"></i>` : ''}${esc(label)}`
-    + `${n ? `<span class="nav-count">${count(n)}</span>` : ''}</a>`;
-  const html = `${logistics ? `
-    <div class="nav-group">
-      <div class="nav-caption">Orders</div>
-      ${link('/orders', 'All orders', 'package')}
-      <div class="nav-tree">${(meta.dispatchTypes || [])
-        .map((t) => link(`/orders?type=${encodeURIComponent(t.key)}`, t.label)).join('')}</div>
-    </div>
-    <div class="nav-group">
-      <div class="nav-caption">Logistics</div>
-      ${Object.entries(meta.views).map(([k, label]) => link(`/orders?view=${k}`, label,
-        { pending_dispatch: 'package-open', in_transit: 'truck', delivered: 'package-check', failed: 'undo-2' }[k],
-        meta.viewCounts?.[k])).join('')}
-      ${link('/couriers', 'Courier partners', 'building-2')}
-      ${link('/destinations', 'Destinations', 'map-pin')}
-    </div>` : ''}${inventory ? `
-    <div class="nav-group">
-      <div class="nav-caption">Inventory</div>
-      ${link('/inventory', 'Stock', 'boxes')}
-      <div class="nav-tree">
-        ${link('/inventory?stock=low', 'Low stock')}
-        ${link('/inventory?expiring=90', 'Expiring soon')}
-        ${link('/inventory?view=unmapped', 'Unmapped SKUs', '', meta.inventory?.unmappedSkus)}
-      </div>
-    </div>` : ''}${hr ? `
-    <div class="nav-group">
-      <div class="nav-caption">HR</div>
-      ${link('/hr/jobs', 'Jobs', 'briefcase')}
-      ${link('/hr/candidates', 'Candidates', 'user-round-search')}
-    </div>` : ''}`;
+  const html = `${logistics ? navDept('Logistics', 'truck', '/orders',
+    navLink('/orders', 'All orders')
+    + Object.entries(meta.views || {}).map(([k, label]) => navLink(`/orders?view=${k}`, label, '', { count: meta.viewCounts?.[k] })).join('')
+    + (meta.dispatchTypes || []).map((t) => navLink(`/orders?type=${encodeURIComponent(t.key)}`, t.label)).join('')
+    + navLink('/couriers', 'Couriers') + navLink('/destinations', 'Destinations')) : ''}${inventory ? navDept('Inventory', 'boxes', '/inventory',
+    navLink('/inventory', 'Stock')
+    + navLink('/inventory?stock=low', 'Low stock')
+    + navLink('/inventory?expiring=90', 'Expiring soon')
+    + navLink('/inventory?view=unmapped', 'Unmapped SKUs', '', { count: meta.inventory?.unmappedSkus })) : ''}`;
   // Re-rendered on every page; replaced only if something (a count) changed.
   if (host.dataset.html === html) return;
   host.dataset.html = html;

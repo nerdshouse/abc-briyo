@@ -1,9 +1,9 @@
 /* ==========================================================================
-   Briyo Recovery — design system (v2)
+   Briyo OS — design system
 
-   Loaded only by pages that have moved to the new shell. The caller board
-   still uses styles.css, so nothing here can change how the board looks while
-   the redesign is reviewed one page at a time.
+   One visual language for every department. Mostly monochrome; colour is
+   reserved for meaning (see "semantic" below) and is always paired with a
+   word or an icon, never used alone.
    ========================================================================== */
 
 :root {
@@ -39,6 +39,22 @@
   --error-text: #B42318;
   --error-soft: #FEF3F2;
   --info: #3978F6;
+  --info-text: #1D4ED8;
+  --info-soft: #EFF4FF;
+  --success-text: #067647;
+  --neutral: #98A2B3;
+  --neutral-soft: #F2F4F7;
+
+  /* type scale: page / section / card / body / meta / label */
+  --fs-page: 22px;
+  --fs-section: 15px;
+  --fs-card: 13px;
+  --fs-body: 14px;
+  --fs-meta: 12.5px;
+  --fs-label: 11px;
+
+  /* spacing scale (4px base) */
+  --sp-1: 4px; --sp-2: 8px; --sp-3: 12px; --sp-4: 16px; --sp-5: 20px; --sp-6: 24px; --sp-8: 32px;
 
   /* shape */
   --r-input: 8px;
@@ -1015,3 +1031,82 @@ a.ro-row:hover { background: #FCFCFD; }
 .wl-clear .lucide { width: 14px; height: 14px; color: var(--success); flex: none; margin-top: 2px; }
 /* The cart table's visually-hidden header escaped its scroll box and widened the page. */
 main.page[data-section="overview"] .table-wrap { position: relative; }
+
+
+/* ==========================================================================
+   Briyo OS layer: sidebar departments, semantic states, shared primitives
+   ========================================================================== */
+
+/* brand */
+a.brand { color: var(--text); }
+.brand-mark { font-weight: 700; font-size: 13px; letter-spacing: -0.02em; }
+
+/* sidebar: Overview, then department sections with their sub-pages */
+.nav-top { margin-top: 4px; }
+.nav-dept + .nav-dept { margin-top: 2px; }
+.nav-dept > .nav-item { font-weight: 500; }
+.nav-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sidebar-foot { display: flex; align-items: center; gap: 6px; }
+.sidebar-foot .user-card { flex: 1; min-width: 0; color: var(--text); }
+.sidebar-foot .user-card:hover { background: var(--surface-2); }
+.avatar { overflow: hidden; }
+.avatar img { width: 100%; height: 100%; object-fit: cover; display: block; border-radius: 50%; }
+
+/* semantic status: .status.{ok,warn,bad,info,neutral} sit beside the cart-era
+   names (.new/.noresp/.callback/.recovered/.lost), which stay as they are */
+.status.ok .dot { background: var(--success); }
+.status.warn .dot { background: var(--warning); }
+.status.bad .dot { background: var(--error); }
+.status.info .dot { background: var(--info); }
+.status.neutral .dot { background: var(--neutral); }
+
+/* badge: a word with a tint, for counts and health — text always present */
+.badge {
+  display: inline-flex; align-items: center; gap: 5px; height: 22px; padding: 0 8px;
+  border-radius: 6px; font-size: 12px; font-weight: 500; white-space: nowrap;
+  background: var(--neutral-soft); color: var(--text-2);
+}
+.badge .lucide { width: 13px; height: 13px; }
+.badge.ok { background: var(--success-soft); color: var(--success-text); }
+.badge.warn { background: var(--warning-soft); color: var(--warning-text); }
+.badge.bad { background: var(--error-soft); color: var(--error-text); }
+.badge.info { background: var(--info-soft); color: var(--info-text); }
+
+/* health indicator: Critical / Warning / Attention / Healthy */
+.health { display: inline-flex; align-items: center; gap: 6px; font-size: var(--fs-meta); font-weight: 500; }
+.health::before { content: ""; width: 8px; height: 8px; border-radius: 50%; background: var(--neutral); flex: none; }
+.health.critical { color: var(--error-text); } .health.critical::before { background: var(--error); }
+.health.warning { color: var(--warning-text); } .health.warning::before { background: var(--warning); }
+.health.attention { color: var(--info-text); } .health.attention::before { background: var(--info); }
+.health.healthy { color: var(--success-text); } .health.healthy::before { background: var(--success); }
+
+/* toast: one quiet confirmation at a time, bottom-right (bottom on phones) */
+.toast-host { position: fixed; right: 20px; bottom: 20px; z-index: 80; display: flex; flex-direction: column; gap: 8px; pointer-events: none; }
+.toast {
+  pointer-events: auto; display: flex; align-items: center; gap: 10px; max-width: 380px;
+  padding: 10px 14px; border-radius: 10px; background: var(--ink); color: #fff;
+  font-size: 13px; box-shadow: 0 8px 24px rgba(16, 24, 40, 0.18);
+  animation: toast-in .16s ease-out;
+}
+.toast .lucide { width: 16px; height: 16px; }
+.toast.bad { background: #7A271A; }
+@keyframes toast-in { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
+@media (prefers-reduced-motion: reduce) { .toast { animation: none; } }
+@media (max-width: 640px) { .toast-host { left: 12px; right: 12px; bottom: 12px; } .toast { max-width: none; } }
+
+/* states: loading / empty / error share one frame */
+.state { padding: 32px 16px; text-align: center; color: var(--text-2); font-size: 13px; }
+.state b { display: block; color: var(--text); font-weight: 500; margin-bottom: 4px; }
+.state .lucide { width: 20px; height: 20px; color: var(--text-3); margin-bottom: 8px; }
+.state .btn { margin-top: 12px; }
+.state.error b { color: var(--error-text); }
+
+/* focus: one visible ring everywhere */
+:where(a, button, input, select, textarea, [tabindex]):focus-visible { outline: 2px solid var(--info); outline-offset: 2px; border-radius: 6px; }
+.skip-link { position: absolute; left: -9999px; top: 8px; z-index: 100; padding: 8px 12px; background: var(--ink); color: #fff; border-radius: 8px; }
+.skip-link:focus { left: 8px; }
+
+html.drawer-open { overflow: hidden; }
+.drawer:focus { outline: none; }
+.nav-dept:not(.open) > .nav-tree { display: none; }
+.nav-dept.open > .nav-item:not(.active) { color: var(--text); }
