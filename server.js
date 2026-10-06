@@ -422,6 +422,9 @@ app.use('/api/destinations', requirePermission('logistics.view'), destinationRou
 // Inventory serves both modules: its own pages, and the stock panel of a shipment.
 app.use('/api/inventory', requirePermission(['inventory.view', 'logistics.view']), inventoryRouter);
 app.use('/api/hr', requirePermission('hr.view'), hrRouter);
+// HR pages: one page, two views (jobs, candidates). The careers host never gets here.
+app.get('/hr', requirePage('hr.view'), (_req, res) => res.redirect('/hr/jobs'));
+app.get(['/hr/jobs', '/hr/candidates'], requirePage('hr.view'), (_req, res) => res.sendFile(path.join(PUBLIC, 'hr.html')));
 
 app.use(express.static(PUBLIC));
 

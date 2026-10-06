@@ -3363,8 +3363,18 @@ await step('hr: RBAC — HR manager, admin and multi-module reach HR; others ref
   }
   const page = await internal('mgr', 'GET', '/');
   if (page.status !== 302 || page.headers.get('location') !== '/hr/jobs') bad.push(`HR-only home: ${page.status} ${page.headers.get('location')}`);
+  // HR pages: HR managers and admins only; everyone else is sent to their own home.
+  for (const [who, p, want, loc] of [['mgr', '/hr/jobs', 200], ['mgr', '/hr/candidates', 200], ['adm', '/hr/candidates', 200], ['multi', '/hr/jobs', 200],
+    ['mgr', '/hr', 302, '/hr/jobs'], ['nonHr', '/hr/jobs', 302, '/'], ['nonHr', '/hr/candidates', 302, '/'], ['', '/hr/jobs', 302, '/login'],
+    ['mgr', '/orders', 302, '/hr/jobs'], ['mgr', '/inventory', 302, '/hr/jobs'], ['mgr', '/admin', 403]]) {
+    const r = await internal(who || null, 'GET', p);
+    if (r.status !== want || (loc && r.headers.get('location') !== loc)) bad.push(`${who || 'anon'} page ${p}: ${r.status} ${r.headers.get('location') || ''}`);
+    if (want === 200 && !/hr\.js/.test(r.body)) bad.push(`${who} ${p}: not the HR page`);
+  }
+  const meta = (await internal('mgr', 'GET', '/api/hr/meta')).body;
+  if (!meta.canManage || !meta.timezone || meta.applicationStatuses.length !== 7) bad.push('meta');
   if (bad.length) throw new Error(bad.join(' | '));
-  return `${M.reduce((n, x) => n + Object.keys(x[3]).length, 0) + 1} checks`;
+  return `${M.reduce((n, x) => n + Object.keys(x[3]).length, 0) + 1} API checks + 11 HR page checks + meta`;
 });
 
 await step('hr: job lifecycle — draft, edit (version), publish, slug, close, reopen, archive, restore', async () => {
@@ -3391,6 +3401,13 @@ await step('hr: job lifecycle — draft, edit (version), publish, slug, close, r
   const feed = await careers('GET', '/jobs');
   const pub = feed.body.jobs.find((j) => j.public_id === job.public_id);
   if (!pub || pub.public_url !== job.public_url || 'id' in pub || 'candidate_count' in pub || pub.salary.min !== 1200000) throw new Error(JSON.stringify(pub));
+  // Salary policy: public only when both ends are set; a single value stays internal.
+  const one = await internal('mgr', 'PATCH', `/api/hr/jobs/${job.id}`, { version: job.version, salary_max: null });
+  const pubOne = (await careers('GET', `/jobs/${job.public_id}`)).body.job;
+  if (pubOne.salary !== null || (await careers('GET', '/jobs')).body.jobs.find((j) => j.public_id === job.public_id).salary !== null) throw new Error('single salary value shown publicly');
+  if (one.body.job.salary_min !== 1200000 || one.body.job.salary_max !== null) throw new Error('internal salary fields lost');
+  job = (await internal('mgr', 'PATCH', `/api/hr/jobs/${job.id}`, { version: one.body.job.version, salary_max: 1800000 })).body.job;
+  if ((await careers('GET', `/jobs/${job.public_id}`)).body.job.salary?.max !== 1800000) throw new Error('both salary values not shown');
   if ((await careers('GET', `/${slug}/apply`)).status !== 200) throw new Error('published page');
   // Title edits keep the URL; an explicit slug change redirects the old one.
   r = await internal('mgr', 'PATCH', `/api/hr/jobs/${job.id}`, { version: job.version, title: `${HRT} Growth Marketing Manager` });
@@ -3422,7 +3439,7 @@ await step('hr: job lifecycle — draft, edit (version), publish, slug, close, r
   if (restored.status !== 'draft' || (await internal('mgr', 'POST', `/api/hr/jobs/${a3.id}/close`, { version: restored.version })).status !== 409) throw new Error('restore / illegal close');
   const ev = (await getPool().query('SELECT event_type FROM hr_events WHERE job_id = $1 ORDER BY id', [job.id])).rows.map((x) => x.event_type);
   for (const t of ['job_created', 'job_updated', 'job_published', 'job_slug_set', 'job_closed']) if (!ev.includes(t)) throw new Error(`no ${t}`);
-  return 'draft private; incomplete publish refused; stale edit 409; publish → slug + URL; title edit keeps URL; rename 301s; close (noindex, no form, out of feed, 409 on apply); reopen; archive 404; restore → draft; events';
+  return 'draft private; incomplete publish refused; stale edit 409; publish → slug + URL; salary public only with both ends; title edit keeps URL; rename 301s; close (noindex, no form, out of feed, 409 on apply); reopen; archive 404; restore → draft; events';
 });
 
 await step('hr: applications — create, reuse candidate, pending vs complete, duplicate, other job, validation', async () => {

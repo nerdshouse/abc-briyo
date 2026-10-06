@@ -457,7 +457,8 @@ async function renderOrdersNav(me) {
   if (!host) return;
   const logistics = hasCap(me, 'logistics.view');
   const inventory = hasCap(me, 'inventory.view');
-  if (!logistics && !inventory) { host.innerHTML = ''; host.dataset.html = ''; return; }
+  const hr = hasCap(me, 'hr.view');
+  if (!logistics && !inventory && !hr) { host.innerHTML = ''; host.dataset.html = ''; return; }
   // Order counts come from the Orders API, which only Logistics may read.
   const meta = logistics ? await ordersMeta() : { ok: true, dispatchTypes: [], views: {} };
   if (!meta.ok) return;
@@ -487,6 +488,11 @@ async function renderOrdersNav(me) {
         ${link('/inventory?expiring=90', 'Expiring soon')}
         ${link('/inventory?view=unmapped', 'Unmapped SKUs', '', meta.inventory?.unmappedSkus)}
       </div>
+    </div>` : ''}${hr ? `
+    <div class="nav-group">
+      <div class="nav-caption">HR</div>
+      ${link('/hr/jobs', 'Jobs', 'briefcase')}
+      ${link('/hr/candidates', 'Candidates', 'user-round-search')}
     </div>` : ''}`;
   // Re-rendered on every page; replaced only if something (a count) changed.
   if (host.dataset.html === html) return;
