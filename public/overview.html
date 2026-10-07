@@ -31,8 +31,8 @@
       <header class="ox-head">
         <div class="ox-id">
           <p class="ox-date" id="ovDate">&nbsp;</p>
-          <h1 class="ox-title" id="ovHello">Overview</h1>
-          <p class="ox-pulse" id="ovSub" aria-live="polite">Reading every department…</p>
+          <h1 class="ox-title">Overview</h1>
+          <p class="ox-greet" id="ovHello">&nbsp;</p>
         </div>
         <div class="ox-actions">
           <span class="ox-updated" id="ovUpdated" aria-live="polite"></span>
@@ -40,7 +40,10 @@
         </div>
       </header>
 
-      <nav class="ox-status" id="ovStatus" aria-label="Department status"></nav>
+      <section class="ox-op" aria-label="Operating status">
+        <div class="ox-op-sum"><span class="ox-op-label">Operating status</span><span class="ox-op-text" id="ovSub" aria-live="polite">Reading every department…</span></div>
+        <nav class="ox-status" id="ovStatus" aria-label="Department status"></nav>
+      </section>
 
       <div class="ox-body" id="ovDepts" aria-busy="true">
         <section class="ox-mod ox-skel" aria-hidden="true"><div class="ox-mod-head"><span class="sk w30"></span></div>

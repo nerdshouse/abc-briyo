@@ -57,7 +57,7 @@ function signal(label, v, { href = '', tone = 'warning', note = '' } = {}) {
   const hot = v > 0;
   const inner = `<span class="ox-sig-dot${hot ? ` d-${tone}` : ''}" aria-hidden="true"></span>
     <span class="ox-sig-label">${esc(label)}${note ? `<span class="ox-sig-note">${note}</span>` : ''}</span>
-    <span class="ox-sig-value num${hot ? ` t-${tone}` : ' t-quiet'}">${n(v)}</span>`;
+    <span class="ox-sig-value num${!hot ? ' t-quiet' : tone === 'attention' ? '' : ` t-${tone}`}">${n(v)}</span>`;
   return href ? `<a class="ox-sig" href="${href}">${inner}${icon('chevron-right', 'ox-chev')}</a>` : `<div class="ox-sig">${inner}<span></span></div>`;
 }
 /** A plain figure on a line: label left, value right. For secondary numbers that are not exceptions. */
@@ -250,7 +250,7 @@ const BODIES = {
       ${stat('Callbacks overdue', n(s.callbacks_overdue), { href: '/?mode=callbacks', tone: s.callbacks_overdue > 0 ? 'critical' : '' })}
     </div>
     <div class="ox-split">
-      ${group('Ownership', `${row('Unassigned', s.unassigned, { href: '/?mode=tocall', tone: s.unassigned > 0 ? 'attention' : '', note: 'Uncalled, no owner' })}
+      ${group('Ownership', `${row('Unassigned', s.unassigned, { href: '/?mode=tocall', note: 'Uncalled, no owner' })}
         ${row('Assigned', s.assigned, { href: '/?mode=all', note: 'Open, with an owner' })}
         ${row('Assigned to you', s.assigned_to_me, { href: '/?mode=mine' })}`)}
       ${group('Today', `${row('Received', s.today.carts, { note: `${n(s.today.called)} called · ${n(s.today.recovered)} recovered${s.today.recovered_value ? ` (${money(s.today.recovered_value)})` : ''}` })}
@@ -261,7 +261,7 @@ const BODIES = {
   // Hiring as a pipeline: review → in progress → hired, with openings alongside.
   hr: (s) => `
     <ol class="ox-flow f3" aria-label="Hiring pipeline">
-      <li>${stat('Awaiting review', n(s.awaiting_review), { href: '/hr/candidates?status=applied', tone: s.awaiting_review > 0 ? 'attention' : '' })}</li>
+      <li>${stat('Awaiting review', n(s.awaiting_review), { href: '/hr/candidates?status=applied', tone: '' })}</li>
       <li>${stat('In progress', n(s.in_progress), { href: '/hr/candidates', note: 'Screening · interview · offer' })}</li>
       <li>${stat('Hired, 30 days', n(s.hired_30d), { href: '/hr/candidates?status=hired', tone: s.hired_30d > 0 ? 'healthy' : '' })}</li>
     </ol>
@@ -282,7 +282,7 @@ const BODIES = {
         <a href="/admin"><span class="ox-k">Admins</span><span class="ox-v num">${n(s.admins)}</span></a>
         <a href="/admin"><span class="ox-k">Online now</span><span class="ox-v num">${s.online > 0 ? '<span class="ox-live" aria-hidden="true"></span>' : ''}${n(s.online)}</span></a>
         <a href="/admin?filter=incomplete"><span class="ox-k">Incomplete profiles</span><span class="ox-v num${s.incomplete_profiles > 0 ? ' t-warning' : ''}">${n(s.incomplete_profiles)}</span></a>
-        <a href="/admin?filter=no_access"><span class="ox-k">No department</span><span class="ox-v num${s.no_access > 0 ? ' t-attention' : ''}">${n(s.no_access)}</span></a>
+        <a href="/admin?filter=no_access"><span class="ox-k">No department</span><span class="ox-v num">${n(s.no_access)}</span></a>
       </div>
       ${depts ? `<div class="ox-chips" aria-label="Members by department"><span class="ox-chips-label">By department</span>${depts}</div>` : ''}
     </div>`;
@@ -305,34 +305,34 @@ function moduleHtml(k, s) {
 
 // ------------------------------------------------------------------ Page
 
+/** Operating status: counts by priority, quiet when healthy. Business context stays in the header. */
 function pulse(d) {
   const items = d.attention || [];
   const by = (sev) => items.filter((a) => a.severity === sev).length;
-  if (!items.length) return `<span class="health healthy">All clear</span><span>Nothing needs intervention in ${state.me?.isAdmin ? 'any department' : 'your departments'}.</span>`;
+  if (!items.length) return `<span class="ox-op-ok">${icon('circle-check')}Operating normally</span><span class="ox-op-quiet">Nothing needs intervention ${state.me?.isAdmin ? 'in any department' : 'in your departments'}.</span>`;
   const [c, w, r] = [by('critical'), by('warning'), by('attention')];
-  const tone = c ? 'critical' : w ? 'warning' : 'attention';
-  const parts = [c && `${c} critical`, w && `${w} ${plural(w, 'warning', 'warnings')}`, r && `${r} to review`].filter(Boolean).join(' · ');
-  const depts = [...new Set(items.map((a) => DEPTS[a.dept]?.label || a.dept))];
-  return `<span class="health ${tone}">${c ? 'Needs intervention' : w ? 'Needs action' : 'Attention'}</span>
-    <span>${esc(parts)} <span class="ox-pulse-where">in ${esc(depts.join(', '))}</span></span>
-    <a class="ox-pulse-link" href="#ox-attention">Review ${icon('arrow-down')}</a>`;
+  const parts = [c && `<span class="ox-op-n sev-critical"><b class="num">${c}</b> critical</span>`, w && `<span class="ox-op-n sev-warning"><b class="num">${w}</b> ${plural(w, 'warning', 'warnings')}</span>`,
+    r && `<span class="ox-op-n sev-attention"><b class="num">${r}</b> to review</span>`].filter(Boolean).join('');
+  return `${parts}<a class="ox-pulse-link" href="#ox-attention">Review exceptions ${icon('arrow-down')}</a>`;
 }
 
+const SEV_GROUP = { critical: 'Critical', warning: 'Warnings', attention: 'To review' };
+
+/** Exceptions, grouped by priority: critical first and loudest; items to review compact and quiet. */
 function renderAttention(d) {
   const items = d.attention || [];
-  const by = (sev) => items.filter((a) => a.severity === sev).length;
-  $('#ovAttnMeta').innerHTML = items.length
-    ? ['critical', 'warning', 'attention'].filter(by).map((sv) => `<span class="health ${sv}">${by(sv)} ${SEV_LABEL[sv].toLowerCase()}</span>`).join('')
-    : '';
-  $('#ox-attention').classList.toggle('is-clear', !items.length);
-  $('#ovAttention').innerHTML = items.length ? `<div class="ox-exc-table" role="table" aria-label="Items that need intervention">
-      <div class="ox-exc-row ox-exc-th" role="row"><span role="columnheader">Priority</span><span role="columnheader">Department</span><span role="columnheader">Issue</span><span role="columnheader"><span class="sr-only">Action</span></span></div>
-      ${items.map((a) => `<a class="ox-exc-row sev-${a.severity}" role="row" href="${a.href}">
-        <span role="cell"><span class="health ${a.severity}">${SEV_LABEL[a.severity]}</span></span>
-        <span role="cell" class="ox-exc-dept">${icon(DEPTS[a.dept]?.icon || 'circle')}${esc(DEPTS[a.dept]?.label || a.dept)}</span>
-        <span role="cell" class="ox-exc-text">${a.count !== null ? `<b class="num">${n(a.count)}</b> ` : ''}${esc(a.text)}</span>
-        <span role="cell" class="ox-exc-go">Open ${icon('arrow-right')}</span></a>`).join('')}
-    </div>`
+  const by = (sev) => items.filter((a) => a.severity === sev);
+  $('#ovAttnMeta').textContent = items.length ? `${items.length} open ${plural(items.length, 'item', 'items')}` : '';
+  const line = (a) => `<a class="ox-exc-row sev-${a.severity}" href="${a.href}">
+      <span class="ox-exc-dept">${icon(DEPTS[a.dept]?.icon || 'circle')}${esc(DEPTS[a.dept]?.label || a.dept)}</span>
+      <span class="ox-exc-text"><span class="sr-only">${SEV_LABEL[a.severity]}: </span>${a.count !== null ? `<b class="num">${n(a.count)}</b> ` : ''}${esc(a.text)}</span>
+      <span class="ox-exc-go" aria-hidden="true">${icon('arrow-right')}</span></a>`;
+  $('#ovAttention').innerHTML = items.length
+    ? ['critical', 'warning', 'attention'].filter((sv) => by(sv).length).map((sv) => `
+      <div class="ox-exc-group g-${sv}" role="group" aria-label="${SEV_GROUP[sv]}: ${by(sv).length}">
+        <h3 class="ox-exc-gh"><span class="health ${sv}">${SEV_GROUP[sv]}</span><span class="num">${by(sv).length}</span></h3>
+        <div class="ox-exc-list">${by(sv).map(line).join('')}</div>
+      </div>`).join('')
     : `<p class="ox-clear">${icon('circle-check')}<span><b>All clear.</b> Nothing needs intervention right now — every department ${state.me?.isAdmin ? '' : 'you can see '}is up to date.</span></p>`;
 }
 
@@ -341,7 +341,7 @@ function render() {
   const tz = d.timezone || 'Asia/Kolkata';
   const first = String(state.me?.name || '').split(/\s+/)[0];
   $('#ovDate').textContent = `${today(tz)} · IST`;
-  $('#ovHello').textContent = `${greeting(tz)}${first && first !== 'Team' ? `, ${first}` : ''}`;
+  $('#ovHello').textContent = `${greeting(tz)}${first && first !== 'Team' ? `, ${first}` : ''}. ${state.me?.isAdmin ? 'The state of Briyo, department by department.' : 'Your departments at a glance.'}`;
   $('#ovSub').innerHTML = pulse(d);
   updated();
 
@@ -349,7 +349,7 @@ function render() {
   // Status strip: one line per visible department; each jumps to its module.
   $('#ovStatus').innerHTML = keys.length > 1 ? ROWS.flat().filter((k) => keys.includes(k)).map((k) => {
     const [tone, word] = healthOf(k, d.sections[k]);
-    return `<a class="ox-chip tone-${tone}" href="#mod-${k}"><span class="ox-chip-dot" aria-hidden="true"></span><span class="ox-chip-name">${esc(DEPTS[k].label)}</span><span class="ox-chip-word">${esc(word)}</span></a>`;
+    return `<a class="ox-chip tone-${tone}" href="#mod-${k}" aria-label="${esc(DEPTS[k].label)}: ${esc(word)}"><span class="ox-chip-dot" aria-hidden="true"></span><span class="ox-chip-name">${esc(DEPTS[k].label)}</span><span class="ox-chip-word">${esc(word)}</span></a>`;
   }).join('') : '';
 
   const body = $('#ovDepts');
@@ -390,6 +390,17 @@ async function load() {
     initShell(state.me);
     $('#ovRefresh').addEventListener('click', load);
     $('#ovDepts').addEventListener('click', (e) => { if (e.target.closest('[data-retry]')) load(); });
+    // In-page jumps (status chips, "Review exceptions"): scroll and move focus here, without a hash change —
+    // a hash change would reach the shell router's popstate handler and re-render the page at the top.
+    document.querySelector('main').addEventListener('click', (e) => {
+      const a = e.target.closest('a[href^="#"]');
+      const target = a && document.getElementById(a.getAttribute('href').slice(1));
+      if (!target || e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
+      e.preventDefault();
+      target.scrollIntoView({ behavior: matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth', block: 'start' });
+      target.setAttribute('tabindex', '-1');
+      target.focus({ preventScroll: true });
+    }, { signal: pageSignal() });
     await load();
     // Refresh quietly every two minutes while the page is open and visible; keep "Updated" honest in between.
     state.timer = setInterval(() => { if (document.visibilityState === 'visible') load(); }, 120000);
