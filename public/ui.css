@@ -1143,7 +1143,7 @@ a.ov-metric:hover { background: var(--surface-2); }
 .ov-m-value.warn { color: var(--warning-text); }
 .ov-m-value.info { color: var(--info-text); }
 .ov-m-note { font-size: var(--fs-label); color: var(--text-3); }
-.ov-foot { margin: 0; padding: 10px 16px; font-size: var(--fs-meta); color: var(--text-2); }
+.ov-foot { grid-column: 1 / -1; margin: 0; padding: 10px 16px; font-size: var(--fs-meta); color: var(--text-2); }
 .ov-chips { display: flex; flex-wrap: wrap; gap: 6px; padding: 10px 16px; }
 .ov-chips .badge b { font-weight: 600; color: var(--text); }
 @media (max-width: 1100px) { .ov-grid { grid-template-columns: minmax(0, 1fr); } }
