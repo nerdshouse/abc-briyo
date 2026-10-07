@@ -140,6 +140,9 @@ button { font: inherit; color: inherit; }
 .brand-mark .lucide { width: 14px; height: 14px; stroke-width: 2; }
 .brand-name { font-size: 14px; font-weight: 600; letter-spacing: -0.01em; }
 .brand-sub { font-size: 11px; color: var(--text-3); margin-top: 1px; }
+/* The Briyo Supplements wordmark (public/brand): its own ratio, never stretched. */
+.sidebar .brand { flex-direction: column; align-items: flex-start; gap: 6px; padding: 4px 6px 12px; }
+.brand-logo { display: block; height: 22px; width: auto; max-width: 100%; }
 
 .side-search { position: relative; display: flex; align-items: center; margin: 2px 0 6px; }
 .side-search .lucide { position: absolute; left: 10px; width: 14px; height: 14px; color: var(--text-3); }

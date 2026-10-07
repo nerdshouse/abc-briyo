@@ -401,6 +401,9 @@ app.get('/api/webhook/gokwik/order-completed', (_req, res) =>
 app.get('/login', (_req, res) => res.sendFile(path.join(PUBLIC, 'login.html')));
 app.use('/login.js', express.static(path.join(PUBLIC, 'login.js')));
 app.use('/styles.css', express.static(path.join(PUBLIC, 'styles.css')));
+// The Briyo Supplements logo and icons: public, so the sign-in page and the favicon can use them.
+app.use('/brand', express.static(path.join(PUBLIC, 'brand'), { index: false, fallthrough: false, maxAge: '7d' }));
+app.get('/favicon.ico', (_req, res) => res.redirect(301, '/brand/briyo-logo-square.png'));
 app.use('/auth', authRouter);
 
 // --- everything below requires a session ------------------------------------
