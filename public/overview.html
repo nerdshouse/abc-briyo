@@ -8,6 +8,7 @@
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap" rel="stylesheet" />
   <link rel="stylesheet" href="/ui.css" />
+  <link rel="stylesheet" href="/overview.css" />
   <!-- The page script imports these; preloading fetches them in parallel instead of one after another. -->
   <link rel="modulepreload" href="/ui/components.js" />
   <link rel="modulepreload" href="/ui/nav.js" />
@@ -26,26 +27,34 @@
       <span class="topbar-title" id="topTitle">Overview</span>
     </header>
 
-    <main class="page ov" data-section="overview">
-      <div class="page-head">
-        <div>
-          <p class="ov-eyebrow" id="ovDate">&nbsp;</p>
-          <h1 class="page-title" id="ovHello">Overview</h1>
-          <p class="page-sub" id="ovSub">Loading the state of the business…</p>
+    <main class="page ov ox" data-section="overview">
+      <header class="ox-head">
+        <div class="ox-id">
+          <p class="ox-date" id="ovDate">&nbsp;</p>
+          <h1 class="ox-title" id="ovHello">Overview</h1>
+          <p class="ox-pulse" id="ovSub" aria-live="polite">Reading every department…</p>
         </div>
-        <div class="page-actions">
-          <span class="ov-updated" id="ovUpdated" aria-live="polite"></span>
-          <button class="btn" id="ovRefresh" type="button"><i data-lucide="refresh-cw"></i>Refresh</button>
+        <div class="ox-actions">
+          <span class="ox-updated" id="ovUpdated" aria-live="polite"></span>
+          <button class="btn" id="ovRefresh" type="button"><i data-lucide="refresh-cw"></i><span>Refresh</span></button>
         </div>
+      </header>
+
+      <nav class="ox-status" id="ovStatus" aria-label="Department status"></nav>
+
+      <div class="ox-body" id="ovDepts" aria-busy="true">
+        <section class="ox-mod ox-skel" aria-hidden="true"><div class="ox-mod-head"><span class="sk w30"></span></div>
+          <div class="ox-skel-grid"><span class="sk lg"></span><span class="sk lg"></span><span class="sk lg"></span><span class="sk lg"></span></div></section>
+        <div class="ox-row"><section class="ox-mod ox-skel" aria-hidden="true"><div class="ox-mod-head"><span class="sk w30"></span></div><div class="ox-skel-grid"><span class="sk lg"></span><span class="sk lg"></span></div></section>
+          <section class="ox-mod ox-skel" aria-hidden="true"><div class="ox-mod-head"><span class="sk w30"></span></div><div class="ox-skel-grid"><span class="sk lg"></span><span class="sk lg"></span></div></section></div>
       </div>
 
-      <section class="card ov-attention" aria-labelledby="ovAttnTitle">
-        <header class="card-head"><h2 class="card-title" id="ovAttnTitle"><i data-lucide="siren"></i>Needs attention</h2><span class="card-meta" id="ovAttnMeta"></span></header>
-        <div id="ovAttention"><div class="state loading" aria-busy="true"><b>Checking every department…</b></div></div>
+      <section class="ox-exc" id="ox-attention" aria-labelledby="ovAttnTitle">
+        <header class="ox-exc-head"><h2 id="ovAttnTitle"><i data-lucide="siren"></i>Needs attention</h2><span class="ox-exc-meta" id="ovAttnMeta"></span></header>
+        <div id="ovAttention"></div>
       </section>
 
-      <div class="ov-grid" id="ovDepts"></div>
-      <p class="footnote">Every number is counted from live records when this page loads; nothing is estimated. Times are in India Standard Time.</p>
+      <p class="footnote">Every number is counted from live records when this page loads; nothing is estimated. Times are in India Standard Time; Meta's reporting day follows the ad account's timezone.</p>
     </main>
   </div>
 </div>
