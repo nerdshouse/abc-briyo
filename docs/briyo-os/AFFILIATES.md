@@ -1,10 +1,12 @@
-# Briyo OS: Affiliates (Phase 1A foundation, Phase 1C admin)
+# Briyo OS: Affiliates (Phase 1A foundation, 1C admin, 1D professional verification)
 
 The affiliate / referral module manages partners such as nutritionists, doctors, influencers and customers who refer orders to the Briyo Supplements storefront. Shopify remains the ecommerce source of truth. Briyo OS will own partner management, verification, attribution, commissions and payouts.
 
 **Phase 1A** added the identity and configuration foundation (tables, statuses, rates, events, roles). **Phase 1C** adds the internal admin: a Growth → Affiliates page where authorised members create, search, inspect, edit, suspend / reactivate / close partners and manage their rate history.
 
-> Referral attribution, commissions, payouts, public referral links and professional verification are **not implemented**. The admin manages partner records only; no figure on it is a commission, revenue or order number.
+**Phase 1D** adds professional verification: a professional profile, verification applications with a full decision history, private certificate storage and the admin review on the affiliate page.
+
+> Referral attribution, commissions, payouts and public referral links are **not implemented**. The admin manages partner records only; no figure on it is a commission, revenue or order number.
 
 ## Tables (`lib/affiliates.js`, `ensureAffiliateSchema()`)
 
@@ -82,7 +84,7 @@ Display name required (≤ 120 characters). The category must exist and be activ
 | Close (reason) | any except `closed` | `closed`, which is final: no edits, rates or transitions |
 | Category change | — | to a category that requires verification: `draft` / `active` / `approved` become `pending_verification`; back to one that doesn't: `pending_verification` becomes `draft`. Suspended and closed are kept. |
 
-Nothing approves, verifies or deletes an affiliate. `approved` is reachable only through verification, which is a later phase.
+Nothing deletes an affiliate. `approved` is reached only by approving a professional verification (Phase 1D, below); activation is always the separate **Activate** action. Reactivating a suspended professional returns to `active` / `approved` only when their latest verification application is approved; otherwise to `pending_verification`.
 
 ### Rates
 The current rate is the latest `affiliate_rates` row effective now (`rateAt`); there is no rate column on `affiliates`. Adding a rate inserts a new row with its reason and actor; earlier rows are never changed (the database refuses it). A rate starts now or at the start of a later day (IST), at most a year ahead; a past start is refused, so history is never rewritten. A duplicate start for the same affiliate is refused (409, `UNIQUE (affiliate_id, effective_from)`). A future rate shows as **Scheduled** until it takes effect. An initial rate can be set when creating the affiliate.
@@ -103,12 +105,85 @@ Event names are snake_case because Phase 1A's `affiliate_events.action` check al
 ### Schema
 Phase 1C adds no tables or columns. The Phase 1A tables are created at server startup (`ensureAffiliateSchema()` in `server.js`, in the background, alongside the other modules' schemas). It is idempotent and seeds only the categories and settings, never affiliates. Requests that arrive meanwhile wait on the same promise; if startup setup fails, it is logged and retried by the next affiliate request.
 
+## Professional verification (Phase 1D)
+
+`lib/affiliate-verification.js`, routes in `lib/affiliate-routes.js`, UI in the **Professional verification** card on `/affiliates/:publicId`.
+
+Only categories with `affiliate_categories.requires_verification = true` take part (nutritionist, dietitian, doctor, dentist, other professional). There is no second list of professional categories. A non-professional affiliate has no profile, application or document, and its page shows no verification section.
+
+### Tables
+Created at startup (`ensureAffiliateVerificationSchema()` in `server.js`, idempotent, schema objects only, nothing seeded).
+
+| Table | What it holds | Key rules |
+|---|---|---|
+| `professional_profiles` | One per affiliate: name as on the credential, profession, qualification, institution, registration number and authority, practice, specialization, city / state / country, notes | `UNIQUE (affiliate_id)`; FK to `affiliates` ON DELETE RESTRICT; length checks; `version` for optimistic locking. Contact details stay on `affiliates`. |
+| `verification_applications` | The history of applications: status, who submitted / started review / decided and when, rejection reason, review notes, `profile_snapshot` (the profile copied in at submission, so a decision refers to exactly what was reviewed), `previous_application_id` for a resubmission | Statuses `draft`, `submitted`, `under_review`, `approved`, `rejected`. **One open application per affiliate** by the partial unique index `verification_applications_one_active` (draft / submitted / under_review). Checks: a rejection has a reason; a decision has a reviewer and time; anything past draft has a submission time and snapshot. |
+| `professional_documents` | Document metadata: type (`certificate`, `registration`, `other`), original filename, content type, size, `storage_key`, sha256, label, issued / expiry dates (DATE), uploader | `UNIQUE (storage_key)`; FK to the application ON DELETE RESTRICT; size 1 byte – 10 MB; content types PDF, PNG, JPEG; expiry not before issue. No file bytes in Postgres. |
+
+Each application and document also has an opaque 10-character reference (`public_id`) used in URLs and the UI; database ids are never sent to the browser.
+
+**History is never destroyed** (trigger `professional_verification_guard`): rows in the three tables are never deleted; a decided (approved / rejected) application cannot be changed; documents cannot be changed. The only exception is the test suite's purge (`app.purge_affiliates`).
+
+Actor columns (`created_by`, `reviewed_by`, `uploaded_by`, …) hold the member's name as text, like every other affiliate table: `allowed_users` has no numeric id to reference.
+
+### Lifecycle
+| Action | From | To | Capability |
+|---|---|---|---|
+| Create profile | — | profile + a **draft** application (when the affiliate is pending verification) | `affiliate.manage` |
+| Upload document | draft | (draft) | `affiliate.manage` |
+| Submit | draft, with at least one certificate | `submitted` — the profile is copied into the application; its documents are locked | `affiliate.verify` |
+| Mark under review | submitted | `under_review` | `affiliate.verify` |
+| Approve (confirmation, optional notes) | under_review | `approved`; the affiliate `pending_verification` → `approved` | `affiliate.verify` |
+| Reject (reason required) | submitted, under_review | `rejected`; the affiliate stays `pending_verification` | `affiliate.verify` |
+| New application ("resubmit") | latest is rejected | a **new** draft linked to the rejected one, which stays exactly as decided | `affiliate.verify` |
+| Start application | nothing open and the affiliate is pending verification (e.g. after moving to another professional category) | new draft | `affiliate.verify` |
+
+Anything else is refused with 409, as is a stale `version`. Each action runs in one transaction with a row lock and writes its event in the same transaction, so two simultaneous decisions cannot both succeed.
+
+**Approval never activates.** The affiliate becomes `approved` and can then be activated with the Phase 1C **Activate** action. No referral link, code or rate is created. Approval is refused for a suspended or closed affiliate.
+
+The UI states it plainly: a certificate on file is not a verification; only an **approved** application counts.
+
+### Documents and storage
+- **Formats:** PDF, PNG and JPG up to 10 MB (`MAX_DOCUMENT_BYTES`), checked by `validateDocument()` in `lib/storage.js` against the file's content (signature), not only its name or the browser's type.
+- **Errors:** empty → 400, too large → 413, wrong or disguised type → 415.
+- **Storage:** the existing private store (`lib/storage.js`: R2 in production, local disk in tests). The key is `affiliates/verification/YYYY-MM/<uuid>.<ext>`, never derived from the filename. The original filename is metadata only, with path separators and control characters neutralised. If the database write fails, the stored object is removed.
+- **Opening a document** (`GET /api/affiliates/:publicId/verification/:applicationRef/documents/:documentRef`, `affiliate.verify`): the document must belong to that affiliate's application. The bytes are streamed through the app with `Cache-Control: private, no-store` and `X-Content-Type-Options: nosniff`; there is no public or pre-signed URL, and nothing is persisted. Every open writes `professional_document_viewed`.
+- Storage keys, hashes and database ids are never returned to the browser.
+
+### Expiry
+Certificates carry an expiry date (DATE). The UI marks **Expired** and **Expires soon** (within 30 days, IST). Expiry never changes an application's or an affiliate's status, and there are no reminder jobs in this phase.
+
+### RBAC
+| Capability | Verification use |
+|---|---|
+| `affiliate.view` (viewer, manager, finance, admin) | See the profile, applications, decisions and document metadata |
+| `affiliate.manage` (manager, admin) | Create / edit the professional profile; upload documents |
+| `affiliate.verify` (manager, admin) | Submit, review, approve, reject, start / new application; open documents |
+
+Finance (`affiliate.commissions`, `affiliate.payouts`) has no verification authority. No capability was added or granted to existing members. Every rule is enforced on the server; the UI only hides what the member cannot do.
+
+### API
+| Endpoint | Capability |
+|---|---|
+| `GET /api/affiliates/:publicId/verification` (profile, current application, history, allowed actions) | `affiliate.view` |
+| `GET /api/affiliates/:publicId/professional` | `affiliate.view` |
+| `POST` / `PATCH /api/affiliates/:publicId/professional` (`version` on PATCH) | `affiliate.manage` |
+| `POST /api/affiliates/:publicId/verification/documents?type&label&issued_at&expires_at` (raw file body, name in `X-Filename`) | `affiliate.manage` |
+| `GET /api/affiliates/:publicId/verification/:applicationRef/documents/:documentRef` | `affiliate.verify` |
+| `POST /api/affiliates/:publicId/verification/{submit,review,approve,reject,resubmit,start}` (`version`, `reason`, `notes`) | `affiliate.verify` |
+
+### Events (in `affiliate_events`)
+`professional_profile_created`, `professional_profile_updated` (field names only), `verification_application_created`, `verification_submitted`, `verification_under_review`, `verification_approved`, `verification_rejected`, `verification_resubmitted`, `professional_document_uploaded`, `professional_document_viewed`, and `affiliate_status_changed` when approval moves the affiliate to `approved`.
+
+Metadata holds application / document references, from → to, reason and notes. It never holds file contents, storage keys, URLs or credentials.
+
 ## Not implemented yet (by design)
 
 - **Shopify:** scopes, discount codes, URL redirects. (Order financial snapshots arrived in Phase 1B; see ORDER-FINANCIAL-SNAPSHOTS.md.)
 - **Referrals:** referral links (`briyosupplements.com/r/…`), the click host, click tracking, codes, links, customer attribution.
 - **Money:** referral attribution, commissions, the commission ledger, refunds and reversals, payouts.
-- **Verification:** professional profiles, verification applications, certificate uploads, approval / rejection. Professional partners stay `pending_verification`.
+- **Verification follow-ups:** automatic expiry handling or renewal reminders, self-service submission by the professional, other kinds of evidence checks.
 - **Interfaces:** an Overview card, the affiliate portal and login, reporting. (The internal admin UI exists since Phase 1C.)
 - **Infrastructure:** Cloudflare, DNS, storefront or theme, and GoKwik changes.
 

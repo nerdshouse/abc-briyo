@@ -14,7 +14,7 @@ import { istDate, istDateTime, istDayKey } from './ui/ist.js';
 const fetch = pageFetch();
 const PAGE = 50;
 const FILTERS = ['q', 'category', 'status', 'sort', 'dir'];
-const state = { me: null, meta: null, f: {}, list: [], total: 0, kpis: null, detail: null, publicId: null, form: null, dirty: false };
+const state = { me: null, meta: null, f: {}, list: [], total: 0, kpis: null, detail: null, ver: null, publicId: null, form: null, dirty: false };
 
 const api = async (url, opts = {}) => {
   const res = await fetch(url, {
@@ -184,8 +184,9 @@ function renderList() {
 async function loadDetail() {
   $('#alerts').innerHTML = '';
   try {
-    const data = await api(`/api/affiliates/${encodeURIComponent(state.publicId)}`);
-    state.detail = data;
+    const pid = encodeURIComponent(state.publicId);
+    const [data, ver] = await Promise.all([api(`/api/affiliates/${pid}`), api(`/api/affiliates/${pid}/verification`)]);
+    state.detail = data; state.ver = ver;
     renderDetail();
   } catch (err) {
     if (err.status === 404) {
@@ -251,6 +252,8 @@ function renderDetail() {
         </div>
       </section>
 
+      ${verificationCard()}
+
       <section class="card af-activity">
         <header class="card-head"><h2 class="card-title">${icon('history')}Activity</h2><span class="card-meta">${count(events.length)} event${events.length === 1 ? '' : 's'}</span></header>
         <div class="pane">
@@ -298,6 +301,7 @@ const catSelect = (cur) => `<label class="fld wide"><span>Category <em>*</em></s
 
 function openForm(kind, extra) {
   const a = state.detail?.affiliate;
+  if (kind === 'ver') { openVerificationForm(extra); return; }
   state.form = kind;
   if (kind === 'new') {
     showDrawer('New affiliate', 'A public ID is issued automatically', `<form id="afForm" novalidate><div class="form-grid">
@@ -357,6 +361,7 @@ async function saveForm() {
       window.location.assign(`/affiliates/${encodeURIComponent(out.affiliate.public_id)}`);
       return;
     }
+    if (VER_FORMS.includes(state.form?.ver)) { await saveVerification(); return; }
     let out;
     if (state.form === 'edit') out = await send(`/api/affiliates/${a.public_id}`, 'PATCH', { ...formData(), version: a.version });
     else if (state.form === 'rate') {
@@ -369,12 +374,178 @@ async function saveForm() {
       out = await send(`/api/affiliates/${a.public_id}/status`, 'POST', { action: state.form.status, version: a.version, reason: state.form.noForm ? undefined : formData().reason });
     }
     state.detail = out;
+    state.ver = await api(`/api/affiliates/${encodeURIComponent(a.public_id)}/verification`).catch(() => state.ver);
     state.dirty = false; closeDrawer({ force: true });
     renderDetail();
   } catch (err) {
     if ($('#drawer').hidden) { failed(err, false); if (err.status === 409) loadDetail(); return; }
     fieldError(err);
   } finally { if (btn) btn.disabled = false; }
+}
+
+// ------------------------------------------------------------------ professional verification (Phase 1D)
+
+const APP_STATUS = {
+  draft: ['new', 'Draft'], submitted: ['callback', 'Submitted'], under_review: ['callback', 'Under review'],
+  approved: ['recovered', 'Approved'], rejected: ['lost', 'Rejected'],
+};
+const appTag = (s) => (s ? `<span class="status ${APP_STATUS[s]?.[0] || ''}"><span class="dot"></span>${esc(APP_STATUS[s]?.[1] || s)}</span>`
+  : '<span class="status none"><span class="dot"></span>Not started</span>');
+const DOC_TYPE = { certificate: 'Certificate', registration: 'Registration proof', other: 'Other' };
+const PROF_FIELDS = [
+  ['full_name', 'Name on credential'], ['profession', 'Profession'], ['qualification', 'Qualification'], ['institution', 'Institution'],
+  ['registration_number', 'Registration number'], ['registration_authority', 'Registration authority'], ['practice_name', 'Practice'],
+  ['specialization', 'Specialization'], ['city', 'City'], ['state', 'State'], ['country', 'Country'], ['profile_notes', 'Notes'],
+];
+const VER_FORMS = ['profile', 'upload', 'approve', 'reject', 'action'];
+const VER_CONFIRM = {
+  submit: 'Submit this application for verification? The professional details are copied into it and its documents are locked.',
+  review: 'Mark this application as under review?',
+  resubmit: 'Start a new application after the rejection? The rejected application stays on record unchanged.',
+  start: 'Start a verification application?',
+};
+const kb = (n) => (n >= 1048576 ? `${(n / 1048576).toFixed(1)} MB` : `${Math.max(1, Math.round(n / 1024))} KB`);
+const docUrl = (app, d) => `/api/affiliates/${encodeURIComponent(state.publicId)}/verification/${encodeURIComponent(app.ref)}/documents/${encodeURIComponent(d.ref)}`;
+const expiryTag = (d) => (d.expiry === 'expired' ? '<span class="mini-tag warn">Expired</span>' : d.expiry === 'expiring_soon' ? '<span class="mini-tag warn">Expires soon</span>' : '');
+const by = (at, who) => (at ? `${esc(istDateTime(at))}${who ? ` <span class="soft">· ${esc(who)}</span>` : ''}` : '<span class="soft">—</span>');
+
+function docTable(app, canOpen) {
+  if (!app.documents.length) return '<div class="empty-note"><b>No documents on this application.</b></div>';
+  return `<div class="table-wrap"><table class="table af-docs">
+    <thead><tr><th>Document</th><th>File</th><th>Issued</th><th>Expires</th><th>Uploaded</th><th class="r"><span class="sr-only">Open</span></th></tr></thead>
+    <tbody>${app.documents.map((d) => `<tr>
+      <td><b>${esc(DOC_TYPE[d.document_type] || d.document_type)}</b>${d.document_label ? `<span class="cell-sub muted">${esc(d.document_label)}</span>` : ''}</td>
+      <td>${esc(d.original_filename)}<span class="cell-sub muted">${esc(kb(d.byte_size))}</span></td>
+      <td>${d.issued_at ? esc(istDate(`${d.issued_at}T12:00:00+05:30`)) : '<span class="soft">—</span>'}</td>
+      <td>${d.expires_at ? `${esc(istDate(`${d.expires_at}T12:00:00+05:30`))} ${expiryTag(d)}` : '<span class="soft">—</span>'}</td>
+      <td>${by(d.uploaded_at, d.uploaded_by)}</td>
+      <td class="r">${canOpen ? `<a class="linkish" href="${docUrl(app, d)}" target="_blank" rel="noopener">Open</a>` : '<span class="soft" title="Opening documents needs verification access">—</span>'}</td>
+    </tr>`).join('')}</tbody></table></div>`;
+}
+
+function appFacts(app) {
+  const kv = (label, value) => `<div class="hr-kv"><span>${esc(label)}</span><span>${value}</span></div>`;
+  return `${kv('Application', `<span class="mono">${esc(app.ref)}</span>${app.previous_ref ? ` <span class="soft">· follows ${esc(app.previous_ref)}</span>` : ''}`)}
+    ${kv('Status', appTag(app.status))}
+    ${kv('Started', by(app.created_at, app.created_by))}
+    ${kv('Submitted', by(app.submitted_at, app.submitted_by))}
+    ${app.review_started_at ? kv('Review started', by(app.review_started_at, app.review_started_by)) : ''}
+    ${['approved', 'rejected'].includes(app.status) ? kv(app.status === 'approved' ? 'Approved' : 'Rejected', by(app.reviewed_at, app.reviewed_by)) : ''}
+    ${app.rejection_reason ? kv('Rejection reason', esc(app.rejection_reason)) : ''}
+    ${app.review_notes ? kv('Review notes', esc(app.review_notes)) : ''}`;
+}
+
+function verificationCard() {
+  const V = state.ver;
+  const v = V?.verification;
+  if (!v || (!v.required && !v.profile)) return '';
+  const a = state.detail.affiliate;
+  const closed = a.status === 'closed';
+  const cur = v.current;
+  const canM = V.canManage && !closed; const canV = V.canVerify && !closed;
+  const act = (key, label, cls = '') => `<button class="btn${cls ? ` ${cls}` : ''}" type="button" data-ver="${key}">${esc(label)}</button>`;
+  const actions = [];
+  if (v.required && cur) {
+    if (canM && cur.status === 'draft') actions.push(act('upload', 'Upload document'));
+    if (canV && v.actions.includes('submit')) actions.push(act('submit', 'Submit for verification', cur.documents.some((d) => d.document_type === 'certificate') ? 'primary' : ''));
+    if (canV && v.actions.includes('review')) actions.push(act('review', 'Mark under review', 'primary'));
+    if (canV && v.actions.includes('approve')) actions.push(act('approve', 'Approve', 'primary'));
+    if (canV && v.actions.includes('reject')) actions.push(act('reject', 'Reject'));
+    if (canV && cur.status === 'rejected' && a.status === 'pending_verification') actions.push(act('resubmit', 'New application'));
+  }
+  if (canV && v.can_start && (!cur || !['draft', 'submitted', 'under_review', 'rejected'].includes(cur.status))) actions.push(act('start', 'Start application'));
+  const history = v.applications.slice(1);
+  const notice = !v.required
+    ? '<div class="alert warn">This category does not require verification. The professional details below are kept for reference only.</div>'
+    : cur?.status === 'approved'
+      ? `<div class="alert af-ok">${icon('badge-check')}<span>Verification approved${a.status === 'approved' ? '. The affiliate can now be activated with <b>Activate</b>; nothing is activated automatically.' : '.'}</span></div>`
+      : `<div class="alert warn">${icon('info')}<span>Not verified. A certificate on file is not a verification: only an <b>approved</b> application counts, and approval never activates the affiliate by itself.</span></div>`;
+  return `<section class="card af-verify">
+    <header class="card-head"><h2 class="card-title">${icon('shield-check')}Professional verification ${appTag(cur?.status)}</h2>
+      ${canM && v.profile && v.required ? '<div class="card-tools"><button class="btn" type="button" data-ver="profile">Edit professional profile</button></div>' : ''}</header>
+    <div class="pane pad">
+      ${notice}
+      ${v.profile ? `<div class="af-verify-grid">
+        <div><h3 class="dsec-title">Professional profile</h3>
+          ${PROF_FIELDS.filter(([k]) => v.profile[k]).map(([k, label]) => `<div class="hr-kv"><span>${esc(label)}</span><span>${esc(v.profile[k])}</span></div>`).join('')}
+          <div class="hr-kv"><span>Last updated</span><span>${by(v.profile.updated_at, v.profile.updated_by)}</span></div></div>
+        <div><h3 class="dsec-title">Current application</h3>${cur ? appFacts(cur) : '<p class="soft">No application yet.</p>'}</div>
+      </div>` : `<div class="empty-note"><b>No professional profile yet.</b>${canM ? 'Add the professional details as they appear on the credential, then upload the certificate.' : 'An affiliate manager adds the professional details.'}
+        ${canM ? '<div style="margin-top:10px"><button class="btn primary" type="button" data-ver="profile">Create professional profile</button></div>' : ''}</div>`}
+      ${cur ? `<h3 class="dsec-title af-gap">Documents</h3>${docTable(cur, V.canVerify)}` : ''}
+      ${actions.length ? `<div class="af-ver-actions">${actions.join('')}</div>` : ''}
+      ${history.length ? `<details class="more af-gap"><summary>${icon('chevron-right')}Earlier applications <span class="soft">— ${history.length}, kept as decided</span></summary>
+        ${history.map((h) => `<div class="af-hist">${appFacts(h)}${docTable(h, V.canVerify)}</div>`).join('')}</details>` : ''}
+    </div>
+  </section>`;
+}
+
+function openVerificationForm(kind) {
+  const v = state.ver.verification; const cur = v.current; const a = state.detail.affiliate;
+  const sub = `${a.display_name} · ${a.public_id}`;
+  if (['submit', 'review', 'resubmit', 'start'].includes(kind)) {
+    if (!window.confirm(VER_CONFIRM[kind])) return;
+    state.form = { ver: 'action', action: kind, noForm: true };
+    saveForm();
+    return;
+  }
+  state.form = { ver: kind };
+  if (kind === 'profile') {
+    const p = v.profile || {};
+    showDrawer(v.profile ? 'Edit professional profile' : 'Create professional profile', sub, `<form id="afForm" novalidate><div class="form-grid">
+      ${PROF_FIELDS.filter(([k]) => k !== 'profile_notes').map(([k, label]) => inp(k, label, p[k] || '', { req: ['full_name', 'profession'].includes(k), attrs: `maxlength="${k === 'registration_number' ? 80 : ['city', 'state', 'country'].includes(k) ? 80 : 200}"` })).join('')}
+      <label class="fld wide"><span>Notes</span><textarea class="input" name="profile_notes" rows="3" maxlength="1000">${esc(p.profile_notes || '')}</textarea></label>
+      <p class="help wide">Enter the details as they appear on the credential. Submitted applications keep the copy they were reviewed with.</p>
+    </div></form>`, footButtons(v.profile ? 'Save profile' : 'Create profile'));
+  } else if (kind === 'upload') {
+    showDrawer('Upload document', `${sub} · application ${cur.ref}`, `<form id="afForm" novalidate><div class="form-grid">
+      <label class="fld wide"><span>Type <em>*</em></span><select class="select" name="type">${v.document_types.map((t) => opt(t, DOC_TYPE[t] || t, t === 'certificate')).join('')}</select></label>
+      <label class="fld wide"><span>File <em>*</em></span><input class="input plain" name="file" type="file" accept=".pdf,.png,.jpg,.jpeg,application/pdf,image/png,image/jpeg" />
+        <span class="help">PDF, PNG or JPG, up to ${Math.round(v.max_bytes / 1048576)} MB. The file is checked by its content and stored privately.</span></label>
+      ${inp('label', 'Label', '', { ph: 'e.g. State Medical Council registration', attrs: 'maxlength="120"' })}
+      ${inp('issued_at', 'Issued on', '', { type: 'date' })}
+      ${inp('expires_at', 'Expires on', '', { type: 'date', help: 'Shown as expired or expiring soon; it never changes a status by itself.' })}
+      <p class="help wide">Uploading does not verify anything. Documents cannot be removed once added; add a new one if a file was wrong.</p>
+    </div></form>`, footButtons('Upload'));
+  } else if (kind === 'approve') {
+    showDrawer('Approve verification', `${sub} · application ${cur.ref}`, `<form id="afForm" novalidate><div class="form-grid">
+      <p class="wide">Approve this application? The affiliate becomes <b>approved</b> and can then be activated with the separate <b>Activate</b> action. No referral link or code is created.</p>
+      <label class="fld wide"><span>Review notes</span><textarea class="input" name="notes" rows="3" maxlength="1000" placeholder="Optional"></textarea></label>
+    </div></form>`, '<button class="btn" type="button" data-close>Cancel</button><button class="btn primary" type="button" id="dSave">Approve verification</button>');
+  } else if (kind === 'reject') {
+    showDrawer('Reject verification', `${sub} · application ${cur.ref}`, `<form id="afForm" novalidate><div class="form-grid">
+      <label class="fld wide"><span>Reason <em>*</em></span><textarea class="input" name="reason" rows="4" maxlength="1000"></textarea><span class="help">Recorded with your name and the time. The rejected application is kept unchanged; a new application can follow it.</span></label>
+      <label class="fld wide"><span>Review notes</span><textarea class="input" name="notes" rows="2" maxlength="1000" placeholder="Optional"></textarea></label>
+    </div></form>`, '<button class="btn" type="button" data-close>Cancel</button><button class="btn danger" type="button" id="dSave">Reject verification</button>');
+  }
+}
+
+async function saveVerification() {
+  const pid = encodeURIComponent(state.publicId);
+  const v = state.ver.verification; const f = state.form;
+  let out;
+  if (f.ver === 'profile') {
+    out = v.profile ? await send(`/api/affiliates/${pid}/professional`, 'PATCH', { ...formData(), version: v.profile.version })
+      : await send(`/api/affiliates/${pid}/professional`, 'POST', formData());
+  } else if (f.ver === 'upload') {
+    const d = formData(); const file = $('#dBody [name="file"]').files[0];
+    if (!file) throw Object.assign(new Error('Choose a file.'), { data: { field: 'file' } });
+    const q = new URLSearchParams({ type: d.type });
+    for (const k of ['label', 'issued_at', 'expires_at']) if (d[k]) q.set(k, d[k]);
+    out = await api(`/api/affiliates/${pid}/verification/documents?${q}`, {
+      method: 'POST', body: file, headers: { 'Content-Type': file.type || 'application/octet-stream', 'X-Filename': encodeURIComponent(file.name) },
+    });
+  } else if (f.ver === 'approve' || f.ver === 'reject') {
+    out = await send(`/api/affiliates/${pid}/verification/${f.ver}`, 'POST', { ...formData(), version: v.current.version });
+  } else if (f.ver === 'action') {
+    const latest = v.current;
+    out = await send(`/api/affiliates/${pid}/verification/${f.action}`, 'POST', latest ? { version: latest.version } : {});
+  }
+  state.ver = out;
+  // Approval changes the affiliate's status too.
+  state.detail = await api(`/api/affiliates/${pid}`);
+  state.dirty = false; closeDrawer({ force: true });
+  renderDetail();
 }
 
 // ------------------------------------------------------------------ events
@@ -404,6 +575,7 @@ function bind() {
     if (t?.id === 'moreBtn') { loadList({ append: true }); return; }
     if (t?.dataset.kpi !== undefined) { state.f.status = t.dataset.kpi; writeUrl(); listFrame(); loadList(); return; }
     if (t?.dataset.open) { openForm(t.dataset.open); return; }
+    if (t?.dataset.ver) { openForm('ver', t.dataset.ver); return; }
     go(e);
   });
   $('#view').addEventListener('keydown', (e) => { if (e.key === 'Enter' && e.target.matches('[data-href]')) window.location.assign(e.target.dataset.href); });
