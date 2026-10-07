@@ -33,6 +33,7 @@ import { careersHost } from './lib/careers.js';
 import { router as hrRouter } from './lib/hr-routes.js';
 import { router as affiliateRouter } from './lib/affiliate-routes.js';
 import { ensureAffiliateSchema } from './lib/affiliates.js';
+import { ensureAffiliateVerificationSchema } from './lib/affiliate-verification.js';
 import { ensureHrSchema, retryPendingRemovals } from './lib/hr.js';
 import { overviewFor } from './lib/overview.js';
 import { router as marketingRouter } from './lib/marketing-routes.js';
@@ -1202,6 +1203,9 @@ app.listen(port, async () => {
       ensureAffiliateSchema()
         .then(() => console.log('Affiliate schema ready'))
         .catch((e) => console.error('Affiliate schema setup failed (will retry on first request):', e.message));
+      ensureAffiliateVerificationSchema()
+        .then(() => console.log('Affiliate verification schema ready'))
+        .catch((e) => console.error('Affiliate verification schema setup failed (will retry on first request):', e.message));
       ensureOrderFinancialSnapshotSchema()
         .then(() => console.log('Order financial snapshot schema ready'))
         .catch((e) => console.error('Order financial snapshot schema setup failed (will retry on the next Shopify sync):', e.message));

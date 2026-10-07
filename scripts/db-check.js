@@ -46,6 +46,7 @@ import { spawn } from 'node:child_process';
 import os from 'node:os';
 import path from 'node:path';
 import fsp from 'node:fs/promises';
+import crypto from 'node:crypto';
 import http from 'node:http';
 import { ensureHrSchema, purgeTestHr, slugify, normalizePhone, removeResume, retryPendingRemovals, istDayKey, HR_TIMEZONE } from '../lib/hr.js';
 import { jobPostingLd } from '../lib/careers-pages.js';
@@ -5429,9 +5430,268 @@ await step('affiliates admin: events — every change audited, append-only, read
   return `${rows.length} events across ${actions.size} actions, each with actor and time; contact values never logged (field names only); UPDATE/DELETE refused; API returns summaries, not raw JSON`;
 });
 
+/* ------------------------------------------------------------------ professional verification (Phase 1D) */
+const PV = {};
+const pvUpload = (who, pid, buf, name, q = 'type=certificate') => (async () => {
+  const headers = { 'content-type': 'application/octet-stream', 'x-filename': encodeURIComponent(name) };
+  const phone = who === 'adm' ? HRM.adm : AFP[who];
+  if (phone) headers.cookie = `${SESSION_COOKIE}=${issueSession(phone)}`;
+  const r = await fetch(`${HRS.base}/api/affiliates/${pid}/verification/documents?${q}`, { method: 'POST', headers, body: buf });
+  return { status: r.status, body: await r.json().catch(() => ({})) };
+})();
+const pvAct = (who, pid, action, body = {}) => af(who, 'POST', `/api/affiliates/${pid}/verification/${action}`, body);
+const pvGet = async (pid) => (await af('viewer', 'GET', `/api/affiliates/${pid}/verification`)).body.verification;
+const pvPdf = (tag = '') => Buffer.concat([Buffer.from(`%PDF-1.7\n% DBCHECK ${tag}\n`), Buffer.alloc(1500, 0x20)]);
+const pvPng = () => Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), Buffer.alloc(400, 1)]);
+const PROFILE = { full_name: 'DBCHECK-AF Dr Meera Iyer', profession: 'Clinical Nutritionist', registration_number: 'IDA-12345', registration_authority: 'Indian Dietetic Association' };
+
+await step('verification: schema — three tables, constraints, restrictive keys, one-open-application index, history triggers; idempotent; nothing seeded', async () => {
+  const bad = [];
+  const { ensureAffiliateVerificationSchema: ensureV } = await import('../lib/affiliate-verification.js');
+  await ensureV(); await ensureV();
+  const q = async (sql, p = []) => (await getPool().query(sql, p)).rows;
+  for (const t of ['professional_profiles', 'verification_applications', 'professional_documents']) {
+    if (!(await q('SELECT to_regclass($1) AS t', [t]))[0].t) bad.push(`${t} missing`);
+  }
+  const fks = await q(`SELECT conrelid::regclass::text AS t, confrelid::regclass::text AS ref, confdeltype FROM pg_constraint
+    WHERE contype = 'f' AND conrelid::regclass::text IN ('professional_profiles', 'verification_applications', 'professional_documents')`);
+  const want = [['professional_profiles', 'affiliates'], ['verification_applications', 'affiliates'], ['verification_applications', 'professional_profiles'],
+    ['verification_applications', 'verification_applications'], ['professional_documents', 'verification_applications']];
+  for (const [t, ref] of want) if (!fks.some((f) => f.t === t && f.ref === ref && (f.confdeltype === 'r' || (t === ref && f.confdeltype === 'a')))) bad.push(`FK ${t} → ${ref} restrictive`);
+  const cons = (await q(`SELECT conname FROM pg_constraint WHERE conrelid::regclass::text IN ('professional_profiles', 'verification_applications', 'professional_documents')`)).map((r) => r.conname);
+  for (const c of ['professional_profiles_affiliate_key', 'verification_applications_status_check', 'verification_applications_rejection_reason', 'verification_applications_decided',
+    'verification_applications_submitted', 'professional_documents_storage_key_key', 'professional_documents_type_check', 'professional_documents_dates', 'verification_applications_public_id_key']) {
+    if (!cons.includes(c)) bad.push(`constraint ${c}`);
+  }
+  const idx = await q(`SELECT indexdef FROM pg_indexes WHERE indexname = 'verification_applications_one_active'`);
+  if (!/UNIQUE/.test(idx[0]?.indexdef || '') || !/WHERE/.test(idx[0]?.indexdef || '')) bad.push('partial unique index');
+  const trig = (await q(`SELECT tgname FROM pg_trigger WHERE NOT tgisinternal AND tgname LIKE '%_guard'`)).map((r) => r.tgname);
+  for (const t of ['professional_profiles_guard', 'verification_applications_guard', 'professional_documents_guard']) if (!trig.includes(t)) bad.push(`trigger ${t}`);
+  const cols = (await q(`SELECT table_name, column_name, data_type FROM information_schema.columns WHERE table_name = 'professional_documents'`));
+  if (cols.some((c) => c.data_type === 'bytea')) bad.push('document bytes column');
+  if (!cols.some((c) => c.column_name === 'expires_at' && c.data_type === 'date')) bad.push('expires_at is not a date');
+  const before = (await q(`SELECT (SELECT count(*) FROM professional_profiles) + (SELECT count(*) FROM verification_applications) + (SELECT count(*) FROM professional_documents) AS n`))[0].n;
+  await ensureV();
+  if ((await q(`SELECT (SELECT count(*) FROM professional_profiles) + (SELECT count(*) FROM verification_applications) + (SELECT count(*) FROM professional_documents) AS n`))[0].n !== before) bad.push('schema run wrote rows');
+  if (bad.length) throw new Error(bad.join(' | '));
+  return '3 tables; 5 RESTRICT foreign keys; 9 named constraints; partial unique index (one open application); 3 history triggers; no byte column; expires_at DATE; re-run writes no rows';
+});
+
+await step('verification: RBAC — view for viewer/finance, profile and documents for managers, decisions and document access for verifiers only', async () => {
+  const bad = [];
+  PV.pid = (await af('manager', 'POST', '/api/affiliates', { display_name: 'DBCHECK-AF Dr Meera', category: 'nutritionist' })).body.affiliate.public_id;
+  const P = PV.pid;
+  const matrix = [
+    ['GET', `/api/affiliates/${P}/verification`, null, { viewer: 200, finance: 200, manager: 200, adm: 200, none: 403, '': 401 }],
+    ['GET', `/api/affiliates/${P}/professional`, null, { viewer: 200, finance: 200, none: 403, '': 401 }],
+    ['POST', `/api/affiliates/${P}/professional`, PROFILE, { viewer: 403, finance: 403, none: 403, '': 401 }],
+  ];
+  for (const [m, p, b, exp] of matrix) for (const [who, w] of Object.entries(exp)) {
+    const r = await af(who || null, m, p, b);
+    if (r.status !== w) bad.push(`${who || 'anon'} ${m} ${p.split('/').slice(-1)}: ${r.status} ≠ ${w}`);
+  }
+  if ((await af('manager', 'POST', `/api/affiliates/${P}/professional`, PROFILE)).status !== 201) bad.push('manager create profile');
+  for (const who of ['viewer', 'finance', 'none']) if ((await pvUpload(who, P, pvPdf(), 'cert.pdf')).status !== 403) bad.push(`${who} upload`);
+  if ((await pvUpload('', P, pvPdf(), 'cert.pdf')).status !== 401) bad.push('anon upload');
+  const up = await pvUpload('manager', P, pvPdf('rbac'), 'meera-certificate.pdf', 'type=certificate&expires_at=2030-01-01');
+  if (up.status !== 201) bad.push(`manager upload ${up.status} ${JSON.stringify(up.body)}`);
+  for (const a of ['submit', 'review', 'approve', 'reject', 'resubmit', 'start']) {
+    for (const who of ['viewer', 'finance', 'none']) { const r = await pvAct(who, P, a, { reason: 'x' }); if (r.status !== 403) bad.push(`${who} ${a}: ${r.status}`); }
+    if ((await pvAct('', P, a)).status !== 401) bad.push(`anon ${a}`);
+  }
+  const v = await pvGet(P);
+  const url = `/api/affiliates/${P}/verification/${v.current.ref}/documents/${v.current.documents[0].ref}`;
+  for (const [who, w] of [['viewer', 403], ['finance', 403], ['none', 403], ['', 401], ['manager', 200], ['adm', 200]]) {
+    const r = await af(who || null, 'GET', url);
+    if (r.status !== w) bad.push(`${who || 'anon'} open document: ${r.status} ≠ ${w}`);
+  }
+  const caps = (await af('finance', 'GET', `/api/affiliates/${P}/verification`)).body;
+  if (caps.canVerify !== false || caps.canManage !== false) bad.push('finance flags');
+  const mcaps = (await af('manager', 'GET', `/api/affiliates/${P}/verification`)).body;
+  if (mcaps.canVerify !== true || mcaps.canManage !== true) bad.push('manager flags');
+  if (bad.length) throw new Error(bad.join(' | '));
+  return 'read: viewer/finance/manager/admin 200, logistics-only 403, signed out 401; profile + upload: manager/admin only; submit/review/approve/reject/resubmit/start: 403 for viewer, finance, others, 401 signed out; document open: manager/admin 200, viewer/finance 403';
+});
+
+await step('verification: professional profile — create, update with version, validation, non-professional and closed refused', async () => {
+  const bad = [];
+  const P = PV.pid;
+  const v0 = await pvGet(P);
+  if (v0.profile.full_name !== PROFILE.full_name || v0.profile.version !== 1 || v0.current?.status !== 'draft') bad.push('created + draft application');
+  if ((await af('manager', 'POST', `/api/affiliates/${P}/professional`, PROFILE)).status !== 409) bad.push('second profile');
+  const upd = await af('manager', 'PATCH', `/api/affiliates/${P}/professional`, { specialization: 'Sports nutrition', city: 'Pune', version: 1 });
+  if (upd.status !== 200 || upd.body.verification.profile.specialization !== 'Sports nutrition' || upd.body.verification.profile.version !== 2) bad.push(`update ${upd.status}`);
+  if ((await af('manager', 'PATCH', `/api/affiliates/${P}/professional`, { city: 'Mumbai', version: 1 })).status !== 409) bad.push('stale profile version');
+  const invalid = [[{ ...PROFILE, full_name: '' }, 'full_name'], [{ ...PROFILE, profession: '  ' }, 'profession'], [{ ...PROFILE, registration_number: 'x'.repeat(81) }, 'registration_number'],
+    [{ ...PROFILE, profile_notes: 'x'.repeat(1001) }, 'profile_notes']];
+  const other = (await af('manager', 'POST', '/api/affiliates', { display_name: 'DBCHECK-AF Dr Two', category: 'dentist' })).body.affiliate.public_id;
+  for (const [body, field] of invalid) { const r = await af('manager', 'POST', `/api/affiliates/${other}/professional`, body); if (r.status !== 400 || r.body.field !== field) bad.push(`${field}: ${r.status} ${r.body.field}`); }
+  const inf = (await af('manager', 'POST', '/api/affiliates', { display_name: 'DBCHECK-AF influencer', category: 'influencer' })).body.affiliate.public_id;
+  if ((await af('manager', 'POST', `/api/affiliates/${inf}/professional`, PROFILE)).status !== 409) bad.push('profile on a non-professional');
+  const infV = await pvGet(inf);
+  if (infV.required !== false || infV.profile !== null || infV.current !== null || infV.applications.length) bad.push('non-professional has verification data');
+  if ((await af('manager', 'POST', '/api/affiliates/ZZZZZZ/professional', PROFILE)).status !== 404) bad.push('unknown affiliate');
+  await af('manager', 'POST', `/api/affiliates/${other}/status`, { action: 'close', reason: 'db-check' });
+  if ((await af('manager', 'POST', `/api/affiliates/${other}/professional`, PROFILE)).status !== 409) bad.push('profile on a closed affiliate');
+  const ev = (await afEvents(P)).map((e) => e.action);
+  for (const e of ['professional_profile_created', 'verification_application_created', 'professional_profile_updated']) if (!ev.includes(e)) bad.push(`event ${e}`);
+  if (bad.length) throw new Error(bad.join(' | '));
+  return 'create opens a draft application; update bumps the version, stale → 409; 4 invalid inputs refused with their field; non-professional and closed → 409, unknown → 404; no verification data for an influencer; events recorded';
+});
+
+await step('verification: documents — content-checked types, size limit, safe names, private opaque keys, metadata, authenticated audited reads', async () => {
+  const bad = [];
+  const P = PV.pid;
+  const cases = [
+    [pvPng(), 'scan.png', 'type=registration&label=Council%20card&issued_at=2024-01-01&expires_at=2026-12-31', 201],
+    [Buffer.from('MZ fake'), 'cert.pdf', 'type=certificate', 415],
+    [pvPdf(), 'cert.exe', 'type=certificate', 415],
+    [pvPdf(), 'cert.docx', 'type=certificate', 415],
+    [Buffer.alloc(0), 'cert.pdf', 'type=certificate', 400],
+    [Buffer.concat([pvPdf(), Buffer.alloc(10 * 1024 * 1024)]), 'big.pdf', 'type=certificate', 413],
+    [pvPdf(), 'cert.pdf', 'type=passport', 400],
+    [pvPdf(), 'cert.pdf', 'type=certificate&issued_at=2025-05-01&expires_at=2025-01-01', 400],
+    [pvPdf(), 'cert.pdf', 'type=certificate&expires_at=2025-02-30', 400],
+    [pvPdf('traversal'), '../../../etc/passwd.pdf', 'type=certificate', 201],
+  ];
+  for (const [buf, name, q, want] of cases) {
+    const r = await pvUpload('manager', P, buf, name, q);
+    if (r.status !== want) bad.push(`${name} ${q}: ${r.status} ≠ ${want} ${r.body.error || ''}`);
+  }
+  const rows = (await getPool().query(`SELECT d.*, d.issued_at::text AS i, d.expires_at::text AS e FROM professional_documents d JOIN verification_applications v ON v.id = d.verification_application_id
+    JOIN affiliates a ON a.id = v.affiliate_id WHERE a.public_id = $1 ORDER BY d.id`, [P])).rows;
+  if (rows.length !== 3) bad.push(`documents stored ${rows.length}`);
+  for (const d of rows) {
+    if (!/^affiliates\/verification\/\d{4}-\d{2}\/[0-9a-f-]{36}\.(pdf|png)$/.test(d.storage_key)) bad.push(`key ${d.storage_key}`);
+    if (/passwd|cert|scan|meera/i.test(d.storage_key)) bad.push('filename in key');
+    const bytes = await fsp.readFile(path.join(HRS.dir, d.storage_key)).catch(() => null);
+    if (!bytes || crypto.createHash('sha256').update(bytes).digest('hex') !== d.sha256 || bytes.length !== Number(d.byte_size)) bad.push(`stored bytes ${d.public_id}`);
+  }
+  const png = rows.find((d) => d.content_type === 'image/png');
+  if (png?.document_type !== 'registration' || png.document_label !== 'Council card' || png.i !== '2024-01-01' || png.e !== '2026-12-31' || png.uploaded_by !== AFN.manager) bad.push('metadata');
+  const trav = rows.find((d) => /passwd/.test(d.original_filename));
+  if (trav?.original_filename !== '.._.._.._etc_passwd.pdf') bad.push(`filename kept as ${trav?.original_filename}`);
+  const v = await pvGet(P);
+  const out = JSON.stringify(v);
+  if (/storage_key|affiliates\/verification|"id":|sha256/.test(out)) bad.push('key, hash or id in API response');
+  const doc = v.current.documents.find((d) => d.content_type === 'application/pdf');
+  const before = (await afEvents(P)).filter((e) => e.action === 'professional_document_viewed').length;
+  const r = await fetch(`${HRS.base}/api/affiliates/${P}/verification/${v.current.ref}/documents/${doc.ref}`, { headers: { cookie: `${SESSION_COOKIE}=${issueSession(AFP.manager)}` } });
+  const body = Buffer.from(await r.arrayBuffer());
+  if (r.status !== 200 || r.headers.get('content-type') !== 'application/pdf' || r.headers.get('cache-control') !== 'private, no-store' || r.headers.get('x-content-type-options') !== 'nosniff'
+    || !body.subarray(0, 4).equals(Buffer.from('%PDF'))) bad.push(`open ${r.status} ${r.headers.get('content-type')}`);
+  const viewed = (await afEvents(P)).filter((e) => e.action === 'professional_document_viewed');
+  if (viewed.length !== before + 1 || viewed.at(-1).actor !== AFN.manager || viewed.at(-1).metadata.document !== doc.ref || viewed.at(-1).metadata.application !== v.current.ref) bad.push('view not audited');
+  if (JSON.stringify(viewed.map((e) => e.metadata)).match(/storage|affiliates\/verification|http|PDF/)) bad.push('audit holds a key, URL or content');
+  // A document is only reachable through its own affiliate and application.
+  const other = (await af('manager', 'POST', '/api/affiliates', { display_name: 'DBCHECK-AF Dr Three', category: 'doctor' })).body.affiliate.public_id;
+  for (const u of [`/api/affiliates/${other}/verification/${v.current.ref}/documents/${doc.ref}`, `/api/affiliates/${P}/verification/AAAAAAAAAA/documents/${doc.ref}`,
+    `/api/affiliates/${P}/verification/${v.current.ref}/documents/1`, `/api/affiliates/${P}/verification/${v.current.ref}/documents/../../x`]) {
+    const x = await af('manager', 'GET', u);
+    if (![404].includes(x.status)) bad.push(`cross lookup ${u.split('/').slice(-3).join('/')}: ${x.status}`);
+  }
+  const ev = (await afEvents(P)).filter((e) => e.action === 'professional_document_uploaded');
+  if (ev.length !== 3 || ev.some((e) => !e.metadata.document || e.metadata.filename || JSON.stringify(e.metadata).includes('passwd'))) bad.push('upload events');
+  const expiry = (await import('../lib/affiliate-verification.js')).expiryState;
+  if (expiry('2026-10-06', '2026-10-07') !== 'expired' || expiry('2026-10-20', '2026-10-07') !== 'expiring_soon' || expiry('2027-01-01', '2026-10-07') !== 'valid' || expiry(null) !== null) bad.push('expiry states');
+  if (bad.length) throw new Error(bad.join(' | '));
+  return 'PNG + PDF stored; fake PDF, .exe, .docx → 415, empty / bad type / bad dates → 400, >10 MB → 413; ../ names neutralised and kept as metadata only; keys opaque (affiliates/verification/YYYY-MM/uuid); bytes and sha256 match; no key, hash or id in responses; open streams no-store + nosniff and is audited; cross-affiliate / wrong application / numeric ids → 404; expiry expired / soon / valid';
+});
+
+await step('verification: lifecycle — submit, review, reject with reason, new application, approve; invalid transitions 409; affiliate approved but never auto-activated', async () => {
+  const bad = [];
+  const P = PV.pid;
+  const s = (who, a, body) => pvAct(who, P, a, body);
+  const empty = (await af('manager', 'POST', '/api/affiliates', { display_name: 'DBCHECK-AF Dr Empty', category: 'dentist' })).body.affiliate.public_id;
+  await af('manager', 'POST', `/api/affiliates/${empty}/professional`, PROFILE);
+  if ((await pvAct('manager', empty, 'submit')).status !== 409) bad.push('submit without a certificate');
+  for (const a of ['review', 'approve', 'reject']) if ((await s('manager', a, { reason: 'r' })).status !== 409) bad.push(`draft → ${a}`);
+  if ((await s('manager', 'resubmit')).status !== 409) bad.push('resubmit a draft');
+  const sub = await s('manager', 'submit');
+  const first = sub.body.verification?.current;
+  if (sub.status !== 200 || first.status !== 'submitted' || first.profile_snapshot?.full_name !== PROFILE.full_name || first.submitted_by !== AFN.manager) bad.push(`submit ${sub.status}`);
+  if ((await pvUpload('manager', P, pvPdf('late'), 'late.pdf')).status !== 409) bad.push('upload after submit');
+  if ((await s('manager', 'approve')).status !== 409) bad.push('submitted → approve');
+  if ((await s('manager', 'submit')).status !== 409) bad.push('submit twice');
+  if ((await s('manager', 'review')).body.verification?.current.status !== 'under_review') bad.push('review');
+  const noReason = await s('manager', 'reject', { reason: '  ' });
+  if (noReason.status !== 400 || noReason.body.field !== 'reason') bad.push(`reject without reason ${noReason.status}`);
+  if ((await s('manager', 'reject', { reason: 'x'.repeat(1001) })).status !== 400) bad.push('long reason');
+  const rej = await s('manager', 'reject', { reason: 'Registration number does not match the certificate', notes: 'Checked IDA list' });
+  PV.rejected = rej.body.verification?.current;
+  if (PV.rejected?.status !== 'rejected' || PV.rejected.rejection_reason !== 'Registration number does not match the certificate' || PV.rejected.reviewed_by !== AFN.manager) bad.push('reject');
+  if ((await af('viewer', 'GET', `/api/affiliates/${P}`)).body.affiliate.status !== 'pending_verification') bad.push('rejection changed the affiliate');
+  if ((await s('manager', 'review')).status !== 409 || (await s('manager', 'approve')).status !== 409) bad.push('decided application moved');
+  const re = await s('manager', 'resubmit', { version: PV.rejected.version });
+  const v = re.body.verification;
+  if (re.status !== 201 || v.current.status !== 'draft' || v.current.previous_ref !== PV.rejected.ref || v.applications.length !== 2 || v.current.documents.length) bad.push('resubmit');
+  const kept = v.applications.find((x) => x.ref === PV.rejected.ref);
+  if (JSON.stringify(kept) !== JSON.stringify(PV.rejected)) bad.push('rejected application changed by resubmission');
+  if ((await s('manager', 'resubmit')).status !== 409) bad.push('second resubmit');
+  if ((await pvUpload('manager', P, pvPdf('second'), 'meera-cert-v2.pdf', 'type=certificate&expires_at=2031-01-01')).status !== 201) bad.push('upload to the new draft');
+  await s('manager', 'submit'); await s('manager', 'review');
+  const ap = await s('adm', 'approve', { notes: 'Matched the IDA register' });
+  const aff = (await af('viewer', 'GET', `/api/affiliates/${P}`)).body.affiliate;
+  if (ap.status !== 200 || ap.body.verification.current.status !== 'approved' || ap.body.verification.current.review_notes !== 'Matched the IDA register'
+    || ap.body.verification.current.reviewed_by !== 'HR admin') bad.push(`approve ${ap.status}`);
+  if (aff.status !== 'approved' || aff.activated_at || !aff.transitions.includes('activate')) bad.push(`affiliate after approval: ${aff.status}`);
+  if ((await getPool().query('SELECT count(*)::int n FROM affiliate_rates r JOIN affiliates a ON a.id = r.affiliate_id WHERE a.public_id = $1', [P])).rows[0].n) bad.push('a rate was created');
+  if ((await s('manager', 'reject', { reason: 'late' })).status !== 409 || (await s('manager', 'start')).status !== 409) bad.push('approved application moved / restarted');
+  // Activation stays the separate Phase 1C action.
+  if ((await af('manager', 'POST', `/api/affiliates/${P}/status`, { action: 'activate' })).body.affiliate?.status !== 'active') bad.push('activate after approval');
+  // An approved professional who is suspended comes back active, not pending.
+  await af('manager', 'POST', `/api/affiliates/${P}/status`, { action: 'suspend', reason: 'pause' });
+  if ((await af('manager', 'POST', `/api/affiliates/${P}/status`, { action: 'reactivate' })).body.affiliate?.status !== 'active') bad.push('approved professional not reactivated to active');
+  const ev = (await afEvents(P)).map((e) => e.action);
+  for (const e of ['verification_submitted', 'verification_under_review', 'verification_rejected', 'verification_resubmitted', 'verification_approved', 'affiliate_status_changed']) if (!ev.includes(e)) bad.push(`event ${e}`);
+  const rejEv = (await afEvents(P)).find((e) => e.action === 'verification_rejected');
+  if (rejEv.metadata.from !== 'under_review' || rejEv.metadata.to !== 'rejected' || rejEv.metadata.reason !== 'Registration number does not match the certificate' || rejEv.actor !== AFN.manager) bad.push('reject event');
+  if (bad.length) throw new Error(bad.join(' | '));
+  return 'certificate required to submit; profile copied at submit; upload locked after submit; 10 invalid transitions → 409; reason required to reject; rejection leaves the affiliate pending; new application links the rejected one, which stays byte-for-byte; approval → affiliate approved (not active, no rate), Activate is separate; approved professional reactivates to active; events with from/to/actor/reason';
+});
+
+await step('verification: history and concurrency — no deletes or edits of decisions/documents, one open application, stale versions and double decisions refused', async () => {
+  const bad = [];
+  const P = PV.pid;
+  const q = (sql, p) => getPool().query(sql, p);
+  const appId = (await q('SELECT id FROM verification_applications WHERE public_id = $1', [PV.rejected.ref])).rows[0].id;
+  const docId = (await q('SELECT id FROM professional_documents WHERE verification_application_id = $1 LIMIT 1', [appId])).rows[0].id;
+  await expectErr('edit decided', () => q(`UPDATE verification_applications SET rejection_reason = 'changed' WHERE id = $1`, [appId]), (e) => /final/.test(e.message));
+  await expectErr('delete application', () => q('DELETE FROM verification_applications WHERE id = $1', [appId]), (e) => /never deleted/.test(e.message));
+  await expectErr('edit document', () => q(`UPDATE professional_documents SET original_filename = 'x.pdf' WHERE id = $1`, [docId]), (e) => /append-only/.test(e.message));
+  await expectErr('delete document', () => q('DELETE FROM professional_documents WHERE id = $1', [docId]), (e) => /never deleted/.test(e.message));
+  await expectErr('delete profile', () => q(`DELETE FROM professional_profiles p USING affiliates a WHERE a.id = p.affiliate_id AND a.public_id = $1`, [P]), (e) => /never deleted/.test(e.message));
+  await expectErr('delete affiliate with profile', () => q('DELETE FROM affiliates WHERE public_id = $1', [P]), (e) => ['23001', '23503'].includes(e.code) || /append-only|never/.test(e.message));
+  // One open application, enforced by the database itself.
+  const C = (await af('manager', 'POST', '/api/affiliates', { display_name: 'DBCHECK-AF Dr Race', category: 'doctor' })).body.affiliate.public_id;
+  await af('manager', 'POST', `/api/affiliates/${C}/professional`, PROFILE);
+  const row = (await q(`SELECT v.affiliate_id, v.professional_profile_id FROM verification_applications v JOIN affiliates a ON a.id = v.affiliate_id WHERE a.public_id = $1`, [C])).rows[0];
+  await expectErr('second open application', () => q(`INSERT INTO verification_applications (public_id, affiliate_id, professional_profile_id) VALUES ('ZZZZZZZZZZ', $1, $2)`,
+    [row.affiliate_id, row.professional_profile_id]), (e) => e.code === '23505');
+  if ((await pvAct('manager', C, 'start')).status !== 409) bad.push('start while open');
+  // Stale version and simultaneous decisions.
+  await pvUpload('manager', C, pvPdf('race'), 'race.pdf');
+  const sub = (await pvAct('manager', C, 'submit')).body.verification.current;
+  if ((await pvAct('manager', C, 'review', { version: sub.version - 1 })).status !== 409) bad.push('stale version accepted');
+  const rev = (await pvAct('manager', C, 'review', { version: sub.version })).body.verification.current;
+  const results = await Promise.all([pvAct('manager', C, 'approve', { version: rev.version }), pvAct('adm', C, 'reject', { version: rev.version, reason: 'race' }),
+    pvAct('manager', C, 'approve', {}), pvAct('adm', C, 'reject', { reason: 'race 2' })]);
+  const okCount = results.filter((r) => r.status === 200).length;
+  if (okCount !== 1 || results.some((r) => r.status !== 200 && r.status !== 409)) bad.push(`concurrent decisions: ${results.map((r) => r.status)}`);
+  const decided = (await q(`SELECT count(*)::int n FROM affiliate_events e JOIN affiliates a ON a.id = e.affiliate_id WHERE a.public_id = $1 AND e.action IN ('verification_approved', 'verification_rejected')`, [C])).rows[0].n;
+  if (decided !== 1) bad.push(`${decided} decision events`);
+  if (bad.length) throw new Error(bad.join(' | '));
+  return 'decided application, documents and profiles cannot be edited or deleted; a second open application is refused by the unique index; stale version → 409; four simultaneous approve/reject requests → exactly one succeeds (one decision event)';
+});
+
 await step('affiliates admin cleanup', async () => {
   let n = 0;
-  for (const actor of [...Object.values(AFN), 'HR admin']) n += (await purgeTestAffiliates(actor)).affiliates;
+  for (const actor of [...Object.values(AFN), 'HR admin']) {
+    const r = await purgeTestAffiliates(actor);
+    n += r.affiliates;
+    // Verification documents written by these tests (the throwaway local store).
+    for (const k of r.paths || []) await fsp.rm(path.join(HRS.dir, k), { force: true }).catch(() => {});
+  }
   await getPool().query('DELETE FROM member_module_roles WHERE phone = ANY($1)', [Object.values(AFP)]);
   await getPool().query('DELETE FROM member_log WHERE target_phone = ANY($1)', [Object.values(AFP)]);
   await getPool().query('DELETE FROM allowed_users WHERE phone = ANY($1)', [Object.values(AFP)]);

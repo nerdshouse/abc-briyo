@@ -397,7 +397,8 @@ html.scroll-locked .drawer-scrim { touch-action: none; }
 .af-table tbody tr { cursor: pointer; }
 .af-title-tag { display: inline-flex; vertical-align: middle; margin-left: 8px; font-size: 13px; }
 .af-title-tag .status { font-size: 12.5px; }
-.af-detail { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.2fr); grid-template-areas: "profile activity" "rates rates"; gap: 16px; align-items: start; }
+.af-detail { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.2fr); grid-template-areas: "profile activity" "verify verify" "rates rates"; gap: 16px; align-items: start; }
+.af-detail .af-verify { grid-area: verify; }
 .af-detail .af-profile { grid-area: profile; }
 .af-detail .af-activity { grid-area: activity; }
 .af-detail .af-rates { grid-area: rates; }
@@ -416,7 +417,8 @@ html.scroll-locked .drawer-scrim { touch-action: none; }
 .af-when label { display: flex; align-items: center; gap: 6px; font-size: 13px; }
 .af-when .input { width: 180px; }
 @media (max-width: 1024px) {
-  .af-detail { grid-template-columns: minmax(0, 1fr); grid-template-areas: "profile" "rates" "activity"; }
+  .af-detail { grid-template-columns: minmax(0, 1fr); grid-template-areas: "profile" "verify" "rates" "activity"; }
+  .af-verify-grid { grid-template-columns: minmax(0, 1fr); }
 }
 @media (max-width: 760px) {
   .table-wrap:has(.af-table) { display: none; }
@@ -424,3 +426,17 @@ html.scroll-locked .drawer-scrim { touch-action: none; }
   .af-kpis .att:nth-child(2) { border-right: 0; }
   .af-kpis .att:nth-child(-n+2) { border-bottom: 1px solid var(--border-soft); }
 }
+
+/* Affiliates — professional verification (Phase 1D) */
+.af-verify .card-title .status { margin-left: 8px; font-size: 12.5px; }
+.af-verify .alert { margin-bottom: 14px; }
+.alert.af-ok { border-color: #ABEFC6; background: #ECFDF3; color: #067647; }
+.af-verify-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 8px 32px; }
+.af-verify .dsec-title { margin: 0 0 6px; }
+.af-gap { margin-top: 18px !important; }
+.af-docs td { vertical-align: top; }
+.af-docs .cell-sub { display: block; }
+.af-docs .mini-tag { margin-left: 4px; }
+.af-ver-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 14px; padding-top: 14px; border-top: 1px solid var(--border-soft); }
+.af-hist { margin-top: 12px; padding: 12px; border: 1px solid var(--border-soft); border-radius: 8px; background: var(--surface-2); }
+.af-hist .table-wrap { margin-top: 8px; background: var(--surface); }
