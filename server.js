@@ -37,6 +37,7 @@ import { router as marketingRouter } from './lib/marketing-routes.js';
 import { router as ordersRouter, courierRouter, destinationRouter } from './lib/orders-routes.js';
 import { router as inventoryRouter } from './lib/inventory-routes.js';
 import { ensureInventorySchema } from './lib/inventory.js';
+import { ensureOrderFinancialSnapshotSchema } from './lib/order-financial-snapshots.js';
 import { activeUsers, seedAllowedUsers, normalisePhone, bootstrapAdmins, nameFor } from './lib/otp.js';
 import { mapShopifyCsv } from './lib/shopify-csv.js';
 import { toCsv } from './lib/csv.js';
@@ -1191,6 +1192,9 @@ app.listen(port, async () => {
       ensureInventorySchema()
         .then(() => console.log('Orders & inventory schema ready'))
         .catch((e) => console.error('Orders & inventory schema setup failed (will retry on first request):', e.message));
+      ensureOrderFinancialSnapshotSchema()
+        .then(() => console.log('Order financial snapshot schema ready'))
+        .catch((e) => console.error('Order financial snapshot schema setup failed (will retry on the next Shopify sync):', e.message));
       ensureHrSchema()
         .then(() => console.log('HR schema ready'))
         // Resume removals interrupted after the file was deleted are finished here.
