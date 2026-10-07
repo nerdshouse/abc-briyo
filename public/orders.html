@@ -209,11 +209,10 @@
     </section>
     <section class="dsec">
       <h3 class="dsec-title">Dispatch Proof &amp; Documents</h3>
-      <label class="fld proof-field"><span>Dispatch Product Image</span>
+      <label class="fld proof-field"><span>Dispatch image (optional)</span>
         <input class="file" type="file" name="dispatch_files" multiple
                accept=".jpg,.jpeg,.png,.webp,image/jpeg,image/png,image/webp" />
-        <span class="help">Photos of the packed cartons, the label or AWB, the final package. Add as many as needed.
-          <b>At least one is required to mark it Dispatched.</b></span></label>
+        <span class="help">Photos of the packed cartons, the label or AWB, the final package. Add as many as needed, or none.</span></label>
       <div class="thumbs" id="cThumbs" hidden></div>
       <div class="form-grid" style="margin-top:12px">
         <label class="fld"><span>Tax Invoice</span><input class="file" type="file" name="invoice_file" accept=".pdf,.png,.jpg,.jpeg,application/pdf,image/png,image/jpeg" /></label>
@@ -274,7 +273,7 @@
         <label class="fld wide"><span>Tracking link</span><input class="input" name="tracking_url" maxlength="500" autocomplete="off" placeholder="Optional — filled from the courier and AWB where it can be" /></label>
         <label class="fld"><span>Shipment status</span><select class="select" name="shipment_status">
           <option value="packed" selected>Packed</option><option value="not_ready">Not ready</option></select>
-          <span class="help">Mark it dispatched from the shipment once the dispatch photo is in.</span></label>
+          <span class="help">Mark it dispatched from the shipment.</span></label>
       </div>
     </section>
   </form>

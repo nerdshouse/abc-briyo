@@ -526,9 +526,6 @@ function renderDrawer() {
       <div id="dStock" class="stock-block"></div>
       ${canEdit() ? `<div class="form-actions"><button class="btn primary" type="button" id="dShipSave">Save shipment</button>
         ${(NEXT_STEPS[ship.shipment_status] || []).map((s) => `<button class="btn" type="button" data-step="${s}">${esc(STEP_TEXT[s])}</button>`).join('')}</div>` : ''}
-      ${canEdit() && !['dispatched', 'in_transit', 'out_for_delivery', 'delivered', 'delivery_failed', 'rto'].includes(ship.shipment_status)
-        && !proofDocs.some((d) => !d.removed_at && d.document_type === 'dispatch_product_image')
-        ? `<p class="photo-needed">${icon('camera')}Add a dispatch product photo (below) before marking it dispatched.</p>` : ''}
     </section>
 
     ${drawerCommon(o, documents, proofDocs, events, notes)}`;
@@ -1226,17 +1223,11 @@ $('#createForm').addEventListener('submit', async (e) => {
     ['source_order_id', 'order number'], ['courier_partner_id', 'courier partner'], ['tracking_id', 'tracking ID / AWB']]
     .filter(([k]) => !String(body[k] || '').trim()).map(([, l]) => l);
   if (missing.length) { err.textContent = `Enter the ${missing.join(', ')}.`; err.hidden = false; return; }
-  // Dispatched (or later) needs a dispatch photo. The shipment is saved as
-  // Packed, the photos go up, then it moves to the chosen status.
+  // Dispatched (or later): the shipment is saved as Packed, any photos
+  // (optional) go up, then it moves to the chosen status.
   const SHIPPED = ['dispatched', 'in_transit', 'out_for_delivery', 'delivered', 'delivery_failed', 'rto'];
   const target = body.shipment_status;
-  if (SHIPPED.includes(target)) {
-    if (!f.dispatch_files.files.length) {
-      err.textContent = `Add at least one Dispatch Product Image to mark it ${label(target)} — or save it as Packed and add photos later.`;
-      err.hidden = false; return;
-    }
-    body.shipment_status = 'packed';
-  }
+  if (SHIPPED.includes(target)) body.shipment_status = 'packed';
   // Photos first: they are the primary proof. Receipt and invoice are optional.
   const items = [
     ...[...f.dispatch_files.files].map((file) => ({ file, type: 'dispatch_product_image' })),

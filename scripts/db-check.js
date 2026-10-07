@@ -1503,13 +1503,12 @@ await step('new shipment: required fields; explicit Dispatched is honoured and s
     catch (err) { if (err.status !== 400) throw err; }
   }
   if ((await listOrders({ q: `${TEST_ORDER}-S2` })).total !== 0) throw new Error('a refused shipment left an order behind');
-  // Dispatched straight away is refused for a brand-new order: there is no photo yet.
-  try {
-    await createShipment({ ...R('zepto'), channel: 'zepto', source_order_id: `${TEST_ORDER}-S2`, courier_partner_id: dl.id,
-      tracking_id: 'AWB-S2', shipment_status: 'dispatched' }, { actor: ACTOR });
-    throw new Error('dispatched without a photo');
-  } catch (err) { if (err.status !== 400 || !err.needsPhoto) throw err; }
-  if ((await listOrders({ q: `${TEST_ORDER}-S2` })).total !== 0) throw new Error('refused create left an order behind');
+  // Dispatched straight away, with no photo: accepted and stamped (photos are optional).
+  const r0 = await createShipment({ ...R('zepto'), channel: 'zepto', source_order_id: `${TEST_ORDER}-S2N`, courier_partner_id: dl.id,
+    tracking_id: 'AWB-S2N', shipment_status: 'dispatched' }, { actor: ACTOR });
+  const o0 = await getOrder(r0.orderId);
+  if (o0.shipment_status !== 'dispatched' || !o0.dispatch_date) throw new Error('direct dispatch without a photo not stamped');
+  if ((await orderDocuments(r0.orderId)).length) throw new Error('a document row was created without an upload');
   // The screen's way: saved as Packed, photo added, then Dispatched.
   const r = await createShipment({ ...R('zepto'), channel: 'zepto', source_order_id: `${TEST_ORDER}-S2`, courier_partner_id: dl.id,
     tracking_id: 'AWB-S2' }, { actor: ACTOR });
@@ -1518,7 +1517,7 @@ await step('new shipment: required fields; explicit Dispatched is honoured and s
   await updateShipment(r.orderId, sh.id, { shipment_status: 'dispatched' }, { actor: ACTOR, version: sh.version });
   const o = await getOrder(r.orderId);
   if (o.shipment_status !== 'dispatched' || !o.dispatch_date) throw new Error('dispatch not stamped');
-  return 'missing fields refused; Dispatched without a photo refused (nothing saved); with a photo, stamped';
+  return 'missing fields refused; Dispatched without a photo accepted and stamped, no document row; with a photo, stamped';
 });
 await step('new shipment on an existing order: no duplicate order; offers the order instead', async () => {
   const bd = (await listCouriers()).find((c) => c.name === 'Blue Dart');
@@ -1701,15 +1700,23 @@ await step('routes: dispatch type must fit the channel; destination must fit bot
   catch (err) { if (err.status !== 400) throw err; }
   return '5 wrong routes refused; one-type channel defaulted; Easy Ship has no destination; change logged';
 });
-await step('dispatch photo is required to leave, not to move between later stages', async () => {
+await step('dispatch photo is optional: no image dispatches, image still works, no placeholder rows', async () => {
   const dl = (await listCouriers()).find((c) => c.name === 'Delhivery');
+  // No image: Packed → Dispatched → In transit → Delivered, same transitions as before.
+  const n = await createShipment({ ...R('bigbasket'), channel: 'bigbasket', source_order_id: `${TEST_ORDER}-NP`, courier_partner_id: dl.id, tracking_id: 'AWB-NP' }, { actor: ACTOR });
+  for (const to of ['dispatched', 'in_transit', 'delivered']) {
+    const s0 = (await orderShipments(n.orderId))[0];
+    await updateShipment(n.orderId, s0.id, { shipment_status: to }, { actor: ACTOR, version: s0.version });
+  }
+  const on = await getOrder(n.orderId);
+  if (on.shipment_status !== 'delivered' || !on.dispatch_date || !on.delivered_at) throw new Error(`no-photo flow: ${on.shipment_status}`);
+  if ((await orderDocuments(n.orderId)).length) throw new Error('placeholder document created');
+  const np = (await listOrders({ q: 'AWB-NP' })).orders[0];
+  if (np.dispatch_image_count !== 0) throw new Error('image count not 0');
+  if (!(await orderEvents(n.orderId)).some((e) => e.event_type === 'shipment_status_changed')) throw new Error('status change not logged');
+  // With an image: unchanged.
   const r = await createShipment({ ...R('bigbasket'), channel: 'bigbasket', source_order_id: `${TEST_ORDER}-PH`, courier_partner_id: dl.id, tracking_id: 'AWB-PH' }, { actor: ACTOR });
   let sh = (await orderShipments(r.orderId))[0];
-  for (const to of ['dispatched', 'in_transit', 'delivered', 'rto']) {
-    try { await updateShipment(r.orderId, sh.id, { shipment_status: to }, { actor: ACTOR, version: sh.version }); throw new Error(`${to} without photo`); }
-    catch (err) { if (!err.needsPhoto) throw err; }
-  }
-  // Courier receipt is still not needed; only the photo.
   const docId = await addPhoto(r.orderId);
   await updateShipment(r.orderId, sh.id, { shipment_status: 'dispatched' }, { actor: ACTOR, version: sh.version });
   // Removing the photo afterwards does not freeze the shipment in transit.
@@ -1717,7 +1724,7 @@ await step('dispatch photo is required to leave, not to move between later stage
   sh = (await orderShipments(r.orderId))[0];
   await updateShipment(r.orderId, sh.id, { shipment_status: 'in_transit' }, { actor: ACTOR, version: sh.version });
   if ((await getOrder(r.orderId)).shipment_status !== 'in_transit') throw new Error('stuck');
-  return 'dispatched/in transit/delivered/RTO refused with no photo; allowed with one; later stages not re-checked';
+  return 'no image → dispatched/in transit/delivered, stamped, logged, 0 document rows, image count 0, with an image → dispatched as before; removing it later blocks nothing';
 });
 await step('destinations: admins add, rename and switch off; mismatches refused', async () => {
   const d = await saveDestination({ channel: 'retailers', dispatch_type: 'retailer', name: 'DBCHECK Retailer' });
@@ -1811,11 +1818,9 @@ await step('shared shipment: no order in two shipments; wrong channel/type/desti
   if ((await shipmentMembers(other.shipmentId)).length !== before || (await sharedShipmentOf(h))) throw new Error('partial batch kept');
   return 'already-shipped, self, other channel, other dispatch type refused; race → 1 winner; batches all-or-nothing';
 });
-await step('shared shipment: one photo rule and one status for all; take an order out', async () => {
+await step('shared shipment: one status for all members; take an order out', async () => {
   const lead = (await shipmentMembers(sharedShip))[0].id;
   let sh = (await orderShipments(lead))[0];
-  try { await updateShipment(lead, sh.id, { shipment_status: 'dispatched' }, { actor: ACTOR, version: sh.version }); throw new Error('no photo'); }
-  catch (err) { if (!err.needsPhoto) throw err; }
   await addPhoto(lead);
   await updateShipment(lead, sh.id, { shipment_status: 'dispatched' }, { actor: ACTOR, version: sh.version });
   const list = await listOrders({ q: 'AWB-SHARED-1' });
@@ -1828,7 +1833,7 @@ await step('shared shipment: one photo rule and one status for all; take an orde
   if (!(await orderEvents(b)).some((e) => e.event_type === 'detached_from_shipment')) throw new Error('detach not logged');
   const hist = (await getPool().query('SELECT detached_at FROM shipment_orders WHERE order_id = $1', [b])).rows;
   if (hist.length !== 1 || !hist[0].detached_at) throw new Error('history row lost');
-  return 'photo needed once for the parcel; members show dispatched; detached order back on its own, history kept';
+  return 'one photo for the parcel; members show dispatched; detached order back on its own, history kept';
 });
 await step('courier list includes Shree Tirupati Courier and it can be used', async () => {
   const c = (await listCouriers()).find((x) => x.name === 'Shree Tirupati Courier');
@@ -2247,8 +2252,8 @@ await step('inventory: second batch aggregates; FEFO suggests earliest expiry, s
 });
 await step('inventory: dispatch deducts the confirmed batch once, in the same transaction', async () => {
   // Dispatch with nothing reserved is refused and the status does not change.
+  // No dispatch photo: stock rules are unchanged without one.
   let sh = (await orderShipments(INV.s1lead))[0];
-  await addPhoto(INV.s1lead);
   await expectErr('unreserved', () => updateShipment(INV.s1lead, sh.id, { shipment_status: 'dispatched' }, { actor: ACTOR, version: sh.version }), (e) => e.needsStock);
   if ((await orderShipments(INV.s1lead))[0].shipment_status !== 'packed') throw new Error('status changed');
   await reserveShipmentStock(INV.s1, [{ batch_id: INV.a2, quantity: 20 }], { actor: ACTOR });
