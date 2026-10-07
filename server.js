@@ -44,6 +44,7 @@ import { driver } from './lib/whatsapp.js';
 import { startKeepAlive } from './lib/keepalive.js';
 import { startSlaAlerts, isIngestSilent } from './lib/sla-alert.js';
 import { startShopifyPoll, pollShopifyOnce } from './lib/shopify-poll.js';
+import { startShopifyOrdersPoll } from './lib/shopify-orders.js';
 import { shopifyConfigured, authMode, apiVersionWarning, getAccessToken } from './lib/shopify.js';
 import {
   SCOPES as SHOPIFY_SCOPES, normaliseShop, installUrl, verifyHmac, exchangeCode,
@@ -1237,4 +1238,6 @@ app.listen(port, async () => {
     },
   });
   if (!MOCK) startShopifyPoll();
+  // Shopify ORDERS (not carts): opt-in with SHOPIFY_ORDERS_POLL_ENABLED=true, and only after an initial import.
+  if (!MOCK) startShopifyOrdersPoll();
 });

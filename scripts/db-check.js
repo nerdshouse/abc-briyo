@@ -52,6 +52,7 @@ import { jobPostingLd } from '../lib/careers-pages.js';
 import nodeCrypto from 'node:crypto';
 import { metricsFrom, rawFromRow, rangeParams, classifyMetaError, createMetaClient, createCache, MetaError, createMetaService, metaConfig, todayIn, resolvePurchaseType, _resetMetaService, billingFrom } from '../lib/meta-ads.js';
 import { overviewFor } from '../lib/overview.js';
+import { runShopifySync, mapShopifyOrder, shopifyPaymentMethod, shopifyPaymentStatus, shopifyOrdersStatus } from '../lib/shopify-orders.js';
 import { istDateTime, istDate, istTime, istDayKey as uiIstDayKey } from '../public/ui/ist.js';
 import { issueFormToken, verifyTurnstile, normalizeHost, isCareersRequest } from '../lib/careers.js';
 import net from 'node:net';
@@ -2915,6 +2916,258 @@ await step('new shipment cleanup', async () => {
   if (left.rows[0].n) throw new Error('orders left behind');
   return `${orders} orders removed`;
 });
+/* ------------------------------------------------------------------ Shopify orders */
+// Shopify order GIDs for this run share a numeric prefix, so purgeTestOrders can remove them.
+const SH_NUM = `77${String(Date.now()).slice(-9)}`;
+const SH_PREFIX = `gid://shopify/Order/${SH_NUM}`;
+const SH_ACTOR = 'db-check-shopify';
+const SH = {};
+const shDays = (n) => new Date(Date.now() - n * 86400000).toISOString();
+/** A Shopify Admin GraphQL order node, as the orders query returns it. */
+const shOrder = (n, o = {}) => ({
+  id: `${SH_PREFIX}${String(n).padStart(4, '0')}`, name: o.name || `#SH${SH_NUM.slice(-5)}-${n}`,
+  createdAt: o.created || shDays(2), updatedAt: o.updated || o.created || shDays(2), processedAt: o.created || shDays(2),
+  cancelledAt: o.cancelled ? shDays(0) : null, cancelReason: o.cancelled ? 'CUSTOMER' : null, closedAt: null, test: Boolean(o.test),
+  displayFinancialStatus: o.fin || 'PAID', displayFulfillmentStatus: o.ful || 'UNFULFILLED', paymentGatewayNames: o.gw || ['razorpay'],
+  currencyCode: 'INR', tags: [], note: null,
+  currentTotalPriceSet: { shopMoney: { amount: String(o.total ?? 1299), currencyCode: 'INR' } },
+  totalPriceSet: { shopMoney: { amount: String(o.total ?? 1299), currencyCode: 'INR' } },
+  currentTotalTaxSet: { shopMoney: { amount: '198.15' } }, currentTotalDiscountsSet: { shopMoney: { amount: '0' } },
+  totalShippingPriceSet: { shopMoney: { amount: '49' } },
+  shippingLines: { nodes: [{ title: 'Standard', code: 'STD', originalPriceSet: { shopMoney: { amount: '49' } } }] },
+  fulfillments: o.ful === 'FULFILLED' ? [{ status: 'SUCCESS', createdAt: shDays(1), trackingInfo: [{ company: 'Delhivery', number: 'SHOPIFY-AWB-1', url: null }] }] : [],
+  email: 'buyer@example.test', phone: null,
+  customer: { firstName: o.first || 'Asha', lastName: 'K', email: 'buyer@example.test', phone: '+919800000001' },
+  shippingAddress: { name: 'Asha K', phone: '+919800000001', address1: '12 MG Road', address2: null, city: 'Pune', province: 'MH', zip: '411001', countryCodeV2: 'IN' },
+  lineItems: { pageInfo: { hasNextPage: Boolean(o.moreLines) }, nodes: (o.lines || [{ sku: `${TS}-SH-D3`, qty: 1 }]).map((l, i) => ({
+    id: `gid://shopify/LineItem/${SH_NUM}${String(n).padStart(4, '0')}${i}`, sku: l.sku ?? null, name: l.title || 'Vitamin D3', title: l.title || 'Vitamin D3',
+    variantTitle: '60 caps', quantity: l.qty, currentQuantity: l.qty,
+    originalTotalSet: { shopMoney: { amount: String(l.price ?? 649.5 * l.qty) } }, totalDiscountSet: { shopMoney: { amount: String(l.discount ?? 0) } },
+    taxLines: [{ priceSet: { shopMoney: { amount: '99.07' } } }] })) },
+});
+/** A fake Admin GraphQL: filters by the query's created_at / updated_at bounds, sorts by updatedAt, pages by cursor. */
+const shFake = (store, { denyPii = false, calls = [] } = {}) => async (query, vars) => {
+  calls.push({ first: vars.first, after: vars.after, q: vars.query, pii: /customer \{/.test(query) });
+  if (denyPii && /customer \{/.test(query)) throw new Error('Shopify GraphQL error: This app is not approved to access the Customer object. See protected customer data.');
+  const q = vars.query || '';
+  const ge = (field) => (q.match(new RegExp(`${field}:>='([^']+)'`)) || [])[1];
+  const le = (field) => (q.match(new RegExp(`${field}:<='([^']+)'`)) || [])[1];
+  const rows = store().filter((x) => (!ge('created_at') || x.createdAt >= ge('created_at')) && (!le('created_at') || x.createdAt <= le('created_at'))
+    && (!ge('updated_at') || x.updatedAt >= ge('updated_at'))).sort((a, b) => a.updatedAt.localeCompare(b.updatedAt) || a.id.localeCompare(b.id));
+  const start = vars.after ? Number(vars.after) : 0;
+  const page = rows.slice(start, start + vars.first);
+  // Like Shopify: fields that were not asked for are not returned.
+  const shaped = /customer \{/.test(query) ? page : page.map(({ customer, shippingAddress, email, phone, ...rest }) => rest);
+  return { orders: { pageInfo: { hasNextPage: start + vars.first < rows.length, endCursor: String(start + page.length) }, nodes: shaped } };
+};
+const shOrders = async () => (await getPool().query(`SELECT * FROM orders WHERE source_order_id LIKE $1 ORDER BY source_order_id`, [`${SH_PREFIX}%`])).rows;
+const shItems = async () => (await getPool().query(`SELECT i.* FROM order_items i JOIN orders o ON o.id = i.order_id WHERE o.source_order_id LIKE $1 ORDER BY i.source_line_item_id`, [`${SH_PREFIX}%`])).rows;
+const shOps = async () => (await getPool().query(
+  `SELECT (SELECT count(*) FROM inventory_movements m JOIN orders o ON o.id = m.order_id WHERE o.source_order_id LIKE $1)::int AS movements,
+          (SELECT count(*) FROM order_shipments s JOIN orders o ON o.id = s.order_id WHERE o.source_order_id LIKE $1)::int AS shipments,
+          (SELECT count(*) FROM inventory_reservations r JOIN order_shipments s ON s.id = r.shipment_id JOIN orders o ON o.id = s.order_id WHERE o.source_order_id LIKE $1)::int AS reservations`,
+  [`${SH_PREFIX}%`])).rows[0];
+const byGid = (rows, n) => rows.find((r) => r.source_order_id === `${SH_PREFIX}${String(n).padStart(4, '0')}`);
+
+await step('shopify orders: mapping — payment method/status, cancellation, SKUs never invented, test and oversized orders held back', async () => {
+  const bad = [];
+  const pm = [[['Cash on Delivery (COD)'], 'cod'], [['cash_on_delivery'], 'cod'], [['razorpay'], 'prepaid'], [['Razorpay Secure'], 'prepaid'], [['shopify_payments'], 'prepaid'],
+    [['manual'], 'other'], [['gokwik'], 'other'], [['razorpay', 'gift_card'], 'other'], [['razorpay', 'Cash on Delivery (COD)'], 'cod'], [[], null]];
+  for (const [g, want] of pm) if (shopifyPaymentMethod(g) !== want) bad.push(`method ${g} → ${shopifyPaymentMethod(g)}`);
+  const ps = [['PENDING', 'pending'], ['AUTHORIZED', 'pending'], ['PAID', 'paid'], ['PARTIALLY_PAID', 'partially_paid'], ['REFUNDED', 'refunded'],
+    ['PARTIALLY_REFUNDED', 'partially_refunded'], ['VOIDED', 'voided'], ['EXPIRED', null], ['', null]];
+  for (const [s, want] of ps) if (shopifyPaymentStatus(s) !== want) bad.push(`status ${s} → ${shopifyPaymentStatus(s)}`);
+  const m = mapShopifyOrder(shOrder(1, { lines: [{ sku: null, qty: 2, title: 'Gift box' }, { sku: 'ABC', qty: 1, discount: 50 }], gw: ['Cash on Delivery (COD)'], fin: 'PENDING' }));
+  if (m.error || m.items[0].sku !== null || m.items[0].title !== 'Gift box — 60 caps' || m.items[1].promotion_discount !== -50 || m.items[0].shipping_price !== null) bad.push(`lines ${JSON.stringify(m.items)}`);
+  if (m.payment_method !== 'cod' || m.payment_status !== 'pending' || m.customer_name !== 'Asha K' || m.order_value !== 1299 || m.source_order_id !== `${SH_PREFIX}0001`) bad.push('order fields');
+  if (m.shopify.name !== shOrder(1).name || m.shopify.ship_to?.city !== 'Pune' || JSON.stringify(m.shopify).match(/shpat_|token|secret/i)) bad.push('payload');
+  if (!mapShopifyOrder(shOrder(2, { moreLines: true })).error) bad.push('order with >100 lines accepted');
+  if (!mapShopifyOrder({ ...shOrder(3), id: '1001' }).error) bad.push('non-GID id accepted');
+  if (!mapShopifyOrder(shOrder(4, { cancelled: true })).cancelled) bad.push('cancel flag');
+  if (bad.length) throw new Error(bad.join(' | '));
+  return 'COD/prepaid/other/unknown and 7 financial statuses mapped without guessing; no SKU stays NULL (title never used); discounts negative; shipping kept on the order; non-GID ids and >100-line orders refused';
+});
+
+await step('shopify orders: window, pagination, dry run writes nothing; import is idempotent; 60-day limit enforced', async () => {
+  const bad = [];
+  const store = [];
+  for (let i = 1; i <= 120; i += 1) store.push(shOrder(i, { created: shDays(1 + (i % 19)), lines: [{ sku: `${TS}-SH-D3`, qty: 1 + (i % 3) }, { sku: 'SHOP-MAG-90', qty: 1 }] }));
+  for (let i = 121; i <= 123; i += 1) store.push(shOrder(i, { created: shDays(45) }));
+  store.push(shOrder(124, { test: true }));
+  store.push(shOrder(125, { moreLines: true }));
+  SH.store = store;
+  const calls = [];
+  const gql = shFake(() => SH.store, { calls });
+  await expectErr('90 days', () => runShopifySync({ window: { days: 90 }, gql }), (e) => e.status === 400 && /60 days/.test(e.message));
+  const imports0 = (await getPool().query(`SELECT count(*)::int n FROM order_imports WHERE kind = 'shopify_sync'`)).rows[0].n;
+  const p = await runShopifySync({ window: { days: 30 }, dryRun: true, gql });
+  if (p.summary.found !== 122 || p.summary.newOrders !== 120 || p.summary.skippedTest !== 1 || p.summary.errors !== 1) bad.push(`preview ${JSON.stringify(p.summary)}`);
+  if (calls.length !== 3 || calls.some((c) => c.first !== 50)) bad.push(`pages ${calls.length}`);
+  if ((await shOrders()).length || (await getPool().query(`SELECT count(*)::int n FROM order_imports WHERE kind = 'shopify_sync'`)).rows[0].n !== imports0) bad.push('dry run wrote');
+  // Bounded runs: 50 at a time, then continue from the stored cursor.
+  const r1 = await runShopifySync({ window: { days: 60 }, dryRun: false, gql, actor: SH_ACTOR, maxOrders: 50 });
+  if (!r1.summary.partial || r1.summary.ordersCreated !== 50) bad.push(`partial ${JSON.stringify(r1.summary)}`);
+  const r2 = await runShopifySync({ dryRun: false, gql, actor: SH_ACTOR, resumeRunId: r1.runId });
+  if (r2.summary.partial || r2.summary.ordersCreated !== 73) bad.push(`resume ${JSON.stringify(r2.summary)}`);
+  const orders = await shOrders(); const items = await shItems();
+  if (orders.length !== 123 || items.length !== 243) bad.push(`counts ${orders.length}/${items.length}`);
+  const again = await runShopifySync({ window: { days: 60 }, dryRun: false, gql, actor: SH_ACTOR });
+  if (again.summary.ordersCreated !== 0 || again.summary.unchanged !== 123 || (await shOrders()).length !== 123 || (await shItems()).length !== 243) bad.push(`re-run ${JSON.stringify(again.summary)}`);
+  const o = byGid(orders, 7);
+  if (o.channel !== 'website' || o.source !== 'shopify_sync' || o.fulfillment_type !== 'merchant' || o.dispatch_type !== 'easy_ship' || o.order_status !== 'new'
+    || o.payment_method !== 'prepaid' || o.payment_status !== 'paid' || o.source_payload.shopify.name !== shOrder(7).name) bad.push(`order ${JSON.stringify(o).slice(0, 300)}`);
+  if (bad.length) throw new Error(bad.join(' | '));
+  return '90-day window refused (read_orders = 60); 30-day preview: 122 found, 120 new, 1 test skipped, 1 oversized held back, 3 pages, 0 writes; import in bounded runs (50 + resume 73); re-run creates 0 orders and 0 lines';
+});
+
+await step('shopify orders: SKU resolution — master code, website mapping, unknown stays unmapped and resolves after mapping without re-import', async () => {
+  const bad = [];
+  SH.d3 = (await createSku({ sku: `${TS}-SH-D3`, product_name: 'Vitamin D3 (Shopify test)' }, { actor: ACTOR })).id;
+  SH.mag = (await createSku({ sku: `${TS}-SH-MAG`, product_name: 'Magnesium (Shopify test)' }, { actor: ACTOR })).id;
+  // Lines imported before the SKUs existed resolve on the next sync (unchanged lines included).
+  SH.store.push(shOrder(130, { lines: [{ sku: `${TS}-SH-D3`, qty: 2 }, { sku: 'SHOP-MAG-90', qty: 1 }, { sku: 'SHOP-UNKNOWN-1', qty: 1, title: 'Zinc' }, { sku: null, qty: 1, title: 'Free shaker' }] }));
+  const gql = shFake(() => SH.store);
+  const pre = await runShopifySync({ window: { days: 60 }, dryRun: true, gql });
+  if (pre.summary.unmappedSkus < 3) bad.push(`preview unmapped ${pre.summary.unmappedSkus}`);
+  await runShopifySync({ window: { days: 60 }, dryRun: false, gql, actor: SH_ACTOR });
+  let items = (await shItems()).filter((i) => i.source_line_item_id.includes(`${SH_NUM}0130`));
+  const at = (sku) => items.find((i) => i.sku === sku);
+  if (at(`${TS}-SH-D3`)?.sku_id !== SH.d3) bad.push('exact master code not resolved');
+  if (at('SHOP-MAG-90')?.sku_id !== null) bad.push('unmapped platform code resolved without a mapping');
+  if (items.find((i) => i.sku === null)?.sku_id !== null) bad.push('blank SKU resolved');
+  // An admin maps the Shopify SKU to the master: existing lines resolve, no re-import.
+  await addPlatformMappings(SH.mag, 'website', ['SHOP-MAG-90'], { actor: ACTOR });
+  items = (await shItems()).filter((i) => i.sku === 'SHOP-MAG-90');
+  if (!items.length || items.some((i) => i.sku_id !== SH.mag)) bad.push(`mapping did not resolve existing lines (${items.filter((i) => i.sku_id !== SH.mag).length} left)`);
+  if ((await shItems()).find((i) => i.sku === 'SHOP-UNKNOWN-1')?.sku_id !== null) bad.push('unknown code guessed');
+  if ((await getPool().query(`SELECT count(*)::int n FROM skus WHERE sku ILIKE 'SHOP-%'`)).rows[0].n) bad.push('a SKU was created');
+  const um = (await unmappedSkus()).find((u) => u.code === 'SHOP-UNKNOWN-1');
+  if (!um || um.channel !== 'website' || !um.mappable) bad.push(`unmapped list ${JSON.stringify(um)}`);
+  if (bad.length) throw new Error(bad.join(' | '));
+  return 'master code → resolved; website platform SKU → resolved once mapped (existing lines updated, no re-import); unknown and blank stay unmapped and appear in Unmapped SKUs as mappable; no SKU created';
+});
+
+await step('shopify orders: import touches no stock, reservation or shipment; carts untouched', async () => {
+  const ops = await shOps();
+  const carts = (await getPool().query('SELECT count(*)::int n FROM abandoned_carts')).rows[0].n;
+  await runShopifySync({ window: { days: 60 }, dryRun: false, gql: shFake(() => SH.store), actor: SH_ACTOR });
+  const after = await shOps();
+  if (ops.movements || ops.shipments || ops.reservations || after.movements || after.shipments || after.reservations) throw new Error(JSON.stringify({ ops, after }));
+  if ((await getPool().query('SELECT count(*)::int n FROM abandoned_carts')).rows[0].n !== carts) throw new Error('cart board changed');
+  return '0 stock movements, 0 reservations, 0 shipments after import and re-import; abandoned-cart table unchanged';
+});
+
+await step('shopify orders: changes — safe commercial updates, team payment kept, locked lines and shipped cancellations become conflicts', async () => {
+  const bad = [];
+  const gql = shFake(() => SH.store);
+  const ix = (n) => SH.store.findIndex((x) => x.id === `${SH_PREFIX}${String(n).padStart(4, '0')}`);
+  // Order 10: COD pending; the team marks it paid; Shopify still says pending.
+  SH.store[ix(10)] = shOrder(10, { created: SH.store[ix(10)].createdAt, gw: ['Cash on Delivery (COD)'], fin: 'PENDING', updated: shDays(0.5) });
+  await runShopifySync({ window: { days: 60 }, dryRun: false, gql, actor: SH_ACTOR });
+  let o10 = byGid(await shOrders(), 10);
+  await updateOrder(o10.id, { payment_status: 'paid' }, { actor: ACTOR, version: o10.version });
+  // Order 30: dispatched in Briyo. Order 31: stock reserved, not dispatched. Order 32: no shipment.
+  const batch = (await receiveInventory({ sku_id: SH.d3, batch_number: 'SH-D3-01', expiry_date: dayOffset(400), quantity: 50, unit_cost: 100, request_id: rid() }, { actor: ACTOR })).batchId;
+  const dl = (await listCouriers()).find((c) => c.name === 'Delhivery');
+  const lines = [{ sku: `${TS}-SH-D3`, qty: 2 }];
+  for (const n of [121, 122, 123]) SH.store[ix(n)] = shOrder(n, { created: SH.store[ix(n)].createdAt, lines, updated: shDays(0.4) });
+  await runShopifySync({ window: { days: 60 }, dryRun: false, gql, actor: SH_ACTOR });
+  let rows = await shOrders();
+  for (const n of [121, 122]) {
+    const o = byGid(rows, n);
+    const r = await createShipmentForOrders([Number(o.id)], { courier_partner_id: dl.id, tracking_id: `AWB-SH-${n}-${SH_NUM}` }, { actor: ACTOR });
+    await reserveShipmentStock(r.shipmentId, [{ batch_id: batch, quantity: 2 }], { actor: ACTOR });
+    if (n === 121) {
+      await addPhoto(Number(o.id));
+      const sh = (await orderShipments(Number(o.id)))[0];
+      await updateShipment(Number(o.id), sh.id, { shipment_status: 'dispatched' }, { actor: ACTOR, version: sh.version });
+    }
+  }
+  const moves = (await shOps()).movements;
+  // Shopify changes: 10 name + value; 30 qty + cancelled; 31 qty; 32 cancelled; also checkpoint-driven incremental mode.
+  const now = new Date().toISOString();
+  SH.store[ix(10)] = { ...shOrder(10, { created: SH.store[ix(10)].createdAt, gw: ['Cash on Delivery (COD)'], fin: 'PENDING', first: 'Ashwini', total: 1499 }), updatedAt: now };
+  SH.store[ix(121)] = { ...shOrder(121, { created: SH.store[ix(121)].createdAt, lines: [{ sku: `${TS}-SH-D3`, qty: 5 }], cancelled: true }), updatedAt: now };
+  SH.store[ix(122)] = { ...shOrder(122, { created: SH.store[ix(122)].createdAt, lines: [{ sku: `${TS}-SH-D3`, qty: 4 }] }), updatedAt: now };
+  SH.store[ix(123)] = { ...shOrder(123, { created: SH.store[ix(123)].createdAt, lines, cancelled: true }), updatedAt: now };
+  const pre = await runShopifySync({ window: { mode: 'incremental' }, dryRun: true, gql });
+  if (pre.summary.conflicts !== 2) bad.push(`preview conflicts ${pre.summary.conflicts}`);
+  const r = await runShopifySync({ window: { mode: 'incremental' }, dryRun: false, gql, actor: SH_ACTOR });
+  if (r.summary.found !== 4 || r.summary.conflicts !== 2) bad.push(`incremental ${JSON.stringify(r.summary)}`);
+  rows = await shOrders(); const items = await shItems();
+  o10 = byGid(rows, 10);
+  if (o10.customer_name !== 'Ashwini K' || Number(o10.order_value) !== 1499 || o10.payment_status !== 'paid') bad.push(`order 10 ${o10.customer_name}/${o10.order_value}/${o10.payment_status}`);
+  const qty = (n) => items.find((i) => i.order_id === byGid(rows, n).id).quantity;
+  if (qty(121) !== 2 || qty(122) !== 2) bad.push(`locked lines changed ${qty(121)}/${qty(122)}`);
+  if (byGid(rows, 121).order_status === 'cancelled') bad.push('dispatched order cancelled');
+  if (byGid(rows, 123).order_status !== 'cancelled') bad.push('unshipped cancellation not applied');
+  if ((await shOps()).movements !== moves) bad.push('stock moved');
+  const ev = async (n) => (await getPool().query(`SELECT metadata->>'kind' k FROM order_events WHERE order_id = $1 AND event_type = 'shopify_sync_conflict'`, [byGid(rows, n).id])).rows.map((x) => x.k).sort();
+  if ((await ev(121)).join() !== 'cancelled_with_shipment,lines_locked' || (await ev(122)).join() !== 'lines_locked') bad.push(`conflict events ${await ev(121)} / ${await ev(122)}`);
+  // The same conflict is not re-logged on every sync.
+  await runShopifySync({ window: { mode: 'incremental' }, dryRun: false, gql, actor: SH_ACTOR });
+  if ((await ev(121)).length !== 2) bad.push('conflict re-logged');
+  if (bad.length) throw new Error(bad.join(' | '));
+  return 'name/value updated; team-marked "paid" kept over Shopify "pending"; reserved (31) and dispatched (30) lines unchanged → lines_locked; Shopify cancel of dispatched 30 → conflict, of unshipped 32 → cancelled; no stock moved; conflicts logged once';
+});
+
+await step('shopify orders: manual duplicates held back; customer-data denial tolerated; audit rows; no credential anywhere', async () => {
+  const bad = [];
+  // A website order typed in by hand as "#SH-DUP" — the Shopify order with that name is not imported.
+  const dupName = `#SHDUP${SH_NUM.slice(-4)}`;
+  await createOrder({ channel: 'website', source_order_id: dupName.slice(1), dispatch_type: 'easy_ship' }, { actor: ACTOR });
+  SH.store.push(shOrder(140, { name: dupName }));
+  const r = await runShopifySync({ window: { days: 60 }, dryRun: false, gql: shFake(() => SH.store), actor: SH_ACTOR });
+  if (r.summary.possibleDuplicates !== 1 || byGid(await shOrders(), 140)) bad.push('manual duplicate imported');
+  // Protected customer data not approved: the sync carries on without it.
+  SH.store.push(shOrder(141));
+  const calls = [];
+  const r2 = await runShopifySync({ window: { days: 60 }, dryRun: false, gql: shFake(() => SH.store, { denyPii: true, calls }), actor: SH_ACTOR });
+  const o141 = byGid(await shOrders(), 141);
+  if (r2.summary.customerDataAvailable !== false || !o141 || o141.customer_name !== null || calls.filter((c) => !c.pii).length < 1) bad.push('pii fallback');
+  // Audit: every run is an order_imports row.
+  const runs = (await getPool().query(`SELECT status, imported_by, orders_in_file, orders_created, conflicts, started_at, completed_at, details
+    FROM order_imports WHERE kind = 'shopify_sync' AND imported_by = $1 ORDER BY id`, [SH_ACTOR])).rows;
+  if (runs.length < 8 || runs.some((x) => !x.started_at || !x.completed_at || !['completed', 'partial'].includes(x.status)) || !runs.some((x) => x.conflicts === 2)) bad.push(`audit ${runs.length}`);
+  // The real client: token in a header to a stub, never in a URL, a result, a payload or the console.
+  const secret = 'shpat_SHOULDNEVERLEAK0123456789';
+  const seen = [];
+  const stub = http.createServer((req, res) => { let b = ''; req.on('data', (c) => { b += c; }); req.on('end', () => {
+    seen.push({ url: req.url, token: req.headers['x-shopify-access-token'], body: b });
+    res.setHeader('content-type', 'application/json');
+    res.end(JSON.stringify({ data: { orders: { pageInfo: { hasNextPage: false, endCursor: null }, nodes: [shOrder(150)] } } }));
+  }); });
+  await new Promise((ok) => stub.listen(0, '127.0.0.1', ok));
+  const keep = { ...process.env };
+  const logs = []; const orig = { log: console.log, error: console.error, warn: console.warn };
+  try {
+    Object.assign(process.env, { APP_ENV: 'test', SHOPIFY_GRAPHQL_BASE: `http://127.0.0.1:${stub.address().port}`, SHOPIFY_STORE_DOMAIN: 'briyo-test.myshopify.com', SHOPIFY_ACCESS_TOKEN: secret });
+    for (const k of ['log', 'error', 'warn']) console[k] = (...a) => logs.push(a.join(' '));
+    const out = await runShopifySync({ window: { days: 60 }, dryRun: false, actor: SH_ACTOR });
+    if (seen[0]?.token !== secret || seen.some((s) => s.url.includes(secret) || s.body.includes(secret))) bad.push('token transport');
+    const o150 = byGid(await shOrders(), 150);
+    const audit = (await getPool().query(`SELECT * FROM order_imports WHERE id = $1`, [out.runId])).rows[0];
+    if ([JSON.stringify(out), JSON.stringify(o150), JSON.stringify(audit), logs.join('\n')].some((x) => x.includes(secret))) bad.push('token leaked');
+    const status = await shopifyOrdersStatus();
+    if (JSON.stringify(status).includes(secret) || !status.configured || status.ordersSynced < 120) bad.push(`status ${JSON.stringify(status).slice(0, 200)}`);
+  } finally {
+    for (const k of ['log', 'error', 'warn']) console[k] = orig[k];
+    for (const k of ['APP_ENV', 'SHOPIFY_GRAPHQL_BASE', 'SHOPIFY_STORE_DOMAIN', 'SHOPIFY_ACCESS_TOKEN']) { if (keep[k] === undefined) delete process.env[k]; else process.env[k] = keep[k]; }
+    stub.close();
+  }
+  if (bad.length) throw new Error(bad.join(' | '));
+  return 'hand-entered duplicate held back; protected customer data refused → imported without PII; every run audited (who, when, counts, conflicts); token only in the request header — not in URL, body, results, payloads, audit, status or logs';
+});
+
+await step('shopify orders cleanup', async () => {
+  await purgeTestOrders(SH_PREFIX);
+  await getPool().query(`DELETE FROM order_imports WHERE kind = 'shopify_sync' AND imported_by = $1`, [SH_ACTOR]);
+  const dup = `SHDUP${SH_NUM.slice(-4)}`;
+  const { rows } = await getPool().query(`SELECT id FROM orders WHERE channel = 'website' AND source_order_id = $1`, [dup]);
+  if (rows.length) await purgeTestOrders(dup);
+  return 'test orders, items, shipments, stock and sync runs removed';
+});
+
 await step('inventory cleanup', async () => {
   const { skus, paths } = await purgeTestInventory(TS);
   for (const p of paths) await storage().remove(p).catch(() => {});

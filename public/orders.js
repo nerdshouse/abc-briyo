@@ -83,6 +83,10 @@ const amount = (v) => (v === null || v === undefined ? '—' : money(v));
 const day = (iso) => (iso ? dateShort(iso) : '—');
 
 const channelLabel = (key) => state.meta.channels.find((c) => c.key === key)?.label || key;
+// Shopify orders are Website orders keyed on Shopify's GID; people know them by "#1001".
+const isShopify = (o) => o?.source === 'shopify_sync';
+const orderNo = (o) => o?.display_number || o?.source_payload?.shopify?.name || o?.source_order_id;
+const channelOf = (o) => `${o.channel_label || channelLabel(o.channel)}${isShopify(o) ? ' · Shopify' : ''}`;
 const typeLabel = (key) => state.meta.dispatchTypes.find((t) => t.key === key)?.label || (key ? label(key) : 'No type');
 const destinationName = (id) => state.meta.destinations.find((d) => d.id === Number(id))?.name || (id ? `#${id}` : '—');
 /** Channels used for a dispatch type (all channels when none is chosen). */
@@ -232,8 +236,8 @@ function renderRows() {
   }
   $('#rows').innerHTML = state.orders.map((o) => `
     <tr class="orow${o.id === state.openId ? ' open' : ''}" data-id="${o.id}" tabindex="0">
-      <td><span class="cell-main mono" style="font-weight:500">${pickBox(o)}${esc(o.source_order_id)}${cancelledTag(o)}</span>${lineSkus(o)}</td>
-      <td><span class="cell-main chan">${esc(o.channel_label)}</span>${o.destination_name
+      <td><span class="cell-main mono" style="font-weight:500">${pickBox(o)}${esc(orderNo(o))}${cancelledTag(o)}</span>${lineSkus(o)}</td>
+      <td><span class="cell-main chan">${esc(channelOf(o))}</span>${o.destination_name
         ? `<span class="cell-sub muted" title="${esc(o.destination_name)}">${esc(o.destination_name)}</span>`
         : o.dispatch_type ? `<span class="cell-sub muted">${esc(typeLabel(o.dispatch_type))}</span>` : ''}</td>
       <td>${o.courier_name ? esc(o.courier_name) : '<span class="muted-cell">—</span>'}</td>
@@ -243,11 +247,11 @@ function renderRows() {
       <td class="num"${o.order_date ? '' : ' title="No order date — shown by when it was entered"'}>${esc(day(o.order_date))}</td>
       <td class="col-cust"><span class="cell-main">${o.customer_name ? esc(o.customer_name) : '<span class="muted-cell">—</span>'}</span></td>
       <td class="r num col-amt">${esc(amount(o.order_value))}</td>
-      <td class="r"><button class="icon-btn bare" type="button" data-open="${o.id}" title="Open" aria-label="Open order ${esc(o.source_order_id)}">${icon('chevron-right')}</button></td>
+      <td class="r"><button class="icon-btn bare" type="button" data-open="${o.id}" title="Open" aria-label="Open order ${esc(orderNo(o))}">${icon('chevron-right')}</button></td>
     </tr>`).join('');
   $('#clist').innerHTML = state.orders.map((o) => `
     <li class="oitem" data-id="${o.id}" tabindex="0">
-      <div class="oi-top">${pickBox(o)}<span class="oi-id mono">${esc(o.source_order_id)}</span><span class="chan">${esc(o.channel_label)}</span>${cancelledTag(o)}
+      <div class="oi-top">${pickBox(o)}<span class="oi-id mono">${esc(orderNo(o))}</span><span class="chan">${esc(channelOf(o))}</span>${cancelledTag(o)}
         <span class="oi-val">${shipIndicator(o)}</span></div>
       ${o.line_skus?.length ? `<div class="oi-sub">${lineSkus(o)}</div>` : ''}
       ${o.destination_name ? `<div class="oi-sub">${icon('map-pin')} ${esc(o.destination_name)}</div>` : ''}
@@ -482,7 +486,7 @@ function renderDrawer() {
   // In a shared shipment the photos and papers are the shipment's (kept on its lead order).
   const proofDocs = state.detail.shipmentDocuments || documents;
 
-  $('#dTitle').textContent = `Order ${o.source_order_id}`;
+  $('#dTitle').textContent = `Order ${orderNo(o)}`;
   $('#dSub').textContent = [o.channel_label, o.dispatch_type && typeLabel(o.dispatch_type), o.destination_name, o.order_date && dateTime(o.order_date),
     o.order_status === 'cancelled' && 'Order cancelled'].filter(Boolean).join(' · ');
   queueMicrotask(() => loadStock(ship.id));
@@ -594,6 +598,25 @@ function itemsSection(o, items) {
 }
 
 /** What the Amazon report said beyond the order's own fields. */
+/** Shopify's own record, for reference. Its fulfilments are not Briyo shipments. */
+function shopifyDetails(s) {
+  if (!s) return '';
+  const to = s.ship_to || {};
+  const place = [to.address_1, to.address_2, to.city, to.state, to.postal_code].filter(Boolean).join(', ');
+  const tracking = (s.fulfillments || []).flatMap((f) => (f.tracking || []).map((t) => [t.company, t.number].filter(Boolean).join(' ')));
+  const rows = [
+    ['Ship To', [to.name, place, to.phone].filter(Boolean).join(' · ')],
+    ['Shopify Payment', [s.financial_status && label(s.financial_status.toLowerCase()), (s.gateways || []).join(', ')].filter(Boolean).join(' · ')],
+    ['Shopify Fulfilment', [s.fulfillment_status && label(s.fulfillment_status.toLowerCase()), tracking.length ? `tracking ${tracking.join(', ')}` : ''].filter(Boolean).join(' · ')
+      + (s.fulfillment_status && s.fulfillment_status !== 'UNFULFILLED' ? ' (Shopify\'s record — not a Briyo shipment)' : '')],
+    ['Shipping', (s.shipping_lines || []).map((l) => [l.title, l.price !== null && l.price !== undefined ? money(l.price) : null].filter(Boolean).join(' ')).join(', ')],
+    ['Cancelled in Shopify', s.cancelled_at ? `${dateTime(s.cancelled_at)}${s.cancel_reason ? ` · ${label(s.cancel_reason.toLowerCase())}` : ''}` : ''],
+    ['Tags', (s.tags || []).join(', ')],
+    ['Shopify Note', s.note],
+  ].filter(([, v]) => v);
+  return rows.map(([k, v]) => `<dt>${k}</dt><dd>${esc(v)}</dd>`).join('');
+}
+
 function amazonDetails(a) {
   if (!a) return '';
   const to = a.ship_to || {};
@@ -634,8 +657,9 @@ function drawerCommon(o, documents, proofDocs, events, notes) {
     <details class="dsec more-sec">
       <summary class="dsec-title">Order details <span class="dsec-meta soft">${esc([amount(o.order_value), o.customer_name].filter((x) => x && x !== '—').join(' · ') || 'value, customer, payment')}</span></summary>
       <dl class="kv" style="margin-top:10px">
-        <dt>Order Number</dt><dd class="mono">${esc(o.source_order_id)}</dd>
-        <dt>Channel</dt><dd>${esc(o.channel_label)}</dd>
+        <dt>Order Number</dt><dd class="mono">${esc(orderNo(o))}</dd>
+        ${isShopify(o) ? `<dt>Shopify ID</dt><dd class="mono soft">${esc(o.source_payload?.shopify?.legacy_id || o.source_order_id)}</dd>` : ''}
+        <dt>Channel</dt><dd>${esc(channelOf(o))}</dd>
         <dt>Dispatch type</dt><dd>${o.dispatch_type ? esc(typeLabel(o.dispatch_type)) : '<span class="muted">Not set</span>'}</dd>
         ${o.destination_name ? `<dt>Destination</dt><dd>${esc(o.destination_name)}</dd>` : ''}
         <dt>Order date</dt><dd>${o.order_date ? esc(dateTime(o.order_date)) : '<span class="muted">Not entered</span>'}</dd>
@@ -643,8 +667,9 @@ function drawerCommon(o, documents, proofDocs, events, notes) {
         <dt>Customer</dt><dd>${esc([o.customer_name, o.customer_phone, o.customer_email].filter(Boolean).join(' · ') || '—')}</dd>
         <dt>Payment</dt><dd>${esc([o.payment_method && label(o.payment_method), o.payment_status && label(o.payment_status)].filter(Boolean).join(' · ') || 'Not known')}</dd>
         <dt>Fulfillment</dt><dd>${esc(o.fulfillment_type ? label(o.fulfillment_type) : 'Not set')}</dd>
-        <dt>Entered</dt><dd>${esc(o.created_by || 'System')}, ${esc(dateTime(o.created_at))}${o.source === 'amazon_import' ? ' · Amazon import' : ''}</dd>
+        <dt>Entered</dt><dd>${esc(o.created_by || 'System')}, ${esc(dateTime(o.created_at))}${o.source === 'amazon_import' ? ' · Amazon import' : isShopify(o) ? ' · Shopify sync' : ''}</dd>
         ${amazonDetails(o.source_payload?.amazon)}
+        ${shopifyDetails(o.source_payload?.shopify)}
       </dl>
       ${canEdit() ? `<div class="d-row" style="margin-top:12px">
         <label class="d-label" for="dOrderStatus">Order status</label>
@@ -671,7 +696,7 @@ function renderDrawerNoShipment() {
   const { order: o, documents, events } = state.detail;
   state.shipId = null;
   const notes = events.filter((e) => e.event_type === 'note_added');
-  $('#dTitle').textContent = `Order ${o.source_order_id}`;
+  $('#dTitle').textContent = `Order ${orderNo(o)}`;
   $('#dSub').textContent = [o.channel_label, o.dispatch_type && typeLabel(o.dispatch_type), o.destination_name, o.order_date && dateTime(o.order_date),
     o.order_status === 'cancelled' && 'Order cancelled'].filter(Boolean).join(' · ');
   $('#dBody').innerHTML = `
@@ -717,7 +742,7 @@ function describeEvent(e) {
     case 'shipment_order_detached': return ['package-minus', 'warn', `Order ${esc(md.source_order_id)} taken out of this shipment`];
     case 'attached_to_shipment': return ['package', 'info', `Added to the shipment of order ${esc(md.lead_source_order_id)}${md.tracking_id ? ` (AWB ${esc(md.tracking_id)})` : ''}`];
     case 'detached_from_shipment': return ['package-minus', 'warn', 'Taken out of the shared shipment'];
-    case 'order_created': return ['plus', 'info', `${md.source === 'amazon_import' ? 'Imported from Amazon ·' : `Order created · ${esc(channelLabel(md.channel))}`} ${esc(md.source_order_id)}${md.order_value === null || md.order_value === undefined ? '' : ` · ${esc(money(md.order_value))}`}`];
+    case 'order_created': return ['plus', 'info', `${md.source === 'amazon_import' ? 'Imported from Amazon ·' : md.source === 'shopify_sync' ? 'Imported from Shopify ·' : `Order created · ${esc(channelLabel(md.channel))}`} ${esc(md.shopify_name || md.source_order_id)}${md.order_value === null || md.order_value === undefined ? '' : ` · ${esc(money(md.order_value))}`}`];
     case 'order_status_changed': return ['circle-dot', ch.order_status?.to === 'cancelled' ? 'bad' : '', `Order ${esc(label(ch.order_status?.from))} → <b>${esc(label(ch.order_status?.to))}</b>`];
     case 'shipment_status_changed': {
       const to = ch.shipment_status?.to;
@@ -740,6 +765,12 @@ function describeEvent(e) {
         md.details_changed && 'Amazon details refreshed'].filter(Boolean);
       return ['file-down', 'info', `Updated from Amazon import${parts.length ? `: ${parts.join('; ')}` : ''}`];
     }
+    case 'shopify_sync_updated': {
+      const parts = [changeList(ch), md.items_added && `${md.items_added} item${md.items_added > 1 ? 's' : ''} added`,
+        md.items_updated && `${md.items_updated} item${md.items_updated > 1 ? 's' : ''} updated`].filter(Boolean);
+      return ['refresh-cw', 'info', `Updated from Shopify${parts.length ? `: ${parts.join('; ')}` : ''}`];
+    }
+    case 'shopify_sync_conflict': return ['triangle-alert', 'warn', `Shopify sync conflict: ${esc(md.detail || md.kind)}`];
     case 'note_added': return ['message-square-text', '', `Note: ${esc(md.note)}`];
     case 'stock_released': return ['package-open', 'warn', `Reserved stock released${md.reason === 'order cancelled' ? ' — order cancelled' : ''}`];
     case 'amazon_import_lines_locked': return ['lock', 'warn', `Amazon import did not change ${md.lines} item${md.lines > 1 ? 's' : ''}: stock for this order has already been dispatched`];
@@ -1631,6 +1662,121 @@ async function commitImport() {
   }
 }
 
+/* ---------------------------------------------------------- Shopify orders (admin) */
+
+const sf = { busy: false, status: null, preview: null, done: false };
+const sfError = (msg) => { $('#sfError').textContent = msg || ''; $('#sfError').hidden = !msg; };
+
+/** The window as the API takes it. Dates are whole IST days, inclusive. */
+function sfWindow() {
+  const m = $('#sfMode').value;
+  if (m === 'incremental') return { mode: 'incremental' };
+  if (m === 'custom') {
+    const from = $('#sfFrom').value; const to = $('#sfTo').value;
+    return { mode: 'window', from: from ? `${from}T00:00:00+05:30` : undefined, to: to ? `${to}T23:59:59+05:30` : undefined };
+  }
+  return { mode: 'window', days: Number(m) };
+}
+
+async function openShopify() {
+  Object.assign(sf, { preview: null, done: false });
+  sfError(''); $('#sfResult').innerHTML = ''; $('#sfSaved').textContent = '';
+  $('#sfSubmit').disabled = true; $('#sfSubmit').textContent = 'Import'; $('#sfPreview').disabled = true;
+  $('#shopifyDrawer').hidden = false; $('#drawerScrim').hidden = false;
+  try {
+    const st = await api('/api/orders/shopify/status');
+    sf.status = st;
+    const last = st.lastRun;
+    $('#sfConn').innerHTML = `<h3 class="dsec-title">Shopify <span class="dsec-meta">${st.configured ? '<span class="health healthy">Connected</span>' : '<span class="health">Not connected</span>'}</span></h3>
+      ${st.configured ? `<dl class="kv">
+        <dt>Store</dt><dd class="mono">${esc(st.store || '—')}</dd>
+        <dt>Last sync</dt><dd>${last ? `${esc(dateTime(last.completed_at || last.started_at))} · ${esc(label(last.status || 'completed'))}${last.imported_by ? ` · ${esc(last.imported_by)}` : ''}` : 'Never'}</dd>
+        <dt>Orders synced</dt><dd class="num">${count(st.ordersSynced)}</dd>
+        <dt>Automatic sync</dt><dd>${st.pollEnabled ? 'On (changes every few minutes)' : 'Off — sync manually here'}</dd>
+      </dl>` : `<p class="imp-note" style="margin:0 0 10px">Connect the store once; Briyo OS then reads orders with read-only access. Nothing is changed in Shopify.</p>
+        <a class="btn primary" href="/auth/shopify/install" data-full-nav>${icon('plug-zap')}Connect Shopify</a>`}`;
+    $('#sfForm').hidden = !st.configured;
+    $('#sfNote').textContent = `Shopify returns orders from the last ${st.maxWindowDays} days with the current access. Importing creates orders and line items only — no shipments, no stock reserved or deducted.`;
+    const incr = $('#sfMode').querySelector('option[value="incremental"]');
+    incr.disabled = !st.checkpoint; incr.textContent = st.checkpoint ? `Changes since the last sync (${dateTime(st.checkpoint)})` : 'Changes since the last sync (after a first import)';
+    $('#sfPreview').disabled = !st.configured;
+    renderShopifyHistory(st.history || []);
+  } catch (err) {
+    $('#sfConn').innerHTML = ''; sfError(err.message);
+  }
+  renderIcons();
+}
+
+function renderShopifyHistory(runs) {
+  $('#sfHistory').innerHTML = runs.length ? `<section class="dsec">
+    <h3 class="dsec-title">Recent syncs</h3>
+    <div class="imp-scroll"><table class="imp-errors"><thead><tr><th>When</th><th>By</th><th>Status</th><th>Fetched</th><th>New</th><th>Updated</th><th>Conflicts</th><th>Unmapped lines</th><th>Errors</th></tr></thead><tbody>
+    ${runs.map((x) => `<tr><td>${esc(dateTime(x.completed_at || x.started_at))}</td><td>${esc(x.imported_by || '—')}</td>
+      <td>${esc(label(x.status || '—'))}${x.resumable ? ` <button type="button" class="linkish" data-sf-resume="${x.id}">Continue</button>` : ''}</td>
+      <td class="num">${count(x.orders_in_file)}</td><td class="num">${count(x.orders_created)}</td><td class="num">${count(x.orders_updated)}</td>
+      <td class="num">${count(x.conflicts)}</td><td class="num">${count(x.unmapped_lines)}</td><td class="num">${count(x.error_rows)}</td></tr>`).join('')}
+    </tbody></table></div></section>` : '';
+}
+
+function sfReport(r, applied) {
+  const s = r.summary;
+  const list = (title, rows, fmt) => (rows.length ? `<section class="dsec"><h3 class="dsec-title">${esc(title)} <span class="dsec-meta">${count(rows.length)}</span></h3>
+    <ul class="imp-list">${rows.slice(0, 50).map(fmt).join('')}</ul></section>` : '');
+  return `<section class="dsec">
+      <h3 class="dsec-title">${applied ? 'Imported' : 'Preview'} <span class="dsec-meta">${applied ? indicator('completed') : 'nothing saved yet'}</span></h3>
+      <div class="imp-stats">
+        ${stat(s.found, 'Found in Shopify')}
+        ${stat(applied ? s.ordersCreated : s.newOrders, applied ? 'Orders added' : 'New')}
+        ${stat(s.unchanged, 'Already imported')}
+        ${stat(s.changed, applied ? 'Updated' : 'Changed')}
+        ${stat(s.unmappedSkus, 'Unmapped SKUs', s.unmappedSkus ? 'warn' : '')}
+        ${stat(s.conflicts, 'Conflicts', s.conflicts ? 'warn' : '')}
+        ${s.possibleDuplicates ? stat(s.possibleDuplicates, 'Possible duplicates held back', 'warn') : ''}
+        ${s.errors ? stat(s.errors, 'Not imported', 'bad') : ''}
+        ${s.skippedTest ? stat(s.skippedTest, 'Test orders skipped') : ''}
+      </div>
+      ${s.partial ? '<p class="imp-note">This window has more orders than one run takes. Import, then choose Continue on the run below.</p>' : ''}
+      ${s.customerDataAvailable === false ? '<p class="imp-note">Shopify did not share customer name, email, phone or address (protected customer data is not approved for this app). Orders import without them.</p>' : ''}
+      <p class="imp-note">Orders and line items only. No shipments are created and no stock is reserved or deducted; Logistics ships them as usual.</p>
+    </section>
+    ${list('Unmapped SKUs', r.unmapped || [], (u) => `<li><span class="mono">${esc(u.code || '(no SKU in Shopify)')}</span> · ${esc(u.title || '')} · ${count(u.lines)} line${u.lines === 1 ? '' : 's'}</li>`)}
+    ${list('Conflicts — not applied', (r.conflicts || []).flatMap((c) => c.conflicts.map((x) => ({ ...c, ...x }))), (c) => `<li><b>${esc(c.name || '')}</b> · ${esc(c.detail)}</li>`)}
+    ${list('Possible duplicates — held back', r.duplicates || [], (d) => `<li><b>${esc(d.name)}</b> already exists as website order <span class="mono">${esc(d.existingNumber)}</span> (entered by hand). Not imported.</li>`)}
+    ${list('Not imported', r.errors || [], (e) => `<li><b>${esc(e.name || e.shopifyId || '')}</b> · ${esc(e.reason)}</li>`)}`;
+}
+
+async function sfRun(step, extra = {}) {
+  if (sf.busy) return;
+  sf.busy = true; sfError('');
+  $('#sfPreview').disabled = true; $('#sfSubmit').disabled = true;
+  $('#sfSaved').textContent = step === 'preview' ? 'Reading Shopify…' : 'Importing…';
+  try {
+    const r = await api(`/api/orders/shopify/${step}`, { method: 'POST', body: JSON.stringify({ ...sfWindow(), ...extra }) });
+    $('#sfResult').innerHTML = sfReport(r, step === 'sync');
+    if (step === 'preview') {
+      const work = (r.summary.newOrders || 0) + (r.summary.changed || 0);
+      $('#sfSubmit').textContent = work ? `Import ${count(work)} order${work > 1 ? 's' : ''}` : 'Nothing to import';
+      $('#sfSubmit').disabled = !work;
+    } else {
+      sf.done = true; $('#sfSubmit').textContent = 'Done'; $('#sfSubmit').disabled = false;
+      load();
+      const st = await api('/api/orders/shopify/status').catch(() => null);
+      if (st) renderShopifyHistory(st.history || []);
+    }
+  } catch (err) {
+    sfError(`${err.message} Nothing was saved.`);
+  } finally {
+    sf.busy = false; $('#sfSaved').textContent = ''; $('#sfPreview').disabled = !sf.status?.configured;
+    renderIcons();
+  }
+}
+
+function closeShopify() {
+  if (sf.busy) return;
+  $('#shopifyDrawer').hidden = true;
+  if ($('#drawer').hidden && $('#formDrawer').hidden && $('#createDrawer').hidden && $('#importDrawer').hidden) $('#drawerScrim').hidden = true;
+}
+
 function bind() {
   const ids = { status: 'fstatus', shipment: 'fshipment', courier: 'fcourier', invoice: 'finvoice', tracking: 'ftracking', from: 'ffrom', to: 'fto' };
   for (const [k, id] of Object.entries(ids)) {
@@ -1695,6 +1841,19 @@ function bind() {
   $('#newShipment').addEventListener('click', openCreate);
   $('#importOrders').addEventListener('click', openImport);
   $('#iClose').addEventListener('click', closeImport);
+  $('#shopifyOrders').addEventListener('click', openShopify);
+  $('#sfClose').addEventListener('click', closeShopify);
+  $('#sfPreview').addEventListener('click', () => sfRun('preview'));
+  $('#sfSubmit').addEventListener('click', () => (sf.done ? closeShopify() : sfRun('sync')));
+  $('#sfMode').addEventListener('change', () => {
+    const custom = $('#sfMode').value === 'custom';
+    $('#sfFromF').hidden = !custom; $('#sfToF').hidden = !custom;
+    $('#sfSubmit').disabled = true; $('#sfSubmit').textContent = 'Import'; $('#sfResult').innerHTML = ''; sf.done = false;
+  });
+  $('#sfHistory').addEventListener('click', (e) => {
+    const b = e.target.closest('[data-sf-resume]');
+    if (b) sfRun('sync', { resumeRunId: Number(b.dataset.sfResume) });
+  });
   $('#iCancel').addEventListener('click', closeImport);
   $('#iFile').addEventListener('change', (e) => { imp.file = e.target.files[0] || null; imp.done = false; previewImport(); });
   $('#iSubmit').addEventListener('click', () => (imp.done ? closeImport() : commitImport()));
@@ -1706,6 +1865,7 @@ function bind() {
   const closeTop = () => {
     if (!$('#shipDrawer').hidden) closeShipNew();
     else if (!$('#importDrawer').hidden) closeImport();
+    else if (!$('#shopifyDrawer').hidden) closeShopify();
     else if (!$('#createDrawer').hidden) closeCreate();
     else if (!$('#formDrawer').hidden) closeForm();
     else if (!$('#drawer').hidden) closeDrawer();
@@ -1739,6 +1899,8 @@ function bind() {
     setTimezone(meta.timezone);
     for (const el of $$('.tz-note')) el.textContent = meta.timezone === 'Asia/Kolkata' ? '(IST)' : `(${meta.timezone})`;
     initShell(me);
+    // Shopify connection and sync are admin-only (the API enforces it too).
+    $('#shopifyOrders').hidden = !me.isAdmin;
     fillFilters();
     bind();
     await load({ pending: firstOrders });
