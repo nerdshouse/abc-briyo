@@ -2977,7 +2977,6 @@ const shOrder = (n, o = {}) => {
       return {
         id: shLineGid(n, i), sku: l.sku ?? null, name: l.title || 'Vitamin D3', title: l.title || 'Vitamin D3', variantTitle: '60 caps',
         quantity: l.qty, currentQuantity: l.qty - refundedQty(i), refundableQuantity: l.qty - refundedQty(i), taxable: true, isGiftCard: false, requiresShipping: true,
-        variant: { id: `gid://shopify/ProductVariant/${9000 + i}` }, product: { id: `gid://shopify/Product/${8000 + i}` },
         originalUnitPriceSet: shM('649.50'), discountedUnitPriceAfterAllDiscountsSet: shM('649.50'),
         originalTotalSet: shM(price), discountedTotalSet: shM(price - (l.discount ?? 0)), totalDiscountSet: shM(l.discount ?? 0),
         taxLines: [{ title: 'IGST', rate: 0.18, ratePercentage: 18, channelLiable: false, priceSet: shM('99.07') }],
@@ -3310,7 +3309,9 @@ await step('financial snapshots: every Shopify query stays under the 1,000-point
     || !/refundLineItems\(first: 50\)/.test(refund) || !/refundShippingLines\(first: 5\)/.test(refund)) bad.push('sizes not in query text');
   for (const f of ['taxesIncluded', 'presentmentCurrencyCode', 'totalRefundedSet', 'totalRefundedShippingSet', 'discountCodes', 'customAttributes', 'currentSubtotalPriceSet', 'currentShippingPriceSet'])
     if (!page.includes(f)) bad.push(`page query lacks ${f}`);
-  for (const f of ['originalUnitPriceSet', 'discountAllocations', 'taxLines', 'variant', 'product', 'refunds']) if (!detail.includes(f)) bad.push(`detail query lacks ${f}`);
+  for (const f of ['originalUnitPriceSet', 'discountAllocations', 'taxLines', 'refunds']) if (!detail.includes(f)) bad.push(`detail query lacks ${f}`);
+  // variant / product need read_products, which the app does not hold: never requested.
+  for (const q of [detail, shopifyOrderQuery('orderLines')]) if (/\b(variant|product) \{/.test(q)) bad.push('a line query requests variant or product');
   if (bad.length) throw new Error(bad.join(' | '));
   return `limit ${SHOPIFY_MAX_QUERY_COST}: ${out.join('; ')}`;
 });
@@ -3351,7 +3352,7 @@ await step('financial snapshots: exact amounts, lines, discounts, attributes and
   if (s.shopify_customer_gid !== `gid://shopify/Customer/${SH_NUM}`) bad.push('customer gid');
   const lines = (await getPool().query(`SELECT * FROM order_financial_snapshot_lines WHERE snapshot_id = $1 ORDER BY position`, [s.id])).rows;
   if (lines.length !== 2 || lines[0].original_unit_price !== '649.50' || lines[0].total_discount !== '129.90' || lines[0].discounted_total !== '1169.10'
-    || lines[0].tax_amount !== '99.07' || lines[0].discount_allocations[0]?.application_index !== 0 || !lines[0].shopify_variant_gid || !lines[0].shopify_product_gid
+    || lines[0].tax_amount !== '99.07' || lines[0].discount_allocations[0]?.application_index !== 0 || lines[0].shopify_variant_gid !== null || lines[0].shopify_product_gid !== null
     || lines[1].current_quantity !== 0 || lines[1].quantity !== 1) bad.push(`lines ${JSON.stringify(lines.map((l) => [l.original_unit_price, l.total_discount, l.discounted_total, l.current_quantity]))}`);
   const refunds = (await getPool().query(`SELECT * FROM order_financial_snapshot_refunds WHERE snapshot_id = $1`, [s.id])).rows;
   const rl = refunds[0] && (await getPool().query(`SELECT * FROM order_financial_snapshot_refund_lines WHERE refund_id = $1`, [refunds[0].id])).rows;
