@@ -3582,6 +3582,81 @@ await step('shopify orders: contact and addresses come from the order itself (re
   return 'query asks for email, phone, shipping and billing address, not customer; complete / customer-null / partial address / billing fallback / no phone / no email / nothing all map without error and nulls stay null; GoKwik attributes and referral untouched; an order imported without contact data is filled by a later sync (same order, no new snapshot) and never wiped by one without it';
 });
 
+await step('shopify orders: transient Shopify failures (503, connection reset) are retried, bounded; permanent errors are not; 429 unchanged; idempotent', async () => {
+  const bad = [];
+  const store = Array.from({ length: 12 }, (_, i) => ({ ...shOrder(701 + i, { created: shDays(0.1) }), updatedAt: new Date(Date.now() - (12 - i) * 1000).toISOString() }));
+  const fake = shFake(() => store);
+  // plan(kind, isNextPage, nth) → 'ok' | '503' | 'reset' | '400' | 'gqlerr' | '429'
+  let plan = () => 'ok'; const hits = {};
+  const stub = http.createServer((req, res) => { let b = ''; req.on('data', (c) => { b += c; }); req.on('end', async () => {
+    const { query, variables } = JSON.parse(b);
+    const kind = (query.match(/^query (\w+)/) || [])[1];
+    const key = `${kind}${variables?.after ? ':next' : ''}`;
+    hits[key] = (hits[key] || 0) + 1;
+    const act = plan(kind, Boolean(variables?.after), hits[key]);
+    if (act === 'reset') { req.socket.destroy(); return; }
+    res.setHeader('content-type', act === '503' ? 'text/plain' : 'application/json');
+    if (act === '503') { res.statusCode = 503; return res.end('upstream connect error or disconnect/reset before headers. reset reason: remote connection failure'); }
+    if (act === '400') { res.statusCode = 400; return res.end(JSON.stringify({ errors: 'Bad request' })); }
+    if (act === '429') { res.statusCode = 429; return res.end(JSON.stringify({ errors: 'Throttled' })); }
+    if (act === 'gqlerr') return res.end(JSON.stringify({ errors: [{ message: 'Field does not exist', extensions: { code: 'undefinedField' } }] }));
+    return res.end(JSON.stringify({ data: await fake(query, variables || {}) }));
+  }); });
+  await new Promise((ok) => stub.listen(0, '127.0.0.1', ok));
+  const keep = { ...process.env };
+  const warn = console.warn; const warnings = []; console.warn = (...a) => warnings.push(a.join(' '));
+  const reset = (p) => { plan = p; for (const k of Object.keys(hits)) delete hits[k]; };
+  const run = (dryRun) => runShopifySync({ window: { days: 3 }, dryRun, actor: SH_ACTOR, backoffMs: 1 });
+  const created = async () => (await getPool().query(`SELECT count(*)::int n FROM orders WHERE source_order_id = ANY($1)`, [store.map((o) => o.id)])).rows[0].n;
+  const snaps = async () => (await getPool().query(`SELECT count(*)::int n FROM order_financial_snapshots s JOIN orders o ON o.id = s.order_id WHERE o.source_order_id = ANY($1)`, [store.map((o) => o.id)])).rows[0].n;
+  try {
+    Object.assign(process.env, { APP_ENV: 'test', SHOPIFY_GRAPHQL_BASE: `http://127.0.0.1:${stub.address().port}`, SHOPIFY_STORE_DOMAIN: 'briyo-test.myshopify.com', SHOPIFY_ACCESS_TOKEN: 'shpat_DBCHECK_RETRY_TOKEN_000000' });
+    // 1. 503 once → retried → success.
+    reset((k, next, n) => (k === 'BriyoOrdersPage' && !next && n === 1 ? '503' : 'ok'));
+    const r1 = await run(true);
+    if (r1.summary.found !== 12 || r1.summary.shopifyTransientRetries !== 1 || hits.BriyoOrdersPage !== 2) bad.push(`1 503→ok ${JSON.stringify([r1.summary.found, r1.summary.shopifyTransientRetries, hits])}`);
+    // 2. connection reset once → retried → success.
+    reset((k, next, n) => (k === 'BriyoOrderDetail' && n === 1 ? 'reset' : 'ok'));
+    const r2 = await run(true);
+    if (r2.summary.found !== 12 || r2.summary.shopifyTransientRetries !== 1 || r2.summary.errors !== 0) bad.push(`2 reset→ok ${JSON.stringify([r2.summary.found, r2.summary.shopifyTransientRetries])}`);
+    // 3. 503 three times → fails after exactly 3 attempts.
+    reset((k) => (k === 'BriyoOrdersPage' ? '503' : 'ok'));
+    await expectErr('503 x3', () => run(true), (e) => /Shopify HTTP 503/.test(e.message));
+    if (hits.BriyoOrdersPage !== 3) bad.push(`3 attempts ${hits.BriyoOrdersPage}`);
+    // 4. permanent 4xx → no retry.
+    reset((k) => (k === 'BriyoOrdersPage' ? '400' : 'ok'));
+    await expectErr('400', () => run(true), (e) => /Shopify HTTP 400/.test(e.message));
+    if (hits.BriyoOrdersPage !== 1) bad.push(`4 retried a 400 (${hits.BriyoOrdersPage})`);
+    // 5. GraphQL errors in a successful response → no retry.
+    reset((k) => (k === 'BriyoOrdersPage' ? 'gqlerr' : 'ok'));
+    await expectErr('graphql error', () => run(true), (e) => /GraphQL error/.test(e.message));
+    if (hits.BriyoOrdersPage !== 1) bad.push(`5 retried a GraphQL error (${hits.BriyoOrdersPage})`);
+    // 6. 429 keeps its own policy (retried, not counted as transient).
+    reset((k, next, n) => (k === 'BriyoOrdersPage' && !next && n <= 2 ? '429' : 'ok'));
+    const r6 = await run(true);
+    if (r6.summary.found !== 12 || hits.BriyoOrdersPage !== 3 || r6.summary.shopifyTransientRetries !== 0) bad.push(`6 429 ${JSON.stringify([r6.summary.found, hits.BriyoOrdersPage, r6.summary.shopifyTransientRetries])}`);
+    // 7. a commit whose second page keeps failing: the first page is applied whole, the second not at all.
+    reset((k, next) => (k === 'BriyoOrdersPage' && next ? '503' : 'ok'));
+    await expectErr('page 2 down', () => run(false), (e) => /Shopify HTTP 503/.test(e.message));
+    if ((await created()) !== 10 || (await snaps()) !== 10 || hits['BriyoOrdersPage:next'] !== 3) bad.push(`7 partial ${await created()}/${await snaps()}/${hits['BriyoOrdersPage:next']}`);
+    // 8. pagination with one 503 on the second page → retried; the rest arrive; no duplicates.
+    reset((k, next, n) => (k === 'BriyoOrdersPage' && next && n === 1 ? '503' : 'ok'));
+    const r8 = await run(false);
+    if (r8.summary.ordersCreated !== 2 || r8.summary.unchanged !== 10 || r8.summary.shopifyTransientRetries !== 1 || (await created()) !== 12 || (await snaps()) !== 12) bad.push(`8 resume ${JSON.stringify([r8.summary.ordersCreated, r8.summary.unchanged, r8.summary.shopifyTransientRetries, await created(), await snaps()])}`);
+    // ...and once more, with a 503 on the first page: still idempotent.
+    reset((k, next, n) => (k === 'BriyoOrdersPage' && !next && n === 1 ? '503' : 'ok'));
+    const r9 = await run(false);
+    if (r9.summary.ordersCreated !== 0 || r9.summary.unchanged !== 12 || (await created()) !== 12 || (await snaps()) !== 12) bad.push(`9 idempotent ${JSON.stringify([r9.summary.ordersCreated, r9.summary.unchanged])}`);
+    if (!warnings.some((w) => /transient failure, retry 1 of 2/.test(w)) || warnings.some((w) => w.includes('shpat_DBCHECK'))) bad.push('retry logging');
+  } finally {
+    console.warn = warn;
+    for (const k of ['APP_ENV', 'SHOPIFY_GRAPHQL_BASE', 'SHOPIFY_STORE_DOMAIN', 'SHOPIFY_ACCESS_TOKEN']) { if (keep[k] === undefined) delete process.env[k]; else process.env[k] = keep[k]; }
+    stub.close();
+  }
+  if (bad.length) throw new Error(bad.join(' | '));
+  return '503 → retry → ok; reset → retry → ok; 503 ×3 → fails after 3 attempts; 400 and GraphQL errors not retried; 429 still on its own policy; a failing page leaves earlier pages applied whole and itself unapplied; a retried page completes the import with no duplicate orders or snapshots; a further run is idempotent; retries logged without the token';
+});
+
 await step('shopify orders cleanup', async () => {
   await purgeTestOrders(SH_PREFIX);
   await getPool().query(`DELETE FROM order_imports WHERE kind = 'shopify_sync' AND imported_by = $1`, [SH_ACTOR]);
