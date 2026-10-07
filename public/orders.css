@@ -385,3 +385,42 @@ html.scroll-locked .drawer-scrim { touch-action: none; }
 .btn.danger { background: var(--error, #D92D20); border-color: var(--error, #D92D20); color: #fff; }
 .alert.hr-ok { color: var(--text); background: var(--surface); }
 .alert.hr-ok .lucide { color: var(--success); }
+
+/* ---------------- Affiliates ---------------- */
+.af-kpis { margin-bottom: 16px; }
+.af-kpis .att.on { background: var(--surface-2); box-shadow: inset 0 -2px 0 var(--ink); }
+.af-kpis .att[data-kpi="active"] .dot { background: var(--success); }
+.af-kpis .att[data-kpi="pending_verification"] .dot { background: var(--info); }
+.af-kpis .att[data-kpi="suspended"] .dot { background: var(--warning); }
+.af-table td { vertical-align: middle; }
+.af-table .cell-main, .af-table .cell-sub { display: block; max-width: 340px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.af-table tbody tr { cursor: pointer; }
+.af-title-tag { display: inline-flex; vertical-align: middle; margin-left: 8px; font-size: 13px; }
+.af-title-tag .status { font-size: 12.5px; }
+.af-detail { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.2fr); grid-template-areas: "profile activity" "rates rates"; gap: 16px; align-items: start; }
+.af-detail .af-profile { grid-area: profile; }
+.af-detail .af-activity { grid-area: activity; }
+.af-detail .af-rates { grid-area: rates; }
+.af-detail .af-activity .pane { max-height: 520px; overflow-y: auto; }
+.af-detail .hr-kv .cell-sub { display: block; color: var(--text-2); margin-top: 2px; }
+.af-detail .mini-tag { margin-left: 6px; }
+.af-events { list-style: none; margin: 0; padding: 0; }
+.af-events li { padding: 10px 16px; border-bottom: 1px solid var(--border-soft); font-size: 13px; }
+.af-events li:last-child { border-bottom: 0; }
+.af-ev-head { display: flex; justify-content: space-between; gap: 12px; }
+.af-ev-head .soft { font-size: 12px; flex: none; }
+.af-ev-sum { color: var(--text); margin-top: 2px; overflow-wrap: anywhere; }
+.af-ev-meta { font-size: 12px; margin-top: 2px; }
+.af-when { border: 0; padding: 0; margin: 0; display: flex; flex-direction: column; gap: 6px; }
+.af-when > span { font-size: 12.5px; color: var(--text-2); }
+.af-when label { display: flex; align-items: center; gap: 6px; font-size: 13px; }
+.af-when .input { width: 180px; }
+@media (max-width: 1024px) {
+  .af-detail { grid-template-columns: minmax(0, 1fr); grid-template-areas: "profile" "rates" "activity"; }
+}
+@media (max-width: 760px) {
+  .table-wrap:has(.af-table) { display: none; }
+  .af-kpis .attention { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .af-kpis .att:nth-child(2) { border-right: 0; }
+  .af-kpis .att:nth-child(-n+2) { border-bottom: 1px solid var(--border-soft); }
+}

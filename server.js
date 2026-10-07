@@ -31,6 +31,8 @@ import { getProfile, updateProfile, savePhoto, clearPhoto, photoFile, memberActi
 import { homeFor, MODULE_KEYS, isValidAssignment } from './lib/permissions.js';
 import { careersHost } from './lib/careers.js';
 import { router as hrRouter } from './lib/hr-routes.js';
+import { router as affiliateRouter } from './lib/affiliate-routes.js';
+import { ensureAffiliateSchema } from './lib/affiliates.js';
 import { ensureHrSchema, retryPendingRemovals } from './lib/hr.js';
 import { overviewFor } from './lib/overview.js';
 import { router as marketingRouter } from './lib/marketing-routes.js';
@@ -500,6 +502,11 @@ app.get('/api/overview', async (req, res) => {
 // HR pages: one page, two views (jobs, candidates). The careers host never gets here.
 app.get('/hr', requirePage('hr.view'), (_req, res) => res.redirect('/hr/jobs'));
 app.get(['/hr/jobs', '/hr/candidates'], requirePage('hr.view'), (_req, res) => res.sendFile(path.join(PUBLIC, 'hr.html')));
+
+// Affiliates (internal admin): one page, list and detail; the detail is addressed
+// by the opaque public id. Reading needs affiliate.view, changes affiliate.manage.
+app.use('/api/affiliates', requirePermission('affiliate.view'), affiliateRouter);
+app.get(['/affiliates', '/affiliates/:publicId([A-Za-z0-9]{6,12})'], requirePage('affiliate.view'), (_req, res) => res.sendFile(path.join(PUBLIC, 'affiliates.html')));
 
 app.use(express.static(PUBLIC));
 
@@ -1192,6 +1199,9 @@ app.listen(port, async () => {
       ensureInventorySchema()
         .then(() => console.log('Orders & inventory schema ready'))
         .catch((e) => console.error('Orders & inventory schema setup failed (will retry on first request):', e.message));
+      ensureAffiliateSchema()
+        .then(() => console.log('Affiliate schema ready'))
+        .catch((e) => console.error('Affiliate schema setup failed (will retry on first request):', e.message));
       ensureOrderFinancialSnapshotSchema()
         .then(() => console.log('Order financial snapshot schema ready'))
         .catch((e) => console.error('Order financial snapshot schema setup failed (will retry on the next Shopify sync):', e.message));
