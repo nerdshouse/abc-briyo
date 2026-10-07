@@ -94,6 +94,7 @@ const BODIES = {
   marketing: (s) => {
     if (!s.configured) return `<div class="state"><b>Meta Ads is not connected.</b><span>No marketing numbers are shown until it is. <a class="linkish" href="/marketing">Set up →</a></span></div>`;
     if (s.unavailable) return `<div class="state error"><b>Meta Ads data unavailable</b><span>${esc(s.message)}</span></div>`;
+    if (s.pending) return `<div class="state"><b>Loading Meta Ads…</b><span>${esc(s.message)}</span></div>`;
     const m = (v) => (v === null || v === undefined ? '—' : new Intl.NumberFormat('en-IN', { style: 'currency', currency: s.currency || 'INR', maximumFractionDigits: 0 }).format(v));
     const fresh = s.stale ? '<span class="health warning">Data delayed</span>' : '<span class="health healthy">Live</span>';
     return [
@@ -148,7 +149,7 @@ function render() {
       return `<section class="card ov-dept"><header class="ov-dept-head"><h2>${icon(dept.icon)}${esc(dept.label)}</h2></header>
         <div class="state error"><b>Unavailable right now</b><span>This department could not be counted. Refresh to try again.</span></div></section>`;
     }
-    const [tone, word] = k === 'marketing' && !s.configured ? ['neutral', 'Not connected'] : deptHealth(k);
+    const [tone, word] = k === 'marketing' && !s.configured ? ['neutral', 'Not connected'] : k === 'marketing' && s.pending ? ['neutral', 'Loading'] : deptHealth(k);
     return `<section class="card ov-dept h-${tone}" aria-labelledby="ov-${k}">
       <header class="ov-dept-head">
         <h2 id="ov-${k}"><a href="${dept.href}">${icon(dept.icon)}${esc(dept.label)}</a></h2>

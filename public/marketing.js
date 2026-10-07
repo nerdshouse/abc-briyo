@@ -15,7 +15,8 @@ import { istDateTime } from './ui/ist.js';
 
 const fetch = pageFetch();
 const RANGES = [['today', 'Today'], ['yesterday', 'Yesterday'], ['last_7d', 'Last 7 days'], ['last_30d', 'Last 30 days'], ['this_month', 'This month'], ['custom', 'Custom']];
-const LIVE_RANGES = new Set(['today', 'last_7d', 'last_30d', 'this_month']);
+// Live = includes today. Meta's Last 7 / Last 30 days are complete days that exclude today: closed periods.
+const LIVE_RANGES = new Set(['today', 'this_month']);
 const SERIES = { spend: { label: 'Spend', color: '#2a78d6' }, revenue: { label: 'Meta-attributed revenue', color: '#eb6834' } };
 const state = {
   me: null, status: null, range: 'today', since: '', until: '', view: 'overview', campaign: null, adset: null,
@@ -81,15 +82,22 @@ function linkTo(extra = {}) {
   for (const [k, v] of Object.entries(extra)) if (v) u.set(k, v);
   return `/marketing${u.toString() ? `?${u}` : ''}`;
 }
-const isLive = () => LIVE_RANGES.has(state.range) || (state.range === 'custom' && state.until >= new Date().toISOString().slice(0, 10));
+/** Today in the ad account's timezone (what Meta means by "today"), not UTC and not the browser's. */
+function accountToday(now = new Date()) {
+  const tz = state.status?.account?.timezone;
+  try { return new Intl.DateTimeFormat('en-CA', { timeZone: tz || 'Asia/Kolkata', year: 'numeric', month: '2-digit', day: '2-digit' }).format(now); }
+  catch { return new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Kolkata', year: 'numeric', month: '2-digit', day: '2-digit' }).format(now); }
+}
+const shiftDay = (day, n) => { const d = new Date(`${day}T00:00:00Z`); d.setUTCDate(d.getUTCDate() + n); return d.toISOString().slice(0, 10); };
+const isLive = () => LIVE_RANGES.has(state.range) || (state.range === 'custom' && state.until === accountToday());
 
 function renderRange() {
-  const today = new Date().toISOString().slice(0, 10);
+  const today = accountToday();
   $('#rangeBar').innerHTML = `<div class="seg">${RANGES.map(([k, l]) => `<button type="button" data-range="${k}" class="${state.range === k ? 'active' : ''}" aria-pressed="${state.range === k}">${l}</button>`).join('')}</div>
     ${state.range === 'custom' ? `<span class="mk-custom"><label class="date-pick">From <input class="input" type="date" id="since" value="${esc(state.since)}" max="${today}" /></label>
       <label class="date-pick">to <input class="input" type="date" id="until" value="${esc(state.until)}" max="${today}" /></label>
       <button class="btn" type="button" id="applyCustom">Apply</button></span>` : ''}
-    ${state.status?.account?.timezone ? `<span class="mk-tz">Days follow the ad account's timezone (${esc(state.status.account.timezone)})</span>` : ''}`;
+    ${state.status?.account?.timezone ? `<span class="mk-tz">Days follow the ad account's timezone (${esc(state.status.account.timezone)})${state.range === 'last_7d' || state.range === 'last_30d' ? ' · complete days, excluding today' : ''}</span>` : ''}`;
 }
 
 // ------------------------------------------------------------------ freshness
@@ -338,7 +346,7 @@ function bind() {
     const b = e.target.closest('[data-range]');
     if (b) {
       state.range = b.dataset.range;
-      if (state.range === 'custom' && !state.since) { const t = new Date(); state.until = t.toISOString().slice(0, 10); state.since = new Date(t - 6 * 86400000).toISOString().slice(0, 10); }
+      if (state.range === 'custom' && !state.since) { state.until = accountToday(); state.since = shiftDay(state.until, -6); }
       history.replaceState(history.state, '', linkTo(state.view === 'campaign' ? { campaign: state.campaign } : state.view === 'adset' ? { adset: state.adset } : state.view === 'campaigns' ? { view: 'campaigns' } : {}));
       state.data = null; render(); load(); return;
     }

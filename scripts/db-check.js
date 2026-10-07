@@ -50,7 +50,8 @@ import http from 'node:http';
 import { ensureHrSchema, purgeTestHr, slugify, normalizePhone, removeResume, retryPendingRemovals, istDayKey, HR_TIMEZONE } from '../lib/hr.js';
 import { jobPostingLd } from '../lib/careers-pages.js';
 import nodeCrypto from 'node:crypto';
-import { metricsFrom, rawFromRow, rangeParams, classifyMetaError, createMetaClient, createCache, MetaError } from '../lib/meta-ads.js';
+import { metricsFrom, rawFromRow, rangeParams, classifyMetaError, createMetaClient, createCache, MetaError, createMetaService, metaConfig, todayIn, resolvePurchaseType, _resetMetaService } from '../lib/meta-ads.js';
+import { overviewFor } from '../lib/overview.js';
 import { istDateTime, istDate, istTime, istDayKey as uiIstDayKey } from '../public/ui/ist.js';
 import { issueFormToken, verifyTurnstile, normalizeHost, isCareersRequest } from '../lib/careers.js';
 import net from 'node:net';
@@ -4124,6 +4125,131 @@ await step('marketing: cache — repeat requests cached, concurrent requests sha
   return 'two concurrent → 1 call; within TTL cached; manual refresh ignored under 10 s, honoured after; expiry refetches; Meta failure → last good data marked stale with the reason; > 24 h old or nothing cached → error';
 });
 
+await step('marketing: freshness classification and the ad account\'s "today" (IST midnight boundary)', async () => {
+  const bad = [];
+  const now = new Date('2026-10-06T19:00:00Z'); // 00:30 IST on 7 Oct; still 6 Oct in UTC
+  const live = (inp, tz = 'Asia/Kolkata') => rangeParams(inp, now, tz).live;
+  const want = [[{ range: 'today' }, true], [{ range: 'yesterday' }, false], [{ range: 'last_7d' }, false], [{ range: 'last_30d' }, false], [{ range: 'this_month' }, true],
+    [{ range: 'custom', since: '2026-10-01', until: '2026-10-07' }, true], [{ range: 'custom', since: '2026-10-01', until: '2026-10-06' }, false]];
+  for (const [inp, w] of want) if (live(inp) !== w) bad.push(`${inp.range}${inp.until ? ` → ${inp.until}` : ''}: live=${live(inp)}`);
+  // Presets are sent unchanged.
+  if (rangeParams({ range: 'last_7d' }, now).params.date_preset !== 'last_7d' || rangeParams({ range: 'last_30d' }, now).params.date_preset !== 'last_30d') bad.push('presets changed');
+  // The account's date, not UTC: at 00:30 IST it is already 7 Oct in India and still 6 Oct in Los Angeles.
+  if (todayIn('Asia/Kolkata', now) !== '2026-10-07' || now.toISOString().slice(0, 10) !== '2026-10-06' || todayIn('America/Los_Angeles', now) !== '2026-10-06') bad.push('todayIn');
+  try { rangeParams({ range: 'custom', since: '2026-10-01', until: '2026-10-07' }, now, 'America/Los_Angeles'); bad.push('LA account accepted IST today'); } catch (e) { if (e.status !== 400) bad.push('LA future'); }
+  // TTLs follow: live 45 s, closed 10 min — through the service, with a counting fake Meta.
+  let calls = 0; let t = Date.parse('2026-10-06T19:00:00Z');
+  const fetchImpl = async (url) => { calls += 1; const u = new URL(url);
+    if (u.pathname.endsWith('act_1')) return { ok: true, status: 200, json: async () => ({ name: 'A', currency: 'INR', timezone_name: 'Asia/Kolkata' }) };
+    return { ok: true, status: 200, json: async () => ({ data: [] }) }; };
+  const svc = createMetaService({ config: metaConfig({ META_ACCESS_TOKEN: 'x', META_AD_ACCOUNT_ID: '1' }), fetchImpl, now: () => t, log: { error() {} } });
+  await svc.summary({ range: 'last_7d' }); const afterFirst = calls;
+  t += 5 * 60 * 1000; await svc.summary({ range: 'last_7d' });
+  if (calls !== afterFirst) bad.push('closed range refetched within 10 min');
+  t += 6 * 60 * 1000; await svc.summary({ range: 'last_7d' });
+  if (calls === afterFirst) bad.push('closed range never expired');
+  const c0 = calls; await svc.summary({ range: 'today' }); t += 50 * 1000; await svc.summary({ range: 'today' });
+  if (calls - c0 !== 2) bad.push(`today TTL (calls ${calls - c0})`);
+  // Custom ending the account's today is live through the service (uses the account timezone).
+  const cust = await svc.summary({ range: 'custom', since: '2026-10-01', until: '2026-10-07' });
+  if (!cust.data || cust.data.range !== 'custom:2026-10-01:2026-10-07') bad.push('custom ending IST today refused');
+  // The page agrees: no 60 s refresh for closed ranges, and the picker uses the account's date.
+  const ui = await fsp.readFile(new URL('../public/marketing.js', import.meta.url), 'utf8');
+  if (!/const LIVE_RANGES = new Set\(\['today', 'this_month'\]\)/.test(ui) || !/state\.until === accountToday\(\)/.test(ui) || /new Date\(\)\.toISOString\(\)\.slice\(0, 10\)/.test(ui)) bad.push('page live set / picker date');
+  if (bad.length) throw new Error(bad.join(' | '));
+  return 'Today, This month, custom ending today → live; Yesterday, Last 7, Last 30, custom ending yesterday → closed; presets unchanged; at 00:30 IST "today" is 7 Oct for an IST account (6 Oct in UTC/LA); closed cached 10 min, live 45 s; page uses the same rules and the account date';
+});
+
+await step('marketing: one purchase type for count and value; unified attribution on every Insights call', async () => {
+  const bad = [];
+  const row = (actions, action_values) => rawFromRow({ spend: '100', impressions: '1000', clicks: '10', actions, action_values });
+  const A = (t, v) => ({ action_type: t, value: String(v) });
+  let r = row([A('omni_purchase', 4), A('offsite_conversion.fb_pixel_purchase', 4)], [A('omni_purchase', 400), A('offsite_conversion.fb_pixel_purchase', 400)]);
+  if (r.purchaseType !== 'omni_purchase' || r.purchases !== 4 || r.value !== 400) bad.push(`both ${JSON.stringify(r)}`);
+  r = row([A('offsite_conversion.fb_pixel_purchase', 3)], [A('offsite_conversion.fb_pixel_purchase', 300)]);
+  if (r.purchaseType !== 'offsite_conversion.fb_pixel_purchase' || r.purchases !== 3 || r.value !== 300) bad.push('fallback');
+  // Lists differ: count has omni, value only pixel → both from omni (value 0), never mixed.
+  r = row([A('omni_purchase', 2)], [A('offsite_conversion.fb_pixel_purchase', 250)]);
+  if (r.purchaseType !== 'omni_purchase' || r.purchases !== 2 || r.value !== 0) bad.push(`mixed ${JSON.stringify(r)}`);
+  r = row([A('purchase', 5)], [A('omni_purchase', 500), A('purchase', 480)]);
+  if (r.purchaseType !== 'omni_purchase' || r.purchases !== 0 || r.value !== 500) bad.push('omni only in values');
+  r = row(undefined, undefined);
+  if (r.purchaseType !== null || r.purchases !== 0 || r.value !== 0) bad.push('missing');
+  r = row([A('omni_purchase', 3)], [A('omni_purchase', 0)]);
+  const m = metricsFrom(r);
+  if (r.value !== 0 || m.roas !== 0 || m.cpa !== 100 / 3) bad.push('zero value');
+  if (resolvePurchaseType([A('link_click', 9)], [A('link_click', 9)]) !== null) bad.push('non-purchase type used');
+  // Attribution: every Insights request carries use_unified_attribution_setting=true.
+  const urls = [];
+  const fetchImpl = async (url) => { urls.push(url); const u = new URL(url);
+    if (u.pathname.endsWith('act_1')) return { ok: true, status: 200, json: async () => ({ name: 'A', currency: 'INR', timezone_name: 'Asia/Kolkata' }) };
+    if (u.pathname.endsWith('/111')) return { ok: true, status: 200, json: async () => ({ id: '111', name: 'C', account_id: '1' }) };
+    return { ok: true, status: 200, json: async () => ({ data: [] }) }; };
+  const svc = createMetaService({ config: metaConfig({ META_ACCESS_TOKEN: 'x', META_AD_ACCOUNT_ID: '1' }), fetchImpl, log: { error() {} } });
+  await svc.summary({ range: 'last_7d' }); await svc.level('campaign', { range: 'today' }); await svc.object('campaign', '111', { range: 'last_30d' }); await svc.level('adset', { range: 'today' }, { parent: { id: '111' } });
+  const ins = urls.filter((u) => new URL(u).pathname.endsWith('/insights'));
+  if (ins.length < 6 || ins.some((u) => new URL(u).searchParams.get('use_unified_attribution_setting') !== 'true')) bad.push(`attribution on ${ins.filter((u) => u.includes('use_unified_attribution_setting=true')).length}/${ins.length}`);
+  if (urls.filter((u) => !new URL(u).pathname.endsWith('/insights')).some((u) => u.includes('use_unified'))) bad.push('attribution sent to non-Insights calls');
+  if (bad.length) throw new Error(bad.join(' | '));
+  return `omni in both → omni; fallback only → fallback for both; lists differ → same type (value 0, never the other type); omni only in values → omni; missing → 0/0; zero value → ROAS 0; ${ins.length} Insights calls all with use_unified_attribution_setting=true, none on object calls`;
+});
+
+await step('marketing: failure backoff — one failure shared by all requests, no Meta calls during it, automatic recovery', async () => {
+  const bad = []; let t = 5_000_000; let calls = 0; let failing = true;
+  const cache = createCache({ now: () => t, backoffMs: 45000 });
+  const loader = async () => { calls += 1; await new Promise((r) => setTimeout(r, 5)); if (failing) throw new MetaError('timeout', 'Meta did not answer in time.', { status: 503, retryable: true }); return { v: calls }; };
+  // Warm one key, then let Meta fail.
+  failing = false; await cache.get('a', 45000, loader); failing = true; t += 46000;
+  // Concurrent requests (two keys) during the first failure: one call per key in flight, then the backoff is shared.
+  const [x, y] = await Promise.all([cache.get('a', 45000, loader), cache.get('b', 45000, loader).catch((e) => e)]);
+  const afterFail = calls;
+  if (!x.stale || x.data.v !== 1 || !(y instanceof MetaError)) bad.push('first failure: stale for a, error for b');
+  for (let i = 0; i < 10; i += 1) { await cache.get('a', 45000, loader); await cache.get('b', 45000, loader).catch(() => {}); await cache.get('c', 45000, loader, { force: true }).catch(() => {}); }
+  if (calls !== afterFail) bad.push(`Meta called ${calls - afterFail}× during backoff`);
+  const during = await cache.get('a', 45000, loader);
+  if (!during.stale || during.error?.kind !== 'timeout') bad.push('stale data not marked delayed');
+  if (!cache.backingOff()) bad.push('backoff not reported');
+  // After the window: one retry; if Meta is back, everything recovers.
+  t += 46000; failing = false;
+  const back = await cache.get('a', 45000, loader);
+  if (calls !== afterFail + 1 || back.stale || cache.backingOff()) bad.push('no recovery after backoff');
+  if ((await cache.get('b', 45000, loader)).stale) bad.push('other key not recovered');
+  // A bad request (our input) does not trigger a backoff.
+  const c2 = createCache({ now: () => t }); let n2 = 0;
+  await c2.get('k', 1, async () => { n2 += 1; throw new MetaError('bad_request', 'x', { status: 400 }); }).catch(() => {});
+  await c2.get('k2', 1, async () => { n2 += 1; return 1; });
+  if (n2 !== 2) bad.push('bad_request caused a backoff');
+  if (bad.length) throw new Error(bad.join(' | '));
+  return 'first failure → last good data marked delayed (or the error if none); next 30 requests incl. other keys and forced refreshes → 0 Meta calls; after 45 s one retry and full recovery; input errors never back off';
+});
+
+await step('marketing: the Overview never waits for Meta (2 s budget), other departments unaffected', async () => {
+  const bad = [];
+  const session = { phone: '919000000304', isAdmin: true, caps: [...CAPABILITIES] };
+  const slowFetch = async (url) => { await new Promise((r) => setTimeout(r, 4000)); const u = new URL(url);
+    if (u.pathname.endsWith('act_1')) return { ok: true, status: 200, json: async () => ({ name: 'A', currency: 'INR', timezone_name: 'Asia/Kolkata' }) };
+    return { ok: true, status: 200, json: async () => ({ data: [{ spend: '50', impressions: '1000', clicks: '5' }] }) }; };
+  const cfg = metaConfig({ META_ACCESS_TOKEN: 'x', META_AD_ACCOUNT_ID: '1' });
+  try {
+    _resetMetaService(createMetaService({ config: cfg, fetchImpl: slowFetch, log: { error() {} } }));
+    const t0 = Date.now(); const ov = await overviewFor(session, { slaHours: 6 }); const took = Date.now() - t0;
+    if (took > 3500) bad.push(`overview took ${took} ms with slow Meta`);
+    if (!ov.sections.marketing?.pending) bad.push(`marketing not pending: ${JSON.stringify(ov.sections.marketing)}`);
+    for (const k of ['logistics', 'inventory', 'support', 'hr', 'people']) if (!ov.sections[k]?.ok) bad.push(`${k} affected`);
+    if (ov.attention.some((a) => a.dept === 'marketing')) bad.push('loading raised an alarm');
+    // The slow fetch keeps going in the background and fills the cache: the next Overview is instant and complete.
+    await new Promise((r) => setTimeout(r, 4500));
+    const t1 = Date.now(); const ov2 = await overviewFor(session, { slaHours: 6 });
+    if (Date.now() - t1 > 1500 || ov2.sections.marketing?.spend !== 50) bad.push(`second overview ${JSON.stringify(ov2.sections.marketing)}`);
+    // Meta fast: the card appears normally on the first load.
+    _resetMetaService(createMetaService({ config: cfg, fetchImpl: async (url) => slowFetch(url).then((r) => r) && { ok: true, status: 200, json: async () => (new URL(url).pathname.endsWith('act_1') ? { name: 'A', currency: 'INR' } : { data: [{ spend: '75', impressions: '1000', clicks: '5' }] }) }, log: { error() {} } }));
+    const ov3 = await overviewFor(session, { slaHours: 6 });
+    if (ov3.sections.marketing?.spend !== 75 || ov3.sections.marketing?.pending) bad.push('fast Meta not shown');
+  } finally { _resetMetaService(null); }
+  if (bad.length) throw new Error(bad.join(' | '));
+  return 'Meta 4 s slow → Overview in < 3.5 s, Marketing "loading", logistics/inventory/support/hr/people intact, no alarm; the background fetch fills the shared cache so the next Overview is instant with the figures; fast Meta → card normally';
+});
+
 await step('marketing: live server — admin only, read-only, real numbers through the stub, no secrets in responses or logs', async () => {
   const bad = []; const TOKEN = 'test-meta-token-NEVER-LEAK-9f3a';
   HRS.meta.mode = 'ok'; HRS.meta.calls = [];
@@ -4150,6 +4276,7 @@ await step('marketing: live server — admin only, read-only, real numbers throu
   if (HRS.meta.calls.length !== before) bad.push('repeat request reached Meta');
   // Token only in the Authorization header; proof present; never followed paging.next.
   if (HRS.meta.calls.some((c) => c.url.includes(TOKEN) || c.url.includes('SHOULD-NOT')) || HRS.meta.calls.some((c) => c.auth !== `Bearer ${TOKEN}` || !c.proof)) bad.push('token transport');
+  if (HRS.meta.calls.filter((c) => c.path.endsWith('/insights')).some((c) => !c.url.includes('use_unified_attribution_setting=true'))) bad.push('insights without unified attribution');
   // Overview: Marketing card from the same cache.
   const ov = (await internal('adm', 'GET', '/api/overview')).body.sections.marketing;
   if (!ov?.configured || ov.spend !== 1000.5 || ov.purchases !== 10 || HRS.meta.calls.length !== before) bad.push(`overview ${JSON.stringify(ov)}`);
