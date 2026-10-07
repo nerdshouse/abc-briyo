@@ -99,6 +99,7 @@ These follow the Amazon re-import rules.
 - **Never wipes:** an empty Shopify value never clears a recorded one.
 - **Team values stand:** payment method and status follow Shopify only while the team hasn't changed them since the last sync. For example, a COD order the team marked **paid** stays paid.
 - **Locked lines:** an order is **locked** once stock is reserved for its parcel, or has left (a dispatch movement, or a parcel past dispatch). A Shopify line change is then **not applied**; it's recorded as a `lines_locked` conflict.
+- **Locked value:** on a locked order, a change to the Shopify total does **not** overwrite `order_value`. Briyo keeps the value Logistics worked to, records a `value_locked` conflict (shown with the old and new values in the sync history and the order's activity), and keeps Shopify's latest total in `source_payload.shopify.current_total`.
 - **Cancellations:** a Shopify cancellation cancels the Briyo order only if it has **no active shipment**. Otherwise it's a `cancelled_with_shipment` conflict for a person to resolve.
 - **Logged once:** a conflict is logged on the order once, and again only if Shopify changes the order after that.
 - **Never changed by a sync:** Briyo's order status (except the cancellation above), shipments, documents, notes and routing.

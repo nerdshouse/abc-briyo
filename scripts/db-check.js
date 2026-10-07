@@ -3111,6 +3111,58 @@ await step('shopify orders: changes — safe commercial updates, team payment ke
   return 'name/value updated; team-marked "paid" kept over Shopify "pending"; reserved (31) and dispatched (30) lines unchanged → lines_locked; Shopify cancel of dispatched 30 → conflict, of unshipped 32 → cancelled; no stock moved; conflicts logged once';
 });
 
+await step('shopify orders: locked order keeps its value — Shopify total change is one value_locked conflict, never duplicated by later polls', async () => {
+  const bad = [];
+  const gql = shFake(() => SH.store);
+  const ix = (n) => SH.store.findIndex((x) => x.id === `${SH_PREFIX}${String(n).padStart(4, '0')}`);
+  const lines = [{ sku: `${TS}-SH-D3`, qty: 1 }];
+  // 1. Imported at ₹1,299 (two orders: one to reserve, one to dispatch).
+  for (const n of [160, 161]) SH.store.push({ ...shOrder(n, { lines, total: 1299, created: shDays(0.3) }), updatedAt: new Date().toISOString() });
+  await runShopifySync({ window: { mode: 'incremental' }, dryRun: false, gql, actor: SH_ACTOR });
+  let rows = await shOrders();
+  if ([160, 161].some((n) => Number(byGid(rows, n)?.order_value) !== 1299)) bad.push('not imported at 1299');
+  // 2. Stock reserved (160) and dispatched (161).
+  const batch = (await receiveInventory({ sku_id: SH.d3, batch_number: 'SH-D3-VAL', expiry_date: dayOffset(400), quantity: 10, unit_cost: 100, request_id: rid() }, { actor: ACTOR })).batchId;
+  const dl = (await listCouriers()).find((c) => c.name === 'Delhivery');
+  for (const n of [160, 161]) {
+    const o = byGid(rows, n);
+    const r = await createShipmentForOrders([Number(o.id)], { courier_partner_id: dl.id, tracking_id: `AWB-SHV-${n}-${SH_NUM}` }, { actor: ACTOR });
+    await reserveShipmentStock(r.shipmentId, [{ batch_id: batch, quantity: 1 }], { actor: ACTOR });
+    if (n === 161) {
+      await addPhoto(Number(o.id));
+      const sh = (await orderShipments(Number(o.id)))[0];
+      await updateShipment(Number(o.id), sh.id, { shipment_status: 'dispatched' }, { actor: ACTOR, version: sh.version });
+    }
+  }
+  // 3. Shopify total changes to ₹1,899 (lines unchanged).
+  const now = new Date().toISOString();
+  for (const n of [160, 161]) SH.store[ix(n)] = { ...shOrder(n, { created: SH.store[ix(n)].createdAt, lines, total: 1899 }), updatedAt: now };
+  const pre = await runShopifySync({ window: { mode: 'incremental' }, dryRun: true, gql });
+  if (pre.summary.conflicts < 2 || !(pre.conflicts || []).some((c) => c.conflicts.some((x) => x.kind === 'value_locked' && x.to === 1899))) bad.push(`preview ${JSON.stringify(pre.conflicts).slice(0, 200)}`);
+  const run = await runShopifySync({ window: { mode: 'incremental' }, dryRun: false, gql, actor: SH_ACTOR });
+  // 4. Briyo keeps ₹1,299; Shopify's ₹1,899 is kept for reference.
+  rows = await shOrders();
+  for (const n of [160, 161]) {
+    const o = byGid(rows, n);
+    if (Number(o.order_value) !== 1299) bad.push(`${n} value overwritten → ${o.order_value}`);
+    if (o.source_payload?.shopify?.current_total !== 1899) bad.push(`${n} latest Shopify total not kept`);
+  }
+  const audit = (await getPool().query(`SELECT conflicts, details FROM order_imports WHERE id = $1`, [run.runId])).rows[0];
+  if (!(audit.conflicts >= 2 && (audit.details.conflicts || []).some((c) => c.conflicts.some((x) => x.kind === 'value_locked')))) bad.push('not in sync history');
+  // 5–6. Recorded once; later polls with no Shopify change add nothing.
+  const events = async () => (await getPool().query(
+    `SELECT order_id, metadata FROM order_events WHERE event_type = 'shopify_sync_conflict' AND metadata->>'kind' = 'value_locked' AND order_id = ANY($1)`,
+    [[160, 161].map((n) => Number(byGid(rows, n).id))])).rows;
+  let ev = await events();
+  if (ev.length !== 2 || ev.some((e) => Number(e.metadata.from) !== 1299 || Number(e.metadata.to) !== 1899 || !/Briyo keeps ₹1,299/.test(e.metadata.detail))) bad.push(`events ${JSON.stringify(ev.map((e) => e.metadata))}`);
+  for (let i = 0; i < 3; i += 1) await runShopifySync({ window: { mode: 'incremental' }, dryRun: false, gql, actor: SH_ACTOR });
+  ev = await events();
+  if (ev.length !== 2) bad.push(`duplicated by polls: ${ev.length}`);
+  if (Number(byGid(await shOrders(), 160).order_value) !== 1299) bad.push('value overwritten by a later poll');
+  if (bad.length) throw new Error(bad.join(' | '));
+  return 'imported ₹1,299 → reserved (160) / dispatched (161) → Shopify ₹1,899: Briyo keeps ₹1,299, Shopify ₹1,899 kept in source_payload; one value_locked conflict per order, shown in run details; 3 more polls → still one each';
+});
+
 await step('shopify orders: manual duplicates held back; customer-data denial tolerated; audit rows; no credential anywhere', async () => {
   const bad = [];
   // A website order typed in by hand as "#SH-DUP" — the Shopify order with that name is not imported.
