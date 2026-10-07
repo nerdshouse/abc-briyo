@@ -1,106 +1,196 @@
-/* careers.briyo.xyz — public pages. Same tokens as the app (ui.css), light only. */
+/* careers.briyo.xyz — public pages for Briyo Supplements. Light only.
+   Ink-led and quiet: the wordmark is black, so is the primary action; the
+   green accent is kept for links and focus. One card (the application), no
+   decoration beyond hairlines. */
 :root {
-  --bg: #ffffff; --surface: #ffffff; --surface-2: #F9FAFB; --border: #EAECF0; --border-strong: #D0D5DD;
-  --text: #101828; --text-2: #475467; --text-3: #667085; --ink: #101828;
-  --accent: #3A6B4C; --accent-hover: #2F5A3F;
+  --bg: #ffffff; --surface: #ffffff; --surface-2: #F8F9FA; --surface-3: #F2F4F7;
+  --border: #EAECF0; --border-strong: #D0D5DD;
+  --text: #101828; --text-2: #344054; --text-3: #5D6B82;
+  --ink: #0B0F17; --ink-hover: #232A36;
+  --accent: #3A6B4C; --accent-hover: #2F5A3F; --accent-soft: rgba(58, 107, 76, .14);
   --error: #D92D20; --error-text: #B42318; --error-soft: #FEF3F2;
   --warning-soft: #FFFAEB; --warning-text: #B54708;
-  --radius: 10px;
+  --radius: 12px;
+  --page-x: 32px;
 }
 * { box-sizing: border-box; }
 html { -webkit-text-size-adjust: 100%; }
-body { margin: 0; background: var(--bg); color: var(--text); font: 15px/1.6 Inter, system-ui, -apple-system, "Segoe UI", sans-serif; -webkit-font-smoothing: antialiased; }
-a { color: var(--accent); text-underline-offset: 2px; }
+body { margin: 0; background: var(--bg); color: var(--text); font: 16px/1.65 Inter, system-ui, -apple-system, "Segoe UI", sans-serif; -webkit-font-smoothing: antialiased; }
+a { color: var(--accent); text-underline-offset: 3px; }
 a:hover { color: var(--accent-hover); }
 :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 4px; }
-.wrap { max-width: 840px; margin: 0 auto; padding: 0 20px; }
+.wrap { max-width: 1200px; margin: 0 auto; padding: 0 var(--page-x); }
 
-.site-head { border-bottom: 1px solid var(--border); }
-.site-head .wrap { display: flex; align-items: center; height: 64px; }
-.brand { display: inline-flex; align-items: baseline; gap: 8px; text-decoration: none; color: var(--ink); }
-.brand-word { font-weight: 700; font-size: 20px; letter-spacing: .06em; text-transform: uppercase; }
-.brand-sub { font-size: 13px; color: var(--text-3); }
-.site-foot { margin-top: 64px; border-top: 1px solid var(--border); font-size: 13px; color: var(--text-3); }
-.site-foot .wrap { display: flex; justify-content: space-between; gap: 12px; padding-top: 20px; padding-bottom: 28px; }
+/* ---------------------------------------------------------------- header / footer */
+.site-head { border-bottom: 1px solid var(--border); background: var(--surface); }
+.site-head .wrap { display: flex; align-items: center; justify-content: space-between; gap: 16px; height: 72px; }
+.brand { display: inline-flex; align-items: center; line-height: 0; border-radius: 4px; }
+.brand-logo { display: block; height: 30px; width: auto; }
+.brand-careers { font-size: 14px; font-weight: 500; letter-spacing: .02em; color: var(--text-2); text-decoration: none; padding: 6px 2px; }
+.brand-careers:hover { color: var(--ink); }
+.site-foot { margin-top: 80px; border-top: 1px solid var(--border); font-size: 13px; color: var(--text-3); }
+.site-foot .wrap { display: flex; justify-content: space-between; gap: 12px; padding-top: 22px; padding-bottom: 30px; }
 
+/* ---------------------------------------------------------------- home */
 .hero { background: var(--surface-2); border-bottom: 1px solid var(--border); }
-.hero .wrap { padding-top: 48px; padding-bottom: 40px; }
-h1 { font-size: 34px; line-height: 1.2; letter-spacing: -.02em; margin: 0 0 10px; }
-.lead { font-size: 17px; color: var(--text-2); margin: 0; max-width: 600px; }
-
-.jobs { margin-top: 32px; }
+.hero .wrap { padding-top: 56px; padding-bottom: 44px; }
+h1 { font-size: 40px; line-height: 1.15; letter-spacing: -.025em; font-weight: 700; margin: 0 0 12px; color: var(--ink); }
+.lead { font-size: 18px; color: var(--text-2); margin: 0; max-width: 620px; }
+.jobs { margin-top: 36px; max-width: 880px; }
 .section-title { font-size: 18px; margin: 0 0 14px; display: flex; align-items: center; gap: 8px; }
 .count { font-size: 12px; font-weight: 600; color: var(--text-2); background: var(--surface-2); border: 1px solid var(--border); border-radius: 999px; padding: 1px 8px; }
 .job-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 12px; }
-.job-card a { display: grid; gap: 4px; padding: 18px 20px; border: 1px solid var(--border); border-radius: var(--radius); text-decoration: none; color: inherit; transition: border-color .12s, box-shadow .12s; }
+.job-card a { display: grid; gap: 4px; padding: 20px 22px; border: 1px solid var(--border); border-radius: var(--radius); text-decoration: none; color: inherit; transition: border-color .12s, box-shadow .12s; }
 .job-card a:hover { border-color: var(--border-strong); box-shadow: 0 1px 3px rgba(16, 24, 40, .08); }
-.job-card-title { font-weight: 600; font-size: 17px; }
-.job-card-facts, .job-facts { color: var(--text-2); font-size: 14px; }
+.job-card-title { font-weight: 600; font-size: 17px; color: var(--ink); }
+.job-card-facts { color: var(--text-2); font-size: 14px; }
 .dot { margin: 0 8px; color: var(--text-3); }
 .job-card-summary { color: var(--text-2); font-size: 14px; }
 .job-card-cta { color: var(--accent); font-weight: 500; font-size: 14px; margin-top: 4px; }
 .empty { padding: 32px 20px; border: 1px dashed var(--border-strong); border-radius: var(--radius); text-align: center; color: var(--text-2); }
 .empty p { margin: 0 0 4px; }
 
+/* ---------------------------------------------------------------- job page */
 .job { margin-top: 28px; }
-.crumbs { font-size: 14px; margin-bottom: 16px; }
-.crumbs a { text-decoration: none; }
+.crumbs { font-size: 14px; margin-bottom: 24px; }
+.crumbs a { text-decoration: none; color: var(--text-3); }
+.crumbs a:hover { color: var(--ink); }
 .crumbs a::before { content: "← "; }
-.job-head { padding-bottom: 24px; border-bottom: 1px solid var(--border); }
-.job-meta { display: flex; flex-wrap: wrap; gap: 8px 28px; margin: 16px 0 0; }
-.job-meta dt { font-size: 12px; color: var(--text-3); text-transform: uppercase; letter-spacing: .04em; }
-.job-meta dd { margin: 0; font-weight: 500; }
-.cta { display: inline-block; margin-top: 20px; padding: 11px 20px; border-radius: 8px; background: var(--accent); color: #fff; font-weight: 600; text-decoration: none; }
-.cta:hover { background: var(--accent-hover); color: #fff; }
-.job-body { padding-top: 8px; }
-.job-body h2 { font-size: 18px; margin: 28px 0 8px; }
-.job-body p, .job-body ul { margin: 0 0 10px; color: var(--text); }
-.job-body ul { padding-left: 22px; }
-.job-body li { margin-bottom: 4px; }
-.summary { font-size: 17px; margin-top: 20px !important; }
-.notice { margin-top: 18px; padding: 14px 16px; border-radius: 8px; font-size: 14px; }
-.notice.closed { background: var(--surface-2); border: 1px solid var(--border-strong); }
-.notice.warn { background: var(--warning-soft); border: 1px solid #FEDF89; color: var(--warning-text); margin: 0 0 16px; }
 
-.apply { margin-top: 40px; padding: 28px; border: 1px solid var(--border); border-radius: 14px; background: var(--surface-2); scroll-margin-top: 16px; }
-.apply > h2 { font-size: 22px; margin: 0 0 18px; }
-fieldset { border: 0; padding: 0; margin: 0 0 8px; min-width: 0; }
-legend { font-weight: 600; font-size: 15px; padding: 0; margin: 0 0 12px; }
-.row2 { display: grid; grid-template-columns: 1fr 1fr; gap: 0 16px; }
-.field { margin-bottom: 16px; min-width: 0; }
-.field label { display: block; font-weight: 500; font-size: 14px; margin-bottom: 6px; }
+/* Two columns from 960px: the role reads on the left and scrolls with the
+   page; the application stays in view on the right (see careers.js for the
+   tall-form offset). A closed role has no form and keeps one column. */
+.job-layout { display: grid; grid-template-columns: minmax(0, 1fr); gap: 40px; }
+.job-main { min-width: 0; }
+.job-side { min-width: 0; }
+
+.job-head { padding-bottom: 28px; border-bottom: 1px solid var(--border); }
+.eyebrow { margin: 0 0 10px; font-size: 12px; font-weight: 600; letter-spacing: .08em; text-transform: uppercase; color: var(--accent); }
+.job-layout.closed .eyebrow { color: var(--text-3); }
+.job-facts { list-style: none; display: flex; flex-wrap: wrap; gap: 8px; margin: 18px 0 0; padding: 0; }
+.job-facts li { font-size: 13.5px; font-weight: 500; color: var(--text-2); background: var(--surface-2); border: 1px solid var(--border); border-radius: 999px; padding: 4px 12px; }
+.job-meta { display: flex; flex-wrap: wrap; gap: 10px 36px; margin: 22px 0 0; }
+.job-meta dt { font-size: 12px; color: var(--text-3); text-transform: uppercase; letter-spacing: .06em; font-weight: 600; }
+.job-meta dd { margin: 2px 0 0; font-weight: 600; color: var(--ink); }
+.cta { display: inline-flex; align-items: center; justify-content: center; min-height: 48px; margin-top: 24px; padding: 12px 22px; border-radius: 10px; background: var(--ink); color: #fff; font-weight: 600; text-decoration: none; }
+.cta:hover { background: var(--ink-hover); color: #fff; }
+
+.job-body { max-width: 68ch; }
+.summary { font-size: 18px; line-height: 1.6; color: var(--text-2); margin: 28px 0 0 !important; }
+.job-body section { padding-top: 28px; margin-top: 28px; border-top: 1px solid var(--border); }
+.job-body .summary + section, .job-body > section:first-child { border-top: 0; margin-top: 8px; }
+.job-body h2 { font-size: 20px; line-height: 1.3; letter-spacing: -.01em; font-weight: 650; color: var(--ink); margin: 0 0 12px; }
+.job-body p { margin: 0 0 14px; color: var(--text-2); overflow-wrap: anywhere; }
+.job-body ul { margin: 0 0 14px; padding: 0; list-style: none; }
+.job-body li { position: relative; padding-left: 22px; margin-bottom: 8px; color: var(--text-2); overflow-wrap: anywhere; }
+.job-body li::before { content: ""; position: absolute; left: 4px; top: .7em; width: 6px; height: 6px; border-radius: 50%; background: var(--accent); }
+.notice { margin-top: 20px; padding: 14px 16px; border-radius: 10px; font-size: 14px; }
+.notice.closed { background: var(--surface-2); border: 1px solid var(--border-strong); }
+.notice.warn { background: var(--warning-soft); border: 1px solid #FEDF89; color: var(--warning-text); margin: 0 0 18px; }
+
+/* ---------------------------------------------------------------- application card */
+.apply {
+  padding: 28px; border: 1px solid var(--border); border-radius: 16px; background: var(--surface);
+  box-shadow: 0 1px 2px rgba(16, 24, 40, .04), 0 16px 40px -20px rgba(16, 24, 40, .18);
+  scroll-margin-top: 20px;
+}
+.apply-head { padding-bottom: 20px; margin-bottom: 22px; border-bottom: 1px solid var(--border); }
+.apply-head h2 { font-size: 24px; line-height: 1.25; letter-spacing: -.015em; font-weight: 700; color: var(--ink); margin: 0 0 6px; }
+.apply-sub { font-size: 14.5px; color: var(--text-3); margin: 0; }
+fieldset { border: 0; padding: 0; margin: 0 0 6px; min-width: 0; }
+fieldset + fieldset { padding-top: 18px; border-top: 1px solid var(--border); }
+legend { float: left; width: 100%; font-weight: 600; font-size: 12px; letter-spacing: .08em; text-transform: uppercase; color: var(--text-3); padding: 0; margin: 0 0 14px; }
+legend + * { clear: left; }
+.row2 { display: grid; grid-template-columns: 1fr 1fr; gap: 0 14px; }
+.field { margin-bottom: 18px; min-width: 0; }
+.field > label { display: block; font-weight: 550; font-size: 14px; color: var(--text); margin-bottom: 6px; }
 .req { color: var(--error-text); }
 .opt { color: var(--text-3); font-weight: 400; font-size: 13px; }
 .field input[type=text], .field input[type=email], .field input[type=tel], .field input[type=url], .field textarea {
-  width: 100%; font: inherit; font-size: 15px; color: var(--text); background: #fff; border: 1px solid var(--border-strong); border-radius: 8px; padding: 10px 12px; }
-.field textarea { resize: vertical; min-height: 96px; }
-.field input:focus, .field textarea:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px rgba(58, 107, 76, .15); }
-.field input[type=file] { font: inherit; font-size: 14px; max-width: 100%; padding: 10px; border: 1px dashed var(--border-strong); border-radius: 8px; background: #fff; width: 100%; }
-.help { font-size: 13px; color: var(--text-3); margin: 6px 0 0; }
-.err { font-size: 13px; color: var(--error-text); margin: 6px 0 0; }
+  width: 100%; min-height: 46px; font: inherit; font-size: 15.5px; color: var(--text); background: #fff;
+  border: 1px solid var(--border-strong); border-radius: 10px; padding: 11px 13px; transition: border-color .12s, box-shadow .12s; }
+.field textarea { resize: vertical; min-height: 110px; line-height: 1.55; }
+.field input:hover, .field textarea:hover { border-color: #98A2B3; }
+.field input:focus, .field textarea:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 4px var(--accent-soft); }
+.field input[type=file] {
+  font: inherit; font-size: 14px; color: var(--text-2); max-width: 100%; width: 100%; min-height: 56px; padding: 14px;
+  border: 1.5px dashed var(--border-strong); border-radius: 10px; background: var(--surface-2); cursor: pointer; }
+.field input[type=file]:hover { border-color: var(--accent); }
+.field input[type=file]:focus-visible { outline: none; border-color: var(--accent); box-shadow: 0 0 0 4px var(--accent-soft); }
+.field input[type=file]::file-selector-button {
+  font: inherit; font-weight: 600; font-size: 14px; margin-right: 12px; padding: 8px 14px; border: 1px solid var(--border-strong);
+  border-radius: 8px; background: #fff; color: var(--ink); cursor: pointer; }
+.help { font-size: 13px; color: var(--text-3); margin: 6px 0 0; line-height: 1.5; }
+.err { font-size: 13px; font-weight: 500; color: var(--error-text); margin: 6px 0 0; }
 .err:empty { display: none; }
 .has-err input, .has-err textarea { border-color: var(--error) !important; }
-.check { display: flex !important; gap: 10px; align-items: flex-start; font-weight: 400 !important; }
-.check input { margin-top: 4px; width: 18px; height: 18px; flex: none; accent-color: var(--accent); }
+.has-err input:focus, .has-err textarea:focus { box-shadow: 0 0 0 4px rgba(217, 45, 32, .14) !important; }
+.consent { padding: 14px 16px; background: var(--surface-2); border: 1px solid var(--border); border-radius: 10px; }
+.check { display: flex !important; gap: 12px; align-items: flex-start; font-weight: 400 !important; font-size: 14px; color: var(--text-2); cursor: pointer; }
+.check input { margin-top: 3px; width: 20px; height: 20px; flex: none; accent-color: var(--accent); cursor: pointer; }
+.consent .help { margin-left: 32px; }
 .hp { position: absolute; left: -10000px; width: 1px; height: 1px; overflow: hidden; }
-.submit { width: 100%; padding: 13px 20px; border: 0; border-radius: 8px; background: var(--accent); color: #fff; font: inherit; font-weight: 600; font-size: 16px; cursor: pointer; }
-.submit:hover:not(:disabled) { background: var(--accent-hover); }
-.submit:disabled { opacity: .6; cursor: progress; }
-.fineprint { font-size: 12px; color: var(--text-3); text-align: center; margin: 10px 0 0; }
-.form-error { padding: 12px 14px; border-radius: 8px; background: var(--error-soft); border: 1px solid #FECDCA; color: var(--error-text); font-size: 14px; margin-bottom: 16px; }
+.submit {
+  width: 100%; min-height: 52px; margin-top: 6px; padding: 14px 20px; border: 0; border-radius: 10px;
+  background: var(--ink); color: #fff; font: inherit; font-weight: 600; font-size: 16px; letter-spacing: .005em; cursor: pointer;
+  transition: background .12s, transform .06s; }
+.submit:hover:not(:disabled) { background: var(--ink-hover); }
+.submit:active:not(:disabled) { transform: translateY(1px); }
+.submit:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+.submit:disabled { opacity: .55; cursor: progress; }
+.fineprint { font-size: 12.5px; color: var(--text-3); text-align: center; margin: 12px 0 0; }
+.form-error { padding: 12px 14px; border-radius: 10px; background: var(--error-soft); border: 1px solid #FECDCA; color: var(--error-text); font-size: 14px; margin-bottom: 18px; }
 .form-error a { color: inherit; font-weight: 600; }
 .done { outline: none; }
-.done h2 { font-size: 22px; margin: 0 0 8px; color: var(--accent); }
-.done p { margin: 0 0 8px; }
-.empty-page { margin-top: 64px; text-align: center; }
+.done h2 { font-size: 24px; margin: 0 0 10px; color: var(--accent); }
+.done p { margin: 0 0 10px; color: var(--text-2); }
+.empty-page { margin-top: 72px; text-align: center; }
 
+@media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
+
+/* ---------------------------------------------------------------- two columns */
+@media (min-width: 960px) {
+  /* The aside stretches to the row (the role's full height): that is the room the sticky card moves within. */
+  .job-layout:not(.closed) { grid-template-columns: minmax(0, 1.3fr) minmax(380px, 1fr); gap: 56px; align-items: stretch; }
+  /* The card sticks; careers.js lowers the offset when the form is taller than the window, so its end (Submit) stays reachable. */
+  .job-side .apply { position: sticky; top: var(--sticky-top, 24px); }
+  .cta-mobile { display: none; }
+}
+@media (min-width: 1200px) {
+  .job-layout:not(.closed) { gap: 72px; }
+  .apply { padding: 32px; }
+}
+
+/* ---------------------------------------------------------------- tablet and phone */
+@media (max-width: 959px) {
+  :root { --page-x: 24px; }
+  .job-body { max-width: none; }
+  .apply { scroll-margin-top: 12px; }
+}
 @media (max-width: 640px) {
-  body { font-size: 15px; }
-  .wrap { padding: 0 16px; }
-  h1 { font-size: 27px; }
-  .hero .wrap { padding-top: 32px; padding-bottom: 28px; }
+  :root { --page-x: 16px; }
+  body { font-size: 15.5px; }
+  .site-head .wrap { height: 64px; }
+  .brand-logo { height: 24px; }
+  h1 { font-size: 30px; }
+  .hero .wrap { padding-top: 36px; padding-bottom: 30px; }
+  .lead { font-size: 16.5px; }
+  .job { margin-top: 20px; }
+  .crumbs { margin-bottom: 16px; }
   .row2 { grid-template-columns: 1fr; }
-  .apply { padding: 20px 16px; margin-left: -4px; margin-right: -4px; }
+  .apply { padding: 22px 18px; border-radius: 14px; box-shadow: 0 1px 2px rgba(16, 24, 40, .05); }
+  .apply-head h2 { font-size: 22px; }
+  .cta-mobile { width: 100%; }
+  .summary { font-size: 17px; }
   .site-foot .wrap { flex-direction: column; }
   .job-card a { padding: 16px; }
+}
+
+/* Side-by-side fields share rows (label / input / help / error), so a label that
+   wraps never pushes its input below its neighbour's. */
+@supports (grid-template-rows: subgrid) {
+  .row2 { grid-template-rows: auto auto auto auto; }
+  .row2 > .field { display: grid; grid-row: span 4; grid-template-rows: subgrid; row-gap: 0; align-content: start; }
+  .row2 > .field > label { align-self: end; }
+  .row2 > .field > .help:empty, .row2 > .field > .err:empty { display: none; }
 }

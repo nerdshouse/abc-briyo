@@ -377,8 +377,8 @@ function sidebarHtml(me) {
   const support = has('support.work');
   return `
     <a class="brand" href="/overview" aria-label="Briyo OS — overview">
-      <span class="brand-mark" aria-hidden="true">B</span>
-      <div><div class="brand-name">Briyo OS</div><div class="brand-sub">Operating system</div></div>
+      <img class="brand-logo" src="/brand/briyo-logo.png" alt="Briyo Supplements" width="512" height="154" />
+      <div class="brand-sub">Briyo OS · Operating system</div>
     </a>
     ${support ? `<form class="side-search" id="sideSearchForm" role="search" data-context="recovery">
       <i data-lucide="search"></i>

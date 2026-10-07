@@ -4,6 +4,27 @@
  *   2. POST /jobs/:id/apply/resume   the file, with that single-use token
  * The page works without this script except for applying (a <noscript> says so).
  */
+/*
+ * Layout only (no part of applying): on wide screens the application card is
+ * sticky beside the role. When the card is taller than the window, a plain
+ * `top: 24px` would hide its end, so the offset goes negative by the overflow:
+ * the card scrolls with the page until its bottom is in view, then holds there.
+ */
+(function () {
+  'use strict';
+  var card = document.getElementById('apply');
+  if (!card || !window.matchMedia) return;
+  var wide = window.matchMedia('(min-width: 960px)');
+  var GAP = 24;
+  function place() {
+    if (!wide.matches) { card.style.removeProperty('--sticky-top'); return; }
+    card.style.setProperty('--sticky-top', Math.min(GAP, window.innerHeight - card.offsetHeight - GAP) + 'px');
+  }
+  place();
+  window.addEventListener('resize', place);
+  if (window.ResizeObserver) new ResizeObserver(place).observe(card);
+}());
+
 (function () {
   'use strict';
   var form = document.getElementById('applyForm');

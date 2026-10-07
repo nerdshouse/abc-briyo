@@ -691,5 +691,8 @@ tr.module-editor td { background: #FAFAFB; }
 .login-brand { display: flex; align-items: center; gap: 10px; margin-bottom: 18px; }
 .login-brand .mark { width: 32px; height: 32px; border-radius: 8px; display: grid; place-items: center; background: #202B3C; color: #fff; font-weight: 700; font-size: 15px; letter-spacing: -0.02em; }
 .login-brand h1 { margin: 0; }
+/* The Briyo Supplements wordmark above the title: its own ratio, never stretched. */
+.login-brand:has(.login-logo) { flex-direction: column; align-items: flex-start; gap: 14px; }
+.login-logo { display: block; height: 26px; width: auto; }
 .login-brand .sub { margin: 2px 0 0 !important; }
 :where(a, button, input, select):focus-visible { outline: 2px solid #3978F6; outline-offset: 2px; }
