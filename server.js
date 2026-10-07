@@ -30,6 +30,7 @@ import {
 import { getProfile, updateProfile, savePhoto, clearPhoto, photoFile, memberActivity, MAX_PHOTO_BYTES } from './lib/profile.js';
 import { homeFor, MODULE_KEYS, isValidAssignment } from './lib/permissions.js';
 import { careersHost } from './lib/careers.js';
+import { clickHost, ensureAffiliateReferralSchema, clickHostName } from './lib/affiliate-referrals.js';
 import { router as hrRouter } from './lib/hr-routes.js';
 import { router as affiliateRouter } from './lib/affiliate-routes.js';
 import { ensureAffiliateSchema } from './lib/affiliates.js';
@@ -65,6 +66,9 @@ app.set('trust proxy', 1);
 // parser, session or static file: that host gets only the careers routes, or a
 // 404 (lib/careers.js). Every other host continues to the app below.
 app.use(careersHost);
+// The affiliate click host (AFFILIATE_CLICK_HOST, e.g. go.briyo.xyz): the same isolation. It answers only
+// GET /r/:affiliatePublicId (record a click, 302 to the storefront) and /healthz; everything else is a 404.
+app.use(clickHost);
 
 /**
  * The webhook takes the body as raw text and parses it itself, so a malformed
@@ -1206,6 +1210,10 @@ app.listen(port, async () => {
       ensureAffiliateVerificationSchema()
         .then(() => console.log('Affiliate verification schema ready'))
         .catch((e) => console.error('Affiliate verification schema setup failed (will retry on first request):', e.message));
+      // Schema only: startup never creates Shopify redirects, theme changes, referral assets or discounts.
+      ensureAffiliateReferralSchema()
+        .then(() => console.log('Affiliate referral schema ready'))
+        .catch((e) => console.error('Affiliate referral schema setup failed (will retry on first request):', e.message));
       ensureOrderFinancialSnapshotSchema()
         .then(() => console.log('Order financial snapshot schema ready'))
         .catch((e) => console.error('Order financial snapshot schema setup failed (will retry on the next Shopify sync):', e.message));
@@ -1217,6 +1225,7 @@ app.listen(port, async () => {
           .catch((e) => console.error('Pending resume removals not retried:', e.message)))
         .catch((e) => console.error('HR schema setup failed (will retry on first request):', e.message));
       console.log(process.env.CAREERS_HOST ? `Careers host: ${process.env.CAREERS_HOST} (public careers routes only)` : 'Careers host: not configured');
+      console.log(clickHostName() ? `Affiliate click host: ${clickHostName()} (referral redirect only)` : 'Affiliate click host: not configured');
     } catch (err) {
       console.error(`\n  Postgres connection FAILED: ${err.message}\n  Check DATABASE_URL.\n`);
     }

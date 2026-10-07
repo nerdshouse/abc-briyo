@@ -4117,7 +4117,8 @@ await step('hr: server with careers host, Turnstile stub and throwaway storage',
       CAREERS_HOST: 'careers.test', CAREERS_BASE_URL: 'https://careers.test', TURNSTILE_SECRET_KEY: 'test-secret', TURNSTILE_SITE_KEY: 'test-site',
       TURNSTILE_VERIFY_URL: `http://127.0.0.1:${HRS.stub.address().port}/verify`, DOCUMENT_STORAGE: 'local', DOCUMENT_STORAGE_DIR: HRS.dir, HR_IP_HASH_SALT: 'db-check',
       META_ACCESS_TOKEN: 'test-meta-token-NEVER-LEAK-9f3a', META_AD_ACCOUNT_ID: '1234567890', META_APP_SECRET: 'test-meta-app-secret', META_API_VERSION: 'v25.0',
-      MARKETING_ROAS_TARGET: '2.5', META_GRAPH_BASE: `http://127.0.0.1:${HRS.metaStub.address().port}` },
+      MARKETING_ROAS_TARGET: '2.5', META_GRAPH_BASE: `http://127.0.0.1:${HRS.metaStub.address().port}`,
+      AFFILIATE_CLICK_HOST: 'go.test', AFFILIATE_STOREFRONT_URL: 'https://store.test', AFFILIATE_HASH_SALT: 'db-check-affiliate-salt' },
     stdio: ['ignore', 'ignore', 'pipe'],
   });
   let stderr = ''; HRS.log = ''; HRS.server.stderr.on('data', (d) => { stderr += d; HRS.log += d; });
@@ -5684,6 +5685,326 @@ await step('verification: history and concurrency — no deletes or edits of dec
   return 'decided application, documents and profiles cannot be edited or deleted; a second open application is refused by the unique index; stale version → 409; four simultaneous approve/reject requests → exactly one succeeds (one decision event)';
 });
 
+/* ------------------------------------------------------------------ referral assets and attribution (Phase 1E) */
+const RF = {};
+/** A request to the click host (go.test) of the running test server, as a browser would send it. */
+const goReq = (p, { method = 'GET', cookie, ip = '203.0.113.7', ua = 'DBCHECK-UA/1.0' } = {}) => new Promise((resolve, reject) => {
+  const u = new URL(HRS.base);
+  const headers = { host: 'go.test', 'x-forwarded-for': ip, 'user-agent': ua };
+  if (cookie) headers.cookie = cookie;
+  const req = http.request({ hostname: u.hostname, port: u.port, path: p, method, headers }, (res) => {
+    let b = ''; res.on('data', (c) => { b += c; }); res.on('end', () => resolve({ status: res.statusCode, location: res.headers.location || null, setCookie: res.headers['set-cookie'] || [], headers: res.headers, body: b }));
+  });
+  req.on('error', reject); req.end();
+});
+const visitorOf = (r) => (r.setCookie.find((c) => c.startsWith('bv=')) || '').split(';')[0];
+const clickOf = (r) => (r.location ? new URL(r.location).searchParams.get('bclid') : null);
+const refGet = async (pid, who = 'viewer') => (await af(who, 'GET', `/api/affiliates/${pid}/referral`)).body;
+/** An active, eligible influencer (non-professional), with its referral link. */
+const eligibleAffiliate = async (name) => {
+  const pid = (await af('manager', 'POST', '/api/affiliates', { display_name: `DBCHECK-AF ${name}`, category: 'influencer' })).body.affiliate.public_id;
+  await af('manager', 'POST', `/api/affiliates/${pid}/status`, { action: 'activate' });
+  await af('manager', 'POST', `/api/affiliates/${pid}/referral`, {});
+  return pid;
+};
+
+await step('referral: schema — three tables, keys, one active link, append-only clicks and attributions, immutable asset identity', async () => {
+  const bad = [];
+  const q = async (sql, p = []) => (await getPool().query(sql, p)).rows;
+  for (const t of ['affiliate_referral_assets', 'affiliate_referral_clicks', 'affiliate_order_attributions']) if (!(await q('SELECT to_regclass($1) t', [t]))[0].t) bad.push(`${t} missing`);
+  const fks = await q(`SELECT conrelid::regclass::text t, confrelid::regclass::text ref, confdeltype d FROM pg_constraint WHERE contype = 'f'
+    AND conrelid::regclass::text IN ('affiliate_referral_assets', 'affiliate_referral_clicks', 'affiliate_order_attributions')`);
+  for (const [t, ref] of [['affiliate_referral_assets', 'affiliates'], ['affiliate_referral_clicks', 'affiliates'], ['affiliate_referral_clicks', 'affiliate_referral_assets'],
+    ['affiliate_order_attributions', 'orders'], ['affiliate_order_attributions', 'affiliates'], ['affiliate_order_attributions', 'affiliate_referral_assets']]) {
+    if (!fks.some((f) => f.t === t && f.ref === ref && f.d === 'r')) bad.push(`FK ${t} → ${ref}`);
+  }
+  const idx = (await q(`SELECT indexname, indexdef FROM pg_indexes WHERE tablename IN ('affiliate_referral_assets', 'affiliate_referral_clicks', 'affiliate_order_attributions')`));
+  if (!/UNIQUE.*WHERE/.test(idx.find((i) => i.indexname === 'affiliate_referral_assets_one_active_link')?.indexdef || '')) bad.push('one active link index');
+  const cons = (await q(`SELECT conname FROM pg_constraint WHERE conrelid::regclass::text IN ('affiliate_referral_assets', 'affiliate_referral_clicks', 'affiliate_order_attributions')`)).map((r) => r.conname);
+  for (const c of ['affiliate_order_attributions_order_key', 'affiliate_referral_clicks_public_id_key', 'affiliate_referral_assets_public_id_key', 'affiliate_order_attributions_method_check']) if (!cons.includes(c)) bad.push(`constraint ${c}`);
+  const cols = (await q(`SELECT column_name FROM information_schema.columns WHERE table_name = 'affiliate_referral_clicks'`)).map((r) => r.column_name);
+  if (cols.some((c) => /^(ip|ip_address|email|phone|user_agent|name)$/.test(c))) bad.push(`raw-data column: ${cols}`);
+  if (bad.length) throw new Error(bad.join(' | '));
+  return '3 tables; 6 RESTRICT foreign keys; one active link per affiliate (partial unique index); unique order attribution and click id; no raw IP, user-agent or PII columns';
+});
+
+await step('referral: eligibility and assets — only active (and verified) affiliates; one live link; disable with reason; RBAC; no internal ids', async () => {
+  const bad = [];
+  const mk = async (name, category) => (await af('manager', 'POST', '/api/affiliates', { display_name: `DBCHECK-AF ${name}`, category })).body.affiliate.public_id;
+  const create = (pid, who = 'manager') => af(who, 'POST', `/api/affiliates/${pid}/referral`, {});
+  const inf = await mk('Ref influencer', 'influencer');
+  const reasonOf = async (pid) => (await refGet(pid)).referral.eligibility.reason;
+  if ((await reasonOf(inf)) !== 'not_active' || (await create(inf)).status !== 409) bad.push('draft influencer eligible');
+  await af('manager', 'POST', `/api/affiliates/${inf}/status`, { action: 'activate' });
+  for (const who of ['viewer', 'finance', 'none']) if ((await create(inf, who)).status !== 403) bad.push(`${who} created a link`);
+  if ((await af('', 'POST', `/api/affiliates/${inf}/referral`, {})).status !== 401) bad.push('anon create');
+  const made = await create(inf);
+  const R = made.body.referral;
+  if (made.status !== 201 || !R.usable || R.public_url !== `https://briyosupplements.com/r/${inf}` || !/^[A-HJKMNP-Z2-9]{10}$/.test(R.link.ref) || R.link.ref === inf) bad.push(`create ${made.status} ${JSON.stringify(R).slice(0, 160)}`);
+  if (JSON.stringify(made.body).match(/"id":|affiliate_id|visitor|ip_hash/)) bad.push('internal fields in response');
+  if ((await create(inf)).status !== 409) bad.push('second active link');
+  for (const who of ['viewer', 'finance']) if ((await af(who, 'GET', `/api/affiliates/${inf}/referral`)).status !== 200) bad.push(`${who} cannot view`);
+  if ((await af('none', 'GET', `/api/affiliates/${inf}/referral`)).status !== 403 || (await af('', 'GET', `/api/affiliates/${inf}/referral`)).status !== 401) bad.push('view gate');
+  // Professionals: not before an approved verification AND activation.
+  const pro = await mk('Ref doctor', 'doctor');
+  if ((await reasonOf(pro)) !== 'verification_not_approved' || (await create(pro)).status !== 409) bad.push('unverified professional');
+  await af('manager', 'POST', `/api/affiliates/${pro}/professional`, PROFILE);
+  await pvUpload('manager', pro, pvPdf('ref'), 'c.pdf');
+  for (const a of ['submit', 'review', 'approve']) await pvAct('manager', pro, a);
+  if ((await reasonOf(pro)) !== 'not_activated' || (await create(pro)).status !== 409) bad.push('approved but not active');
+  await af('manager', 'POST', `/api/affiliates/${pro}/status`, { action: 'activate' });
+  if ((await create(pro)).status !== 201) bad.push('verified active professional refused');
+  RF.pro = pro;
+  // Suspended / closed: not eligible; the link stays but is unusable, and comes back on reactivation (no new asset).
+  await af('manager', 'POST', `/api/affiliates/${inf}/status`, { action: 'suspend', reason: 'db-check' });
+  const sus = (await refGet(inf)).referral;
+  if (sus.usable || sus.eligibility.reason !== 'suspended' || !sus.link) bad.push('suspended link usable');
+  await af('manager', 'POST', `/api/affiliates/${inf}/status`, { action: 'reactivate' });
+  const back = (await refGet(inf)).referral;
+  if (!back.usable || back.link.ref !== R.link.ref) bad.push('reactivation created a new asset or stayed unusable');
+  const cl = await mk('Ref closed', 'creator');
+  await af('manager', 'POST', `/api/affiliates/${cl}/status`, { action: 'close', reason: 'db-check' });
+  if ((await reasonOf(cl)) !== 'closed' || (await create(cl)).status !== 409) bad.push('closed affiliate');
+  // Disable: reason required; final; a new link may follow with the same public URL.
+  if ((await af('manager', 'POST', `/api/affiliates/${inf}/referral/disable`, {})).status !== 400) bad.push('disable without reason');
+  if ((await af('finance', 'POST', `/api/affiliates/${inf}/referral/disable`, { reason: 'x' })).status !== 403) bad.push('finance disabled');
+  const dis = await af('manager', 'POST', `/api/affiliates/${inf}/referral/disable`, { reason: 'Partner asked to pause' });
+  if (dis.body.referral?.link !== null || dis.body.referral.history[0]?.disable_reason !== 'Partner asked to pause') bad.push('disable');
+  const again = await create(inf);
+  if (again.status !== 201 || again.body.referral.public_url !== R.public_url || again.body.referral.link.ref === R.link.ref) bad.push('new link after disable');
+  RF.inf = inf; RF.disabledAsset = R.link.ref;
+  // Identity is immutable and a disabled asset stays disabled — in the database itself.
+  const id = (await getPool().query('SELECT id FROM affiliate_referral_assets WHERE public_id = $1', [R.link.ref])).rows[0].id;
+  await expectErr('change public id', () => getPool().query(`UPDATE affiliate_referral_assets SET public_id = 'ZZZZZZZZZZ' WHERE id = $1`, [id]), (e) => /immutable/.test(e.message));
+  await expectErr('re-enable', () => getPool().query(`UPDATE affiliate_referral_assets SET status = 'active' WHERE id = $1`, [id]), (e) => /stays disabled|one_active/.test(e.message));
+  await expectErr('delete asset', () => getPool().query('DELETE FROM affiliate_referral_assets WHERE id = $1', [id]), (e) => /never deleted/.test(e.message));
+  // The storefront redirect is an explicit action; without the click host / Shopify it reports, never guesses.
+  const sr = await af('manager', 'POST', `/api/affiliates/${inf}/referral/storefront-redirect`, {});
+  if (![409, 502].includes(sr.status) || sr.body.ok !== false) bad.push(`storefront redirect ${sr.status}`);
+  if ((await af('finance', 'POST', `/api/affiliates/${inf}/referral/storefront-redirect`, {})).status !== 403) bad.push('finance storefront redirect');
+  const ev = (await afEvents(inf)).map((e) => e.action);
+  if (!ev.includes('referral_asset_created') || !ev.includes('referral_asset_disabled')) bad.push('events');
+  if (bad.length) throw new Error(bad.join(' | '));
+  return 'draft / unverified / approved-not-active / closed → no link (409); active influencer and verified active doctor → link; one live link; viewer+finance read only, others 403/401; suspension makes the link unusable and reactivation restores the same asset; disable needs a reason, is final, a new link keeps the public URL; identity immutable in the DB; storefront redirect explicit and refused safely without Shopify';
+});
+
+await step('referral: storefront redirect action — finds or creates the Shopify URL redirect, refuses a conflicting one, reports a missing scope', async () => {
+  const bad = [];
+  const { syncStorefrontRedirect } = await import('../lib/affiliate-referrals.js');
+  const keep = process.env.AFFILIATE_CLICK_HOST;
+  process.env.AFFILIATE_CLICK_HOST = 'go.test';
+  try {
+    const calls = [];
+    const fake = (existing, opts = {}) => async (query, vars) => {
+      calls.push({ query: query.split('(')[0], vars });
+      if (opts.deny) throw new Error('Shopify GraphQL error: Access denied for urlRedirects field. Required access: `read_online_store_navigation` access scope.');
+      if (/urlRedirects/.test(query)) return { urlRedirects: { nodes: existing } };
+      return { urlRedirectCreate: { urlRedirect: { id: 'gid://shopify/UrlRedirect/1' }, userErrors: [] } };
+    };
+    const made = await syncStorefrontRedirect(RF.pro, { actor: 'db-check', gql: fake([]) });
+    const create = calls.find((c) => /mutation/.test(c.query));
+    if (!made.link.storefront_redirect_set || create?.vars.r.path !== `/r/${RF.pro}` || create.vars.r.target !== `https://go.test/r/${RF.pro}`) bad.push(`create ${JSON.stringify(create?.vars)}`);
+    calls.length = 0;
+    await syncStorefrontRedirect(RF.pro, { actor: 'db-check', gql: fake([{ id: 'gid://shopify/UrlRedirect/1', path: `/r/${RF.pro}`, target: `https://go.test/r/${RF.pro}` }]) });
+    if (calls.some((c) => /mutation/.test(c.query))) bad.push('re-created an existing redirect');
+    await expectErr('conflicting redirect', () => syncStorefrontRedirect(RF.pro, { actor: 'db-check', gql: fake([{ id: 'x', path: `/r/${RF.pro}`, target: 'https://elsewhere.example/' }]) }), (e) => e.status === 409);
+    await expectErr('missing scope', () => syncStorefrontRedirect(RF.pro, { actor: 'db-check', gql: fake([], { deny: true }) }), (e) => e.status === 409 && e.scope && /write_online_store_navigation/.test(e.message));
+    delete process.env.AFFILIATE_CLICK_HOST;
+    await expectErr('no click host', () => syncStorefrontRedirect(RF.pro, { gql: fake([]) }), (e) => e.status === 409 && /AFFILIATE_CLICK_HOST/.test(e.message));
+  } finally { if (keep === undefined) delete process.env.AFFILIATE_CLICK_HOST; else process.env.AFFILIATE_CLICK_HOST = keep; }
+  if (bad.length) throw new Error(bad.join(' | '));
+  return '/r/{id} → https://{click host}/r/{id} created once; an identical existing redirect is reused; a conflicting one is refused (409); a missing navigation scope is reported with the exact scopes; no click host → 409';
+});
+
+await step('referral: public redirect — 302 to the fixed storefront, opaque click and visitor ids, UTM allow-list, no open redirect, safe failures, isolated host', async () => {
+  const bad = [];
+  const P = RF.inf;
+  const count = async () => (await getPool().query(`SELECT count(*)::int n FROM affiliate_referral_clicks k JOIN affiliates a ON a.id = k.affiliate_id WHERE a.public_id = $1`, [P])).rows[0].n;
+  const c0 = await count();
+  const r = await goReq(`/r/${P}?utm_campaign=summer%20sale&utm_source=ig&utm_evil=1&next=https://evil.example&bref=HACKED&redirect=//evil.example&utm_content=%3Cscript%3E`);
+  const u = r.location && new URL(r.location);
+  if (r.status !== 302 || u.origin !== 'https://store.test' || u.pathname !== '/') bad.push(`redirect ${r.status} ${r.location}`);
+  const keys = u ? [...u.searchParams.keys()].sort().join(',') : '';
+  if (keys !== 'bclid,bref,utm_campaign,utm_medium,utm_source') bad.push(`forwarded params: ${keys}`);
+  if (u?.searchParams.get('bref') !== P || u.searchParams.get('utm_campaign') !== 'summer sale' || u.searchParams.get('utm_source') !== 'ig' || u.searchParams.get('utm_medium') !== 'referral') bad.push('params');
+  const click = clickOf(r); const visitor = visitorOf(r);
+  if (!/^[A-Za-z0-9_-]{22}$/.test(click || '') || click === P) bad.push(`click id ${click}`);
+  if (!/^bv=[A-Za-z0-9_-]{22}$/.test(visitor) || !/HttpOnly/i.test(r.setCookie.join(';')) || !/SameSite=Lax/i.test(r.setCookie.join(';'))) bad.push(`visitor cookie ${r.setCookie}`);
+  if (!/no-store/.test(r.headers['cache-control'] || '') || r.headers['referrer-policy'] !== 'no-referrer') bad.push('headers');
+  if (await count() !== c0 + 1) bad.push('click not recorded');
+  const row = (await getPool().query('SELECT * FROM affiliate_referral_clicks WHERE public_id = $1', [click])).rows[0];
+  if (!row || !/^[0-9a-f]{64}$/.test(row.ip_hash || '') || !/^[0-9a-f]{64}$/.test(row.user_agent_hash || '') || row.utm_content !== null || row.visitor_id !== visitor.slice(3)) bad.push(`click row ${JSON.stringify(row).slice(0, 200)}`);
+  if (JSON.stringify(row).includes('203.0.113.7') || JSON.stringify(row).includes('DBCHECK-UA')) bad.push('raw IP or user agent stored');
+  // A retry by the same browser reuses the click; another browser gets its own.
+  const again = await goReq(`/r/${P}`, { cookie: visitor });
+  if (clickOf(again) !== click || await count() !== c0 + 1) bad.push('retry made a second click');
+  const other = await goReq(`/r/${P}`);
+  if (clickOf(other) === click || await count() !== c0 + 2) bad.push('second browser');
+  if (visitorOf(await goReq(`/r/${P}`, { cookie: 'bv=<script>alert(1)</script>' })) === 'bv=<script>alert(1)</script>') bad.push('forged visitor id kept');
+  // Lower case resolves; anything malformed or unusable lands on the plain home page, with no click and no hint.
+  if (new URL((await goReq(`/r/${P.toLowerCase()}`)).location).searchParams.get('bref') !== P) bad.push('lower case');
+  const before = await getPool().query('SELECT count(*)::int n FROM affiliate_referral_clicks');
+  const home = 'https://store.test/';
+  const sus = (await af('manager', 'POST', '/api/affiliates', { display_name: 'DBCHECK-AF Ref suspended', category: 'creator' })).body.affiliate.public_id;
+  await af('manager', 'POST', `/api/affiliates/${sus}/status`, { action: 'activate' });
+  await af('manager', 'POST', `/api/affiliates/${sus}/referral`, {});
+  await af('manager', 'POST', `/api/affiliates/${sus}/status`, { action: 'suspend', reason: 'db-check' });
+  const clo = (await af('manager', 'POST', '/api/affiliates', { display_name: 'DBCHECK-AF Ref closing', category: 'creator' })).body.affiliate.public_id;
+  await af('manager', 'POST', `/api/affiliates/${clo}/status`, { action: 'activate' });
+  await af('manager', 'POST', `/api/affiliates/${clo}/referral`, {});
+  await af('manager', 'POST', `/api/affiliates/${clo}/status`, { action: 'close', reason: 'db-check' });
+  const noLink = (await af('manager', 'POST', '/api/affiliates', { display_name: 'DBCHECK-AF Ref no link', category: 'creator' })).body.affiliate.public_id;
+  await af('manager', 'POST', `/api/affiliates/${noLink}/status`, { action: 'activate' });
+  for (const p of ['/r/ZZZZZZ', '/r/%2F%2Fevil.example', '/r/..%2F..%2Fapi%2Faffiliates', '/r/AB', `/r/${P}%27%3BDROP%20TABLE%20affiliates`, `/r/${sus}`, `/r/${clo}`, `/r/${noLink}`, '/r/', '/']) {
+    const x = await goReq(p);
+    if (x.status !== 302 || x.location !== home) bad.push(`${p}: ${x.status} ${x.location}`);
+    if (x.body && /affiliate|suspend|closed|error/i.test(x.body)) bad.push(`${p} leaks: ${x.body.slice(0, 60)}`);
+  }
+  if ((await getPool().query('SELECT count(*)::int n FROM affiliate_referral_clicks')).rows[0].n !== before.rows[0].n) bad.push('click recorded for an unusable link');
+  // The disabled asset's link is not usable either (the affiliate's new link is).
+  // Host isolation: the click host serves nothing else; the internal host has no /r.
+  for (const [m, p, want] of [['GET', '/api/affiliates', 404], ['GET', '/login', 404], ['GET', '/affiliates', 404], ['POST', `/r/${P}`, 404], ['GET', '/healthz', 200]]) {
+    const x = await goReq(p, { method: m });
+    if (x.status !== want) bad.push(`click host ${m} ${p}: ${x.status}`);
+  }
+  if ((await af('', 'GET', `/r/${P}`)).status === 302 && (await af('', 'GET', `/r/${P}`)).headers.get('location')?.includes('store.test')) bad.push('redirect served on the internal host');
+  if (bad.length) throw new Error(bad.join(' | '));
+  return '302 to https://store.test/ with bref, bclid and allow-listed UTMs only (next/redirect/bref overrides/unknown utm dropped, unsafe utm value dropped); 22-char random click and visitor ids; HttpOnly SameSite cookie; salted hashes only (no raw IP/UA); retry reuses the click; invalid, malicious, unknown, suspended, closed and link-less ids → plain home, no click, no hint; click host serves only /r and /healthz';
+});
+
+await step('referral: attribution through the existing Shopify sync — last eligible click in the window, coupon first, idempotent, totals untouched', async () => {
+  const bad = [];
+  const A = RF.inf;
+  const B = await eligibleAffiliate('Ref second');
+  const C = await eligibleAffiliate('Ref coupon');
+  // Visitor 1: clicks A, then B (B is the last click).
+  const a1 = await goReq(`/r/${A}`, { ip: '203.0.113.21' });
+  const v1 = visitorOf(a1);
+  await new Promise((r) => setTimeout(r, 20));
+  const b1 = await goReq(`/r/${B}`, { cookie: v1, ip: '203.0.113.21' });
+  await new Promise((r) => setTimeout(r, 20));
+  // Orders placed just after the clicks (the sync window ends "now", so never in the future).
+  const placed = () => new Date().toISOString();
+  const att = (ref, click) => [{ key: '__briyo_ref', value: ref }, { key: '__briyo_click', value: click }, { key: 'gift_note', value: 'Happy birthday' }];
+  // A coupon asset (the reserved coupon path): only the database can hold one in this phase.
+  const cid = (await getPool().query(`SELECT id FROM affiliates WHERE public_id = $1`, [C])).rows[0].id;
+  await getPool().query(`INSERT INTO affiliate_referral_assets (public_id, affiliate_id, type, code, created_by) VALUES ('CPNDBCHECK', $1, 'coupon', 'DBCHECKCPN10', 'db-check')`, [cid]);
+  SH.store = [
+    shOrder(901, { created: placed(), attributes: att(B, clickOf(b1)), total: 1499 }),                            // last click → B
+    shOrder(902, { created: placed(), attributes: att(A, clickOf(a1)) }),                                       // A's click, but visitor's last click is B → B
+    shOrder(903, { created: placed(), attributes: att(A, clickOf(b1)) }),                                       // bref does not match the click → nobody
+    shOrder(904, { created: placed(), attributes: att(B, 'AAAAAAAAAAAAAAAAAAAAAA') }),                           // unknown click → nobody
+    shOrder(905, { created: placed(), attributes: att(B, clickOf(b1)), codes: ['dbcheckcpn10'] }),              // affiliate coupon wins over the click → C
+    shOrder(906, { created: placed(), attributes: att(B, clickOf(b1)), codes: ['WELCOME10'] }),                 // non-affiliate coupon → click → B
+    shOrder(907, { created: placed() }),                                                                         // nothing → nobody
+    shOrder(908, { created: shDays(1), attributes: att(B, clickOf(b1)) }),                                       // ordered before the click → nobody
+    shOrder(909, { created: placed(), attributes: [{ key: '_briyo_ref', value: B }, { key: '_briyo_click', value: clickOf(b1) }] }), // single-underscore keys → B
+  ];
+  const gql = shFake(() => SH.store);
+  const pre = await runShopifySync({ window: { days: 3 }, dryRun: true, gql });
+  if (pre.summary.newAffiliateAttributions !== 5) bad.push(`preview ${pre.summary.newAffiliateAttributions}`);
+  const r = await runShopifySync({ window: { days: 3 }, dryRun: false, gql, actor: SH_ACTOR });
+  const who = async (n) => (await getPool().query(`SELECT t.attribution_method m, t.rule_version v, t.window_days w, t.click_id, a.public_id aff FROM affiliate_order_attributions t
+    JOIN orders o ON o.id = t.order_id JOIN affiliates a ON a.id = t.affiliate_id WHERE o.source_order_id = $1`, [`${SH_PREFIX}${String(n).padStart(4, '0')}`])).rows[0] || null;
+  const want = { 901: [B, 'referral_click'], 902: [B, 'referral_click'], 903: null, 904: null, 905: [C, 'coupon'], 906: [B, 'referral_click'], 907: null, 908: null, 909: [B, 'referral_click'] };
+  for (const [n, w] of Object.entries(want)) {
+    const got = await who(n);
+    if (w === null ? got !== null : (got?.aff !== w[0] || got.m !== w[1] || got.v !== 'v1' || got.w !== 30)) bad.push(`order ${n}: ${got ? `${got.aff}/${got.m}/${got.v}/${got.w}` : 'none'}`);
+  }
+  if ((await who(902))?.click_id !== clickOf(b1)) bad.push('last click not the one recorded');
+  if (r.summary.affiliateAttributionsRecorded !== 5) bad.push(`recorded ${r.summary.affiliateAttributionsRecorded}`);
+  // Idempotent: another sync changes nothing, even after the affiliate is suspended.
+  await af('manager', 'POST', `/api/affiliates/${B}/status`, { action: 'suspend', reason: 'db-check' });
+  const again = await runShopifySync({ window: { days: 3 }, dryRun: false, gql, actor: SH_ACTOR });
+  if (again.summary.affiliateAttributionsRecorded !== 0 || (await who(901))?.aff !== B) bad.push('re-sync changed attribution');
+  // Eligibility is checked at attribution time: B suspended → a new order falls back to the visitor's previous eligible click (A).
+  SH.store.push(shOrder(910, { created: placed(), attributes: att(B, clickOf(b1)) }));
+  await runShopifySync({ window: { days: 3 }, dryRun: false, gql, actor: SH_ACTOR });
+  if ((await who(910))?.aff !== A) bad.push(`suspended last click → ${(await who(910))?.aff}`);
+  // The window comes from affiliate_settings: an old click (40 days) is ignored at 30 days, counted at 60.
+  const aid = (await getPool().query(`SELECT a.id, r.id rid FROM affiliates a JOIN affiliate_referral_assets r ON r.affiliate_id = a.id AND r.status = 'active' AND r.type = 'link' WHERE a.public_id = $1`, [A])).rows[0];
+  const oldVisitor = 'OLDVISITOR_DBCHECK_0001'.slice(0, 22);
+  await getPool().query(`INSERT INTO affiliate_referral_clicks (public_id, affiliate_id, referral_asset_id, visitor_id, clicked_at) VALUES ('OLDCLICK_DBCHECK_00001', $1, $2, $3, now() - interval '40 days')`, [aid.id, aid.rid, oldVisitor]);
+  SH.store.push(shOrder(911, { created: placed(), attributes: att(A, 'OLDCLICK_DBCHECK_00001') }));
+  await runShopifySync({ window: { days: 3 }, dryRun: false, gql, actor: SH_ACTOR });
+  if (await who(911)) bad.push('click outside the window attributed');
+  await getPool().query(`UPDATE affiliate_settings SET value = '60'::jsonb WHERE key = 'attribution_window_days'`);
+  try {
+    SH.store.push(shOrder(912, { created: placed(), attributes: att(A, 'OLDCLICK_DBCHECK_00001') }));
+    await runShopifySync({ window: { days: 3 }, dryRun: false, gql, actor: SH_ACTOR });
+    const w = await who(912);
+    if (w?.aff !== A || w.w !== 60) bad.push(`60-day window not read from settings: ${JSON.stringify(w)}`);
+    if (await who(911)) bad.push('existing (non-)attribution rewritten');
+  } finally { await getPool().query(`UPDATE affiliate_settings SET value = '30'::jsonb WHERE key = 'attribution_window_days'`); }
+  // Totals, items, snapshots and stock: exactly as without attribution.
+  const orderRow = async (n) => (await getPool().query('SELECT * FROM orders WHERE source_order_id = $1', [`${SH_PREFIX}${String(n).padStart(4, '0')}`])).rows[0];
+  const o901 = await orderRow(901);
+  if (!o901 || Number(o901.order_value) !== 1499 || o901.source_payload.shopify.referral?.ref !== B) bad.push(`order value or referral payload: ${o901?.order_value} ${JSON.stringify(o901?.source_payload?.shopify?.referral)}`);
+  if ((await orderRow(907))?.source_payload.shopify.referral !== undefined) bad.push('referral key on an order without referral');
+  const snap = (await getPool().query(`SELECT s.custom_attributes FROM order_financial_snapshots s WHERE s.order_id = $1 ORDER BY s.sequence DESC LIMIT 1`, [o901?.id])).rows[0];
+  if (!snap?.custom_attributes.some((x) => x.key === '__briyo_ref' && x.value === B) || !snap.custom_attributes.some((x) => x.key === 'gift_note')) bad.push('snapshot custom attributes');
+  if ((await shOps()).movements || (await shOps()).shipments || (await shOps()).reservations) bad.push('stock or shipments touched');
+  // One attribution per order, and none for an order that does not exist — in the database itself.
+  if (!o901) throw new Error(`order 901 missing; ${bad.join(' | ')}`);
+  const oid = o901.id;
+  await expectErr('second attribution', () => getPool().query(`INSERT INTO affiliate_order_attributions (order_id, affiliate_id, attribution_method, order_placed_at, rule_version) VALUES ($1, $2, 'coupon', now(), 'v1')`, [oid, cid]), (e) => e.code === '23505');
+  await expectErr('nonexistent order', () => getPool().query(`INSERT INTO affiliate_order_attributions (order_id, affiliate_id, attribution_method, order_placed_at, rule_version) VALUES (-1, $1, 'coupon', now(), 'v1')`, [cid]), (e) => e.code === '23503');
+  await expectErr('edit attribution', () => getPool().query(`UPDATE affiliate_order_attributions SET rule_version = 'v2' WHERE order_id = $1`, [oid]), (e) => /append-only/.test(e.message));
+  await expectErr('edit click', () => getPool().query(`UPDATE affiliate_referral_clicks SET utm_source = 'x' WHERE public_id = $1`, [clickOf(b1)]), (e) => /append-only/.test(e.message));
+  // The admin view shows the summary without personal data.
+  const view = (await refGet(A)).referral;
+  if (view.attributions.total < 2 || JSON.stringify(view).match(/Asha|buyer@|\+91|gift|visitor|ip_hash|"id":/)) bad.push('admin summary');
+  if (process.env.SHOPIFY_ORDERS_POLL_ENABLED === 'true') bad.push('polling enabled');
+  if (bad.length) throw new Error(bad.join(' | '));
+  return '9 orders: last click (incl. across affiliates) wins, bref/click mismatch and unknown click ignored, affiliate coupon beats the click, a non-affiliate coupon does not, ordered-before-click ignored, legacy keys read; preview = commit (5); re-sync idempotent; suspended affiliate loses new orders to the previous eligible click; 30 → 60-day window read from settings; rule v1 stored; totals, snapshots and stock untouched; DB refuses a second or orphan attribution and edits';
+});
+
+await step('referral: storefront snippet — stores bref/bclid, writes private cart attributes once, ignores bad input, never throws', async () => {
+  const bad = [];
+  const src = (await fsp.readFile(new URL('../storefront/briyo-referral.liquid', import.meta.url), 'utf8'));
+  const code = src.match(/<script>([\s\S]*?)<\/script>/)[1];
+  const vm = await import('node:vm');
+  const run = async (search, { cart = {}, storage = true, failFetch = false, cookie = '' } = {}) => {
+    const calls = []; const store = new Map(); let jar = cookie;
+    const ctx = {
+      window: { location: { search, protocol: 'https:' }, Shopify: { routes: { root: '/' } } },
+      location: { protocol: 'https:' }, URLSearchParams, JSON, Date, Number, String, RegExp,
+      document: { get cookie() { return jar; }, set cookie(v) { jar = v.split(';')[0]; } },
+    };
+    if (storage) ctx.window.localStorage = { getItem: (k) => store.get(k) ?? null, setItem: (k, v) => store.set(k, v) };
+    else Object.defineProperty(ctx.window, 'localStorage', { get() { throw new Error('blocked'); } });
+    ctx.window.fetch = async (url, opts = {}) => {
+      calls.push({ url, body: opts.body ? JSON.parse(opts.body) : null });
+      if (failFetch) throw new Error('offline');
+      return { json: async () => ({ attributes: cart }) };
+    };
+    vm.runInNewContext(code, ctx);
+    await new Promise((r) => setTimeout(r, 20));
+    return { calls, store, jar };
+  };
+  const CLICK = 'abcDEF123_-xyzXYZ98765';
+  const ok = await run(`?bref=b7k4p9&bclid=${CLICK}&utm_source=x`);
+  const upd = ok.calls.find((c) => c.url === '/cart/update.js');
+  if (!upd || JSON.stringify(upd.body) !== JSON.stringify({ attributes: { __briyo_ref: 'B7K4P9', __briyo_click: CLICK } })) bad.push(`cart write ${JSON.stringify(upd?.body)}`);
+  if (!ok.store.get('briyo_ref_v1')?.includes('B7K4P9') || !/^briyo_ref=B7K4P9\./.test(ok.jar)) bad.push('not stored');
+  const same = await run(`?bref=B7K4P9&bclid=${CLICK}`, { cart: { __briyo_ref: 'B7K4P9', __briyo_click: CLICK } });
+  if (same.calls.some((c) => c.url === '/cart/update.js')) bad.push('rewrote identical attributes');
+  for (const qs of ['?bref=B7K4P9', `?bclid=${CLICK}`, '?bref=<x>&bclid=<y>', `?bref=B0K4P9&bclid=${CLICK}`, '?bref=B7K4P9&bclid=short', '']) {
+    const x = await run(qs);
+    if (x.calls.length) bad.push(`acted on "${qs}"`);
+  }
+  const blocked = await run(`?bref=B7K4P9&bclid=${CLICK}`, { storage: false });
+  if (!blocked.calls.some((c) => c.url === '/cart/update.js')) bad.push('no cookie fallback when storage is blocked');
+  const later = await run('', { cookie: `briyo_ref=B7K4P9.${CLICK}.${Date.now()}` , storage: false });
+  if (!later.calls.some((c) => c.url === '/cart/update.js')) bad.push('stored pair not reapplied on a later page');
+  const expired = await run('', { cookie: `briyo_ref=B7K4P9.${CLICK}.${Date.now() - 31 * 86400000}`, storage: false });
+  if (expired.calls.length) bad.push('expired pair used');
+  try { await run(`?bref=B7K4P9&bclid=${CLICK}`, { failFetch: true }); } catch (err) { bad.push(`threw: ${err.message}`); }
+  if (/price|discount|checkout|email|phone|alert\(/i.test(code.replace(/\/\/.*$/gm, ''))) bad.push('snippet touches pricing, checkout or PII');
+  if (bad.length) throw new Error(bad.join(' | '));
+  return 'valid bref/bclid → stored (localStorage + cookie) and written once as __briyo_ref/__briyo_click; identical cart not rewritten; 6 malformed inputs ignored; storage blocked → cookie fallback; later page reapplies; 30-day expiry; network failure swallowed; no pricing, checkout or PII code';
+});
+
 await step('affiliates admin cleanup', async () => {
   let n = 0;
   for (const actor of [...Object.values(AFN), 'HR admin']) {
@@ -5692,6 +6013,9 @@ await step('affiliates admin cleanup', async () => {
     // Verification documents written by these tests (the throwaway local store).
     for (const k of r.paths || []) await fsp.rm(path.join(HRS.dir, k), { force: true }).catch(() => {});
   }
+  // Orders made by the Phase 1E attribution test (their attributions go with them).
+  await purgeTestOrders(SH_PREFIX);
+  await getPool().query(`DELETE FROM order_imports WHERE kind = 'shopify_sync' AND imported_by = $1`, [SH_ACTOR]);
   await getPool().query('DELETE FROM member_module_roles WHERE phone = ANY($1)', [Object.values(AFP)]);
   await getPool().query('DELETE FROM member_log WHERE target_phone = ANY($1)', [Object.values(AFP)]);
   await getPool().query('DELETE FROM allowed_users WHERE phone = ANY($1)', [Object.values(AFP)]);
