@@ -52,6 +52,7 @@ import { jobPostingLd } from '../lib/careers-pages.js';
 import nodeCrypto from 'node:crypto';
 import { metricsFrom, rawFromRow, rangeParams, classifyMetaError, createMetaClient, createCache, MetaError, createMetaService, metaConfig, todayIn, resolvePurchaseType, _resetMetaService, billingFrom } from '../lib/meta-ads.js';
 import { overviewFor } from '../lib/overview.js';
+import { ensureAffiliateSchema, newAffiliatePublicId, rateAt, getAffiliateSetting, setAffiliateSetting, purgeTestAffiliates, _resetAffiliateSchemaForTest } from '../lib/affiliates.js';
 import { runShopifySync, mapShopifyOrder, shopifyPaymentMethod, shopifyPaymentStatus, shopifyOrdersStatus } from '../lib/shopify-orders.js';
 import { istDateTime, istDate, istTime, istDayKey as uiIstDayKey } from '../public/ui/ist.js';
 import { issueFormToken, verifyTurnstile, normalizeHost, isCareersRequest } from '../lib/careers.js';
@@ -3234,6 +3235,135 @@ await step('inventory cleanup', async () => {
 });
 
 // ---- environment guard ------------------------------------------------------
+/* ------------------------------------------------------------------ affiliates (Phase 1A) */
+const AFF_ACTOR = 'db-check-affiliate';
+const AFF = {};
+const affPool = () => getPool();
+const affInsert = (o = {}) => affPool().query(
+  `INSERT INTO affiliates (public_id, category, display_name, status, created_by, updated_by) VALUES ($1, $2, $3, $4, $5, $5) RETURNING *`,
+  [o.public_id ?? newAffiliatePublicId(), o.category ?? 'nutritionist', o.display_name ?? 'DB Check Partner', o.status ?? 'draft', AFF_ACTOR]);
+
+await step('affiliates: schema runs twice; categories and settings seeded once; categories enforced', async () => {
+  await ensureAffiliateSchema();
+  // A second, independent run of the same DDL (as a fresh process would) must be harmless.
+  await affPool().query("UPDATE affiliate_categories SET label = label WHERE key = 'nutritionist'");
+  const before = (await affPool().query('SELECT count(*)::int n FROM affiliate_categories')).rows[0].n;
+  _resetAffiliateSchemaForTest(); await ensureAffiliateSchema(); _resetAffiliateSchemaForTest(); await ensureAffiliateSchema();
+  const cats = (await affPool().query('SELECT key, label, requires_verification FROM affiliate_categories ORDER BY sort')).rows;
+  const want = ['nutritionist', 'dietitian', 'doctor', 'dentist', 'other_professional', 'influencer', 'creator', 'customer'];
+  if (cats.length !== before || want.some((k) => cats.filter((c) => c.key === k).length !== 1)) throw new Error(`categories ${JSON.stringify(cats.map((c) => c.key))}`);
+  if (cats.find((c) => c.key === 'other_professional').label !== 'Other Professional' || !cats.find((c) => c.key === 'doctor').requires_verification
+    || cats.find((c) => c.key === 'customer').requires_verification) throw new Error('labels / verification flags');
+  const settings = Object.fromEntries((await affPool().query('SELECT key, value FROM affiliate_settings')).rows.map((r) => [r.key, r.value]));
+  if (settings.attribution_window_days !== 30 || settings.attribution_rule_version !== 'v1') throw new Error(`settings ${JSON.stringify(settings)}`);
+  // Valid and invalid categories.
+  AFF.a = (await affInsert()).rows[0];
+  await expectErr('unknown category', () => affInsert({ category: 'astrologer' }), (e) => e.code === '23503');
+  // A category in use cannot be deleted or re-keyed (RESTRICT: 23001 restrict_violation).
+  await expectErr('delete category in use', () => affPool().query("DELETE FROM affiliate_categories WHERE key = 'nutritionist'"), (e) => ['23001', '23503'].includes(e.code));
+  await expectErr('rekey category in use', () => affPool().query("UPDATE affiliate_categories SET key = 'nutri' WHERE key = 'nutritionist'"), (e) => ['23001', '23503'].includes(e.code));
+  return `${cats.length} categories (each once after 3 schema runs); window 30 days, rule v1; unknown category refused; category in use cannot be deleted or re-keyed`;
+});
+
+await step('affiliates: public id — opaque, unique, immutable; status values enforced', async () => {
+  const ids = new Set(Array.from({ length: 2000 }, () => newAffiliatePublicId()));
+  if ([...ids].some((x) => !/^[A-HJKMNP-Z2-9]{6}$/.test(x)) || ids.size < 1995) throw new Error('id format / spread');
+  if (!/^[A-HJKMNP-Z2-9]{6}$/.test(AFF.a.public_id) || String(AFF.a.public_id) === String(AFF.a.id)) throw new Error('stored id');
+  await expectErr('duplicate public id', () => affInsert({ public_id: AFF.a.public_id }), (e) => e.code === '23505');
+  await expectErr('malformed public id', () => affInsert({ public_id: 'ab0O1l' }), (e) => e.code === '23514');
+  await expectErr('change public id', () => affPool().query('UPDATE affiliates SET public_id = $2 WHERE id = $1', [AFF.a.id, newAffiliatePublicId()]), (e) => /immutable/.test(e.message));
+  // Other fields still update normally.
+  await affPool().query("UPDATE affiliates SET display_name = 'DB Check Partner (renamed)', version = version + 1 WHERE id = $1", [AFF.a.id]);
+  for (const s of ['draft', 'pending_verification', 'approved', 'active', 'suspended', 'closed']) {
+    const r = (await affInsert({ status: s })).rows[0];
+    if (r.status !== s) throw new Error(s);
+  }
+  await expectErr('bad status', () => affInsert({ status: 'paused' }), (e) => e.code === '23514');
+  await expectErr('blank name', () => affInsert({ display_name: '  ' }), (e) => e.code === '23514');
+  return '2000 ids: 6 chars, no look-alikes, no collisions to speak of; duplicate / malformed refused; public_id cannot change, other fields can; 6 statuses accepted, others refused';
+});
+
+await step('affiliates: rate history — basis points, deterministic rate on a date, append-only', async () => {
+  const id = AFF.a.id;
+  const add = (bps, from) => affPool().query(`INSERT INTO affiliate_rates (affiliate_id, rate_bps, effective_from, created_by, reason) VALUES ($1, $2, $3, $4, 'db-check') RETURNING id`, [id, bps, from, AFF_ACTOR]);
+  await add(1500, '2026-01-01T00:00:00+05:30');
+  await add(2000, '2026-03-01T00:00:00+05:30');
+  for (const bad of [-1, 10001]) await expectErr(`rate ${bad}`, () => add(bad, '2026-05-01T00:00:00Z'), (e) => e.code === '23514');
+  await add(0, '2026-06-01T00:00:00Z'); await add(10000, '2026-07-01T00:00:00Z');
+  await expectErr('same effective_from twice', () => add(1800, '2026-03-01T00:00:00+05:30'), (e) => e.code === '23505');
+  const at = async (d) => (await rateAt(affPool(), id, d))?.rate_bps ?? null;
+  const got = [await at('2025-12-31T00:00:00Z'), await at('2026-02-15T00:00:00Z'), await at('2026-03-01T00:00:00+05:30'), await at('2026-04-10T00:00:00Z'), await at('2026-06-15T00:00:00Z')];
+  if (JSON.stringify(got) !== JSON.stringify([null, 1500, 2000, 2000, 0])) throw new Error(`rateAt ${JSON.stringify(got)}`);
+  await expectErr('update rate', () => affPool().query('UPDATE affiliate_rates SET rate_bps = 2500 WHERE affiliate_id = $1', [id]), (e) => /append-only/.test(e.message));
+  await expectErr('delete rate', () => affPool().query('DELETE FROM affiliate_rates WHERE affiliate_id = $1', [id]), (e) => /append-only/.test(e.message));
+  await expectErr('delete affiliate with history', () => affPool().query('DELETE FROM affiliates WHERE id = $1', [id]), (e) => ['23001', '23503'].includes(e.code));
+  const cols = (await affPool().query(`SELECT column_name FROM information_schema.columns WHERE table_name = 'affiliates'`)).rows.map((r) => r.column_name);
+  if (cols.some((c) => /rate/.test(c))) throw new Error('a mutable rate column exists on affiliates');
+  return '15% from 1 Jan, 20% from 1 Mar: before → none, Feb → 1500, 1 Mar → 2000, Apr → 2000; 0 and 10000 allowed, -1 / 10001 refused; duplicate date refused; UPDATE/DELETE refused; no rate column on affiliates';
+});
+
+await step('affiliates: events append-only; settings read and upsert with a version', async () => {
+  const ev = (await affPool().query(`INSERT INTO affiliate_events (actor, action, affiliate_id, entity, entity_id, metadata)
+    VALUES ($1, 'affiliate_created', $2, 'affiliate', $3, $4) RETURNING id`, [AFF_ACTOR, AFF.a.id, String(AFF.a.id), JSON.stringify({ source: 'db-check' })])).rows[0];
+  await affPool().query(`INSERT INTO affiliate_events (actor, action, metadata) VALUES ($1, 'settings_updated', '{}')`, [AFF_ACTOR]);
+  await expectErr('bad action name', () => affPool().query(`INSERT INTO affiliate_events (actor, action) VALUES ($1, 'Not An Action')`, [AFF_ACTOR]), (e) => e.code === '23514');
+  await expectErr('update event', () => affPool().query("UPDATE affiliate_events SET action = 'affiliate_updated' WHERE id = $1", [ev.id]), (e) => /append-only/.test(e.message));
+  await expectErr('delete event', () => affPool().query('DELETE FROM affiliate_events WHERE id = $1', [ev.id]), (e) => /append-only/.test(e.message));
+  // Settings: read, upsert (version bumps), new key, fallback for a missing key.
+  const KEY = 'dbcheck_probe_setting';
+  if ((await getAffiliateSetting('attribution_window_days')) !== 30) throw new Error('read');
+  if ((await getAffiliateSetting('no_such_setting', 'fallback')) !== 'fallback') throw new Error('fallback');
+  const v1 = await setAffiliateSetting(KEY, { days: 14 }, { actor: AFF_ACTOR });
+  const v2 = await setAffiliateSetting(KEY, { days: 21 }, { actor: AFF_ACTOR });
+  if (v1 !== 1 || v2 !== 2 || (await getAffiliateSetting(KEY)).days !== 21) throw new Error(`upsert ${v1}/${v2}`);
+  // Re-running the schema never overwrites a changed seeded setting.
+  await affPool().query(`UPDATE affiliate_settings SET value = '45'::jsonb WHERE key = 'attribution_window_days'`);
+  _resetAffiliateSchemaForTest(); await ensureAffiliateSchema();
+  const kept = await getAffiliateSetting('attribution_window_days');
+  await affPool().query(`UPDATE affiliate_settings SET value = '30'::jsonb WHERE key = 'attribution_window_days'`);
+  await affPool().query('DELETE FROM affiliate_settings WHERE key = $1', [KEY]);
+  if (kept !== 45) throw new Error('seed overwrote an edited setting');
+  return 'events insert; UPDATE/DELETE refused; action names checked; settings read with fallback, upsert bumps version (1 → 2), edited seed kept on re-run';
+});
+
+await step('affiliates: RBAC — viewer / manager / finance grants; admins unchanged; module role stored', async () => {
+  const caps = (role) => capabilitiesOf({ allowed: true, admin: false, roles: { affiliate: role } });
+  const A = ['affiliate.view', 'affiliate.manage', 'affiliate.verify', 'affiliate.commissions', 'affiliate.payouts'];
+  const has = (c) => A.filter((x) => c.includes(x)).join(',');
+  const want = { viewer: 'affiliate.view', manager: 'affiliate.view,affiliate.manage,affiliate.verify', finance: 'affiliate.view,affiliate.commissions,affiliate.payouts' };
+  for (const [role, w] of Object.entries(want)) if (has(caps(role)) !== w) throw new Error(`${role}: ${has(caps(role))}`);
+  // The negatives, spelled out.
+  const no = [['viewer', 'affiliate.manage'], ['viewer', 'affiliate.verify'], ['viewer', 'affiliate.commissions'], ['viewer', 'affiliate.payouts'],
+    ['manager', 'affiliate.commissions'], ['manager', 'affiliate.payouts'], ['finance', 'affiliate.manage'], ['finance', 'affiliate.verify']];
+  for (const [r, c] of no) if (caps(r).includes(c)) throw new Error(`${r} has ${c}`);
+  if (caps('operator').some((c) => c.startsWith('affiliate.'))) throw new Error('unknown role grants');
+  // Admins: every capability (affiliate ones included); members without the module: none.
+  const admin = capabilitiesOf({ allowed: true, admin: true, roles: {} });
+  if (!A.every((c) => admin.includes(c)) || admin.length !== CAPABILITIES.length) throw new Error('admin');
+  for (const roles of [{}, { logistics: 'manager' }, { inventory: 'manager', support: 'lead', hr: 'manager' }]) {
+    if (capabilitiesOf({ allowed: true, admin: false, roles }).some((c) => c.startsWith('affiliate.'))) throw new Error(`granted without the module: ${JSON.stringify(roles)}`);
+  }
+  // The stored module/role pairs: affiliate roles accepted, others refused.
+  const PHONE = '919000000990';
+  await getPool().query(`INSERT INTO allowed_users (phone, name, added_by) VALUES ($1, 'DB Check Affiliate RBAC', $2) ON CONFLICT (phone) DO NOTHING`, [PHONE, AFF_ACTOR]);
+  try {
+    for (const r of ['viewer', 'manager', 'finance']) await getPool().query(`INSERT INTO member_module_roles (phone, module, role) VALUES ($1, 'affiliate', $2) ON CONFLICT (phone, module) DO UPDATE SET role = EXCLUDED.role`, [PHONE, r]);
+    await expectErr('affiliate operator', () => getPool().query(`UPDATE member_module_roles SET role = 'operator' WHERE phone = $1 AND module = 'affiliate'`, [PHONE]), (e) => e.code === '23514');
+    await expectErr('logistics finance', () => getPool().query(`INSERT INTO member_module_roles (phone, module, role) VALUES ($1, 'logistics', 'finance')`, [PHONE]), (e) => e.code === '23514');
+  } finally {
+    await getPool().query('DELETE FROM member_module_roles WHERE phone = $1', [PHONE]);
+    await getPool().query('DELETE FROM allowed_users WHERE phone = $1', [PHONE]);
+  }
+  return 'viewer → view; manager → view/manage/verify; finance → view/commissions/payouts; 8 negative checks; admins get all 5 (and all others); no grant without the module; DB accepts affiliate viewer/manager/finance and refuses other pairs';
+});
+
+await step('affiliates cleanup', async () => {
+  const r = await purgeTestAffiliates(AFF_ACTOR);
+  const left = (await getPool().query('SELECT count(*)::int n FROM affiliates WHERE created_by = $1', [AFF_ACTOR])).rows[0].n;
+  if (left) throw new Error('left behind');
+  return `${r.affiliates} test affiliates (with their rates and events) removed`;
+});
+
 await step('environment guard: labels and APP_ENV must agree; production is never touched', async () => {
   const { appEnv, EnvironmentError: EnvErr } = await import('../lib/env-guard.js');
   const fake = (env) => ({ async query(q) {
