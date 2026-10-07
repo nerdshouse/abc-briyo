@@ -275,9 +275,9 @@ app.get('/auth/shopify/callback', async (req, res) => {
     const { access_token: token, scope } = await exchangeCode({ shop, code: req.query.code });
     await storeToken({ shop, token, scope });
     console.log(`Shopify connected to ${shop}. Scopes: ${scope || '(none reported)'}`);
-    // Pull straight away rather than making someone wait out the poll interval.
-    pollShopifyOnce({ assignedTo: normalisePhone(process.env.IMPORT_DEFAULT_CALLER || '') || null })
-      .catch((err) => console.error('First Shopify pull failed:', err.message));
+    // Connecting only stores the authorization. Nothing is pulled here: abandoned
+    // checkouts come in through the scheduled poll (SHOPIFY_POLL_ENABLED) or an
+    // admin's manual pull, and orders only through Orders → Shopify → Preview → Import.
     return res.redirect('/import?shopify=connected');
   } catch (err) {
     console.error('Shopify OAuth failed:', err.message);

@@ -3694,6 +3694,84 @@ await step('hr: server with careers host, Turnstile stub and throwaway storage',
   return `listening; careers host = careers.test`;
 });
 
+await step('shopify oauth: APP_BASE_URL pins the callback; connecting stores the token and pulls nothing; state and HMAC checks intact', async () => {
+  const bad = [];
+  const TOKEN = 'shpat_oauth_TEST_NEVER_LOG_7c1e';
+  const SECRET = 'test-shopify-client-secret';
+  const SHOP = 'briyo-test.myshopify.com';
+  const calls = { token: 0, graphql: [] };
+  const stub = http.createServer((req, res) => { let b = ''; req.on('data', (c) => { b += c; }); req.on('end', () => {
+    res.setHeader('content-type', 'application/json');
+    if (req.url === '/admin/oauth/access_token') { calls.token += 1; return res.end(JSON.stringify({ access_token: TOKEN, scope: 'read_orders' })); }
+    calls.graphql.push(b.slice(0, 120));
+    return res.end(JSON.stringify({ data: { abandonedCheckouts: { pageInfo: { hasNextPage: false }, edges: [] }, orders: { pageInfo: { hasNextPage: false }, nodes: [] } } }));
+  }); });
+  await new Promise((ok) => stub.listen(0, '127.0.0.1', ok));
+  const stubBase = `http://127.0.0.1:${stub.address().port}`;
+  const port = await freePort();
+  let log = '';
+  const srv = spawn(process.execPath, ['server.js'], {
+    cwd: new URL('..', import.meta.url).pathname,
+    env: { ...process.env, PORT: String(port), APP_ENV: 'test', ADMIN_PHONES: '', ELEVENZA_AUTH_TOKEN: '', SHOPIFY_ACCESS_TOKEN: '',
+      SLA_ALERTS_ENABLED: 'false', DAILY_SUMMARY_ENABLED: 'false', KEEPALIVE_URL: '', RENDER_EXTERNAL_URL: '', CAREERS_HOST: 'careers.test',
+      DOCUMENT_STORAGE: 'local', DOCUMENT_STORAGE_DIR: HRS.dir, META_ACCESS_TOKEN: '', SHOPIFY_ORDERS_POLL_ENABLED: '',
+      SHOPIFY_POLL_ENABLED: 'false', SHOPIFY_POLL_MINUTES: '0', SHOPIFY_STORE_DOMAIN: SHOP, SHOPIFY_CLIENT_ID: 'test-client-id', SHOPIFY_CLIENT_SECRET: SECRET,
+      APP_BASE_URL: 'https://abc.briyo.xyz', SHOPIFY_OAUTH_BASE: stubBase, SHOPIFY_GRAPHQL_BASE: stubBase },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  srv.stdout.on('data', (d) => { log += d; }); srv.stderr.on('data', (d) => { log += d; });
+  const base = `http://127.0.0.1:${port}`;
+  try {
+    for (let i = 0; i < 100; i++) {
+      try { if ((await fetch(`${base}/healthz`)).ok) break; } catch { /* starting */ }
+      await new Promise((r) => setTimeout(r, 150));
+      if (i === 99) throw new Error(`server did not start: ${log.slice(-300)}`);
+    }
+    const admin = `${SESSION_COOKIE}=${issueSession(HRM.adm)}`;
+    // The install redirect, requested under the Render host: APP_BASE_URL still decides the callback.
+    const install = await new Promise((ok, no) => http.get({ host: '127.0.0.1', port, path: '/auth/shopify/install',
+      headers: { cookie: admin, host: 'abc-briyo-sg.onrender.com', 'x-forwarded-proto': 'https' } }, (r) => { r.resume(); ok(r); }).on('error', no));
+    const loc = new URL(install.headers.location || 'http://x/');
+    const state = (install.headers['set-cookie'] || []).join(';').match(/shopify_oauth_state=([0-9a-f]+)/)?.[1];
+    if (install.statusCode !== 302 || loc.host !== SHOP || loc.pathname !== '/admin/oauth/authorize') bad.push(`install ${install.statusCode} ${loc}`);
+    if (loc.searchParams.get('redirect_uri') !== 'https://abc.briyo.xyz/auth/shopify/callback') bad.push(`redirect_uri ${loc.searchParams.get('redirect_uri')}`);
+    if (loc.searchParams.get('scope') !== 'read_orders' || !state) bad.push('scope/state');
+    // Non-admins cannot start it.
+    const nonAdmin = await fetch(`${base}/auth/shopify/install`, { headers: { cookie: `${SESSION_COOKIE}=${issueSession(HRM.nonHr)}` }, redirect: 'manual' });
+    if (nonAdmin.status === 302 && /myshopify/.test(nonAdmin.headers.get('location') || '')) bad.push('non-admin reached Shopify');
+    // A signed callback: the HMAC Shopify would send.
+    const signed = (q) => {
+      const msg = Object.keys(q).sort().map((k) => `${k}=${q[k]}`).join('&');
+      return new URLSearchParams({ ...q, hmac: nodeCrypto.createHmac('sha256', SECRET).update(msg).digest('hex') });
+    };
+    const q = { code: 'test-auth-code', shop: SHOP, state, timestamp: String(Math.floor(Date.now() / 1000)) };
+    const cb = (params, cookie) => fetch(`${base}/auth/shopify/callback?${params}`, { headers: cookie ? { cookie } : {}, redirect: 'manual' });
+    const carts = (await getPool().query('SELECT count(*)::int n FROM abandoned_carts')).rows[0].n;
+    // Security checks still refuse: no state cookie, wrong state, bad signature.
+    if ((await cb(signed(q))).status !== 403) bad.push('missing state accepted');
+    if ((await cb(signed({ ...q, state: 'f'.repeat(32) }), `shopify_oauth_state=${state}`)).status !== 403) bad.push('wrong state accepted');
+    const tampered = signed(q); tampered.set('code', 'other-code');
+    if ((await cb(tampered, `shopify_oauth_state=${state}`)).status !== 403) bad.push('bad hmac accepted');
+    if (calls.token !== 0) bad.push('token exchanged before checks passed');
+    // The real thing: connects, stores the token, redirects — and pulls nothing.
+    const ok = await cb(signed(q), `shopify_oauth_state=${state}`);
+    if (ok.status !== 302 || ok.headers.get('location') !== '/import?shopify=connected') bad.push(`callback ${ok.status} ${ok.headers.get('location')}`);
+    const stored = await getSystemState('shopify_oauth_token');
+    if (!stored || JSON.parse(stored.value).token !== TOKEN || JSON.parse(stored.value).shop !== SHOP || calls.token !== 1) bad.push('token not stored');
+    await new Promise((r) => setTimeout(r, 2500));
+    if (calls.graphql.length) bad.push(`Shopify was queried after connecting: ${calls.graphql.length} call(s)`);
+    if ((await getPool().query('SELECT count(*)::int n FROM abandoned_carts')).rows[0].n !== carts) bad.push('carts changed');
+    if ((await getPool().query(`SELECT count(*)::int n FROM order_imports WHERE kind = 'shopify_sync'`)).rows[0].n) bad.push('an order sync ran');
+    if (/First Shopify pull|Shopify poll: every|Shopify orders poll: every/.test(log)) bad.push('a pull or poll started');
+    if (log.includes(TOKEN) || log.includes(SECRET)) bad.push('token or secret in the server log');
+  } finally {
+    srv.kill(); stub.close();
+    await getPool().query(`DELETE FROM system_state WHERE key = 'shopify_oauth_token'`);
+  }
+  if (bad.length) throw new Error(bad.join(' | '));
+  return 'install from the Render host → redirect_uri https://abc.briyo.xyz/auth/shopify/callback (APP_BASE_URL); non-admin refused; missing/wrong state and tampered HMAC → 403 with no token exchange; valid callback stores the token and redirects; then 0 Shopify queries, 0 carts, 0 order syncs, no poll started, no token in logs';
+});
+
 await step('hr: RBAC — HR manager, admin and multi-module reach HR; others refused; no accidental access', async () => {
   const M = [
     ['GET', '/api/hr/jobs', null, { mgr: 200, multi: 200, adm: 200, nonHr: 403, '': 401 }],
