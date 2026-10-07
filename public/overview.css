@@ -180,8 +180,6 @@ a.ox-sig:hover .ox-chev, a.ox-sig:focus-visible .ox-chev { opacity: 1; }
 .ox-spark-spend, .ox-spark-rev { fill: none; stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; vector-effect: non-scaling-stroke; }
 .ox-spark-spend { stroke: #475467; }
 .ox-spark-rev { stroke: var(--info); }
-.ox-spark-spend-pt { fill: #475467; stroke: var(--surface); stroke-width: 1.5; vector-effect: non-scaling-stroke; }
-.ox-spark-rev-pt { fill: var(--info); stroke: var(--surface); stroke-width: 1.5; vector-effect: non-scaling-stroke; }
 .ox-spark-axis { display: flex; justify-content: space-between; font-size: 10.5px; color: var(--text-3); font-variant-numeric: tabular-nums; margin-top: -2px; }
 .ox-legend { display: flex; gap: 14px; font-size: var(--fs-label); color: var(--text-2); }
 .ox-key { display: inline-flex; align-items: center; gap: 6px; }

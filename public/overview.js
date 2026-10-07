@@ -5,9 +5,9 @@
  * ever renders those. A department that could not be counted says so; it never
  * shows zeros it does not have.
  *
- * Layout, top to bottom: pulse (one sentence) → department status strip (also a
- * jump list) → Marketing (the executive module) → operations pairs → People →
- * exceptions. Marketing context (7-day trend, campaigns today) comes from the
+ * Layout, top to bottom: header (date, Overview, greeting) → operating status
+ * (counts by priority + department chips that jump to modules) → Marketing (the
+ * executive module) → operations pairs → People → exceptions grouped by priority. Marketing context (7-day trend, campaigns today) comes from the
  * existing Marketing APIs and loads after the page; it never delays it.
  */
 import { $, esc, count, money, icon, renderIcons, initShell, pageFetch, pageSignal, onLeave, relative } from './ui/components.js';
@@ -144,12 +144,12 @@ function mkCampaigns(s) {
   return `<div class="ox-aside-block">
       <div class="ox-aside-head"><h3>Campaigns today</h3><a class="ox-aside-link" href="/marketing?view=campaigns">All campaigns ${icon('arrow-right')}</a></div>
       <p class="ox-aside-figs"><span><b class="num">${n(delivering.length)}</b> spending</span><span><b class="num">${n(active)}</b> active</span><span><b class="num">${n(rows.length)}</b> total</span></p>
-      ${top.length ? `<div class="ox-camps" role="table" aria-label="Top campaigns by spend today">
-          <div class="ox-camp-th" role="row"><span role="columnheader">Campaign</span><span role="columnheader">Spend</span><span role="columnheader">ROAS</span></div>
-          ${top.map((r) => `<a role="row" href="/marketing?campaign=${encodeURIComponent(r.id)}">
-          <span role="cell" class="ox-camp-name">${esc(r.name)}</span>
-          <span role="cell" class="ox-camp-spend num">${esc(mkMoney(s, r.spend))}</span>
-          <span role="cell" class="ox-camp-roas num">${r.roas === null ? '—' : `${r.roas.toFixed(2)}×`}</span></a>`).join('')}</div>`
+      ${top.length ? `<div class="ox-camps" role="group" aria-label="Top campaigns by spend today">
+          <div class="ox-camp-th" aria-hidden="true"><span>Campaign</span><span>Spend</span><span>ROAS</span></div>
+          ${top.map((r) => `<a href="/marketing?campaign=${encodeURIComponent(r.id)}">
+          <span class="ox-camp-name">${esc(r.name)}</span>
+          <span class="ox-camp-spend num"><span class="sr-only">, spend </span>${esc(mkMoney(s, r.spend))}</span>
+          <span class="ox-camp-roas num"><span class="sr-only">, ROAS </span>${r.roas === null ? '—' : `${r.roas.toFixed(2)}×`}</span></a>`).join('')}</div>`
         : '<p class="ox-aside-note" style="padding:4px 0 0">No campaign has spent yet today.</p>'}
     </div>`;
 }
@@ -175,7 +175,7 @@ function marketingBody(s) {
         ${stat('Meta ROAS', s.roas === null ? '—' : `${s.roas.toFixed(2)}×`, { href: '/marketing', note: roasNote, tone: roasTone, cls: 'hero' })}
         ${stat('Purchases', has ? n(s.purchases) : '—', { href: '/marketing', cls: 'hero' })}
       </div>
-      <div class="ox-eff" aria-label="Efficiency">
+      <div class="ox-eff" role="group" aria-label="Efficiency">
         ${stat('Cost / purchase', mkMoney(s, s.cpa), { cls: 'eff' })}
         ${stat('CTR', s.ctr === null || s.ctr === undefined ? '—' : `${s.ctr.toFixed(2)}%`, { cls: 'eff' })}
         ${stat('CPC', mkMoney(s, s.cpc, 2), { cls: 'eff' })}
@@ -198,10 +198,12 @@ async function loadMarketingContext() {
   state.mk.trend = trend.status === 'fulfilled' ? trend.value : null;
   state.mk.campaigns = camps.status === 'fulfilled' ? camps.value : null;
   state.mk.done = true;
-  if (state.data?.sections?.marketing !== s) return;
+  // A refresh may have re-rendered meanwhile: fill whatever Marketing module is on the page now.
+  const cur = state.data?.sections?.marketing;
   const t = document.getElementById('ovMkTrend'); const c = document.getElementById('ovMkCamps');
-  if (t) t.innerHTML = mkTrend(s);
-  if (c) c.innerHTML = mkCampaigns(s);
+  if (!cur?.ok) return;
+  if (t) t.innerHTML = mkTrend(cur);
+  if (c) c.innerHTML = mkCampaigns(cur);
   renderIcons();
 }
 
@@ -374,7 +376,6 @@ async function load() {
   btn.disabled = true; btn.classList.add('is-busy'); btn.setAttribute('aria-busy', 'true');
   try {
     state.data = await api('/api/overview');
-    state.mk = { trend: null, campaigns: null, loading: false, done: false };
     render();
   } catch (err) {
     $('#ovDepts').innerHTML = `<div class="ox-panel p-critical"><b>The overview could not be loaded.</b><span>${esc(err.message)}</span><button class="btn" type="button" data-retry>Try again</button></div>`;
