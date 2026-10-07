@@ -397,7 +397,8 @@ html.scroll-locked .drawer-scrim { touch-action: none; }
 .af-table tbody tr { cursor: pointer; }
 .af-title-tag { display: inline-flex; vertical-align: middle; margin-left: 8px; font-size: 13px; }
 .af-title-tag .status { font-size: 12.5px; }
-.af-detail { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.2fr); grid-template-areas: "profile activity" "verify verify" "rates rates"; gap: 16px; align-items: start; }
+.af-detail { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.2fr); grid-template-areas: "profile activity" "verify verify" "referral referral" "rates rates"; gap: 16px; align-items: start; }
+.af-detail .af-referral { grid-area: referral; }
 .af-detail .af-verify { grid-area: verify; }
 .af-detail .af-profile { grid-area: profile; }
 .af-detail .af-activity { grid-area: activity; }
@@ -417,7 +418,8 @@ html.scroll-locked .drawer-scrim { touch-action: none; }
 .af-when label { display: flex; align-items: center; gap: 6px; font-size: 13px; }
 .af-when .input { width: 180px; }
 @media (max-width: 1024px) {
-  .af-detail { grid-template-columns: minmax(0, 1fr); grid-template-areas: "profile" "verify" "rates" "activity"; }
+  .af-detail { grid-template-columns: minmax(0, 1fr); grid-template-areas: "profile" "verify" "referral" "rates" "activity"; }
+  .af-ref-grid { grid-template-columns: minmax(0, 1fr); }
   .af-verify-grid { grid-template-columns: minmax(0, 1fr); }
 }
 @media (max-width: 760px) {
@@ -440,3 +442,10 @@ html.scroll-locked .drawer-scrim { touch-action: none; }
 .af-ver-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 14px; padding-top: 14px; border-top: 1px solid var(--border-soft); }
 .af-hist { margin-top: 12px; padding: 12px; border: 1px solid var(--border-soft); border-radius: 8px; background: var(--surface-2); }
 .af-hist .table-wrap { margin-top: 8px; background: var(--surface); }
+
+/* Affiliates — referral link (Phase 1E) */
+.af-referral .card-title .status { margin-left: 8px; font-size: 12.5px; }
+.af-referral .alert { margin-bottom: 14px; }
+.af-link { margin-bottom: 14px; }
+.af-ref-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 4px 32px; }
+.af-note { font-size: 12px; margin: 14px 0 0; }

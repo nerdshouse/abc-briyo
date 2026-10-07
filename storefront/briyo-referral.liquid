@@ -1,0 +1,54 @@
+{%- comment -%}
+  Briyo affiliate referral persistence (Phase 1E) — Shopify theme snippet.
+
+  NOT deployed by Briyo OS. Install by hand after review (docs/briyo-os/AFFILIATES.md → "Storefront snippet"):
+    1. Online Store → Themes → (a duplicate of the live theme) → Edit code → Snippets → Add "briyo-referral".
+    2. Paste this file. In layout/theme.liquid, just before </body>, add:  {% render 'briyo-referral' %}
+    3. Preview, verify (the checklist in the doc), then publish.
+
+  What it does, and nothing else:
+    - reads bref (affiliate public id) and bclid (click id) from the landing URL, checks their format;
+    - remembers the latest pair for 30 days in first-party storage (localStorage, cookie as a fallback);
+    - writes them to the Shopify cart as private attributes __briyo_ref and __briyo_click, once per cart.
+  No personal data, no pricing or discount change, no visible UI. Any failure is silent: shopping and
+  checkout continue exactly as without it. Browser privacy controls (e.g. Safari) may shorten storage.
+{%- endcomment -%}
+<script>
+(function () {
+  try {
+    var KEY = 'briyo_ref_v1', COOKIE = 'briyo_ref', DAYS = 30, MAX_AGE = DAYS * 86400000;
+    var REF = /^[A-HJKMNP-Z2-9]{6,12}$/, CLICK = /^[A-Za-z0-9_-]{22}$/;
+    var root = (window.Shopify && window.Shopify.routes && window.Shopify.routes.root) || '/';
+    var store = null;
+    try { store = window.localStorage; } catch (e) { store = null; }
+    var valid = function (v) { return v && REF.test(v.ref) && CLICK.test(v.click) && Date.now() - v.at < MAX_AGE; };
+    var read = function () {
+      try { var v = JSON.parse(store.getItem(KEY)); if (valid(v)) return v; } catch (e) { /* none */ }
+      var m = document.cookie.match(/(?:^|;\s*)briyo_ref=([A-HJKMNP-Z2-9]{6,12})\.([A-Za-z0-9_-]{22})\.(\d{10,14})/);
+      var c = m ? { ref: m[1], click: m[2], at: Number(m[3]) } : null;
+      return valid(c) ? c : null;
+    };
+    var q = new URLSearchParams(window.location.search);
+    var ref = String(q.get('bref') || '').toUpperCase(), click = String(q.get('bclid') || '');
+    if (REF.test(ref) && CLICK.test(click)) {
+      // The latest referral wins: a new valid pair replaces the stored one.
+      var v = { ref: ref, click: click, at: Date.now() };
+      try { store.setItem(KEY, JSON.stringify(v)); } catch (e) { /* storage blocked */ }
+      document.cookie = COOKIE + '=' + ref + '.' + click + '.' + v.at + '; path=/; max-age=' + DAYS * 86400 + '; samesite=lax' + (location.protocol === 'https:' ? '; secure' : '');
+    }
+    var cur = read();
+    if (!cur || !window.fetch) return;
+    window.fetch(root + 'cart.js', { credentials: 'same-origin' })
+      .then(function (r) { return r.json(); })
+      .then(function (cart) {
+        var a = (cart && cart.attributes) || {};
+        if (a.__briyo_ref === cur.ref && a.__briyo_click === cur.click) return null;
+        return window.fetch(root + 'cart/update.js', {
+          method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ attributes: { __briyo_ref: cur.ref, __briyo_click: cur.click } }),
+        });
+      })
+      .catch(function () { /* never block shopping */ });
+  } catch (e) { /* never block shopping */ }
+})();
+</script>

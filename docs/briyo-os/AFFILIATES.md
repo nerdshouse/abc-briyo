@@ -1,4 +1,4 @@
-# Briyo OS: Affiliates (Phase 1A foundation, 1C admin, 1D professional verification)
+# Briyo OS: Affiliates (Phase 1A foundation, 1C admin, 1D professional verification, 1E referral attribution)
 
 The affiliate / referral module manages partners such as nutritionists, doctors, influencers and customers who refer orders to the Briyo Supplements storefront. Shopify remains the ecommerce source of truth. Briyo OS will own partner management, verification, attribution, commissions and payouts.
 
@@ -6,7 +6,9 @@ The affiliate / referral module manages partners such as nutritionists, doctors,
 
 **Phase 1D** adds professional verification: a professional profile, verification applications with a full decision history, private certificate storage and the admin review on the affiliate page.
 
-> Referral attribution, commissions, payouts and public referral links are **not implemented**. The admin manages partner records only; no figure on it is a commission, revenue or order number.
+**Phase 1E** adds referral links, click tracking and order attribution: who gets credit for an order.
+
+> **Phase 1E does not calculate commissions or payouts.** Commissions, the commission ledger and payouts are not implemented; no figure in the module is a commission or an amount owed.
 
 ## Tables (`lib/affiliates.js`, `ensureAffiliateSchema()`)
 
@@ -178,11 +180,132 @@ Finance (`affiliate.commissions`, `affiliate.payouts`) has no verification autho
 
 Metadata holds application / document references, from → to, reason and notes. It never holds file contents, storage keys, URLs or credentials.
 
+## Referral links and attribution (Phase 1E)
+
+`lib/affiliate-referrals.js`; routes in `lib/affiliate-routes.js`; the storefront snippet in `storefront/briyo-referral.liquid`; the **Referral link** card on `/affiliates/:publicId`.
+
+### The path of a referral
+```
+https://briyosupplements.com/r/{affiliate public id}       public link (Shopify URL redirect — set up explicitly, below)
+  → https://{AFFILIATE_CLICK_HOST}/r/{affiliate public id}  Briyo OS on its own isolated host: records a click
+  → 302 https://briyosupplements.com/?bref={id}&bclid={click id}&utm_source=affiliate&utm_medium=referral&utm_campaign={id}
+  → storefront snippet: stores bref/bclid, writes private cart attributes __briyo_ref / __briyo_click
+  → checkout → Shopify order customAttributes
+  → existing Briyo OS Shopify order sync → financial snapshot + attribution
+```
+The affiliate's public ID is the referral identifier, so the public link never changes for a partner, even if a link is disabled and a new one created.
+
+### Eligibility (one server-side rule: `getAffiliateReferralEligibility`)
+| Affiliate | Eligible |
+|---|---|
+| suspended or closed | never |
+| professional category | only with an **approved** verification **and** status `active` |
+| other categories | status `active` (Phase 1C lifecycle) |
+
+It is checked when a link is created, on every redirect, and again when an order is attributed. A suspended or closed affiliate keeps its link record, but the link is unusable: visitors land on the storefront home page, no click is recorded, nothing is attributed, and the response does not say why. Reactivation makes the same link usable again; no new asset is created.
+
+### Tables (created at startup, schema only)
+| Table | Holds | Rules |
+|---|---|---|
+| `affiliate_referral_assets` | An affiliate's link (`type = 'link'`); `type = 'coupon'` with a `code` is reserved for the coupon phase | Opaque 10-character `public_id`; one **active** link per affiliate (partial unique index); identity (`public_id`, affiliate, type, code, created_at) immutable and `active → disabled` final (trigger); disabling needs a reason; never deleted |
+| `affiliate_referral_clicks` | One row per recorded redirect: opaque `public_id` (the `bclid`), opaque `visitor_id`, allow-listed UTM fields, `ip_hash` / `user_agent_hash` | Append-only. No raw IP, user agent, name, email or phone is stored. |
+| `affiliate_order_attributions` | Who gets attribution credit for an order: affiliate, asset, click, method (`coupon` / `referral_click`), order time, `rule_version`, window used | `UNIQUE (order_id)`; FK to `orders`; append-only. Credit only, no amounts. |
+
+### Click host
+- **Setting:** `AFFILIATE_CLICK_HOST`, for example `go.briyo.xyz`.
+- **Isolation:** like the careers host, it is answered by the first middleware in `server.js` and serves only `GET /r/:affiliatePublicId` and `/healthz`. Everything else is a plain 404, and it never reaches sessions, `/api`, `/auth` or app pages. The internal host has no `/r` route.
+- **Not set:** no click host is served.
+- **DNS:** the host must point at the Render service. That is a manual DNS step; nothing here changes DNS or Cloudflare.
+
+### The redirect
+- **Always a 302, never a 301.** It lands on `AFFILIATE_STOREFRONT_URL` (default `https://briyosupplements.com`) at `/`. The destination is built server-side, so nothing in the request can choose it: there is no open redirect.
+- **Parameters:** only `bref`, `bclid` and the allow-listed `utm_source`, `utm_medium`, `utm_campaign`, `utm_content` and `utm_term` are sent on. Each UTM value is at most 100 plain characters, and anything else is dropped. Defaults are `utm_source=affiliate`, `utm_medium=referral` and `utm_campaign={id}`.
+- **Click ID (`bclid`):** 16 random bytes, base64url (22 characters). It reveals no affiliate, customer, time or sequence.
+- **Visitor ID:** a separate random value in the click host's first-party cookie `bv` (HttpOnly, SameSite=Lax, Secure over HTTPS). It lasts 30 days and is never derived from the IP, email or phone. It only links clicks from the same browser and is not a customer identity; there is no cross-device matching and no fingerprinting.
+- **Retries:** the same browser repeating the same redirect within 30 seconds reuses the click.
+- **Abuse:** past 30 clicks per IP in 10 minutes, the visitor still lands but no click is recorded.
+- **IP and user agent:** stored only as HMAC hashes keyed by `AFFILIATE_HASH_SALT` (falling back to `HR_IP_HASH_SALT`), and not stored at all when neither is set.
+- **Unusable link:** a malformed, unknown, disabled, suspended or closed link lands on the plain home page with no click recorded.
+
+### Attribution (rule `v1`, from `affiliate_settings.attribution_rule_version`)
+Run by the **existing** Shopify order sync (`lib/shopify-orders.js`), inside the same transaction as the order and its financial snapshot. There is no second importer, and no polling or webhook.
+
+1. **Coupon first.** A discount code on the order that matches an active affiliate **coupon asset**, created before the order, for an affiliate eligible now. *No coupon assets can be created yet* (there is no coupon source), so this path is wired and tested but inactive until the coupon phase. Codes that are not affiliate coupons never create an attribution.
+2. **Referral click.**
+   - The order's `__briyo_click` must be a click recorded by Briyo OS, and the order's `__briyo_ref` (when present) must name that click's affiliate.
+   - Then the **latest** click by the same visitor wins, provided it was made no later than the order (5-minute clock tolerance), within `affiliate_settings.attribution_window_days` before the order (30 days, read on every run, never hard-coded), with an active link and an affiliate eligible now. An ineligible affiliate's click is skipped in favour of the visitor's previous eligible one.
+3. Otherwise **no attribution.** Browser values alone are never trusted.
+
+Attribution is decided **once, when Briyo first imports the order**:
+- **No rewrites:** a later sync never adds, changes or removes it, even after a suspension, reactivation or settings change.
+- **No duplicates:** one per order, enforced by the database.
+- **Nothing retroactive:** orders imported before Phase 1E are never attributed.
+- **Values untouched:** order values, items, snapshots, stock and shipments are not changed.
+
+The sync also adds `shopify.referral = { ref, click }` to the order's stored payload when present, and the financial snapshot keeps every custom attribute verbatim. Previews report `newAffiliateAttributions`; runs report `affiliateAttributionsRecorded`.
+
+### Storefront snippet: required, not deployed
+The Shopify theme is not in this repository and is never changed by Briyo OS. `storefront/briyo-referral.liquid` is the exact snippet to install, after review:
+1. Online Store → Themes → **duplicate** the live theme → Edit code → Snippets → add `briyo-referral`, then paste the file.
+2. In `layout/theme.liquid`, just before `</body>`, add `{% render 'briyo-referral' %}`.
+3. Preview the duplicate, run the verification below, then publish it.
+
+What the snippet does:
+- reads `bref` and `bclid` from the landing URL and checks their format;
+- keeps the latest pair for 30 days in `localStorage` (cookie `briyo_ref` as a fallback);
+- writes them once per cart to `/cart/update.js` as the private attributes `__briyo_ref` and `__briyo_click`.
+
+It never changes prices or discounts, adds no UI, and fails silently: shopping and checkout continue as before. Browser privacy controls (Safari's ITP, private windows, cleared storage) can shorten or remove the stored pair. That is accepted, and no workaround (fingerprinting and the like) is used.
+
+### Shopify URL redirect (`/r/{id}` on the storefront)
+The storefront is Shopify-hosted, so `/r/{id}` has to be a Shopify **URL redirect** to `https://{AFFILIATE_CLICK_HOST}/r/{id}`.
+- **How it's created:** the **Set up storefront redirect** action on the Referral card (`affiliate.manage`) does this through the Shopify Admin API. It is the only Shopify write in Briyo OS, it is always explicit, and nothing does it on startup or when a link is created.
+- **Scope needed:** it requires the scopes **`read_online_store_navigation`** and **`write_online_store_navigation`**. The current app has only `read_orders`, so the action reports the missing scope instead of working around it.
+- **To enable it:** add both scopes to the Shopify app, then reconnect Shopify in Briyo OS. Alternatively, create the redirect by hand in Shopify → Online Store → Navigation → URL redirects.
+- **Conflicts:** an existing redirect with another target is refused, not overwritten.
+
+### GoKwik: verification required before relying on attribution
+Checkout runs through GoKwik. It has **not** been verified that cart attributes survive GoKwik into the Shopify order's `customAttributes`, and this cannot be reproduced locally. Before relying on attribution:
+1. With the snippet live, open `https://briyosupplements.com/r/{a test affiliate's id}`. Confirm you land with `bref` / `bclid` and that `/cart.js` shows the two attributes.
+2. Place a real low-value order through the GoKwik checkout.
+3. In Shopify admin, check the order's additional details (or the Admin API `customAttributes`) for `__briyo_ref` / `__briyo_click`.
+4. Run a Shopify order sync preview in Briyo OS and confirm `newAffiliateAttributions` counts it.
+
+If the attributes do not arrive, click attribution cannot work through GoKwik as it stands. Coupon attribution, in its phase, does not depend on cart attributes.
+
+### RBAC
+| Capability | Referral use |
+|---|---|
+| `affiliate.view` | See link, status, click and attribution summaries (no customer data) |
+| `affiliate.manage` | Create / disable the link; set up the storefront redirect |
+| `affiliate.verify`, `affiliate.commissions`, `affiliate.payouts` | No referral authority of their own |
+
+The public redirect needs no sign-in and reveals nothing internal.
+
+### Events
+- `referral_asset_created`
+- `referral_asset_disabled` (with the reason)
+- `storefront_redirect_synced`
+- `order_attributed`, with the Shopify order name, method and rule version
+
+Clicks are not events; they live in their own table.
+
+### Settings and environment
+| Name | Default | Purpose |
+|---|---|---|
+| `AFFILIATE_CLICK_HOST` | (none) | The click host, e.g. `go.briyo.xyz` |
+| `AFFILIATE_STOREFRONT_URL` | `https://briyosupplements.com` | Where clicks land (origin only) |
+| `AFFILIATE_LINK_BASE` | `https://briyosupplements.com` | Origin of the displayed public link |
+| `AFFILIATE_HASH_SALT` | `HR_IP_HASH_SALT` | Key for the IP / user-agent hashes |
+| `affiliate_settings.attribution_window_days` | 30 | Click window, read on every attribution |
+| `affiliate_settings.attribution_rule_version` | `v1` | Stored on every attribution |
+
 ## Not implemented yet (by design)
 
-- **Shopify:** scopes, discount codes, URL redirects. (Order financial snapshots arrived in Phase 1B; see ORDER-FINANCIAL-SNAPSHOTS.md.)
-- **Referrals:** referral links (`briyosupplements.com/r/…`), the click host, click tracking, codes, links, customer attribution.
-- **Money:** referral attribution, commissions, the commission ledger, refunds and reversals, payouts.
+- **Coupons:** creating affiliate coupon codes or Shopify discounts. The coupon attribution path exists but has no source yet.
+- **Money:** commissions, the commission ledger, approval, refunds and reversals, payouts, payout batches, tax / TDS.
+- **Automation:** Shopify order polling, webhooks, theme deployment, DNS / Cloudflare changes, Cloudflare Workers.
+- **Attribution extras:** retroactive attribution, attribution corrections, marketing analytics dashboards.
 - **Verification follow-ups:** automatic expiry handling or renewal reminders, self-service submission by the professional, other kinds of evidence checks.
 - **Interfaces:** an Overview card, the affiliate portal and login, reporting. (The internal admin UI exists since Phase 1C.)
 - **Infrastructure:** Cloudflare, DNS, storefront or theme, and GoKwik changes.

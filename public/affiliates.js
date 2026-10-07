@@ -14,7 +14,7 @@ import { istDate, istDateTime, istDayKey } from './ui/ist.js';
 const fetch = pageFetch();
 const PAGE = 50;
 const FILTERS = ['q', 'category', 'status', 'sort', 'dir'];
-const state = { me: null, meta: null, f: {}, list: [], total: 0, kpis: null, detail: null, ver: null, publicId: null, form: null, dirty: false };
+const state = { me: null, meta: null, f: {}, list: [], total: 0, kpis: null, detail: null, ver: null, ref: null, publicId: null, form: null, dirty: false };
 
 const api = async (url, opts = {}) => {
   const res = await fetch(url, {
@@ -185,8 +185,8 @@ async function loadDetail() {
   $('#alerts').innerHTML = '';
   try {
     const pid = encodeURIComponent(state.publicId);
-    const [data, ver] = await Promise.all([api(`/api/affiliates/${pid}`), api(`/api/affiliates/${pid}/verification`)]);
-    state.detail = data; state.ver = ver;
+    const [data, ver, ref] = await Promise.all([api(`/api/affiliates/${pid}`), api(`/api/affiliates/${pid}/verification`), api(`/api/affiliates/${pid}/referral`)]);
+    state.detail = data; state.ver = ver; state.ref = ref;
     renderDetail();
   } catch (err) {
     if (err.status === 404) {
@@ -253,6 +253,7 @@ function renderDetail() {
       </section>
 
       ${verificationCard()}
+      ${referralCard()}
 
       <section class="card af-activity">
         <header class="card-head"><h2 class="card-title">${icon('history')}Activity</h2><span class="card-meta">${count(events.length)} event${events.length === 1 ? '' : 's'}</span></header>
@@ -302,6 +303,7 @@ const catSelect = (cur) => `<label class="fld wide"><span>Category <em>*</em></s
 function openForm(kind, extra) {
   const a = state.detail?.affiliate;
   if (kind === 'ver') { openVerificationForm(extra); return; }
+  if (kind === 'ref') { openReferralForm(extra); return; }
   state.form = kind;
   if (kind === 'new') {
     showDrawer('New affiliate', 'A public ID is issued automatically', `<form id="afForm" novalidate><div class="form-grid">
@@ -362,6 +364,7 @@ async function saveForm() {
       return;
     }
     if (VER_FORMS.includes(state.form?.ver)) { await saveVerification(); return; }
+    if (state.form?.ref) { await saveReferral(); return; }
     let out;
     if (state.form === 'edit') out = await send(`/api/affiliates/${a.public_id}`, 'PATCH', { ...formData(), version: a.version });
     else if (state.form === 'rate') {
@@ -375,6 +378,7 @@ async function saveForm() {
     }
     state.detail = out;
     state.ver = await api(`/api/affiliates/${encodeURIComponent(a.public_id)}/verification`).catch(() => state.ver);
+    state.ref = await api(`/api/affiliates/${encodeURIComponent(a.public_id)}/referral`).catch(() => state.ref);
     state.dirty = false; closeDrawer({ force: true });
     renderDetail();
   } catch (err) {
@@ -544,6 +548,91 @@ async function saveVerification() {
   state.ver = out;
   // Approval changes the affiliate's status too.
   state.detail = await api(`/api/affiliates/${pid}`);
+  state.ref = await api(`/api/affiliates/${pid}/referral`).catch(() => state.ref);
+  state.dirty = false; closeDrawer({ force: true });
+  renderDetail();
+}
+
+// ------------------------------------------------------------------ referral link (Phase 1E)
+
+const METHOD = { coupon: 'Coupon', referral_click: 'Referral click' };
+function referralCard() {
+  const R = state.ref?.referral;
+  if (!R) return '';
+  const a = state.detail.affiliate;
+  const canM = state.ref.canManage;
+  const link = R.link;
+  const badge = link
+    ? (R.usable ? '<span class="status recovered"><span class="dot"></span>Live</span>' : '<span class="status noresp"><span class="dot"></span>Not usable now</span>')
+    : '<span class="status none"><span class="dot"></span>No link</span>';
+  const kv = (label, value) => `<div class="hr-kv"><span>${esc(label)}</span><span>${value}</span></div>`;
+  const notice = !R.eligibility.eligible
+    ? `<div class="alert warn">${icon('info')}<span>${link ? 'The link exists but is not usable: ' : 'A referral link cannot be created yet: '}${esc(R.eligibility.text)}${link ? ' Visitors land on the storefront home page and no click is recorded.' : ''}</span></div>` : '';
+  const actions = [];
+  if (canM && !link && R.eligibility.eligible) actions.push('<button class="btn primary" type="button" data-ref="create">Create referral link</button>');
+  if (canM && link) {
+    actions.push(`<button class="btn" type="button" data-ref="redirect">${link.storefront_redirect_set ? 'Re-check storefront redirect' : 'Set up storefront redirect'}</button>`);
+    actions.push('<button class="btn" type="button" data-ref="disable">Disable link</button>');
+  }
+  return `<section class="card af-referral">
+    <header class="card-head"><h2 class="card-title">${icon('link')}Referral link ${badge}</h2></header>
+    <div class="pane pad">
+      ${notice}
+      ${link ? `<div class="hr-link af-link"><input class="input mono" id="refUrl" readonly value="${esc(R.public_url)}" aria-label="Referral link" />
+          <button class="btn" type="button" data-copy-link>${icon('copy')}Copy</button></div>
+        <div class="af-ref-grid">
+          <div>${kv('Created', by(link.created_at, link.created_by))}
+            ${kv('Storefront redirect', link.storefront_redirect_set ? `Set up ${esc(istDateTime(link.storefront_redirect_at))}` : '<span class="soft">Not set up in Shopify yet — the public link does not work until it is.</span>')}</div>
+          <div>${kv('Clicks', `${count(R.clicks.total)} <span class="soft">· ${count(R.clicks.last_30_days)} in 30 days</span>`)}
+            ${kv('Latest click', R.clicks.latest_at ? esc(istDateTime(R.clicks.latest_at)) : '<span class="soft">None yet</span>')}
+            ${kv('Attributed orders', count(R.attributions.total))}</div>
+        </div>`
+    : `<div class="empty-note"><b>No referral link.</b>${R.eligibility.eligible ? (canM ? 'Create one: the public link is fixed for this partner.' : 'An affiliate manager creates referral links.') : ''}</div>`}
+      ${R.attributions.recent.length ? `<h3 class="dsec-title af-gap">Recent attributions</h3><div class="table-wrap"><table class="table">
+        <thead><tr><th>Order</th><th>Method</th><th>Order placed</th><th>Attributed</th><th>Rule</th></tr></thead>
+        <tbody>${R.attributions.recent.map((t) => `<tr><td>${esc(t.order || '—')}</td><td>${esc(METHOD[t.method] || t.method)}</td>
+          <td>${esc(istDateTime(t.order_placed_at))}</td><td>${esc(istDateTime(t.attributed_at))}</td><td class="mono">${esc(t.rule_version)}</td></tr>`).join('')}</tbody></table></div>` : ''}
+      ${R.history.length ? `<details class="more af-gap"><summary>${icon('chevron-right')}Disabled links <span class="soft">— ${R.history.length}, kept</span></summary>
+        ${R.history.map((h) => `<div class="af-hist">${kv('Created', by(h.created_at, h.created_by))}${kv('Disabled', by(h.disabled_at, h.disabled_by))}${kv('Reason', esc(h.disable_reason || '—'))}</div>`).join('')}</details>` : ''}
+      ${actions.length && a.status !== 'closed' ? `<div class="af-ver-actions">${actions.join('')}</div>` : ''}
+      <p class="soft af-note">Attribution credit only: no commission is calculated or paid.</p>
+    </div>
+  </section>`;
+}
+
+async function copyLink(btn) {
+  const input = $('#refUrl');
+  try { await navigator.clipboard.writeText(input.value); btn.textContent = 'Copied'; } catch { input.select(); btn.textContent = 'Press ⌘C'; }
+  setTimeout(() => { btn.innerHTML = `${icon('copy')}Copy`; renderIcons(); }, 1600);
+}
+
+function openReferralForm(kind) {
+  const a = state.detail.affiliate;
+  if (kind === 'create' || kind === 'redirect') {
+    const msg = kind === 'create'
+      ? `Create the referral link for ${a.display_name}? Its public address is fixed: ${state.ref.referral.public_url}`
+      : 'Create (or check) the /r/ redirect for this partner in Shopify? This is the only change Briyo OS makes in Shopify.';
+    if (!window.confirm(msg)) return;
+    state.form = { ref: kind, noForm: true };
+    saveForm();
+    return;
+  }
+  state.form = { ref: 'disable' };
+  showDrawer('Disable referral link', `${a.display_name} · ${a.public_id}`, `<form id="afForm" novalidate><div class="form-grid">
+    <label class="fld wide"><span>Reason <em>*</em></span><textarea class="input" name="reason" rows="3" maxlength="300"></textarea><span class="help">Recorded with your name and the time.</span></label>
+    <p class="help wide">A disabled link stays disabled and is kept with its clicks and attributions. Visitors then land on the storefront home page. A new link can be created later; the public address stays the same.</p>
+  </div></form>`, '<button class="btn" type="button" data-close>Cancel</button><button class="btn danger" type="button" id="dSave">Disable link</button>');
+}
+
+async function saveReferral() {
+  const pid = encodeURIComponent(state.publicId);
+  const f = state.form;
+  let out;
+  if (f.ref === 'create') out = await send(`/api/affiliates/${pid}/referral`, 'POST', {});
+  else if (f.ref === 'redirect') out = await send(`/api/affiliates/${pid}/referral/storefront-redirect`, 'POST', {});
+  else out = await send(`/api/affiliates/${pid}/referral/disable`, 'POST', { ...formData(), version: state.ref.referral.link?.version });
+  state.ref = out;
+  state.detail = await api(`/api/affiliates/${pid}`);
   state.dirty = false; closeDrawer({ force: true });
   renderDetail();
 }
@@ -576,6 +665,8 @@ function bind() {
     if (t?.dataset.kpi !== undefined) { state.f.status = t.dataset.kpi; writeUrl(); listFrame(); loadList(); return; }
     if (t?.dataset.open) { openForm(t.dataset.open); return; }
     if (t?.dataset.ver) { openForm('ver', t.dataset.ver); return; }
+    if (t?.dataset.ref) { openForm('ref', t.dataset.ref); return; }
+    if (t?.dataset.copyLink !== undefined) { copyLink(t); return; }
     go(e);
   });
   $('#view').addEventListener('keydown', (e) => { if (e.key === 'Enter' && e.target.matches('[data-href]')) window.location.assign(e.target.dataset.href); });
