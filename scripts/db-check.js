@@ -5959,6 +5959,86 @@ await step('referral: attribution through the existing Shopify sync — last eli
   return '9 orders: last click (incl. across affiliates) wins, bref/click mismatch and unknown click ignored, affiliate coupon beats the click, a non-affiliate coupon does not, ordered-before-click ignored, legacy keys read; preview = commit (5); re-sync idempotent; suspended affiliate loses new orders to the previous eligible click; 30 → 60-day window read from settings; rule v1 stored; totals, snapshots and stock untouched; DB refuses a second or orphan attribution and edits';
 });
 
+await step('referral: GoKwik fallback (rule v2) — /r/{id} in full_url + a recorded click; UTMs alone never; v1 unchanged', async () => {
+  const bad = [];
+  const keepShop = process.env.SHOPIFY_STORE_DOMAIN;
+  process.env.SHOPIFY_STORE_DOMAIN = 'briyo-supp.myshopify.com';
+  try {
+    const gk = (id, extra = []) => [
+      { key: 'gk_order_confirmation_url', value: 'https://briyo-supplements.addons.gokwik.co/thank-you?token=x' }, { key: 'gokwik_cid', value: 'a322d27a-cc3f-48a0-9be6-ea9ea3a3e32d' },
+      { key: 'cart_token', value: 'hWNGjsufWe8Q7IA6bbNdHyU5?key=35feb1f451bd7db98c1881ff9714d7bc' },
+      ...(id ? [{ key: 'full_url', value: `https://briyo-supp.myshopify.com/r/${id}?utm_source=affiliate&utm_campaign=${id}&utm_medium=referral` }] : []),
+      { key: 'utm_source', value: 'affiliate' }, { key: 'utm_campaign', value: id || 'NOPE22' }, { key: 'utm_medium', value: 'referral' },
+      { key: 'Payment_Method', value: 'Cash on Delivery' }, ...extra];
+    const X = await eligibleAffiliate('GK main');     // the #2809 replica
+    const Y = await eligibleAffiliate('GK no click');
+    const Z = await eligibleAffiliate('GK late click');
+    const W = await eligibleAffiliate('GK old click');
+    const S = await eligibleAffiliate('GK suspended');
+    const M = await eligibleAffiliate('GK multi');
+    const V = await eligibleAffiliate('GK v1 direct');
+    const zOrderTime = new Date(Date.now() - 60000).toISOString();   // placed before Z's click below
+    const xClick = clickOf(await goReq(`/r/${X}`, { ip: '203.0.113.31' }));
+    await goReq(`/r/${Z}`, { ip: '203.0.113.32' });
+    await goReq(`/r/${S}`, { ip: '203.0.113.33' });
+    const m1 = clickOf(await goReq(`/r/${M}`, { ip: '203.0.113.34' }));
+    await new Promise((r) => setTimeout(r, 30));
+    const m2 = clickOf(await goReq(`/r/${M}`, { ip: '203.0.113.35' }));
+    const vClick = clickOf(await goReq(`/r/${V}`, { ip: '203.0.113.36' }));
+    const w = (await getPool().query(`SELECT a.id, r.id rid FROM affiliates a JOIN affiliate_referral_assets r ON r.affiliate_id = a.id AND r.status = 'active' WHERE a.public_id = $1`, [W])).rows[0];
+    await getPool().query(`INSERT INTO affiliate_referral_clicks (public_id, affiliate_id, referral_asset_id, visitor_id, clicked_at) VALUES ('GKOLDCLICK_DBCHECK_001', $1, $2, 'GKOLDVISITOR_DBCHECK_0', now() - interval '40 days')`, [w.id, w.rid]);
+    await new Promise((r) => setTimeout(r, 30));
+    await af('manager', 'POST', `/api/affiliates/${S}/status`, { action: 'suspend', reason: 'db-check' });
+    const now = () => new Date().toISOString();
+    const cases = {
+      921: [{ created: now(), attributes: gk(X) }, { aff: X, m: 'gokwik_full_url', v: 'v2', click: xClick }],                       // #2809 replica
+      922: [{ created: now(), attributes: gk(null) }, null],                                                                          // UTMs only
+      923: [{ created: now(), attributes: gk(null, [{ key: 'full_url', value: `https://briyo-supp.myshopify.com/?utm_campaign=${X}` }]) }, null], // full_url without /r/
+      924: [{ created: now(), attributes: gk(null, [{ key: 'full_url', value: `https://evil.example/r/${X}` }]) }, null],             // foreign host
+      925: [{ created: now(), attributes: gk(Y) }, null],                                                                             // /r/ but no recorded click
+      926: [{ created: zOrderTime, attributes: gk(Z) }, null],                                                                        // click after the order
+      927: [{ created: now(), attributes: gk(W) }, null],                                                                             // click outside 30 days
+      928: [{ created: now(), attributes: gk('ZZZZZZ') }, null],                                                                     // unknown affiliate
+      929: [{ created: now(), attributes: gk(S) }, null],                                                                             // suspended at import
+      930: [{ created: now(), attributes: gk(M) }, { aff: M, m: 'gokwik_full_url', v: 'v2', click: m2 }],                            // latest click wins
+      931: [{ created: now(), attributes: [{ key: '__briyo_ref', value: V }, { key: '__briyo_click', value: vClick }, ...gk(X)] }, { aff: V, m: 'referral_click', v: 'v1', click: vClick }], // v1 decides
+      932: [{ created: now(), attributes: [{ key: '__briyo_ref', value: X }, { key: '__briyo_click', value: vClick }, ...gk(X)] }, null], // v1 mismatch: no fallback override
+      933: [{ created: now() }, null],                                                                                                // plain order
+      934: [{ created: now(), attributes: gk(null, [{ key: 'full_url', value: `http://briyo-supp.myshopify.com/r/${X}` }]) }, null],  // not https
+    };
+    for (const [n, [o]] of Object.entries(cases)) SH.store.push(shOrder(Number(n), o));
+    const gql = shFake(() => SH.store);
+    const pre = await runShopifySync({ window: { days: 3 }, dryRun: true, gql });
+    const r = await runShopifySync({ window: { days: 3 }, dryRun: false, gql, actor: SH_ACTOR });
+    const who = async (n) => (await getPool().query(`SELECT t.attribution_method m, t.rule_version v, t.click_id, t.metadata, a.public_id aff FROM affiliate_order_attributions t
+      JOIN orders o ON o.id = t.order_id JOIN affiliates a ON a.id = t.affiliate_id WHERE o.source_order_id = $1`, [`${SH_PREFIX}${String(n).padStart(4, '0')}`])).rows[0] || null;
+    for (const [n, [, want]] of Object.entries(cases)) {
+      const got = await who(n);
+      if (want === null ? got !== null : (got?.aff !== want.aff || got.m !== want.m || got.v !== want.v || got.click_id !== want.click)) {
+        bad.push(`order ${n}: ${got ? `${got.aff}/${got.m}/${got.v}/${got.click_id === m1 ? 'older click' : got.click_id}` : 'none'}`);
+      }
+    }
+    const g = await who(921);
+    if (g && (g.metadata.source !== 'gokwik_full_url' || g.metadata.landing_path !== `/r/${X}` || g.metadata.click_match !== 'latest_affiliate_click_before_order')) bad.push(`metadata ${JSON.stringify(g.metadata)}`);
+    if (pre.summary.newAffiliateAttributions !== 3 || r.summary.affiliateAttributionsRecorded !== 3) bad.push(`preview ${pre.summary.newAffiliateAttributions} / recorded ${r.summary.affiliateAttributionsRecorded}`);
+    const o921 = (await getPool().query('SELECT source_payload FROM orders WHERE source_order_id = $1', [`${SH_PREFIX}0921`])).rows[0];
+    if (o921?.source_payload.shopify.referral?.landing_ref !== X || o921.source_payload.shopify.referral.source !== 'gokwik_full_url') bad.push('landing referral not kept on the order');
+    // No synthetic clicks, no click changes; idempotent.
+    const clicks = (await getPool().query(`SELECT count(*)::int n FROM affiliate_referral_clicks k JOIN affiliates a ON a.id = k.affiliate_id WHERE a.public_id = ANY($1)`, [[X, Y, Z, W, S, M, V]])).rows[0].n;
+    if (clicks !== 7) bad.push(`clicks ${clicks}`);
+    const again = await runShopifySync({ window: { days: 3 }, dryRun: false, gql, actor: SH_ACTOR });
+    if (again.summary.affiliateAttributionsRecorded !== 0) bad.push('re-sync attributed again');
+    // landingReferral on its own.
+    const { landingReferral } = await import('../lib/affiliate-referrals.js');
+    const lr = (u) => landingReferral([{ key: 'full_url', value: u }]);
+    if (lr(`https://briyo-supp.myshopify.com/r/${X.toLowerCase()}?a=1`) !== X || lr(`https://www.briyosupplements.com/r/${X}`) !== X || lr(`https://briyosupplements.com/r/${X}/`) !== X
+      || lr(`https://briyo-supp.myshopify.com/r/${X}/extra`) !== null || lr('not a url') !== null || lr(`https://briyosupplements.com.evil.example/r/${X}`) !== null
+      || landingReferral([{ key: 'utm_campaign', value: X }]) !== null) bad.push('landingReferral parsing');
+  } finally { if (keepShop === undefined) delete process.env.SHOPIFY_STORE_DOMAIN; else process.env.SHOPIFY_STORE_DOMAIN = keepShop; }
+  if (bad.length) throw new Error(bad.join(' | '));
+  return '#2809 replica → gokwik_full_url / v2 to the recorded click; UTMs alone, full_url without /r/, foreign host, http, no click, click after order, 40-day-old click, unknown affiliate, suspended affiliate → none; latest of two clicks wins; __briyo_click orders still v1 (and a v1 mismatch is not overridden); plain order none; preview = commit (3); no clicks created; idempotent';
+});
+
 await step('referral: storefront snippet — stores bref/bclid, writes private cart attributes once, ignores bad input, never throws', async () => {
   const bad = [];
   const src = (await fsp.readFile(new URL('../storefront/briyo-referral.liquid', import.meta.url), 'utf8'));

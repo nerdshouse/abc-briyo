@@ -555,7 +555,7 @@ async function saveVerification() {
 
 // ------------------------------------------------------------------ referral link (Phase 1E)
 
-const METHOD = { coupon: 'Coupon', referral_click: 'Referral click' };
+const METHOD = { coupon: 'Coupon', referral_click: 'Referral click', gokwik_full_url: 'Referral link (GoKwik)' };
 function referralCard() {
   const R = state.ref?.referral;
   if (!R) return '';

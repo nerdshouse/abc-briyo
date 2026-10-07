@@ -209,7 +209,7 @@ It is checked when a link is created, on every redirect, and again when an order
 |---|---|---|
 | `affiliate_referral_assets` | An affiliate's link (`type = 'link'`); `type = 'coupon'` with a `code` is reserved for the coupon phase | Opaque 10-character `public_id`; one **active** link per affiliate (partial unique index); identity (`public_id`, affiliate, type, code, created_at) immutable and `active → disabled` final (trigger); disabling needs a reason; never deleted |
 | `affiliate_referral_clicks` | One row per recorded redirect: opaque `public_id` (the `bclid`), opaque `visitor_id`, allow-listed UTM fields, `ip_hash` / `user_agent_hash` | Append-only. No raw IP, user agent, name, email or phone is stored. |
-| `affiliate_order_attributions` | Who gets attribution credit for an order: affiliate, asset, click, method (`coupon` / `referral_click`), order time, `rule_version`, window used | `UNIQUE (order_id)`; FK to `orders`; append-only. Credit only, no amounts. |
+| `affiliate_order_attributions` | Who gets attribution credit for an order: affiliate, asset, click, method (`coupon` / `referral_click` / `gokwik_full_url`), order time, `rule_version` (`v1`, or `v2` for the GoKwik fallback), window used | `UNIQUE (order_id)`; FK to `orders`; append-only. Credit only, no amounts. |
 
 ### Click host
 - **Setting:** `AFFILIATE_CLICK_HOST`, for example `go.briyo.xyz`.
@@ -234,7 +234,16 @@ Run by the **existing** Shopify order sync (`lib/shopify-orders.js`), inside the
 2. **Referral click.**
    - The order's `__briyo_click` must be a click recorded by Briyo OS, and the order's `__briyo_ref` (when present) must name that click's affiliate.
    - Then the **latest** click by the same visitor wins, provided it was made no later than the order (5-minute clock tolerance), within `affiliate_settings.attribution_window_days` before the order (30 days, read on every run, never hard-coded), with an active link and an affiliate eligible now. An ineligible affiliate's click is skipped in favour of the visitor's previous eligible one.
-3. Otherwise **no attribution.** Browser values alone are never trusted.
+3. **GoKwik fallback (rule `v2`, method `gokwik_full_url`).** It runs only when the order carries **none** of our referral attributes; an order with them is decided by step 2 alone, even when step 2 finds nothing.
+   - **Why it exists:** GoKwik checkout drops the private cart attributes, as verified on order #2809. It keeps its own `full_url` attribute: the landing URL of the session.
+   - **The landing path:** `full_url` must be HTTPS on our storefront (apex or `www`) or the store's myshopify domain, with the path `/r/{affiliate public id}`.
+   - **The click:** that affiliate must have a click recorded by Briyo OS, made no later than the order (no clock tolerance), within `attribution_window_days` before it, on an active link, and the affiliate must be eligible now. The latest such click is credited.
+   - **What is recorded:** `rule_version = 'v2'`. The metadata records `source: gokwik_full_url`, the landing path and `click_match: latest_affiliate_click_before_order`.
+   - **The credit is the affiliate's.** GoKwik drops our click ID, so the credited click is the affiliate's latest qualifying one, not proven to be this visitor's.
+   - **UTM values alone never attribute.** Nor does a `full_url` without `/r/{id}`, on another host, or over plain HTTP. No click is ever created or changed.
+4. Otherwise **no attribution.** Browser values alone are never trusted.
+
+**`cart_token` (investigated, not used).** GoKwik also keeps Shopify's `cart_token`. Briyo OS does not record cart tokens: the click happens on the click host before any cart exists, and the snippet writes to the cart without reporting its token. So there is nothing to join it against, and a `cart_token` join would need the snippet to send `{cart_token, bclid}` to Briyo OS. That is a possible future change, not implemented.
 
 Attribution is decided **once, when Briyo first imports the order**:
 - **No rewrites:** a later sync never adds, changes or removes it, even after a suspension, reactivation or settings change.
@@ -242,7 +251,7 @@ Attribution is decided **once, when Briyo first imports the order**:
 - **Nothing retroactive:** orders imported before Phase 1E are never attributed.
 - **Values untouched:** order values, items, snapshots, stock and shipments are not changed.
 
-The sync also adds `shopify.referral = { ref, click }` to the order's stored payload when present, and the financial snapshot keeps every custom attribute verbatim. Previews report `newAffiliateAttributions`; runs report `affiliateAttributionsRecorded`.
+The sync also adds `shopify.referral = { ref, click }` to the order's stored payload when present (for a GoKwik order with a referral landing path, `{ ref: null, click: null, landing_ref, source: 'gokwik_full_url' }`), and the financial snapshot keeps every custom attribute verbatim. Previews report `newAffiliateAttributions`; runs report `affiliateAttributionsRecorded`.
 
 ### Storefront snippet: required, not deployed
 The Shopify theme is not in this repository and is never changed by Briyo OS. `storefront/briyo-referral.liquid` is the exact snippet to install, after review:
