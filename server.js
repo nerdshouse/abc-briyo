@@ -1164,7 +1164,7 @@ if (!MOCK) {
 }
 
 app.listen(port, async () => {
-  console.log(`Recovery Board on http://localhost:${port}`);
+  console.log(`Briyo OS on http://localhost:${port}`);
   if (process.env.BOARD_TZ && !process.env.BOARD_TIMEZONE) {
     console.warn('BOARD_TZ is deprecated — rename it to BOARD_TIMEZONE. '
       + 'It is still honoured, but only BOARD_TIMEZONE is documented.');
