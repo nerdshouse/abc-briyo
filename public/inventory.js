@@ -344,8 +344,10 @@ function platformSection(s) {
         <li class="pf-row">
           <div class="pf-main"><span class="pf-label">${esc(g.label)}</span>
             <span class="pf-code mono">${esc(m.platform_sku)}</span>
-            ${m.duplicate_override ? `<span class="mini-tag warn" title="${esc(`Also mapped to another master SKU. Reason: ${m.duplicate_reason}`)}">Duplicate</span>` : ''}</div>
+            ${m.duplicate_override ? `<span class="mini-tag warn" title="${esc(`Also mapped to another master SKU. Reason: ${m.duplicate_reason}`)}">Duplicate</span>` : ''}
+            <span class="mini-tag" title="Units per listing: how many master-SKU units one channel listing represents.">${count(m.units_per_listing)} unit${m.units_per_listing === 1 ? '' : 's'} per listing</span></div>
           <span class="pf-meta soft" title="${esc(`Added ${m.source === 'import' ? 'by import' : m.source === 'migrated' ? 'from the old Amazon field' : m.source === 'unmapped' ? 'from Unmapped platform SKUs' : 'by hand'}${m.created_by ? ` · ${m.created_by}` : ''}`)}">${usage[m.id] ? `${count(usage[m.id])} order line${usage[m.id] === 1 ? '' : 's'}` : ''}</span>
+          ${canCatalog() ? `<button type="button" class="linkish pf-remove" data-units="${m.id}" data-current="${m.units_per_listing}" data-code="${esc(m.platform_sku)}" aria-label="Change units per listing for ${esc(g.label)} SKU ${esc(m.platform_sku)}">Units</button>` : ''}
           ${canCatalog() ? `<button type="button" class="linkish pf-remove" data-unmap="${m.id}" data-code="${esc(m.platform_sku)}" data-lines="${usage[m.id] || 0}" aria-label="Remove ${esc(g.label)} SKU ${esc(m.platform_sku)}">Remove</button>` : ''}
         </li>`).join('')).join('')}</ul>`
         : '<p class="soft" style="margin:0">No platform SKUs yet. Orders from marketplaces will not resolve to this product until they are added.</p>'}
@@ -354,6 +356,8 @@ function platformSection(s) {
         <label class="fld"><span>Platform SKU</span><div class="pf-entry">
           <input class="input mono" id="pfCode" placeholder="Enter platform SKU" maxlength="80" autocomplete="off" spellcheck="false" />
           <button type="button" class="btn" id="pfAdd">Add</button></div></label>
+        <label class="fld"><span>Units per listing</span><input class="input" id="pfUnits" type="number" min="1" step="1" value="1" inputmode="numeric" />
+          <span class="help">How many master-SKU units one channel listing represents.</span></label>
         <p class="pf-error" id="pfError" role="alert" hidden></p>
       </div>` : ''}
       ${s.asin || s.amazon_listing_id || s.amazon_product_id || s.amazon_item_name ? `<dl class="kv" style="margin-top:12px">
@@ -411,6 +415,8 @@ function openForm(kind, ctx = {}) {
       <div class="form-grid" style="margin-top:12px">
         <label class="fld wide"><span>Master Briyo SKU</span><select class="select" name="sku_id" required>${skuOptions('')}</select>
           <span class="help">No new SKU is created. If the product is not in the master list yet, create it with New master SKU first, then map.</span></label>
+        <label class="fld"><span>Units per listing</span><input class="input" name="units_per_listing" type="number" min="1" step="1" value="1" inputmode="numeric" required />
+          <span class="help">How many master-SKU units one channel listing represents.</span></label>
       </div></section>`;
   } else if (kind === 'dup-map') {
     const d = ctx.dup;
@@ -587,7 +593,9 @@ async function addPlatformSku() {
   if (!code) return showError('Enter the platform SKU.');
   if (/\s/.test(code)) return showError('SKU cannot contain spaces.');
   state.pfPlatform = $('#pfPlatform').value;
-  const req = { skuId: state.detail.sku.id, platform: state.pfPlatform, codes: [code] };
+  const units = $('#pfUnits').value.trim();
+  if (!/^[1-9]\d*$/.test(units)) return showError('Units per listing must be a whole number of at least 1.');
+  const req = { skuId: state.detail.sku.id, platform: state.pfPlatform, codes: [code], unitsPerListing: Number(units) };
   $('#pfAdd').disabled = true;
   try {
     const r = await addMapping(req);
@@ -603,9 +611,9 @@ async function addPlatformSku() {
 }
 
 /** Adds platform SKUs to a master; a duplicate comes back as err.data.duplicateMapping. */
-const addMapping = ({ skuId, platform, codes, fromOrder = false, confirmDuplicate = false, reason = '' }) =>
+const addMapping = ({ skuId, platform, codes, fromOrder = false, confirmDuplicate = false, reason = '', unitsPerListing }) =>
   api(`/api/inventory/skus/${skuId}/platform-skus`, { method: 'POST', body: JSON.stringify({
-    platform, platform_skus: codes, from_order: fromOrder, confirm_duplicate: confirmDuplicate, duplicate_reason: reason }) });
+    platform, platform_skus: codes, from_order: fromOrder, confirm_duplicate: confirmDuplicate, duplicate_reason: reason, units_per_listing: unitsPerListing }) });
 
 async function submitForm(e) {
   e.preventDefault();
@@ -635,7 +643,8 @@ async function submitForm(e) {
       openAfter = state.detail.sku.id;
     } else if (kind === 'map') {
       if (!v.sku_id) throw new Error('Choose the master Briyo SKU.');
-      const req = { skuId: Number(v.sku_id), platform: ctx.platform, codes: [ctx.code], fromOrder: true };
+      if (!/^[1-9]\d*$/.test(String(v.units_per_listing || '').trim())) throw new Error('Units per listing must be a whole number of at least 1.');
+      const req = { skuId: Number(v.sku_id), platform: ctx.platform, codes: [ctx.code], fromOrder: true, unitsPerListing: Number(v.units_per_listing) };
       try { await addMapping(req); } catch (err) {
         if (!err.data?.duplicateMapping) throw err;
         return openForm('dup-map', { ...req, dup: err.data.duplicateMapping });
@@ -784,6 +793,17 @@ function bind() {
       return openForm(a.dataset.act === 'receive' ? 'receive' : a.dataset.act, { batchId, skuId: state.detail.sku.id });
     }
     if (e.target.closest('#pfAdd')) { addPlatformSku(); return null; }
+    const ch = e.target.closest('[data-units]');
+    if (ch) {
+      const next = window.prompt(`Units per listing for ${ch.dataset.code}: how many master-SKU units one channel listing represents.`, ch.dataset.current);
+      if (next === null || next.trim() === ch.dataset.current) return null;
+      try {
+        await api(`/api/inventory/platform-skus/${ch.dataset.units}`, { method: 'PATCH', body: JSON.stringify({ units_per_listing: next.trim() }) });
+        await openSku(state.detail.sku.id);
+        load();
+      } catch (err) { $('#dSaved').className = 'saved failed'; $('#dSaved').textContent = err.message; }
+      return null;
+    }
     const un = e.target.closest('[data-unmap]');
     if (un) {
       const lines = Number(un.dataset.lines);

@@ -30,6 +30,7 @@ import {
   uploadBatchDocument, getBatchDocument, shipmentStock, reserveShipmentStock, releaseShipmentStock, dispatchShipmentStock,
   inventoryOverview, resolveSkuIds, purgeTestInventory, saveWarehouse, unmappedSkus, fefoSuggest,
   addPlatformMappings, removePlatformMapping, savePlatform, listPlatforms, splitPlatformCell, migrateLegacyAmazonSkus, mappingUsage,
+  updateMappingUnits, unitsPerListingOf,
 } from '../lib/inventory.js';
 import { planSkuSheet, previewSkuImport, commitSkuImport } from '../lib/sku-master-import.js';
 import { DOCUMENT_FORMATS } from '../lib/orders.js';
@@ -2686,6 +2687,131 @@ await step('platform SKUs: historical Amazon orders keep their master SKU throug
   try { await remapOrderItems(c2, legacy); } finally { c2.release(); }
   if ((await lineOf(waiting)).sku_id !== legacy) throw new Error('waiting line not resolved via migrated mapping');
   return 'old column → Amazon mapping (source "migrated"), column cleared, re-run moves 0; resolved line unchanged; waiting line resolves';
+});
+// ---- units per listing: a channel listing can be several master-SKU units -----------
+const upShip = async (channel, number, tracking) => {
+  const dl = (await listCouriers()).find((x) => x.name === 'Delhivery');
+  return (await createShipment({ ...R(channel), channel, source_order_id: `${TEST_ORDER}-${number}`, courier_partner_id: dl.id, tracking_id: tracking, shipment_status: 'packed' },
+    { actor: ACTOR, addToExisting: true })).shipmentId;
+};
+const upLine = async (orderId, lineId, code, qty) => {
+  const c = await getPool().connect();
+  let skuId;
+  try { skuId = (await resolveSkuIds(c, 'amazon', [code])).get(code.toLowerCase()) ?? null; } finally { c.release(); }
+  await getPool().query(`INSERT INTO order_items (order_id, source_line_item_id, sku, title, quantity, item_price, sku_id) VALUES ($1, $2, $3, 'Test line', $4, 100, $5)`,
+    [orderId, lineId, code, qty, skuId]);
+};
+const upMap = async (code) => (await getSku(INV.up)).platform_skus.find((x) => x.platform_sku === code);
+
+await step('units per listing: new mapping defaults to 1; explicit 1, 2 and 3 are stored', async () => {
+  INV.up = (await createSku({ sku: `${TS}-UP-SINGLE`, product_name: 'Single pack (units per listing)' }, { actor: ACTOR })).id;
+  await addPlatformMappings(INV.up, PF.amazon, [`${TS}-UP-DEFAULT`], { actor: ACTOR });
+  await addPlatformMappings(INV.up, PF.amazon, [`${TS}-UP-ONE`], { actor: ACTOR, unitsPerListing: 1 });
+  await addPlatformMappings(INV.up, PF.amazon, [`${TS}-UP-PACK2`], { actor: ACTOR, unitsPerListing: 2 });
+  await addPlatformMappings(INV.up, PF.amazon, [`${TS}-UP-PACK3`], { actor: ACTOR, unitsPerListing: '3' });
+  const got = ['DEFAULT', 'ONE', 'PACK2', 'PACK3'].map(async (k) => (await upMap(`${TS}-UP-${k}`)).units_per_listing);
+  const v = await Promise.all(got);
+  if (v.join() !== '1,1,2,3') throw new Error(v.join());
+  // A row written without the column (as existing rows were) is 1.
+  await getPool().query(`INSERT INTO sku_platform_mappings (sku_id, platform, platform_sku) VALUES ($1, 'zepto', $2)`, [INV.up, `${TS}-UP-RAW`]);
+  if ((await upMap(`${TS}-UP-RAW`)).units_per_listing !== 1) throw new Error('raw row');
+  // A Blinkit mapping made the way production's 10190237 → BS002E90 was (no multiplier given) is 1.
+  await addPlatformMappings(INV.up, PF.blinkit, [`${TS}-UP-10190237`], { actor: ACTOR });
+  if ((await upMap(`${TS}-UP-10190237`)).units_per_listing !== 1) throw new Error('blinkit');
+  return 'omitted → 1, 1 → 1, 2 → 2, "3" → 3; rows without the column → 1; Blinkit 10190237-style mapping stays 1';
+});
+await step('units per listing: 0, negative, decimal, null and empty refused (API and database)', async () => {
+  const oneId = (await upMap(`${TS}-UP-ONE`)).id;
+  for (const bad of [0, -1, 1.5, '2.5', '0', '-2', null, '', '  ', 'two', true]) {
+    await expectErr(`add ${JSON.stringify(bad)}`, () => addPlatformMappings(INV.up, PF.amazon, [`${TS}-UP-BAD`], { actor: ACTOR, unitsPerListing: bad }), (e) => e.status === 400);
+    await expectErr(`edit ${JSON.stringify(bad)}`, () => updateMappingUnits(oneId, bad, { actor: ACTOR }), (e) => e.status === 400);
+  }
+  await expectErr('edit omitted', () => updateMappingUnits(oneId, undefined, { actor: ACTOR }), (e) => e.status === 400);
+  if (await upMap(`${TS}-UP-BAD`)) throw new Error('a refused mapping was saved');
+  if ((await upMap(`${TS}-UP-ONE`)).units_per_listing !== 1) throw new Error('a refused edit changed the mapping');
+  if (unitsPerListingOf(undefined) !== 1) throw new Error('omitted');
+  await expectErr('db check', () => getPool().query('UPDATE sku_platform_mappings SET units_per_listing = 0 WHERE platform_sku = $1', [`${TS}-UP-ONE`]), (e) => e.code === '23514');
+  await expectErr('db not null', () => getPool().query('UPDATE sku_platform_mappings SET units_per_listing = NULL WHERE platform_sku = $1', [`${TS}-UP-ONE`]), (e) => e.code === '23502');
+  return '11 bad values refused on add and edit, nothing saved; the column itself refuses 0 and NULL';
+});
+await step('units per listing: 3 × pack of 2 = 6 units — FEFO, availability, reservation, release, dispatch; order line keeps 3', async () => {
+  INV.upB1 = (await receiveInventory({ sku_id: INV.up, batch_number: 'UP-LATE', expiry_date: dayOffset(400), quantity: 50, unit_cost: 10, request_id: rid() }, { actor: ACTOR })).batchId;
+  INV.upB2 = (await receiveInventory({ sku_id: INV.up, batch_number: 'UP-EARLY', expiry_date: dayOffset(100), quantity: 4, unit_cost: 10, request_id: rid() }, { actor: ACTOR })).batchId;
+  const order = await lineOn('amazon', 'UP-1', `${TS}-UP-PACK2`, 3);
+  const sid = await upShip('amazon', 'UP-1', 'AWB-UP-1');
+  let st = await shipmentStock(sid);
+  const l = st.lines[0];
+  if (st.state !== 'needs_reservation' || l.required !== 6 || l.ordered !== 6 || !l.enough) throw new Error(JSON.stringify(l));
+  // FEFO: the 4 earliest-expiring units first, then 2 from the later batch.
+  const picks = l.suggestion.picks.map((p) => `${p.batch_id}:${p.quantity}`).join();
+  if (picks !== `${INV.upB2}:4,${INV.upB1}:2`) throw new Error(picks);
+  // Reservation must cover 6 units, not the channel quantity 3.
+  await expectErr('reserve 3', () => reserveShipmentStock(sid, [{ batch_id: INV.upB1, quantity: 3 }], { actor: ACTOR }), (e) => e.status === 400);
+  await reserveShipmentStock(sid, l.suggestion.picks, { actor: ACTOR });
+  if (JSON.stringify(await stockOf(INV.up)) !== JSON.stringify({ on: 54, res: 6, av: 48 })) throw new Error(JSON.stringify(await stockOf(INV.up)));
+  await releaseShipmentStock(sid, { actor: ACTOR });
+  if (JSON.stringify(await stockOf(INV.up)) !== JSON.stringify({ on: 54, res: 0, av: 54 })) throw new Error('release');
+  await reserveShipmentStock(sid, [{ batch_id: INV.upB1, quantity: 6 }], { actor: ACTOR });
+  const sh = (await orderShipments(order))[0];
+  await updateShipment(order, sh.id, { shipment_status: 'dispatched' }, { actor: ACTOR, version: sh.version });
+  const out = (await skuDetail(INV.up)).movements.filter((m) => m.shipment_id === sid);
+  if (out.length !== 1 || out[0].quantity !== -6) throw new Error(JSON.stringify(out));
+  // Repeating the deduction takes nothing more.
+  const c = await getPool().connect();
+  try { await c.query('BEGIN'); const again = await dispatchShipmentStock(c, sid, { actor: ACTOR }); await c.query('COMMIT'); if (!again.repeated) throw new Error('not idempotent'); } finally { c.release(); }
+  if (await ledgerSum(INV.up) !== 48 || (await stockOf(INV.up)).on !== 48) throw new Error('deducted twice');
+  const q = (await getPool().query('SELECT quantity FROM order_items WHERE order_id = $1', [order])).rows[0].quantity;
+  if (q !== 3) throw new Error(`commercial quantity changed to ${q}`);
+  if ((await skuDetail(INV.up)).orderLines.units !== 6) throw new Error('sku detail units');
+  return 'required 6; FEFO 4 (early) + 2 (late); reserving 3 refused; reserved 6 → 54/6/48; released → 54; dispatched −6 once (retry repeated); order line still 3';
+});
+await step('units per listing: availability check uses inventory units (3 × pack of 3 = 9 > 8 available → insufficient)', async () => {
+  const sku = (await createSku({ sku: `${TS}-UP-SHORT`, product_name: 'Short (units per listing)' }, { actor: ACTOR })).id;
+  await addPlatformMappings(sku, PF.amazon, [`${TS}-UP-SHORT-P3`], { actor: ACTOR, unitsPerListing: 3 });
+  const b = (await receiveInventory({ sku_id: sku, batch_number: 'UPS-1', expiry_date: dayOffset(200), quantity: 8, unit_cost: 10, request_id: rid() }, { actor: ACTOR })).batchId;
+  await lineOn('amazon', 'UP-2', `${TS}-UP-SHORT-P3`, 3);
+  const sid = await upShip('amazon', 'UP-2', 'AWB-UP-2');
+  const st = await shipmentStock(sid);
+  if (st.state !== 'insufficient' || st.lines[0].required !== 9 || st.lines[0].available !== 8 || st.lines[0].suggestion.short !== 1) throw new Error(JSON.stringify(st.lines));
+  await expectErr('reserve 9', () => reserveShipmentStock(sid, [{ batch_id: b, quantity: 9 }], { actor: ACTOR }), (e) => e.insufficientStock);
+  return 'needs 9 master units, 8 on hand: insufficient (short 1), reservation refused';
+});
+await step('units per listing: mixed shipment (×1, ×2, unmapped) — units add up per SKU; the unmapped line still blocks', async () => {
+  const order = await lineOn('amazon', 'UP-3', `${TS}-UP-ONE`, 2);
+  await upLine(order, 'L2', `${TS}-UP-PACK2`, 2);
+  await upLine(order, 'L3', `${TS}-UP-NOT-MAPPED`, 1);
+  const sid = await upShip('amazon', 'UP-3', 'AWB-UP-3');
+  const st = await shipmentStock(sid);
+  if (st.state !== 'unmapped' || st.lines.length !== 1 || st.lines[0].required !== 6) throw new Error(JSON.stringify({ state: st.state, lines: st.lines.map((x) => x.required) }));
+  const before = await ledgerSum(INV.up);
+  const resBefore = (await stockOf(INV.up)).res;
+  // Existing rule: no reservation and no dispatch while any line is unmapped.
+  await expectErr('reserve', () => reserveShipmentStock(sid, [{ batch_id: INV.upB1, quantity: 6 }], { actor: ACTOR }), (e) => e.unmappedSkus);
+  if ((await stockOf(INV.up)).res !== resBefore) throw new Error('reserved');
+  const sh = (await orderShipments(order))[0];
+  await expectErr('dispatch', () => updateShipment(order, sh.id, { shipment_status: 'dispatched' }, { actor: ACTOR, version: sh.version }), (e) => e.unmappedSkus);
+  if (await ledgerSum(INV.up) !== before || (await orderShipments(order))[0].shipment_status !== 'packed') throw new Error('changed');
+  return '2 × 1 + 2 × 2 = 6 units of one master; the unmapped line keeps the shipment "unmapped"; reservation and dispatch refused, nothing changed';
+});
+await step('units per listing: changing it is refused while stock is reserved for its orders, then allowed and audited', async () => {
+  // The dispatched shipment (UP-1) blocks PACK2: its stock has left.
+  const pack2 = (await upMap(`${TS}-UP-PACK2`)).id;
+  await expectErr('dispatched', () => updateMappingUnits(pack2, 4, { actor: ACTOR }), (e) => e.status === 409);
+  // A reservation blocks PACK3 until it is released.
+  await lineOn('amazon', 'UP-4', `${TS}-UP-PACK3`, 1);
+  const sid = await upShip('amazon', 'UP-4', 'AWB-UP-4');
+  await reserveShipmentStock(sid, [{ batch_id: INV.upB1, quantity: 3 }], { actor: ACTOR });
+  const free = await upMap(`${TS}-UP-PACK3`);
+  await expectErr('reserved', () => updateMappingUnits(free.id, 6, { actor: ACTOR }), (e) => e.status === 409);
+  await releaseShipmentStock(sid, { actor: ACTOR });
+  const r = await updateMappingUnits(free.id, 6, { actor: ACTOR });
+  if ((await shipmentStock(sid)).lines[0].required !== 6) throw new Error('new units not used');
+  if (!r.changed || (await upMap(`${TS}-UP-PACK3`)).units_per_listing !== 6) throw new Error(JSON.stringify(r));
+  const same = await updateMappingUnits(free.id, 6, { actor: ACTOR });
+  if (same.changed) throw new Error('same value counted as a change');
+  const a = (await getPool().query(`SELECT metadata FROM inventory_audit WHERE action = 'platform_sku_units_changed' AND sku_id = $1`, [INV.up])).rows;
+  if (a.length !== 1 || a[0].metadata.from !== 3 || a[0].metadata.to !== 6) throw new Error(JSON.stringify(a));
+  return 'refused after dispatch and while reserved; released → 3 → 6, the shipment now needs 6, audited once; same value is a no-op';
 });
 await step('master SKU import: parser — Briyo SKU + Product Name only; platform columns ignored with a warning', async () => {
   const two = planSkuSheet([['Briyo SKU', 'Product Name'], ['A1', 'Alpha'], ['', ''], ['A2', '  Beta   capsules ']]);
