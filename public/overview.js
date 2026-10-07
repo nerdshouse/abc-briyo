@@ -48,6 +48,16 @@ function deptHealth(key) {
   return ['healthy', 'Healthy'];
 }
 
+/** Marketing's header word is its freshness state; a ROAS warning still shows as Needs action. */
+function marketingHealth(s) {
+  if (!s.configured) return ['neutral', 'Not connected'];
+  if (s.pending) return ['neutral', 'Loading'];
+  if (s.unavailable) return ['critical', 'Unavailable'];
+  if (s.stale) return ['warning', 'Data delayed'];
+  const [tone, word] = deptHealth('marketing');
+  return tone === 'healthy' ? ['healthy', 'Live'] : [tone, word];
+}
+
 const BODIES = {
   logistics: (s) => [
     metric('Orders today', n(s.today), { href: '/orders' }),
@@ -102,7 +112,7 @@ const BODIES = {
       metric('Meta-attributed revenue', s.delivered || s.spend ? m(s.revenue) : '—', { href: '/marketing', note: 'Not Briyo\'s actual revenue' }),
       metric('Meta ROAS', s.roas === null ? '—' : `${s.roas.toFixed(2)}×`, { href: '/marketing', note: s.roas_target ? `Target ${s.roas_target}×` : '' }),
       metric('Purchases', s.delivered || s.spend ? n(s.purchases) : '—', { href: '/marketing' }),
-    ].join('') + `<p class="ov-foot">${fresh} · Meta Ads, today in the ad account's timezone · updated ${esc(relative(s.fetched_at))}</p>`;
+    ].join('') + `<p class="ov-foot">${fresh} · Meta Ads, today in the ad account's timezone${s.timezone ? ` (${esc(s.timezone)})` : ''} · updated ${esc(relative(s.fetched_at))}</p>`;
   },
   people: (s) => {
     const cat = state.me?.moduleCatalog || {};
@@ -149,7 +159,7 @@ function render() {
       return `<section class="card ov-dept"><header class="ov-dept-head"><h2>${icon(dept.icon)}${esc(dept.label)}</h2></header>
         <div class="state error"><b>Unavailable right now</b><span>This department could not be counted. Refresh to try again.</span></div></section>`;
     }
-    const [tone, word] = k === 'marketing' && !s.configured ? ['neutral', 'Not connected'] : k === 'marketing' && s.pending ? ['neutral', 'Loading'] : deptHealth(k);
+    const [tone, word] = k === 'marketing' ? marketingHealth(s) : deptHealth(k);
     return `<section class="card ov-dept h-${tone}" aria-labelledby="ov-${k}">
       <header class="ov-dept-head">
         <h2 id="ov-${k}"><a href="${dept.href}">${icon(dept.icon)}${esc(dept.label)}</a></h2>

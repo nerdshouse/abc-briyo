@@ -267,6 +267,19 @@ function unavailable(msg) {
     <button class="btn" type="button" data-retry>Try again</button></div></section>`;
 }
 
+/** Account billing from Meta. Available funds show only if Meta supplies them — never estimated. */
+function billingCard(b) {
+  if (!b) return '';
+  const item = (k, v) => `<dt>${esc(k)}</dt><dd>${v}</dd>`;
+  return `<section class="card"><header class="card-head"><h2 class="card-title">${icon('wallet')}Account &amp; billing</h2></header>
+    <dl class="kv mk-billing" style="padding:0 16px 16px">
+      ${item('Account status', b.statusLabel ? esc(b.statusLabel) : '—')}
+      ${item('Spending limit', b.spendCap === null ? 'No limit set' : money(b.spendCap))}
+      ${item('Spent (lifetime, toward the limit)', b.amountSpent === null ? '—' : money(b.amountSpent))}
+      ${item('Available funds', b.availableFundsSupported && b.availableFunds !== null ? money(b.availableFunds) : '<span class="soft">Not available from Meta</span>')}
+    </dl></section>`;
+}
+
 function render() {
   renderRange(); renderFresh();
   const acct = state.status?.account;
@@ -282,6 +295,7 @@ function render() {
   if (state.view === 'overview') {
     $('#pageTitle').textContent = 'Marketing'; $('#crumbHere').textContent = 'Marketing';
     html += kpis(d.summary.totals, { delivered: d.summary.delivered || d.summary.totals.spend > 0 });
+    html += billingCard(state.status?.account?.billing);
     html += trendChart(d.summary.trend);
     html += `<section class="card"><header class="card-head"><h2 class="card-title">${icon('megaphone')}Campaigns</h2><a class="ov-open" href="${linkTo({ view: 'campaigns' })}">All campaigns ${icon('arrow-right')}</a></header>
       <div class="pane">${perfTable(d.campaigns.rows, { kind: 'campaign', link: (r) => linkTo({ campaign: r.id }), empty: 'No campaigns in this ad account.' })}</div></section>`;

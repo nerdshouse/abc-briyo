@@ -50,7 +50,7 @@ import http from 'node:http';
 import { ensureHrSchema, purgeTestHr, slugify, normalizePhone, removeResume, retryPendingRemovals, istDayKey, HR_TIMEZONE } from '../lib/hr.js';
 import { jobPostingLd } from '../lib/careers-pages.js';
 import nodeCrypto from 'node:crypto';
-import { metricsFrom, rawFromRow, rangeParams, classifyMetaError, createMetaClient, createCache, MetaError, createMetaService, metaConfig, todayIn, resolvePurchaseType, _resetMetaService } from '../lib/meta-ads.js';
+import { metricsFrom, rawFromRow, rangeParams, classifyMetaError, createMetaClient, createCache, MetaError, createMetaService, metaConfig, todayIn, resolvePurchaseType, _resetMetaService, billingFrom } from '../lib/meta-ads.js';
 import { overviewFor } from '../lib/overview.js';
 import { istDateTime, istDate, istTime, istDayKey as uiIstDayKey } from '../public/ui/ist.js';
 import { issueFormToken, verifyTurnstile, normalizeHost, isCareersRequest } from '../lib/careers.js';
@@ -4248,6 +4248,67 @@ await step('marketing: the Overview never waits for Meta (2 s budget), other dep
   } finally { _resetMetaService(null); }
   if (bad.length) throw new Error(bad.join(' | '));
   return 'Meta 4 s slow → Overview in < 3.5 s, Marketing "loading", logistics/inventory/support/hr/people intact, no alarm; the background fetch fills the shared cache so the next Overview is instant with the figures; fast Meta → card normally';
+});
+
+await step('marketing on the Admin Overview: same service and cache, account "today", same ROAS, every state; non-admins unchanged', async () => {
+  const bad = [];
+  const admin = { phone: '919000000304', isAdmin: true, caps: [...CAPABILITIES] };
+  const cfg = metaConfig({ META_ACCESS_TOKEN: 'x', META_AD_ACCOUNT_ID: '1' });
+  let t = Date.parse('2026-10-06T19:00:00Z'); let fail = false; const urls = [];
+  const fetchImpl = async (url) => { urls.push(url); if (fail) return { ok: false, status: 500, json: async () => ({ error: { code: 2, message: 'x' } }) };
+    const u = new URL(url);
+    if (u.pathname.endsWith('act_1')) return { ok: true, status: 200, json: async () => ({ name: 'A', currency: 'INR', timezone_name: 'Asia/Kolkata', account_status: 1, spend_cap: '5000000', amount_spent: '1234567', balance: '99900' }) };
+    return { ok: true, status: 200, json: async () => ({ data: [{ spend: '200', impressions: '4000', clicks: '40', actions: [{ action_type: 'omni_purchase', value: '3' }], action_values: [{ action_type: 'omni_purchase', value: '700' }] }] }) }; };
+  try {
+    const svc = createMetaService({ config: cfg, fetchImpl, now: () => t, log: { error() {} } });
+    _resetMetaService(svc);
+    // The page's numbers first (warms the shared cache); the Overview then makes no Meta call of its own.
+    const page = await svc.summary({ range: 'today' });
+    const before = urls.length;
+    const ov = (await overviewFor(admin, { slaHours: 6 })).sections.marketing;
+    if (urls.length !== before + 1 || !new URL(urls.at(-1)).pathname.endsWith('act_1')) bad.push(`overview made ${urls.length - before} calls (only the cached-30-min account read allowed)`);
+    // Same ROAS as the page: both are metricsFrom over the same raw sums.
+    const expectRoas = metricsFrom(rawFromRow({ spend: '200', impressions: '4000', clicks: '40', actions: [{ action_type: 'omni_purchase', value: '3' }], action_values: [{ action_type: 'omni_purchase', value: '700' }] })).roas;
+    if (ov.roas !== page.data.totals.roas || ov.roas !== expectRoas || ov.roas !== 3.5) bad.push(`roas ${ov.roas} vs page ${page.data.totals.roas}`);
+    if (ov.spend !== 200 || ov.revenue !== 700 || ov.purchases !== 3 || ov.stale || ov.pending || !ov.fetched_at) bad.push(`card ${JSON.stringify(ov)}`);
+    // "Today" is Meta's (the account's timezone): date_preset=today, never a computed UTC/IST date; the card names the zone.
+    const tq = new URL(urls.find((u) => u.includes('/insights'))).searchParams;
+    if (tq.get('date_preset') !== 'today' || tq.get('time_range') || ov.timezone !== 'Asia/Kolkata') bad.push('today not the account\'s');
+    // Funds: never fabricated, even with spend cap, amount spent and balance present.
+    if (ov.available_funds !== null) bad.push('available funds fabricated on the card');
+    const acct = (await svc.account()).data.billing;
+    if (acct.availableFunds !== null || acct.availableFundsSupported !== false || acct.spendCap !== 50000 || acct.amountSpent !== 12345.67 || acct.statusLabel !== 'Active') bad.push(`billing ${JSON.stringify(acct)}`);
+    const af = new URL(urls.find((u) => new URL(u).pathname.endsWith('act_1'))).searchParams.get('fields');
+    if (/funding_source|balance/.test(af) || !/spend_cap/.test(af) || !/amount_spent/.test(af)) bad.push(`account fields ${af}`);
+    if (billingFrom({ spend_cap: '0' }, 'INR').spendCap !== null || billingFrom({ amount_spent: '500' }, 'JPY').amountSpent !== 500 || billingFrom({}, 'INR').amountSpent !== null) bad.push('billingFrom');
+    const ui = await fsp.readFile(new URL('../public/marketing.js', import.meta.url), 'utf8');
+    if (!ui.includes('Not available from Meta') || /spendCap\s*-\s*|-\s*b\.amountSpent/.test(ui) || !/b\.availableFundsSupported && b\.availableFunds !== null/.test(ui)) bad.push('page funds display');
+    // Cached: within 45 s a second Overview is served from the cache (no insights call).
+    t += 20 * 1000; const n1 = urls.length; await overviewFor(admin, { slaHours: 6 });
+    if (urls.slice(n1).some((u) => u.includes('/insights'))) bad.push('cache not used');
+    // Data delayed: after the TTL Meta fails → last good data, stale; header says Data delayed.
+    t += 60 * 1000; fail = true;
+    const st = (await overviewFor(admin, { slaHours: 6 })).sections.marketing;
+    if (!st.stale || st.spend !== 200) bad.push(`delayed ${JSON.stringify(st)}`);
+    // Unavailable: nothing cached and Meta failing.
+    _resetMetaService(createMetaService({ config: cfg, fetchImpl, now: () => t, log: { error() {} } }));
+    const un = (await overviewFor(admin, { slaHours: 6 })).sections.marketing;
+    if (!un.unavailable || !un.message || un.spend !== undefined) bad.push(`unavailable ${JSON.stringify(un)}`);
+    // Not connected: no Meta call at all.
+    const n2 = urls.length;
+    _resetMetaService(createMetaService({ config: metaConfig({}), fetchImpl, log: { error() {} } }));
+    const nc = (await overviewFor(admin, { slaHours: 6 })).sections.marketing;
+    if (nc.configured !== false || urls.length !== n2) bad.push('not connected');
+    // Non-admins: no Marketing section, nothing else changes.
+    const logi = { phone: '919000000305', isAdmin: false, caps: CAPABILITIES.filter((c) => c !== 'marketing.view') };
+    const lo = await overviewFor(logi, { slaHours: 6 });
+    if (lo.sections.marketing !== undefined || urls.length !== n2) bad.push('non-admin saw marketing');
+    // Header word per state (page code).
+    const ov2 = await fsp.readFile(new URL('../public/overview.js', import.meta.url), 'utf8');
+    for (const w of ["'Not connected'", "'Loading'", "'Unavailable'", "'Data delayed'", "'Live'"]) if (!ov2.includes(w)) bad.push(`state ${w}`);
+  } finally { _resetMetaService(null); }
+  if (bad.length) throw new Error(bad.join(' | '));
+  return 'Overview reuses the page\'s cached summary (0 extra Insights calls); ROAS 3.50× = page = metricsFrom; Meta date_preset=today, zone shown; cached within 45 s; Data delayed / Unavailable / Not connected (0 Meta calls); available funds null (no field, never cap − spend); billing = status, spend cap, amount spent; non-admins get no Marketing section';
 });
 
 await step('marketing: live server — admin only, read-only, real numbers through the stub, no secrets in responses or logs', async () => {

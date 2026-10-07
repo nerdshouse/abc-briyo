@@ -76,6 +76,25 @@ Metrics are computed from raw sums, never by averaging Meta's averages:
 - **Labelling:** revenue is always labelled **"Meta-attributed revenue"**. It is not Briyo's actual revenue.
 - **Reach:** reach is not additive across days, so it only comes from un-bucketed queries.
 
+### Account billing and funds
+
+The account read (`GET /{act_id}?fields=name,currency,timezone_name,account_status,spend_cap,amount_spent`, cached 30 min) also feeds an **Account & billing** card on the Marketing page:
+
+| Shown | Meta field | Notes |
+|---|---|---|
+| Account status | `account_status` | 1 Active, 2 Disabled, 3 Unsettled, 7 Pending risk review, 8 Pending settlement, 9 In grace period, 100/101 closing/closed |
+| Spending limit | `spend_cap` | Minor currency units ÷ 100 (zero-decimal currencies as is); `0` = no limit |
+| Spent toward the limit | `amount_spent` | Lifetime, relative to `spend_cap` |
+| Available funds | — | **Not available from Meta** |
+
+**Available / prepaid funds are not exposed by the Marketing API (v25.0)** for this setup:
+- `balance` is the *bill amount due*, not funds remaining.
+- `funding_source_details` (payment method, coupons, display text) needs MANAGE or ADVERTISE task access; the ads_read system user has view-only access, and its display text is not a reliable number.
+- `is_prepay_account` also needs ADVERTISE/MANAGE.
+- Spending limit minus amount spent is **not** available funds and is never calculated.
+
+The UI therefore shows "Not available from Meta". The service carries `availableFunds: null, availableFundsSupported: false`, so a real value can be shown later without UI changes.
+
 ## 5. Freshness, caching and backoff
 
 | Range | Class | Cache | Auto-refresh |
@@ -103,6 +122,7 @@ Metrics are computed from raw sums, never by averaging Meta's averages:
 ### Admin Overview
 
 - Marketing never blocks the rest of the Overview.
+- The card shows today's spend, Meta-attributed revenue, Meta ROAS (the same `metricsFrom` calculation as the page) and purchases, with the freshness state as its header (Live, Data delayed, Loading, Unavailable, Not connected) and the account timezone.
 - Cached data is shown immediately. A fresh fetch gets about **2 s**; past that the card shows **Loading** and every other department renders normally, with no alert raised.
 - The fetch keeps running in the background and fills the shared cache, so the next Overview (or the Marketing page) gets the figures at once.
 - The Marketing page itself is not subject to the 2 s budget (it uses the normal 15 s request timeout).
