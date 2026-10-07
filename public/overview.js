@@ -5,6 +5,7 @@
  * says so; it never shows zeros it does not have.
  */
 import { $, esc, count, money, icon, renderIcons, initShell, pageFetch, pageSignal, onLeave, relative } from './ui/components.js';
+import { istDateTime } from './ui/ist.js';
 
 const fetch = pageFetch();
 const state = { me: null, data: null, timer: null };
@@ -112,7 +113,7 @@ const BODIES = {
       metric('Meta-attributed revenue', s.delivered || s.spend ? m(s.revenue) : '—', { href: '/marketing', note: 'Not Briyo\'s actual revenue' }),
       metric('Meta ROAS', s.roas === null ? '—' : `${s.roas.toFixed(2)}×`, { href: '/marketing', note: s.roas_target ? `Target ${s.roas_target}×` : '' }),
       metric('Purchases', s.delivered || s.spend ? n(s.purchases) : '—', { href: '/marketing' }),
-    ].join('') + `<p class="ov-foot">${fresh} · Meta Ads, today in the ad account's timezone${s.timezone ? ` (${esc(s.timezone)})` : ''} · updated ${esc(relative(s.fetched_at))}</p>`;
+    ].join('') + `<p class="ov-foot">${fresh} · Meta Ads today · reporting day follows the ad account timezone${s.timezone ? ` (${esc(s.timezone)})` : ''} · <span title="${esc(istDateTime(s.fetched_at))}">updated ${esc(relative(s.fetched_at))}</span></p>`;
   },
   people: (s) => {
     const cat = state.me?.moduleCatalog || {};

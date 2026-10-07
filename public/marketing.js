@@ -97,7 +97,7 @@ function renderRange() {
     ${state.range === 'custom' ? `<span class="mk-custom"><label class="date-pick">From <input class="input" type="date" id="since" value="${esc(state.since)}" max="${today}" /></label>
       <label class="date-pick">to <input class="input" type="date" id="until" value="${esc(state.until)}" max="${today}" /></label>
       <button class="btn" type="button" id="applyCustom">Apply</button></span>` : ''}
-    ${state.status?.account?.timezone ? `<span class="mk-tz">Days follow the ad account's timezone (${esc(state.status.account.timezone)})${state.range === 'last_7d' || state.range === 'last_30d' ? ' · complete days, excluding today' : ''}</span>` : ''}`;
+    ${state.status?.account?.timezone ? `<span class="mk-tz">Reporting day follows Meta's ad account timezone · ${esc(state.status.account.timezone)}${state.range === 'last_7d' || state.range === 'last_30d' ? ' · complete days, excluding today' : ''} · Times shown in IST</span>` : ''}`;
 }
 
 // ------------------------------------------------------------------ freshness

@@ -4306,6 +4306,10 @@ await step('marketing on the Admin Overview: same service and cache, account "to
     // Header word per state (page code).
     const ov2 = await fsp.readFile(new URL('../public/overview.js', import.meta.url), 'utf8');
     for (const w of ["'Not connected'", "'Loading'", "'Unavailable'", "'Data delayed'", "'Live'"]) if (!ov2.includes(w)) bad.push(`state ${w}`);
+    // Reporting day = the account's zone; displayed times = IST (absolute times only via istDateTime).
+    if (!ui.includes("Reporting day follows Meta's ad account timezone") || !ui.includes('Times shown in IST') || ui.includes("Days follow the ad account's timezone")) bad.push('page timezone wording');
+    if (!/istDateTime\(s\.fetched_at\)/.test(ov2) || !ov2.includes("from './ui/ist.js'")) bad.push('overview card absolute time not IST');
+    for (const src of [ui, ov2]) if (/toLocale(Date|Time)?String\([^)]*\)/.test(src.replace(/timeZone: 'UTC'/g, '')) && /toLocaleTimeString/.test(src)) bad.push('non-IST time formatting');
   } finally { _resetMetaService(null); }
   if (bad.length) throw new Error(bad.join(' | '));
   return 'Overview reuses the page\'s cached summary (0 extra Insights calls); ROAS 3.50× = page = metricsFrom; Meta date_preset=today, zone shown; cached within 45 s; Data delayed / Unavailable / Not connected (0 Meta calls); available funds null (no field, never cap − spend); billing = status, spend cap, amount spent; non-admins get no Marketing section';
