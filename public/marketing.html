@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Marketing — Briyo OS</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/ui.css" />
+  <!-- The page script imports these; preloading fetches them in parallel instead of one after another. -->
+  <link rel="modulepreload" href="/ui/components.js" />
+  <link rel="modulepreload" href="/ui/nav.js" />
+  <link rel="modulepreload" href="/marketing.js" />
+  <script src="https://cdn.jsdelivr.net/npm/lucide@0.469.0/dist/umd/lucide.min.js" defer></script>
+</head>
+<body>
+<div class="app">
+
+  <aside class="sidebar" id="sidebar" aria-label="Main navigation"></aside>
+  <div class="scrim" id="scrim"></div>
+
+  <div class="main">
+    <header class="topbar">
+      <button class="icon-btn" id="navOpen" type="button" aria-label="Open navigation"><i data-lucide="menu"></i></button>
+      <span class="topbar-title" id="topTitle">Marketing</span>
+    </header>
+
+    <main class="page mk" data-section="marketing">
+      <div class="crumbs" id="crumbs"><i data-lucide="megaphone"></i><span>Growth</span><span class="sep">/</span><a href="/marketing" class="here" id="crumbHere">Marketing</a></div>
+      <div class="page-head">
+        <div style="min-width:0">
+          <h1 class="page-title" id="pageTitle">Marketing</h1>
+          <p class="page-sub" id="pageSub">Meta Ads</p>
+        </div>
+        <div class="page-actions">
+          <span class="mk-fresh" id="fresh" role="status" aria-live="polite"></span>
+          <button class="btn" id="refresh" type="button"><i data-lucide="refresh-cw"></i>Refresh</button>
+        </div>
+      </div>
+
+      <div class="mk-range" id="rangeBar" role="group" aria-label="Date range"></div>
+      <div id="alerts"></div>
+      <div id="view"><div class="state loading" aria-busy="true"><b>Loading Meta Ads…</b></div></div>
+      <p class="footnote" id="foot"></p>
+    </main>
+  </div>
+</div>
+
+<div class="mk-tip" id="tip" role="tooltip" hidden></div>
+<script type="module" src="/marketing.js"></script>
+</body>
+</html>

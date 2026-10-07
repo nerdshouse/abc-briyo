@@ -21,6 +21,7 @@ const DEPTS = {
   inventory: { label: 'Inventory', icon: 'boxes', href: '/inventory' },
   support: { label: 'Support', icon: 'headset', href: '/?mode=tocall' },
   hr: { label: 'HR', icon: 'briefcase', href: '/hr/jobs' },
+  marketing: { label: 'Marketing', icon: 'megaphone', href: '/marketing' },
   people: { label: 'People', icon: 'users', href: '/admin' },
 };
 const SEV_LABEL = { critical: 'Critical', warning: 'Warning', attention: 'Attention' };
@@ -90,6 +91,18 @@ const BODIES = {
     metric('New this week', n(s.new_7d), { href: '/hr/candidates' }),
     metric('Hired, 30 days', n(s.hired_30d), { href: '/hr/candidates?status=hired', tone: toneIf(s.hired_30d, 'ok') }),
   ].join(''),
+  marketing: (s) => {
+    if (!s.configured) return `<div class="state"><b>Meta Ads is not connected.</b><span>No marketing numbers are shown until it is. <a class="linkish" href="/marketing">Set up →</a></span></div>`;
+    if (s.unavailable) return `<div class="state error"><b>Meta Ads data unavailable</b><span>${esc(s.message)}</span></div>`;
+    const m = (v) => (v === null || v === undefined ? '—' : new Intl.NumberFormat('en-IN', { style: 'currency', currency: s.currency || 'INR', maximumFractionDigits: 0 }).format(v));
+    const fresh = s.stale ? '<span class="health warning">Data delayed</span>' : '<span class="health healthy">Live</span>';
+    return [
+      metric('Spend today', s.delivered || s.spend ? m(s.spend) : '—', { href: '/marketing' }),
+      metric('Meta-attributed revenue', s.delivered || s.spend ? m(s.revenue) : '—', { href: '/marketing', note: 'Not Briyo\'s actual revenue' }),
+      metric('Meta ROAS', s.roas === null ? '—' : `${s.roas.toFixed(2)}×`, { href: '/marketing', note: s.roas_target ? `Target ${s.roas_target}×` : '' }),
+      metric('Purchases', s.delivered || s.spend ? n(s.purchases) : '—', { href: '/marketing' }),
+    ].join('') + `<p class="ov-foot">${fresh} · Meta Ads, today in the ad account's timezone · updated ${esc(relative(s.fetched_at))}</p>`;
+  },
   people: (s) => {
     const cat = state.me?.moduleCatalog || {};
     const depts = Object.entries(s.by_department || {}).map(([k, v]) => `<span class="badge">${esc(cat[k]?.label || k)} <b class="num">${n(v)}</b></span>`).join('');
@@ -135,7 +148,7 @@ function render() {
       return `<section class="card ov-dept"><header class="ov-dept-head"><h2>${icon(dept.icon)}${esc(dept.label)}</h2></header>
         <div class="state error"><b>Unavailable right now</b><span>This department could not be counted. Refresh to try again.</span></div></section>`;
     }
-    const [tone, word] = deptHealth(k);
+    const [tone, word] = k === 'marketing' && !s.configured ? ['neutral', 'Not connected'] : deptHealth(k);
     return `<section class="card ov-dept h-${tone}" aria-labelledby="ov-${k}">
       <header class="ov-dept-head">
         <h2 id="ov-${k}"><a href="${dept.href}">${icon(dept.icon)}${esc(dept.label)}</a></h2>

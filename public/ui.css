@@ -1292,3 +1292,44 @@ a.mb-stat:hover { background: var(--surface-2); }
 .mb-stat.info > b { color: var(--info-text); }
 .mb-stat .badge b { color: var(--text); }
 @media (max-width: 1100px) { .mb-summary { grid-template-columns: repeat(2, minmax(0, 1fr)); } .mb-depts { grid-column: 1 / -1; } }
+
+/* --------------------------------------------------------------------------
+   Marketing (Meta Ads)
+   -------------------------------------------------------------------------- */
+.ov-dept.h-neutral { border-top-color: var(--neutral); }
+.mk-fresh { display: inline-flex; align-items: center; gap: 8px; font-size: var(--fs-meta); align-self: center; }
+.mk-range { display: flex; flex-wrap: wrap; align-items: center; gap: var(--sp-3); margin-bottom: var(--sp-4); }
+.mk-custom { display: inline-flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.mk-tz { font-size: var(--fs-meta); color: var(--text-3); }
+.mk-kpis { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); margin-bottom: var(--sp-4); }
+.mk-kpis .ov-metric { border-bottom: 1px solid var(--border-soft); border-right: 1px solid var(--border-soft); }
+.mk-kpis .ov-metric:nth-child(4n) { border-right: 0; }
+.mk-kpis .ov-metric:nth-child(n+5) { border-bottom: 0; }
+.mk-trend { margin-bottom: var(--sp-4); }
+.mk-legend { display: inline-flex; gap: 14px; margin-left: auto; font-size: var(--fs-meta); color: var(--text-2); }
+.mk-legend i { display: inline-block; width: 14px; height: 2px; border-radius: 1px; vertical-align: middle; margin-right: 6px; }
+.mk-chart { padding: 8px 12px 4px; background: var(--surface); }
+.mk-chart svg { width: 100%; height: 220px; display: block; touch-action: pan-y; }
+.mk-grid { stroke: var(--border-soft); stroke-width: 1; vector-effect: non-scaling-stroke; }
+.mk-axis { font-size: 11px; fill: var(--text-3); font-family: var(--font); }
+.mk-cross { stroke: var(--text-3); stroke-width: 1; vector-effect: non-scaling-stroke; }
+.mk-hit { cursor: crosshair; outline: none; }
+.mk-hit:focus-visible { stroke: var(--info); stroke-width: 2; }
+.mk-direct { margin: 6px 4px 8px; font-size: var(--fs-meta); color: var(--text-2); }
+.mk-table-view { padding: 0 16px 12px; background: var(--surface); border-radius: 0 0 var(--r-card) var(--r-card); }
+.mk-table-view summary { cursor: pointer; font-size: var(--fs-meta); color: var(--text-2); padding: 6px 0; }
+.mk-tip { position: fixed; z-index: 90; pointer-events: none; background: var(--surface); border: 1px solid var(--border); border-radius: 8px; box-shadow: 0 8px 24px rgba(16,24,40,.12); padding: 8px 10px; font-size: 12.5px; display: flex; flex-direction: column; gap: 4px; min-width: 190px; }
+.mk-tip > div { display: flex; align-items: center; gap: 8px; }
+.mk-tip i { width: 12px; height: 2px; border-radius: 1px; flex: none; }
+.mk-tip strong { font-variant-numeric: tabular-nums; }
+.mk-tip span { color: var(--text-2); }
+.mk-table th .mk-sort { background: none; border: 0; padding: 0; font: inherit; color: inherit; cursor: pointer; text-transform: inherit; letter-spacing: inherit; }
+.mk-table td, .mk-table th { white-space: nowrap; }
+.mk-table .health { margin-left: 6px; }
+.mk-back { display: inline-flex; align-items: center; gap: 6px; font-size: var(--fs-meta); color: var(--text-2); margin-bottom: 6px; }
+.mk-meta { margin: 0 0 var(--sp-4); font-size: var(--fs-meta); color: var(--text-2); display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.mk-setup { padding: 0 16px 16px; font-size: var(--fs-body); }
+.mk-setup ol { margin: 0; padding-left: 20px; display: flex; flex-direction: column; gap: 6px; color: var(--text-2); }
+@media (max-width: 900px) { .mk-kpis { grid-template-columns: repeat(2, minmax(0, 1fr)); } .mk-kpis .ov-metric:nth-child(4n) { border-right: 1px solid var(--border-soft); } .mk-kpis .ov-metric:nth-child(2n) { border-right: 0; } .mk-kpis .ov-metric:nth-child(n+5) { border-bottom: 1px solid var(--border-soft); } .mk-kpis .ov-metric:nth-child(n+7) { border-bottom: 0; } }
+@media (max-width: 640px) { .mk-legend { margin-left: 0; flex-wrap: wrap; } .mk-range .seg { flex-wrap: wrap; height: auto; max-width: 100%; } .mk-range .seg button { white-space: nowrap; } }
+.mk-table .cell-main, .mk-table .cell-sub { display: block; }

@@ -33,6 +33,7 @@ import { careersHost } from './lib/careers.js';
 import { router as hrRouter } from './lib/hr-routes.js';
 import { ensureHrSchema, retryPendingRemovals } from './lib/hr.js';
 import { overviewFor } from './lib/overview.js';
+import { router as marketingRouter } from './lib/marketing-routes.js';
 import { router as ordersRouter, courierRouter, destinationRouter } from './lib/orders-routes.js';
 import { router as inventoryRouter } from './lib/inventory-routes.js';
 import { ensureInventorySchema } from './lib/inventory.js';
@@ -474,6 +475,9 @@ app.use('/api/destinations', requirePermission('logistics.view'), destinationRou
 // Inventory serves both modules: its own pages, and the stock panel of a shipment.
 app.use('/api/inventory', requirePermission(['inventory.view', 'logistics.view']), inventoryRouter);
 app.use('/api/hr', requirePermission('hr.view'), hrRouter);
+// Marketing (Meta Ads): admins only in V1, read-only (lib/marketing-routes.js).
+app.use('/api/marketing', requirePermission('marketing.view'), marketingRouter);
+app.get('/marketing', requirePage('marketing.view'), (_req, res) => res.sendFile(path.join(PUBLIC, 'marketing.html')));
 // Briyo OS overview: every signed-in member with a department. The API returns
 // only the departments the caller may see (lib/overview.js); nothing else.
 app.get('/overview', (req, res) => ((req.session?.caps || []).length

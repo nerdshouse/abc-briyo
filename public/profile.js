@@ -12,7 +12,7 @@ const CAP_LABEL = {
   'logistics.view': 'See orders, shipments, couriers and destinations', 'logistics.edit': 'Create and update orders and shipments',
   'logistics.setup': 'Manage couriers and destinations', 'inventory.view': 'See stock, batches and SKUs',
   'inventory.move': 'Receive, adjust and transfer stock', 'inventory.catalog': 'Manage master SKUs, platforms, suppliers and warehouses',
-  'support.work': 'Work the cart recovery call board', 'hr.view': 'See jobs, candidates and resumes', 'hr.manage': 'Manage jobs and applications',
+  'support.work': 'Work the cart recovery call board', 'hr.view': 'See jobs, candidates and resumes', 'hr.manage': 'Manage jobs and applications', 'marketing.view': 'See Meta Ads performance (read-only)',
 };
 const FIELD_LABEL = { name: 'Full name', email: 'Email', photo: 'Profile photo' };
 

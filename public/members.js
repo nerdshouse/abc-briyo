@@ -34,7 +34,7 @@ const FIELD_LABEL = { name: 'full name', email: 'email', photo: 'profile photo' 
 const CAP_LABEL = {
   'logistics.view': 'See orders and shipments', 'logistics.edit': 'Create and update orders and shipments', 'logistics.setup': 'Manage couriers and destinations',
   'inventory.view': 'See stock and SKUs', 'inventory.move': 'Receive, adjust and transfer stock', 'inventory.catalog': 'Manage SKUs, suppliers and warehouses',
-  'support.work': 'Work the cart recovery board', 'hr.view': 'See jobs and candidates', 'hr.manage': 'Manage jobs and applications',
+  'support.work': 'Work the cart recovery board', 'hr.view': 'See jobs and candidates', 'hr.manage': 'Manage jobs and applications', 'marketing.view': 'See Meta Ads performance (read-only)',
 };
 
 const roleLabel = (mod, role) => state.catalog[mod]?.roles?.find((r) => r.key === role)?.label || role;

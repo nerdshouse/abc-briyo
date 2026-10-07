@@ -49,6 +49,8 @@ import fsp from 'node:fs/promises';
 import http from 'node:http';
 import { ensureHrSchema, purgeTestHr, slugify, normalizePhone, removeResume, retryPendingRemovals, istDayKey, HR_TIMEZONE } from '../lib/hr.js';
 import { jobPostingLd } from '../lib/careers-pages.js';
+import nodeCrypto from 'node:crypto';
+import { metricsFrom, rawFromRow, rangeParams, classifyMetaError, createMetaClient, createCache, MetaError } from '../lib/meta-ads.js';
 import { istDateTime, istDate, istTime, istDayKey as uiIstDayKey } from '../public/ui/ist.js';
 import { issueFormToken, verifyTurnstile, normalizeHost, isCareersRequest } from '../lib/careers.js';
 import net from 'node:net';
@@ -3341,6 +3343,29 @@ await step('hr: server with careers host, Turnstile stub and throwaway storage',
     const ok = new URLSearchParams(b).get('response') === 'pass';
     res.setHeader('content-type', 'application/json'); res.end(JSON.stringify({ success: ok }));
   }); }).listen(0);
+  // A local Meta Graph stub: records what the server sends, answers like Meta (incl. pagination).
+  HRS.meta = { mode: 'ok', calls: [] };
+  HRS.metaStub = http.createServer((req, res) => {
+    const u = new URL(req.url, 'http://x');
+    HRS.meta.calls.push({ path: u.pathname, url: req.url, auth: req.headers.authorization, proof: u.searchParams.get('appsecret_proof') });
+    res.setHeader('content-type', 'application/json');
+    if (HRS.meta.mode === 'token') { res.statusCode = 400; return res.end(JSON.stringify({ error: { message: 'Error validating access token: secret detail', type: 'OAuthException', code: 190, fbtrace_id: 'TRACE1' } })); }
+    const p = u.pathname.replace(/^\/v\d+\.\d+\//, '');
+    const row = (spend, imp, clk, pur, val, extra = {}) => ({ spend: String(spend), impressions: String(imp), reach: String(Math.round(imp * 0.7)), clicks: String(clk),
+      actions: [{ action_type: 'omni_purchase', value: String(pur) }, { action_type: 'offsite_conversion.fb_pixel_purchase', value: String(pur) }],
+      action_values: [{ action_type: 'omni_purchase', value: String(val) }, { action_type: 'offsite_conversion.fb_pixel_purchase', value: String(val) }], ...extra });
+    if (p === 'act_1234567890') return res.end(JSON.stringify({ name: 'Briyo Test Ads', currency: 'INR', timezone_name: 'Asia/Kolkata', account_status: 1, id: 'act_1234567890' }));
+    if (p === 'act_1234567890/insights') {
+      if (u.searchParams.get('time_increment')) return res.end(JSON.stringify({ data: [{ ...row(400, 8000, 160, 4, 1400), date_start: '2026-10-01', date_stop: '2026-10-01' }, { ...row(600.5, 12000, 240, 6, 2101.75), date_start: '2026-10-02', date_stop: '2026-10-02' }] }));
+      if (u.searchParams.get('level') === 'campaign') return res.end(JSON.stringify({ data: [row(900.5, 18000, 360, 10, 3501.75, { campaign_id: '111', campaign_name: 'Prospecting' }), row(100, 2000, 40, 0, 0, { campaign_id: '999', campaign_name: 'Old Archived', actions: undefined, action_values: undefined })] }));
+      return res.end(JSON.stringify({ data: [row(1000.5, 20000, 400, 10, 3501.75)] }));
+    }
+    if (p === 'act_1234567890/campaigns') {
+      if (!u.searchParams.get('after')) return res.end(JSON.stringify({ data: [{ id: '111', name: 'Prospecting', status: 'ACTIVE', effective_status: 'ACTIVE', objective: 'OUTCOME_SALES' }], paging: { cursors: { after: 'C2' }, next: 'https://graph.facebook.com/next?access_token=SHOULD-NOT-BE-FOLLOWED' } }));
+      return res.end(JSON.stringify({ data: [{ id: '222', name: 'Retargeting', status: 'PAUSED', effective_status: 'PAUSED', objective: 'OUTCOME_SALES' }], paging: { cursors: { after: 'C3' } } }));
+    }
+    res.statusCode = 404; return res.end(JSON.stringify({ error: { message: 'Unknown path', code: 100 } }));
+  }).listen(0);
   const port = await freePort();
   await completeTestProfiles();
   HRS.server = spawn(process.execPath, ['server.js'], {
@@ -3348,10 +3373,12 @@ await step('hr: server with careers host, Turnstile stub and throwaway storage',
     env: { ...process.env, PORT: String(port), APP_ENV: 'test', ADMIN_PHONES: '', ELEVENZA_AUTH_TOKEN: '', SHOPIFY_ACCESS_TOKEN: '',
       SHOPIFY_POLL_ENABLED: 'false', SHOPIFY_POLL_MINUTES: '0', SLA_ALERTS_ENABLED: 'false', DAILY_SUMMARY_ENABLED: 'false', KEEPALIVE_URL: '', RENDER_EXTERNAL_URL: '',
       CAREERS_HOST: 'careers.test', CAREERS_BASE_URL: 'https://careers.test', TURNSTILE_SECRET_KEY: 'test-secret', TURNSTILE_SITE_KEY: 'test-site',
-      TURNSTILE_VERIFY_URL: `http://127.0.0.1:${HRS.stub.address().port}/verify`, DOCUMENT_STORAGE: 'local', DOCUMENT_STORAGE_DIR: HRS.dir, HR_IP_HASH_SALT: 'db-check' },
+      TURNSTILE_VERIFY_URL: `http://127.0.0.1:${HRS.stub.address().port}/verify`, DOCUMENT_STORAGE: 'local', DOCUMENT_STORAGE_DIR: HRS.dir, HR_IP_HASH_SALT: 'db-check',
+      META_ACCESS_TOKEN: 'test-meta-token-NEVER-LEAK-9f3a', META_AD_ACCOUNT_ID: '1234567890', META_APP_SECRET: 'test-meta-app-secret', META_API_VERSION: 'v25.0',
+      MARKETING_ROAS_TARGET: '2.5', META_GRAPH_BASE: `http://127.0.0.1:${HRS.metaStub.address().port}` },
     stdio: ['ignore', 'ignore', 'pipe'],
   });
-  let stderr = ''; HRS.server.stderr.on('data', (d) => { stderr += d; });
+  let stderr = ''; HRS.log = ''; HRS.server.stderr.on('data', (d) => { stderr += d; HRS.log += d; });
   HRS.base = `http://127.0.0.1:${port}`;
   for (let i = 0; i < 100; i++) {
     try { if ((await fetch(`${HRS.base}/healthz`)).ok) break; } catch { /* starting */ }
@@ -3871,7 +3898,7 @@ await step('careers host detection behind a proxy — the Host header decides, n
 await step('overview: each member sees only their departments; numbers match the records; signed out refused', async () => {
   const bad = [];
   const keys = async (who) => { const r = await internal(who, 'GET', '/api/overview'); return r.status === 200 ? Object.keys(r.body.sections).sort().join() : `HTTP ${r.status}`; };
-  const want = { mgr: 'hr', multi: 'hr,inventory,logistics', nonHr: 'support', adm: 'hr,ingest,inventory,logistics,people,support' };
+  const want = { mgr: 'hr', multi: 'hr,inventory,logistics', nonHr: 'support', adm: 'hr,ingest,inventory,logistics,marketing,people,support' };
   for (const [who, k] of Object.entries(want)) { const got = await keys(who); if (got !== k) bad.push(`${who}: ${got} ≠ ${k}`); }
   if ((await internal(null, 'GET', '/api/overview')).status !== 401) bad.push('signed out not refused');
   const page = await internal(null, 'GET', '/overview');
@@ -4013,9 +4040,137 @@ await step('profiles: existing members keep working with an incomplete profile a
   return `column defaults to required, existing rows grandfathered; existing incomplete member: pages + APIs 200, auth/me says incomplete/not required, RBAC unchanged, completes normally; complete → normal; photo removed → missing photo shown, still operational, roles kept; new member (default) → /profile + 403 PROFILE_INCOMPLETE; Overview incomplete count = ${n} = records`;
 });
 
+await step('marketing: metrics, purchases (one action type), ranges and Meta error classification', async () => {
+  const bad = [];
+  const m0 = metricsFrom({ spend: 0, impressions: 0, clicks: 0 });
+  if (m0.roas !== null || m0.cpa !== null || m0.ctr !== null || m0.cpc !== null || m0.cpm !== null) bad.push('zero spend/impressions not null');
+  const m = metricsFrom({ spend: 1000, impressions: 20000, clicks: 400, purchases: 10, value: 3500 });
+  if (m.ctr !== 2 || m.cpc !== 2.5 || m.cpm !== 50 || m.cpa !== 100 || m.roas !== 3.5) bad.push(`metrics ${JSON.stringify(m)}`);
+  const noBuy = metricsFrom({ spend: 500, impressions: 1000, clicks: 0, purchases: 0, value: 0 });
+  if (noBuy.roas !== 0 || noBuy.cpa !== null || noBuy.cpc !== null) bad.push('no purchases with spend');
+  if (Object.values(metricsFrom({ spend: 1, impressions: 0, clicks: 0 })).some((v) => typeof v === 'number' && !Number.isFinite(v))) bad.push('NaN/Infinity');
+  // Purchases: omni_purchase only, never summed with the pixel type; missing actions → real 0.
+  const r = rawFromRow({ spend: '10', impressions: '100', clicks: '5', actions: [{ action_type: 'omni_purchase', value: '3' }, { action_type: 'offsite_conversion.fb_pixel_purchase', value: '3' }],
+    action_values: [{ action_type: 'offsite_conversion.fb_pixel_purchase', value: '90' }, { action_type: 'omni_purchase', value: '90' }] });
+  if (r.purchases !== 3 || r.value !== 90) bad.push(`double count ${r.purchases}/${r.value}`);
+  const r2 = rawFromRow({ spend: '10', impressions: '100', clicks: '5' });
+  if (r2.purchases !== 0 || r2.value !== 0) bad.push('missing actions');
+  if (rawFromRow({ spend: '5', actions: [{ action_type: 'purchase', value: '2' }] }).purchases !== 2) bad.push('fallback purchase type');
+  await expectErr('malformed row', () => rawFromRow(null), (e) => e.kind === 'bad_response');
+  // Ranges
+  const now = new Date('2026-10-07T06:00:00Z');
+  if (rangeParams({ range: 'today' }, now).params.date_preset !== 'today' || !rangeParams({ range: 'today' }, now).live || rangeParams({ range: 'yesterday' }, now).live) bad.push('presets');
+  for (const [inp, why] of [[{ range: 'custom', since: '2026-10-05', until: '2026-10-01' }, 'order'], [{ range: 'custom', since: '2026-01-01', until: '2026-10-01' }, '>92 days'],
+    [{ range: 'custom', since: '2026-10-01', until: '2026-12-01' }, 'future'], [{ range: 'custom', since: 'x', until: 'y' }, 'format'], [{ range: 'lifetime' }, 'unknown']]) {
+    try { rangeParams(inp, now); bad.push(`range ${why} accepted`); } catch (e) { if (e.status !== 400) bad.push(`range ${why} ${e.status}`); }
+  }
+  // Errors → kinds, never raw text
+  for (const [err, kind] of [[{ code: 190 }, 'token'], [{ code: 17 }, 'rate_limit'], [{ code: 4, error_subcode: 1504022 }, 'rate_limit'], [{ code: 80004 }, 'rate_limit'],
+    [{ code: 10 }, 'permission'], [{ code: 200 }, 'permission'], [{ code: 100, message: 'Unsupported get request. Object with ID act_1 does not exist' }, 'account'], [{ code: 2 }, 'temporary']]) {
+    const e = classifyMetaError({ ...err, message: err.message || 'raw meta text SECRET' });
+    if (e.kind !== kind || /SECRET|raw meta/.test(e.message)) bad.push(`classify ${err.code} → ${e.kind}`);
+  }
+  if (bad.length) throw new Error(bad.join(' | '));
+  return 'CTR/CPC/CPM/CPA/ROAS from sums; zero spend → ROAS "—"; spend without purchases → ROAS 0, CPA "—"; never NaN/Infinity; omni_purchase not summed with pixel; missing actions = 0; custom ranges validated; 8 Meta error codes mapped, no raw text';
+});
+
+await step('marketing: Meta client — Bearer header, appsecret_proof, cursor pagination, malformed, timeout, token never logged', async () => {
+  const bad = []; const logs = []; const log = { error: (...a) => logs.push(a.join(' ')) };
+  const TOKEN = 'unit-token-NEVER-LEAK-77'; const calls = [];
+  const reply = (status, body) => ({ ok: status < 400, status, json: async () => body });
+  const fake = (handler) => async (url, opts) => { calls.push({ url, auth: opts.headers.Authorization }); return handler(new URL(url)); };
+  let c = createMetaClient({ token: TOKEN, appSecret: 'sek', fetchImpl: fake((u) => (u.searchParams.get('after') ? reply(200, { data: [{ id: 2 }] }) : reply(200, { data: [{ id: 1 }], paging: { cursors: { after: 'A' }, next: 'https://x/?access_token=LEAK' } }))), log });
+  const l = await c.list('act_1/campaigns', { fields: 'id' });
+  const proof = nodeCrypto.createHmac('sha256', 'sek').update(TOKEN).digest('hex');
+  if (l.rows.length !== 2 || l.truncated) bad.push('pagination');
+  if (calls.some((x) => x.url.includes(TOKEN) || x.url.includes('LEAK')) || calls.some((x) => x.auth !== `Bearer ${TOKEN}`) || !calls.every((x) => x.url.includes(`appsecret_proof=${proof}`))) bad.push('auth/proof/url');
+  if (!calls.every((x) => x.url.startsWith('https://graph.facebook.com/v25.0/'))) bad.push('version/host');
+  c = createMetaClient({ token: TOKEN, fetchImpl: fake(() => reply(200, { data: 'nope' })), log });
+  await expectErr('malformed list', () => c.list('act_1/campaigns'), (e) => e.kind === 'bad_response');
+  c = createMetaClient({ token: TOKEN, fetchImpl: fake(() => reply(400, { error: { code: 190, message: `Invalid OAuth access token ${TOKEN}`, fbtrace_id: 'T1' } })), log });
+  await expectErr('token error', () => c.call('act_1'), (e) => e.kind === 'token' && !e.message.includes(TOKEN));
+  c = createMetaClient({ token: TOKEN, fetchImpl: async () => { const e = new Error('t'); e.name = 'TimeoutError'; throw e; }, log });
+  await expectErr('timeout', () => c.call('act_1'), (e) => e.kind === 'timeout' && e.retryable);
+  c = createMetaClient({ token: TOKEN, fetchImpl: fake(() => reply(500, { error: { code: 1 } })), log });
+  await expectErr('5xx', () => c.call('act_1'), (e) => e.kind === 'temporary');
+  c = createMetaClient({ token: TOKEN, fetchImpl: fake(() => reply(400, { error: { code: 17, message: 'User request limit reached' } })), log });
+  await expectErr('rate limit', () => c.call('act_1'), (e) => e.kind === 'rate_limit' && e.status === 503);
+  if (logs.some((x) => x.includes(TOKEN) || x.includes('sek'))) bad.push('token or secret logged');
+  if (!logs.some((x) => /code=190/.test(x) && /trace=T1/.test(x))) bad.push('diagnostics not logged');
+  if (bad.length) throw new Error(bad.join(' | '));
+  return `token only in Authorization: Bearer; appsecret_proof = HMAC(token, secret); v25.0; 2 pages via cursors (paging.next with a token never followed); malformed/190/timeout/5xx/17 classified; ${logs.length} log lines, none containing token or secret, with code and fbtrace_id`;
+});
+
+await step('marketing: cache — repeat requests cached, concurrent requests share one call, expiry, stale-if-error, refresh floor', async () => {
+  const bad = []; let t = 1_000_000; const clock = () => t; let calls = 0; let fail = false;
+  const cache = createCache({ now: clock });
+  const loader = async () => { calls += 1; await new Promise((r) => setTimeout(r, 5)); if (fail) throw new MetaError('rate_limit', 'Meta is limiting requests right now.', { status: 503 }); return { v: calls }; };
+  const [a, b] = await Promise.all([cache.get('k', 45000, loader), cache.get('k', 45000, loader)]);
+  if (calls !== 1 || a.data.v !== 1 || b.data.v !== 1) bad.push(`in-flight sharing (${calls} calls)`);
+  t += 10000; const c = await cache.get('k', 45000, loader);
+  if (calls !== 1 || !c.cached || c.stale) bad.push('not served from cache');
+  t += 5000; await cache.get('k', 45000, loader, { force: true });
+  if (calls !== 2) bad.push('refresh after 15 s did not refetch');
+  await cache.get('k', 45000, loader, { force: true });
+  if (calls !== 2) bad.push('refresh within 10 s hit Meta');
+  t += 46000; const d = await cache.get('k', 45000, loader);
+  if (calls !== 3 || d.stale) bad.push('expiry');
+  fail = true; t += 46000; const e = await cache.get('k', 45000, loader);
+  if (!e.stale || e.error?.kind !== 'rate_limit' || e.data.v !== 3) bad.push(`stale-if-error ${JSON.stringify(e)}`);
+  t += 25 * 3600 * 1000;
+  await expectErr('too old to serve', () => cache.get('k', 45000, loader), (err) => err.kind === 'rate_limit');
+  await expectErr('nothing cached', () => cache.get('other', 45000, loader), (err) => err.kind === 'rate_limit');
+  if (bad.length) throw new Error(bad.join(' | '));
+  return 'two concurrent → 1 call; within TTL cached; manual refresh ignored under 10 s, honoured after; expiry refetches; Meta failure → last good data marked stale with the reason; > 24 h old or nothing cached → error';
+});
+
+await step('marketing: live server — admin only, read-only, real numbers through the stub, no secrets in responses or logs', async () => {
+  const bad = []; const TOKEN = 'test-meta-token-NEVER-LEAK-9f3a';
+  HRS.meta.mode = 'ok'; HRS.meta.calls = [];
+  for (const [who, p, want] of [['mgr', '/api/marketing/status', 403], ['multi', '/api/marketing/summary', 403], ['nonHr', '/api/marketing/campaigns', 403], ['', '/api/marketing/status', 401],
+    ['mgr', '/marketing', 302], ['adm', '/marketing', 200]]) {
+    const r = await internal(who || null, 'GET', p);
+    if (r.status !== want) bad.push(`${who || 'anon'} ${p}: ${r.status} ≠ ${want}`);
+  }
+  if ((await internal('adm', 'POST', '/api/marketing/summary', {})).status !== 405 || (await internal('adm', 'PATCH', '/api/marketing/campaigns/111', {})).status !== 405) bad.push('write accepted');
+  if ((await careers('GET', '/api/marketing/status', { cookieAs: 'adm' })).status !== 404 || (await careers('GET', '/marketing', { cookieAs: 'adm' })).status !== 404) bad.push('careers host');
+  const st = await internal('adm', 'GET', '/api/marketing/status');
+  if (!st.body.configured || st.body.account?.name !== 'Briyo Test Ads' || st.body.version !== 'v25.0' || !st.body.signed || st.body.roasTarget !== 2.5) bad.push(`status ${JSON.stringify(st.body)}`);
+  const sum = await internal('adm', 'GET', '/api/marketing/summary?range=today');
+  const t = sum.body.totals;
+  if (t?.purchases !== 10 || t.revenue !== 3501.75 || Math.abs(t.roas - 3501.75 / 1000.5) > 1e-9 || t.reach !== 14000 || !sum.body.fetchedAt || sum.body.stale !== false || sum.body.trend.length !== 0) bad.push(`summary ${JSON.stringify(sum.body)}`);
+  const week = await internal('adm', 'GET', '/api/marketing/summary?range=last_7d');
+  if (week.body.trend?.length !== 2 || week.body.trend[1].roas !== 2101.75 / 600.5) bad.push('trend');
+  const camp = await internal('adm', 'GET', '/api/marketing/campaigns?range=today');
+  const names = (camp.body.rows || []).map((r) => `${r.name}:${r.delivered}:${r.status}`).join(',');
+  if (names !== 'Prospecting:true:ACTIVE,Old Archived:true:ARCHIVED,Retargeting:false:PAUSED' || camp.body.rows[1].roas !== 0) bad.push(`campaigns ${names}`);
+  // Cached: the same request again makes no Meta call.
+  const before = HRS.meta.calls.length;
+  await internal('adm', 'GET', '/api/marketing/summary?range=today');
+  if (HRS.meta.calls.length !== before) bad.push('repeat request reached Meta');
+  // Token only in the Authorization header; proof present; never followed paging.next.
+  if (HRS.meta.calls.some((c) => c.url.includes(TOKEN) || c.url.includes('SHOULD-NOT')) || HRS.meta.calls.some((c) => c.auth !== `Bearer ${TOKEN}` || !c.proof)) bad.push('token transport');
+  // Overview: Marketing card from the same cache.
+  const ov = (await internal('adm', 'GET', '/api/overview')).body.sections.marketing;
+  if (!ov?.configured || ov.spend !== 1000.5 || ov.purchases !== 10 || HRS.meta.calls.length !== before) bad.push(`overview ${JSON.stringify(ov)}`);
+  // Meta refuses the token: actionable message, no raw Meta text, logged with code only.
+  HRS.meta.mode = 'token';
+  const err = await internal('adm', 'GET', '/api/marketing/summary?range=yesterday');
+  if (err.status !== 502 || err.body.kind !== 'token' || /secret detail|OAuthException/.test(JSON.stringify(err.body))) bad.push(`token error ${err.status} ${JSON.stringify(err.body)}`);
+  HRS.meta.mode = 'ok';
+  const everything = JSON.stringify([st.body, sum.body, week.body, camp.body, ov, err.body]);
+  if (everything.includes(TOKEN) || everything.includes('test-meta-app-secret')) bad.push('secret in a response');
+  await new Promise((r) => setTimeout(r, 200));
+  if (HRS.log.includes(TOKEN) || HRS.log.includes('test-meta-app-secret')) bad.push('secret in server log');
+  if (!/Meta .*token code=190/.test(HRS.log)) bad.push('token failure not logged for diagnosis');
+  if (bad.length) throw new Error(bad.join(' | '));
+  return 'non-admins 403, signed out 401, page admin-only, POST/PATCH 405, careers host 404; account + today totals (omni purchases 10, Meta ROAS 3.50×, reach), 7-day trend, campaigns incl. paginated paused one and archived delivery; repeat served from cache; Overview card from the same cache; token error → actionable 502; token and app secret in no response and no log line';
+});
+
 await step('hr cleanup', async () => {
   if (HRS.server) { HRS.server.kill(); await new Promise((r) => HRS.server.once('exit', r)); }
   if (HRS.stub) HRS.stub.close();
+  if (HRS.metaStub) HRS.metaStub.close();
   const { jobs } = await purgeTestHr(HRT);
   await getPool().query(`DELETE FROM hr_candidates c WHERE email LIKE 'dbcheck-hr-%' AND NOT EXISTS (SELECT 1 FROM hr_applications a WHERE a.candidate_id = c.id)`);
   await hrCleanMembers();
