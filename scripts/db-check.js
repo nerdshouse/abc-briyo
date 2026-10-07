@@ -2963,9 +2963,10 @@ const shOrder = (n, o = {}) => {
     currentTotalPriceSet: shM(o.total ?? 1299), totalPriceSet: shM(o.total ?? 1299), currentSubtotalPriceSet: shM(o.subtotal ?? 1250),
     currentTotalTaxSet: shM('198.15'), currentTotalDiscountsSet: shM(o.discounts ?? '0'), currentShippingPriceSet: shM('49'),
     totalShippingPriceSet: shM('49'), totalRefundedSet: shM(o.refunded ?? '0.00'), totalRefundedShippingSet: shM(o.refundedShipping ?? '0.00'),
-    email: 'buyer@example.test', phone: null,
+    email: 'email' in o ? o.email : 'buyer@example.test', phone: 'phone' in o ? o.phone : null,
     customer: { id: `gid://shopify/Customer/${SH_NUM}`, firstName: o.first || 'Asha', lastName: 'K', email: 'buyer@example.test', phone: '+919800000001' },
-    shippingAddress: { name: 'Asha K', phone: '+919800000001', address1: '12 MG Road', address2: null, city: 'Pune', province: 'MH', zip: '411001', countryCodeV2: 'IN' },
+    shippingAddress: 'ship' in o ? o.ship : { name: `${o.first || 'Asha'} K`, phone: '+919800000001', address1: '12 MG Road', address2: null, city: 'Pune', province: 'MH', zip: '411001', countryCodeV2: 'IN' },
+    billingAddress: 'bill' in o ? o.bill : { name: `${o.first || 'Asha'} K`, phone: '+919800000002', address1: '4 FC Road', address2: 'Flat 2', city: 'Pune', province: 'MH', zip: '411004', countryCodeV2: 'IN' },
     // Detail-query fields.
     shippingLines: { pageInfo: { hasNextPage: false, endCursor: null }, nodes: [{ title: 'Standard', code: 'STD', originalPriceSet: shM('49') }] },
     fulfillments: o.ful === 'FULFILLED' ? [{ status: 'SUCCESS', createdAt: shDays(1), trackingInfo: [{ company: 'Delhivery', number: 'SHOPIFY-AWB-1', url: null }] }] : [],
@@ -2999,7 +3000,7 @@ const shPage = (conn, first, after) => {
 const shFake = (store, { denyPii = false, calls = [] } = {}) => async (query, vars) => {
   const kind = (query.match(/^query (\w+)/) || [])[1];
   const first = Number((query.match(/(?:orders|lineItems)\(first: (\d+)/) || [])[1]);
-  calls.push({ kind, first, after: vars.after, q: vars.query, pii: /customer \{/.test(query) });
+  calls.push({ kind, first, after: vars.after, q: vars.query, pii: /shippingAddress \{/.test(query) });
   const find = (id) => store().find((x) => x.id === id);
   const lineConn = (order, after) => structuredClone(shPage(order.lineItems.nodes, first, after));
   if (kind === 'BriyoOrderDetail') {
@@ -3013,7 +3014,8 @@ const shFake = (store, { denyPii = false, calls = [] } = {}) => async (query, va
     return structuredClone({ node: r ? { id: r.id, refundLineItems: r.refundLineItems, refundShippingLines: r.refundShippingLines } : null });
   }
   if (kind !== 'BriyoOrdersPage') throw new Error(`unexpected query ${kind}`);
-  if (denyPii && /customer \{/.test(query)) throw new Error('Shopify GraphQL error: This app is not approved to access the Customer object. See protected customer data.');
+  // A store that has not approved protected customer data: Shopify refuses the contact fields themselves.
+  if (denyPii && /shippingAddress \{/.test(query)) throw new Error('Shopify GraphQL error: This app is not approved to access protected customer data (shippingAddress).');
   const q = vars.query || '';
   const ge = (field) => (q.match(new RegExp(`${field}:>='([^']+)'`)) || [])[1];
   const le = (field) => (q.match(new RegExp(`${field}:<='([^']+)'`)) || [])[1];
@@ -3023,7 +3025,8 @@ const shFake = (store, { denyPii = false, calls = [] } = {}) => async (query, va
   // Like Shopify: fields that were not asked for are not returned (detail fields come from their own query).
   const shaped = page.nodes.map((x) => {
     const out = Object.fromEntries(Object.entries(x).filter(([k]) => !SH_DETAIL.includes(k)));
-    if (!/customer \{/.test(query)) { delete out.customer; delete out.shippingAddress; delete out.email; delete out.phone; }
+    if (!/customer \{/.test(query)) delete out.customer;
+    if (!/shippingAddress \{/.test(query)) { delete out.shippingAddress; delete out.billingAddress; delete out.email; delete out.phone; }
     return structuredClone(out);
   });
   return { orders: { pageInfo: page.pageInfo, nodes: shaped } };
@@ -3349,7 +3352,8 @@ await step('financial snapshots: exact amounts, lines, discounts, attributes and
   if (s.money.current_total_price.shop.amount !== '1818.60' || s.money.current_total_price.presentment.currency !== 'INR') bad.push('money strings');
   if (s.discount_codes.join() !== 'BRIYO10' || s.discount_applications[0]?.code !== 'BRIYO10' || s.discount_applications[0]?.value?.percentage !== '10') bad.push(`discounts ${JSON.stringify(s.discount_applications)}`);
   if (!s.custom_attributes.some((a) => a.key === '_briyo_ref' && a.value === 'AFF-123') || !s.custom_attributes.some((a) => a.key === '_briyo_click')) bad.push('attributes');
-  if (s.shopify_customer_gid !== `gid://shopify/Customer/${SH_NUM}`) bad.push('customer gid');
+  // The order's customer object needs read_customers and is no longer requested: the customer id stays empty.
+  if (s.shopify_customer_gid !== null) bad.push('customer gid');
   const lines = (await getPool().query(`SELECT * FROM order_financial_snapshot_lines WHERE snapshot_id = $1 ORDER BY position`, [s.id])).rows;
   if (lines.length !== 2 || lines[0].original_unit_price !== '649.50' || lines[0].total_discount !== '129.90' || lines[0].discounted_total !== '1169.10'
     || lines[0].tax_amount !== '99.07' || lines[0].discount_allocations[0]?.application_index !== 0 || lines[0].shopify_variant_gid !== null || lines[0].shopify_product_gid !== null
@@ -3517,6 +3521,65 @@ await step('financial snapshots: paging and hold-back boundaries — every line 
   }
   if (bad.length) throw new Error(bad.join(' | '));
   return `${out.join('; ')}; 14- and 50-line orders: every line exactly once in order (6 + 8 + … paging)`;
+});
+
+await step('shopify orders: contact and addresses come from the order itself (read_orders); a missing customer object never drops them', async () => {
+  const bad = [];
+  // The page query no longer asks for `customer` (read_customers); it asks for the order's own contact fields.
+  const page = shopifyOrderQuery('ordersPage');
+  if (/customer \{/.test(page) || !/\bemail\b/.test(page) || !/\bphone\b/.test(page) || !/shippingAddress \{/.test(page) || !/billingAddress \{/.test(page)) bad.push('page query fields');
+  if (estimateShopifyOrderQueryCost('ordersPage') > 600) bad.push('page query cost');
+  const noCustomer = (n, o) => { const x = shOrder(n, o); delete x.customer; return x; };
+  // A. complete contact, shipping and billing.
+  const a = mapShopifyOrder(noCustomer(601, { first: 'Meera' }));
+  if (a.customer_name !== 'Meera K' || a.customer_email !== 'buyer@example.test' || a.customer_phone !== '+919800000001'
+    || a.shopify.ship_to?.address_1 !== '12 MG Road' || a.shopify.ship_to.postal_code !== '411001' || a.shopify.ship_to.country !== 'IN'
+    || a.shopify.bill_to?.address_1 !== '4 FC Road' || a.shopify.bill_to.address_2 !== 'Flat 2' || a.shopify.bill_to.postal_code !== '411004') bad.push(`A complete ${JSON.stringify([a.customer_name, a.customer_email, a.customer_phone, a.shopify.ship_to, a.shopify.bill_to])}`);
+  // B. customer object null, order-level contact present (what Shopify returns now).
+  const b = mapShopifyOrder({ ...shOrder(602, { phone: '+919811111111' }), customer: null });
+  if (b.customer_email !== 'buyer@example.test' || b.customer_phone !== '+919811111111' || b.customer_name !== 'Asha K' || !b.shopify.ship_to) bad.push('B customer null');
+  // C. partial / null address.
+  const c = mapShopifyOrder(noCustomer(603, { ship: { name: null, phone: null, address1: '9 Hill Rd', address2: null, city: null, province: null, zip: '400050', countryCodeV2: null }, bill: null }));
+  if (c.error || c.shopify.ship_to?.address_1 !== '9 Hill Rd' || c.shopify.ship_to.city !== null || c.shopify.ship_to.postal_code !== '400050' || 'bill_to' in c.shopify
+    || c.customer_name !== null || c.customer_phone !== null) bad.push(`C partial ${JSON.stringify([c.error, c.shopify?.ship_to, c.customer_name, c.customer_phone])}`);
+  // Billing name / phone fill in when the shipping address has none.
+  const c2 = mapShopifyOrder(noCustomer(604, { phone: null, ship: null }));
+  if (c2.customer_name !== 'Asha K' || c2.customer_phone !== '+919800000002' || c2.shopify.ship_to !== null) bad.push('billing fallback');
+  // D. missing phone everywhere.
+  const d = mapShopifyOrder(noCustomer(605, { phone: null, ship: { name: 'Ravi S', phone: null, address1: 'x', city: 'Goa', zip: '403001', countryCodeV2: 'IN' }, bill: null }));
+  if (d.customer_phone !== null || d.customer_email !== 'buyer@example.test' || d.customer_name !== 'Ravi S') bad.push('D no phone');
+  // E. missing email.
+  const e = mapShopifyOrder(noCustomer(606, { email: null }));
+  if (e.customer_email !== null || e.customer_phone !== '+919800000001' || !e.shopify.ship_to) bad.push('E no email');
+  // F. nothing at all.
+  const f = mapShopifyOrder(noCustomer(607, { email: null, phone: null, ship: null, bill: null }));
+  if (f.error || f.customer_name !== null || f.customer_email !== null || f.customer_phone !== null || f.shopify.ship_to !== null || 'bill_to' in f.shopify) bad.push('F nothing');
+  // G + H. GoKwik attributes and the referral payload are untouched; the financial snapshot keeps every attribute.
+  const gkAttrs = [{ key: 'gokwik_cid', value: 'abc' }, { key: 'full_url', value: 'https://briyo-supp.myshopify.com/r/B7K4P9?utm_source=affiliate' },
+    { key: '__briyo_ref', value: 'B7K4P9' }, { key: '__briyo_click', value: 'abcDEF123_-xyzXYZ98765' }];
+  const g = mapShopifyOrder(noCustomer(608, { attributes: gkAttrs }));
+  if (g.shopify.referral?.ref !== 'B7K4P9' || g.shopify.referral.click !== 'abcDEF123_-xyzXYZ98765' || g.financial.custom_attributes.length !== 4
+    || g.financial.shopify_customer_gid !== null || g.customer_email !== 'buyer@example.test') bad.push('G/H attributes or referral');
+  // Through the real sync: an order imported without contact data (store refusing protected data) gets it on a later normal sync —
+  // same order, no new snapshot, nothing else touched.
+  SH.store.push({ ...shOrder(609, { first: 'Kiran', created: shDays(0.2) }), updatedAt: new Date().toISOString() });
+  await runShopifySync({ window: { days: 60 }, dryRun: false, gql: shFake(() => SH.store, { denyPii: true }), actor: SH_ACTOR });
+  const before = (await getPool().query(`SELECT id, customer_name, customer_email, customer_phone, order_value, source_payload FROM orders WHERE source_order_id = $1`, [`${SH_PREFIX}0609`])).rows[0];
+  if (!before || before.customer_name !== null || before.source_payload.shopify.ship_to !== null) bad.push('setup: imported without contact');
+  const snaps0 = (await getPool().query('SELECT count(*)::int n FROM order_financial_snapshots WHERE order_id = $1', [before?.id])).rows[0].n;
+  const pre = await runShopifySync({ window: { days: 60 }, dryRun: true, gql: shFake(() => SH.store) });
+  const r = await runShopifySync({ window: { days: 60 }, dryRun: false, gql: shFake(() => SH.store), actor: SH_ACTOR });
+  const after = (await getPool().query(`SELECT id, customer_name, customer_email, customer_phone, order_value, source_payload FROM orders WHERE source_order_id = $1`, [`${SH_PREFIX}0609`])).rows[0];
+  if (r.summary.customerDataAvailable !== true || pre.summary.newOrders !== 0 || r.summary.ordersCreated !== 0) bad.push(`re-sync summary ${JSON.stringify([pre.summary.newOrders, r.summary.ordersCreated, r.summary.customerDataAvailable])}`);
+  if (after.id !== before.id || after.customer_name !== 'Kiran K' || after.customer_email !== 'buyer@example.test' || after.customer_phone !== '+919800000001'
+    || after.source_payload.shopify.ship_to?.city !== 'Pune' || after.source_payload.shopify.bill_to?.postal_code !== '411004' || Number(after.order_value) !== Number(before.order_value)) bad.push(`re-sync fill ${JSON.stringify([after.customer_name, after.customer_email, after.source_payload.shopify.ship_to])}`);
+  if ((await getPool().query('SELECT count(*)::int n FROM order_financial_snapshots WHERE order_id = $1', [after.id])).rows[0].n !== snaps0) bad.push('contact change created a financial snapshot');
+  // A later sync where Shopify returns no contact never wipes what is recorded.
+  await runShopifySync({ window: { days: 60 }, dryRun: false, gql: shFake(() => SH.store, { denyPii: true }), actor: SH_ACTOR });
+  const kept = (await getPool().query(`SELECT customer_name, customer_email FROM orders WHERE id = $1`, [after.id])).rows[0];
+  if (kept.customer_name !== 'Kiran K' || kept.customer_email !== 'buyer@example.test') bad.push('contact wiped by a sync without contact data');
+  if (bad.length) throw new Error(bad.join(' | '));
+  return 'query asks for email, phone, shipping and billing address, not customer; complete / customer-null / partial address / billing fallback / no phone / no email / nothing all map without error and nulls stay null; GoKwik attributes and referral untouched; an order imported without contact data is filled by a later sync (same order, no new snapshot) and never wiped by one without it';
 });
 
 await step('shopify orders cleanup', async () => {
