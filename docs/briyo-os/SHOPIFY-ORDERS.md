@@ -85,10 +85,10 @@ Nothing is fuzzy-matched or guessed, and no SKU is ever created. Once an admin a
   - Always preview first: the preview writes nothing.
 - **Incremental:** `updated_at ≥ checkpoint − 5 min`.
   - The checkpoint is the start time of the last *complete* run, so anything changed while a run was going is caught next time.
-- **Bounded and resumable:** 50 orders per page and at most 2,500 per run.
+- **Bounded and resumable:** 10 orders per page and at most 2,500 per run. Each order's detail (lines, discounts, refunds) is fetched in its own requests so every query stays well under Shopify's 1,000-point cost limit — see [ORDER-FINANCIAL-SNAPSHOTS.md](ORDER-FINANCIAL-SNAPSHOTS.md).
   - A longer window ends "partial", with a cursor saved on the run. **Continue** picks it up.
   - Runs are idempotent, so a repeat or a resume only finds the remaining work.
-- **Skipped:** Shopify test orders. Orders with more than 100 line items are held back whole, never half-imported.
+- **Skipped:** Shopify test orders. Orders with more than 50 line items, or with any detail that could not be fetched completely (10 or more refunds, more than 50 lines in a refund, more than 10 discount applications, 5 or more tax lines on a line), are held back whole, never half-imported.
 - **Polling:** `SHOPIFY_ORDERS_POLL_ENABLED=true` (default off), every `SHOPIFY_ORDERS_POLL_MINUTES` (default 15). It only runs once an initial import has set a checkpoint.
 - **Customer data:** if Shopify refuses protected customer data (name, email, phone, address), the sync continues without those fields and says so.
 
