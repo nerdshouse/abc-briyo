@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <link rel="icon" type="image/png" href="/brand/briyo-logo-square.png" />
+  <link rel="apple-touch-icon" href="/brand/apple-touch-icon.png" />
+  <title>Affiliates — Briyo OS</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/ui.css" />
+  <link rel="stylesheet" href="/orders.css" />
+  <!-- The page script imports these; preloading fetches them in parallel instead of one after another. -->
+  <link rel="modulepreload" href="/ui/components.js" />
+  <link rel="modulepreload" href="/ui/nav.js" />
+  <link rel="modulepreload" href="/affiliates.js" />
+  <script src="https://cdn.jsdelivr.net/npm/lucide@0.469.0/dist/umd/lucide.min.js" defer></script>
+</head>
+<body>
+<div class="app">
+
+  <aside class="sidebar" id="sidebar" aria-label="Main navigation"></aside>
+  <div class="scrim" id="scrim"></div>
+
+  <div class="main">
+    <header class="topbar">
+      <button class="icon-btn" id="navOpen" type="button" aria-label="Open navigation"><i data-lucide="menu"></i></button>
+      <span class="topbar-title" id="topTitle">Affiliates</span>
+    </header>
+
+    <main class="page af" data-section="affiliates">
+      <div class="crumbs" id="crumbs"><i data-lucide="handshake"></i><span>Growth</span><span class="sep">/</span><a href="/affiliates" class="here" id="crumbList">Affiliates</a></div>
+      <div class="page-head">
+        <div style="min-width:0">
+          <h1 class="page-title" id="pageTitle">Affiliates</h1>
+          <p class="page-sub" id="pageSub">Loading…</p>
+        </div>
+        <div class="page-actions" id="pageActions"></div>
+      </div>
+
+      <div id="alerts"></div>
+      <div id="view"><section class="card"><div class="empty-note" aria-busy="true">Loading affiliates…</div></section></div>
+      <p class="footnote" id="footnote">Partner records only. Referral links, attribution, commissions and payouts are not part of Briyo OS yet.</p>
+    </main>
+  </div>
+</div>
+
+<div class="drawer-scrim" id="drawerScrim" hidden></div>
+<aside class="drawer" id="drawer" hidden aria-label="Affiliate form">
+  <div class="drawer-head">
+    <div style="min-width:0"><h2 class="drawer-title" id="dTitle"></h2><div class="drawer-sub" id="dSub"></div></div>
+    <div class="drawer-nav"><button class="icon-btn" id="dClose" type="button" title="Close" aria-label="Close"><i data-lucide="x"></i></button></div>
+  </div>
+  <div class="drawer-body" id="dBody"></div>
+  <div class="drawer-foot" id="dFoot">
+    <span class="saved" id="dSaved" aria-live="polite"></span>
+    <div style="display:flex;gap:8px" id="dButtons"></div>
+  </div>
+</aside>
+
+<script type="module" src="/affiliates.js"></script>
+</body>
+</html>

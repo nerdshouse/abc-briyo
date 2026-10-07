@@ -52,7 +52,7 @@ import { jobPostingLd } from '../lib/careers-pages.js';
 import nodeCrypto from 'node:crypto';
 import { metricsFrom, rawFromRow, rangeParams, classifyMetaError, createMetaClient, createCache, MetaError, createMetaService, metaConfig, todayIn, resolvePurchaseType, _resetMetaService, billingFrom } from '../lib/meta-ads.js';
 import { overviewFor } from '../lib/overview.js';
-import { ensureAffiliateSchema, newAffiliatePublicId, rateAt, getAffiliateSetting, setAffiliateSetting, purgeTestAffiliates, _resetAffiliateSchemaForTest } from '../lib/affiliates.js';
+import { ensureAffiliateSchema, newAffiliatePublicId, rateAt, getAffiliateSetting, setAffiliateSetting, purgeTestAffiliates, _resetAffiliateSchemaForTest, createAffiliate } from '../lib/affiliates.js';
 import { runShopifySync, mapShopifyOrder, shopifyPaymentMethod, shopifyPaymentStatus, shopifyOrdersStatus } from '../lib/shopify-orders.js';
 import { ensureOrderFinancialSnapshotSchema, financialSnapshotFrom, addAmounts, FINANCIAL_TABLES } from '../lib/order-financial-snapshots.js';
 import { SHOPIFY_MAX_QUERY_COST, SHOPIFY_ORDER_QUERIES, LIMITS as SHOPIFY_LIMITS, shopifyOrderQuery, estimateShopifyOrderQueryCost } from '../lib/shopify-order-queries.js';
@@ -5175,6 +5175,269 @@ await step('marketing: live server — admin only, read-only, real numbers throu
   if (!/Meta .*token code=190/.test(HRS.log)) bad.push('token failure not logged for diagnosis');
   if (bad.length) throw new Error(bad.join(' | '));
   return 'non-admins 403, signed out 401, page admin-only, POST/PATCH 405, careers host 404; account + today totals (omni purchases 10, Meta ROAS 3.50×, reach), 7-day trend, campaigns incl. paginated paused one and archived delivery; repeat served from cache; Overview card from the same cache; token error → actionable 502; token and app secret in no response and no log line';
+});
+
+/* ------------------------------------------------------------------ affiliates admin (Phase 1C) */
+// Members holding only an affiliate role (or none), on the running test server; HRM.adm is an admin.
+const AFP = { viewer: '919000000401', manager: '919000000402', finance: '919000000403', none: '919000000404' };
+const AFN = { viewer: 'DBCHECK-AF viewer', manager: 'DBCHECK-AF manager', finance: 'DBCHECK-AF finance', none: 'DBCHECK-AF none' };
+const AFC = {};
+const af = async (who, method, p, body) => {
+  const headers = { 'content-type': 'application/json' };
+  const phone = who === 'adm' ? HRM.adm : AFP[who];
+  if (phone) headers.cookie = `${SESSION_COOKIE}=${issueSession(phone)}`;
+  const r = await fetch(`${HRS.base}${p}`, { method, headers, body: body ? JSON.stringify(body) : undefined, redirect: 'manual' });
+  const ct = r.headers.get('content-type') || '';
+  return { status: r.status, headers: r.headers, body: ct.includes('json') ? await r.json() : await r.text() };
+};
+const afEvents = async (pid) => (await getPool().query(
+  `SELECT e.action, e.actor, e.metadata FROM affiliate_events e JOIN affiliates a ON a.id = e.affiliate_id WHERE a.public_id = $1 ORDER BY e.id`, [pid])).rows;
+
+await step('affiliates admin: RBAC — viewer and finance read only, manager and admin manage, others refused (API and pages)', async () => {
+  const bad = [];
+  // profile_required false: these members are about affiliate access, not the profile gate (tested elsewhere).
+  await getPool().query(`INSERT INTO allowed_users (phone, name, is_admin, added_by, profile_required) VALUES ($1,$5,false,'db-check',false),($2,$6,false,'db-check',false),
+    ($3,$7,false,'db-check',false),($4,$8,false,'db-check',false) ON CONFLICT (phone) DO NOTHING`, [...Object.values(AFP), ...Object.values(AFN)]);
+  await getPool().query(`INSERT INTO member_module_roles (phone, module, role) VALUES ($1,'affiliate','viewer'),($2,'affiliate','manager'),($3,'affiliate','finance'),($4,'logistics','viewer')
+    ON CONFLICT (phone, module) DO UPDATE SET role = EXCLUDED.role`, Object.values(AFP));
+  const made = await af('manager', 'POST', '/api/affiliates', { display_name: 'DBCHECK-AF RBAC partner', category: 'influencer' });
+  if (made.status !== 201) throw new Error(`manager create ${made.status} ${JSON.stringify(made.body)}`);
+  AFC.rbac = made.body.affiliate.public_id;
+  const P = AFC.rbac;
+  const M = [
+    ['GET', '/api/affiliates', null, { viewer: 200, manager: 200, finance: 200, adm: 200, none: 403, '': 401 }],
+    ['GET', `/api/affiliates/${P}`, null, { viewer: 200, finance: 200, adm: 200, none: 403, '': 401 }],
+    ['GET', `/api/affiliates/${P}/events`, null, { viewer: 200, none: 403 }],
+    ['GET', '/api/affiliates/meta', null, { viewer: 200, none: 403 }],
+    ['POST', '/api/affiliates', { display_name: 'DBCHECK-AF refused', category: 'creator' }, { viewer: 403, finance: 403, none: 403, '': 401 }],
+    ['PATCH', `/api/affiliates/${P}`, { display_name: 'DBCHECK-AF hijack' }, { viewer: 403, finance: 403, none: 403, '': 401 }],
+    ['POST', `/api/affiliates/${P}/status`, { action: 'activate' }, { viewer: 403, finance: 403, none: 403 }],
+    ['POST', `/api/affiliates/${P}/rates`, { rate_percent: '10', reason: 'probe' }, { viewer: 403, finance: 403, none: 403 }],
+    ['POST', '/api/affiliates', { display_name: 'DBCHECK-AF by admin', category: 'creator' }, { adm: 201 }],
+    ['PATCH', `/api/affiliates/${P}`, { display_name: 'DBCHECK-AF RBAC partner (edited)' }, { manager: 200 }],
+  ];
+  for (const [m, p, b, exp] of M) for (const [who, want] of Object.entries(exp)) {
+    const r = await af(who || null, m, p, b);
+    if (r.status !== want) bad.push(`${who || 'anon'} ${m} ${p}: ${r.status} ≠ ${want}`);
+    if (r.status === 403 && r.body?.ok !== false) bad.push(`${who} ${m} ${p}: 403 without the standard error body`);
+  }
+  if ((await af('viewer', 'GET', `/api/affiliates/${P}`)).body.affiliate.display_name !== 'DBCHECK-AF RBAC partner (edited)') bad.push('refused edit was applied');
+  if ((await af('viewer', 'GET', '/api/affiliates/meta')).body.canManage !== false || (await af('manager', 'GET', '/api/affiliates/meta')).body.canManage !== true
+    || (await af('finance', 'GET', '/api/affiliates/meta')).body.canManage !== false || (await af('adm', 'GET', '/api/affiliates/meta')).body.canManage !== true) bad.push('meta canManage');
+  // Pages: affiliate.view only; an affiliate-only member's home is /affiliates (no redirect loop via /no-access).
+  for (const [who, p, want, loc] of [['viewer', '/affiliates', 200], ['viewer', `/affiliates/${P}`, 200], ['finance', '/affiliates', 200], ['adm', '/affiliates', 200],
+    ['none', '/affiliates', 302, '/orders'], ['', '/affiliates', 302, '/login'], ['viewer', '/', 302, '/affiliates'], ['viewer', '/no-access', 302, '/affiliates'],
+    ['viewer', '/orders', 302, '/affiliates'], ['viewer', '/hr/jobs', 302, '/affiliates']]) {
+    const r = await af(who || null, 'GET', p);
+    if (r.status !== want || (loc && r.headers.get('location') !== loc)) bad.push(`${who || 'anon'} page ${p}: ${r.status} ${r.headers.get('location') || ''}`);
+    if (want === 200 && !/affiliates\.js/.test(r.body)) bad.push(`${who} ${p}: not the affiliates page`);
+  }
+  const me = (await af('viewer', 'GET', '/auth/me')).body;
+  if (!me.caps.includes('affiliate.view') || me.caps.includes('affiliate.manage')) bad.push(`viewer caps ${me.caps}`);
+  if (bad.length) throw new Error(bad.join(' | '));
+  return `${M.reduce((n, x) => n + Object.keys(x[3]).length, 0)} API checks (viewer/finance read only; manager/admin manage; logistics-only 403; signed out 401) + 10 page checks; refused edit not applied`;
+});
+
+await step('affiliates admin: create and edit — server public ID, initial status by category, validation, no ID or status changes through edit', async () => {
+  const bad = [];
+  const mk = (body) => af('manager', 'POST', '/api/affiliates', body);
+  const a = await mk({ display_name: '  DBCHECK-AF Riya   Sharma ', category: 'influencer', contact_email: 'Riya.DBCHECK@Example.test', contact_phone: '98765 43210', rate_percent: '12.5', public_id: 'AAAAAA' });
+  const x = a.body.affiliate;
+  if (a.status !== 201 || !/^[A-HJKMNP-Z2-9]{6}$/.test(x.public_id) || x.public_id === 'AAAAAA' || x.display_name !== 'DBCHECK-AF Riya Sharma'
+    || x.contact_email !== 'riya.dbcheck@example.test' || x.contact_phone !== '+919876543210' || x.status !== 'draft' || x.current_rate_bps !== 1250) bad.push(`create ${JSON.stringify(x)}`);
+  AFC.riya = x.public_id;
+  const d = await mk({ display_name: 'DBCHECK-AF Dr. Anil', category: 'doctor' });
+  if (d.body.affiliate?.status !== 'pending_verification' || d.body.affiliate.current_rate_bps !== null || d.body.rates.length) bad.push(`professional ${d.body.affiliate?.status}`);
+  AFC.doc = d.body.affiliate.public_id;
+  if (JSON.stringify([a.body, d.body]).match(/"id":|"affiliate_id"/)) bad.push('internal id exposed');
+  const refused = [
+    [{ category: 'creator' }, 'display_name'], [{ display_name: 'X', category: 'no_such' }, 'category'], [{ display_name: 'X' }, 'category'],
+    [{ display_name: 'X', category: 'creator', contact_email: 'not-an-email' }, 'contact_email'], [{ display_name: 'X', category: 'creator', contact_phone: '12' }, 'contact_phone'],
+    [{ display_name: 'X'.repeat(121), category: 'creator' }, 'display_name'],
+    ...['100.01', '-1', 'abc', '1.234', '101'].map((r) => [{ display_name: 'X', category: 'creator', rate_percent: r }, 'rate']),
+    [{ display_name: 'X', category: 'creator', rate_bps: 10001 }, 'rate'],
+  ];
+  for (const [body, field] of refused) {
+    const r = await mk(body);
+    if (r.status !== 400 || r.body.field !== field) bad.push(`${JSON.stringify(body).slice(0, 60)} → ${r.status} ${r.body.field}`);
+  }
+  await getPool().query(`UPDATE affiliate_categories SET active = false WHERE key = 'dentist'`);
+  try { if ((await mk({ display_name: 'X', category: 'dentist' })).status !== 400) bad.push('inactive category accepted'); }
+  finally { await getPool().query(`UPDATE affiliate_categories SET active = true WHERE key = 'dentist'`); }
+  if ((await mk({ display_name: 'DBCHECK-AF zero', category: 'customer', rate_percent: '0' })).body.affiliate?.current_rate_bps !== 0) bad.push('0% refused');
+  if ((await mk({ display_name: 'DBCHECK-AF full', category: 'customer', rate_percent: '100' })).body.affiliate?.current_rate_bps !== 10000) bad.push('100% refused');
+  // Edit: profile fields only, with the version.
+  const v = x.version;
+  const e = await af('manager', 'PATCH', `/api/affiliates/${AFC.riya}`, { display_name: 'DBCHECK-AF Riya S.', contact_email: '', contact_phone: '+44 20 7946 0958', version: v });
+  if (e.status !== 200 || e.body.affiliate.display_name !== 'DBCHECK-AF Riya S.' || e.body.affiliate.contact_email !== null || e.body.affiliate.contact_phone !== '+442079460958'
+    || e.body.affiliate.version !== v + 1 || e.body.affiliate.public_id !== AFC.riya) bad.push(`edit ${e.status} ${JSON.stringify(e.body).slice(0, 200)}`);
+  if ((await af('manager', 'PATCH', `/api/affiliates/${AFC.riya}`, { display_name: 'stale', version: v })).status !== 409) bad.push('stale version accepted');
+  for (const body of [{ public_id: 'BBBBBB' }, { status: 'active' }, { rate_bps: 500 }]) {
+    const r = await af('manager', 'PATCH', `/api/affiliates/${AFC.riya}`, body);
+    if (r.status !== 400) bad.push(`edit ${Object.keys(body)[0]} → ${r.status}`);
+  }
+  const after = (await af('viewer', 'GET', `/api/affiliates/${AFC.riya}`)).body.affiliate;
+  if (after.public_id !== AFC.riya || after.status !== 'draft' || after.current_rate_bps !== 1250) bad.push('edit changed id, status or rate');
+  if ((await af('manager', 'PATCH', '/api/affiliates/ZZZZZZ', { display_name: 'x' })).status !== 404) bad.push('unknown public id');
+  if (bad.length) throw new Error(bad.join(' | '));
+  return `public ID issued by the server (client value ignored); influencer → draft, doctor → pending verification; ${refused.length + 1} invalid inputs refused with their field; 0% and 100% accepted; edit with version (stale → 409); public ID / status / rate not editable; no internal ids in responses`;
+});
+
+await step('affiliates admin: lifecycle — activate, suspend with reason, reactivate, close; invalid transitions refused; category change never verifies', async () => {
+  const bad = [];
+  const st = (pid, action, extra = {}) => af('manager', 'POST', `/api/affiliates/${pid}/status`, { action, ...extra });
+  const R = AFC.riya;
+  const act = await st(R, 'activate');
+  if (act.status !== 200 || act.body.affiliate.status !== 'active' || !act.body.affiliate.activated_at) bad.push(`activate ${act.status}`);
+  if ((await st(AFC.doc, 'activate')).status !== 409) bad.push('professional activated without verification');
+  if ((await st(R, 'activate')).status !== 409) bad.push('active → activate accepted');
+  if ((await st(R, 'reactivate')).status !== 409) bad.push('active → reactivate accepted');
+  if ((await st(R, 'approve')).status !== 400) bad.push('unknown action accepted');
+  const noReason = await st(R, 'suspend');
+  if (noReason.status !== 400 || noReason.body.field !== 'reason') bad.push(`suspend without reason ${noReason.status}`);
+  if ((await st(R, 'suspend', { reason: 'x'.repeat(301) })).status !== 400) bad.push('long reason accepted');
+  const sus = await st(R, 'suspend', { reason: 'Content agreement under review' });
+  const s = sus.body.affiliate;
+  if (s?.status !== 'suspended' || s.suspension_reason !== 'Content agreement under review' || s.suspended_by !== AFN.manager || !s.suspended_at) bad.push(`suspend ${JSON.stringify(s).slice(0, 200)}`);
+  if ((await st(R, 'suspend', { reason: 'again' })).status !== 409) bad.push('suspended → suspend accepted');
+  if ((await af('viewer', 'GET', `/api/affiliates/${R}`)).body.affiliate.suspension_reason !== 'Content agreement under review') bad.push('reason not shown');
+  const re = await st(R, 'reactivate');
+  if (re.body.affiliate?.status !== 'active' || re.body.affiliate.suspension_reason !== null) bad.push(`reactivate → ${re.body.affiliate?.status}`);
+  // Category: influencer (active) → doctor goes back to pending verification, never stays active; → creator returns to draft.
+  const toDoc = await af('manager', 'PATCH', `/api/affiliates/${R}`, { category: 'doctor' });
+  if (toDoc.body.affiliate?.status !== 'pending_verification' || !toDoc.body.affiliate.requires_verification) bad.push(`to professional → ${toDoc.body.affiliate?.status}`);
+  if ((await st(R, 'activate')).status !== 409) bad.push('activated after a move to a professional category');
+  const toCreator = await af('manager', 'PATCH', `/api/affiliates/${R}`, { category: 'creator' });
+  if (toCreator.body.affiliate?.status !== 'draft') bad.push(`back to non-professional → ${toCreator.body.affiliate?.status}`);
+  // A suspended professional is reactivated to pending verification at most.
+  await st(R, 'activate'); await st(R, 'suspend', { reason: 'pause' });
+  await af('manager', 'PATCH', `/api/affiliates/${R}`, { category: 'nutritionist' });
+  const re2 = await st(R, 'reactivate');
+  if (re2.body.affiliate?.status !== 'pending_verification') bad.push(`suspended professional reactivated to ${re2.body.affiliate?.status}`);
+  // Close: reason required, final; nothing deleted.
+  if ((await st(AFC.doc, 'close')).status !== 400) bad.push('close without reason');
+  const cl = await st(AFC.doc, 'close', { reason: 'No longer practising' });
+  if (cl.body.affiliate?.status !== 'closed' || cl.body.affiliate.transitions.length) bad.push(`close ${cl.body.affiliate?.status}`);
+  for (const a of ['activate', 'reactivate', 'suspend', 'close']) if ((await st(AFC.doc, a, { reason: 'r' })).status !== 409) bad.push(`closed → ${a} accepted`);
+  if ((await af('manager', 'PATCH', `/api/affiliates/${AFC.doc}`, { display_name: 'x' })).status !== 409) bad.push('closed affiliate edited');
+  if ((await getPool().query('SELECT count(*)::int n FROM affiliates WHERE public_id = $1', [AFC.doc])).rows[0].n !== 1) bad.push('closed affiliate deleted');
+  // Events, in order, with actor and reason.
+  const ev = (await afEvents(R)).map((e) => e.action);
+  for (const want of ['affiliate_created', 'affiliate_rate_added', 'affiliate_updated', 'affiliate_status_changed', 'affiliate_suspended', 'affiliate_reactivated']) if (!ev.includes(want)) bad.push(`no ${want}`);
+  const susEv = (await afEvents(R)).find((e) => e.action === 'affiliate_suspended');
+  if (susEv.actor !== AFN.manager || susEv.metadata.reason !== 'Content agreement under review' || susEv.metadata.from !== 'active' || susEv.metadata.to !== 'suspended') bad.push('suspend event');
+  if (!(await afEvents(AFC.doc)).some((e) => e.action === 'affiliate_closed' && e.metadata.reason === 'No longer practising')) bad.push('close event');
+  if (bad.length) throw new Error(bad.join(' | '));
+  return 'draft → active (activated_at); professional cannot activate; suspend needs a reason (recorded with actor and time), reactivate restores the previous state; active influencer → doctor = pending verification; suspended professional → pending at most; close needs a reason, is final, deletes nothing; 9 invalid transitions refused; events recorded';
+});
+
+await step('affiliates admin: rates — initial, added, scheduled; old rates kept; duplicate, past, out-of-range and reasonless refused', async () => {
+  const bad = [];
+  const R = (await af('manager', 'POST', '/api/affiliates', { display_name: 'DBCHECK-AF rates', category: 'creator', rate_percent: '10' })).body.affiliate.public_id;
+  AFC.rates = R;
+  const add = (body) => af('manager', 'POST', `/api/affiliates/${R}/rates`, body);
+  const first = (await getPool().query('SELECT r.* FROM affiliate_rates r JOIN affiliates a ON a.id = r.affiliate_id WHERE a.public_id = $1', [R])).rows;
+  if (first.length !== 1 || first[0].rate_bps !== 1000 || first[0].reason !== 'Initial rate') bad.push('initial rate');
+  const now = await add({ rate_percent: '12.75', reason: 'Renegotiated' });
+  if (now.status !== 201 || now.body.affiliate.current_rate_bps !== 1275 || now.body.rates.length !== 2) bad.push(`add ${now.status} ${now.body.affiliate?.current_rate_bps}`);
+  const future = new Date(Date.now() + 10 * 86400000); future.setUTCMilliseconds(0);
+  const sch = await add({ rate_percent: '15', reason: 'From next campaign', effective_from: future.toISOString() });
+  if (sch.status !== 201 || sch.body.affiliate.current_rate_bps !== 1275 || sch.body.rates.find((r) => r.rate_bps === 1500)?.state !== 'scheduled') bad.push('scheduled rate');
+  const dup = await add({ rate_percent: '16', reason: 'dup', effective_from: future.toISOString() });
+  if (dup.status !== 409 || dup.body.field !== 'effective_from') bad.push(`duplicate effective date ${dup.status}`);
+  const refused = [[{ rate_percent: '20', reason: 'past', effective_from: new Date(Date.now() - 86400000).toISOString() }, 'effective_from'],
+    [{ rate_percent: '20', reason: 'far', effective_from: new Date(Date.now() + 400 * 86400000).toISOString() }, 'effective_from'],
+    [{ rate_percent: '20', reason: 'bad date', effective_from: 'tomorrow' }, 'effective_from'],
+    [{ rate_percent: '100.5', reason: 'r' }, 'rate'], [{ rate_bps: -1, reason: 'r' }, 'rate'], [{ rate_bps: 10001, reason: 'r' }, 'rate'], [{ reason: 'r' }, 'rate'],
+    [{ rate_percent: '20' }, 'reason'], [{ rate_percent: '20', reason: 'x'.repeat(301) }, 'reason']];
+  for (const [body, field] of refused) {
+    const r = await add(body);
+    if (r.status !== 400 || r.body.field !== field) bad.push(`${JSON.stringify(body).slice(0, 50)} → ${r.status} ${r.body.field}`);
+  }
+  // Earlier rows unchanged (same ids and values); history only grows; never on the affiliate row.
+  const all = (await getPool().query('SELECT r.* FROM affiliate_rates r JOIN affiliates a ON a.id = r.affiliate_id WHERE a.public_id = $1 ORDER BY r.effective_from', [R])).rows;
+  if (all.length !== 3 || all[0].id !== first[0].id || all[0].rate_bps !== 1000 || String(all[0].effective_from) !== String(first[0].effective_from)) bad.push(`history ${all.map((r) => r.rate_bps)}`);
+  if (all[1].created_by !== AFN.manager || all[1].reason !== 'Renegotiated') bad.push('actor / reason');
+  const ev = (await afEvents(R)).filter((e) => e.action === 'affiliate_rate_added').map((e) => e.metadata.rate_bps);
+  if (ev.join() !== '1000,1275,1500') bad.push(`rate events ${ev}`);
+  if ((await af('viewer', 'GET', '/api/affiliates?q=DBCHECK-AF rates')).body.affiliates[0]?.current_rate_bps !== 1275) bad.push('list current rate');
+  // Closed: no new rate.
+  await af('manager', 'POST', `/api/affiliates/${R}/status`, { action: 'close', reason: 'done' });
+  if ((await add({ rate_percent: '5', reason: 'after close' })).status !== 409) bad.push('rate added to a closed affiliate');
+  if (bad.length) throw new Error(bad.join(' | '));
+  return `10% initial → 12.75% now → 15% scheduled (current stays 12.75%); earlier rows unchanged; duplicate start 409; ${refused.length} invalid rates/dates/reasons refused; one event per rate; closed affiliate gets no rate`;
+});
+
+await step('affiliates admin: search, filters, whitelisted sort and paging', async () => {
+  const bad = [];
+  for (let i = 1; i <= 55; i += 1) {
+    await createAffiliate({ display_name: `DBCHECK-AF bulk ${String(i).padStart(2, '0')}`, category: i % 2 ? 'customer' : 'creator',
+      contact_email: `bulk${i}.dbcheck@example.test`, contact_phone: `+9198000${String(10000 + i).slice(-5)}` }, { actor: AFN.manager });
+  }
+  const list = async (qs) => (await af('viewer', 'GET', `/api/affiliates?${qs}`)).body;
+  const names = (r) => r.affiliates.map((a) => a.display_name);
+  const riya = (await af('viewer', 'GET', `/api/affiliates/${AFC.riya}`)).body.affiliate;
+  const checks = [
+    ['q=DBCHECK-AF bulk 07', (r) => r.total === 1 && names(r)[0] === 'DBCHECK-AF bulk 07'],
+    ['q=bulk12.dbcheck@example', (r) => r.total === 1 && names(r)[0] === 'DBCHECK-AF bulk 12'],
+    ['q=9800010033', (r) => r.total === 1 && names(r)[0] === 'DBCHECK-AF bulk 33'],
+    ['q=98000-10033', (r) => r.total === 1],
+    [`q=${riya.public_id.toLowerCase()}`, (r) => r.total === 1 && r.affiliates[0].public_id === riya.public_id],
+    ['q=%25', (r) => r.total === 0],
+    ['q=DBCHECK-AF bulk&category=creator', (r) => r.total === 27 && r.affiliates.every((a) => a.category === 'creator')],
+    ['q=DBCHECK-AF&status=closed', (r) => r.total >= 2 && r.affiliates.every((a) => a.status === 'closed')],
+    ['q=DBCHECK-AF bulk&status=draft&category=customer', (r) => r.total === 28],
+    ['q=DBCHECK-AF bulk&sort=name&dir=asc', (r) => r.total === 55 && r.affiliates.length === 50 && names(r)[0] === 'DBCHECK-AF bulk 01' && names(r)[49] === 'DBCHECK-AF bulk 50'],
+    ['q=DBCHECK-AF bulk&sort=name&dir=asc&offset=50', (r) => r.affiliates.length === 5 && names(r)[4] === 'DBCHECK-AF bulk 55'],
+    ['q=DBCHECK-AF bulk&sort=name&dir=desc&limit=3', (r) => names(r).join() === 'DBCHECK-AF bulk 55,DBCHECK-AF bulk 54,DBCHECK-AF bulk 53'],
+    ['q=DBCHECK-AF bulk&limit=1000', (r) => r.limit === 100 && r.affiliates.length === 55],
+    ['q=DBCHECK-AF bulk&sort=display_name;DROP TABLE affiliates&dir=sideways', (r) => r.total === 55],
+    ['q=DBCHECK-AF bulk&sort=__proto__', (r) => r.total === 55],
+    ['q=zzzz-no-such-partner', (r) => r.total === 0 && r.affiliates.length === 0 && r.kpis.total >= 55],
+  ];
+  for (const [qs, ok] of checks) {
+    const r = await list(qs);
+    try { if (!ok(r)) bad.push(`${qs}: total ${r.total}, first ${names(r)[0]}`); } catch (err) { bad.push(`${qs}: ${err.message}`); }
+  }
+  if ((await af('viewer', 'GET', '/api/affiliates?status=verified')).status !== 400) bad.push('unknown status accepted');
+  const k = (await list('limit=1')).kpis;
+  const counts = Object.fromEntries((await getPool().query('SELECT status, count(*)::int n FROM affiliates GROUP BY status')).rows.map((r) => [r.status, r.n]));
+  if (k.total !== Object.values(counts).reduce((a, b) => a + b, 0) || k.active !== (counts.active || 0) || k.suspended !== (counts.suspended || 0)
+    || k.pending_verification !== (counts.pending_verification || 0)) bad.push(`kpis ${JSON.stringify(k)}`);
+  if ((await getPool().query('SELECT count(*)::int n FROM affiliates')).rows[0].n < 55) bad.push('bulk not created');
+  if (bad.length) throw new Error(bad.join(' | '));
+  return `55 partners: search by name, email, phone (any punctuation) and public ID; LIKE wildcards literal; category / status filters combine; pages of 50 (50 + 5), limit capped at 100; sort whitelisted (injection and __proto__ fall back); unknown status 400; KPIs match the table`;
+});
+
+await step('affiliates admin: events — every change audited, append-only, readable, no personal data or secrets', async () => {
+  const bad = [];
+  const { rows } = await getPool().query(`SELECT e.* FROM affiliate_events e JOIN affiliates a ON a.id = e.affiliate_id WHERE a.display_name LIKE 'DBCHECK-AF%'`);
+  const actions = new Set(rows.map((r) => r.action));
+  for (const a of ['affiliate_created', 'affiliate_updated', 'affiliate_status_changed', 'affiliate_suspended', 'affiliate_reactivated', 'affiliate_rate_added', 'affiliate_closed']) if (!actions.has(a)) bad.push(`missing ${a}`);
+  if (rows.some((r) => !r.actor || !r.at)) bad.push('event without actor or time');
+  const meta = JSON.stringify(rows.map((r) => r.metadata));
+  if (/@example\.test|\+?9198|\+4420|9876543210|crb_session|session|token|password|otp|secret/i.test(meta)) bad.push('personal data or secret in event metadata');
+  const one = rows.find((r) => r.action === 'affiliate_updated');
+  await expectErr('update event', () => getPool().query('UPDATE affiliate_events SET metadata = $2 WHERE id = $1', [one.id, '{}']), (e) => /append-only/.test(e.message));
+  await expectErr('delete event', () => getPool().query('DELETE FROM affiliate_events WHERE id = $1', [one.id]), (e) => /append-only/.test(e.message));
+  // The API gives readable summaries, never raw metadata.
+  const ev = (await af('viewer', 'GET', `/api/affiliates/${AFC.riya}/events`)).body.events;
+  if (!ev.length || ev.some((e) => 'metadata' in e || !e.label || typeof e.summary !== 'string')) bad.push('events API shape');
+  if (!ev.some((e) => /Active → Suspended · Reason: Content agreement under review/.test(e.summary))) bad.push(`summary ${ev.map((e) => e.summary).join(' / ')}`);
+  if (!ev.some((e) => e.action === 'affiliate_updated' && /Changed .*email/.test(e.summary))) bad.push('update summary');
+  if (bad.length) throw new Error(bad.join(' | '));
+  return `${rows.length} events across ${actions.size} actions, each with actor and time; contact values never logged (field names only); UPDATE/DELETE refused; API returns summaries, not raw JSON`;
+});
+
+await step('affiliates admin cleanup', async () => {
+  let n = 0;
+  for (const actor of [...Object.values(AFN), 'HR admin']) n += (await purgeTestAffiliates(actor)).affiliates;
+  await getPool().query('DELETE FROM member_module_roles WHERE phone = ANY($1)', [Object.values(AFP)]);
+  await getPool().query('DELETE FROM member_log WHERE target_phone = ANY($1)', [Object.values(AFP)]);
+  await getPool().query('DELETE FROM allowed_users WHERE phone = ANY($1)', [Object.values(AFP)]);
+  const left = (await getPool().query(`SELECT count(*)::int n FROM affiliates WHERE display_name LIKE 'DBCHECK-AF%'`)).rows[0].n;
+  if (left) throw new Error(`${left} test affiliates left`);
+  return `${n} test affiliates (with rates and events) and 4 test members removed`;
 });
 
 await step('hr cleanup', async () => {

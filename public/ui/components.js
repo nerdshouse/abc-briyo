@@ -361,7 +361,7 @@ export const initials = (name) => String(name || '?').split(/\s+/).filter(Boolea
  *   Overview
  *   OPERATIONS  Logistics · Inventory
  *   CUSTOMER    Support (cart recovery)
- *   GROWTH      Marketing (Meta Ads; admins in V1)
+ *   GROWTH      Marketing (Meta Ads; admins in V1) · Affiliates
  *   PEOPLE      HR
  *   ADMIN       Members · Import carts · Export report
  */
@@ -393,8 +393,9 @@ function sidebarHtml(me) {
         + navLink('/?mode=callbacks', 'Callbacks', '', { id: 'countCallbacks', view: 'callbacks' })
         + navLink('/?mode=mine', 'My queue', '', { view: 'mine' })
         + navLink('/?mode=all', 'All carts', '', { view: 'all' })) : '')}
-      ${navSection('Growth', has('marketing.view') ? navDept('Marketing', 'megaphone', '/marketing',
-        navLink('/marketing', 'Overview') + navLink('/marketing?view=campaigns', 'Campaigns')) : '')}
+      ${navSection('Growth', (has('marketing.view') ? navDept('Marketing', 'megaphone', '/marketing',
+        navLink('/marketing', 'Overview') + navLink('/marketing?view=campaigns', 'Campaigns')) : '')
+        + (has('affiliate.view') ? navLink('/affiliates', 'Affiliates', 'handshake') : ''))}
       ${navSection('People', has('hr.view') ? navDept('HR', 'briefcase', '/hr/jobs',
         navLink('/hr/jobs', 'Jobs') + navLink('/hr/candidates', 'Candidates')) : '')}
       ${navSection('Admin', admin ? navLink('/admin', 'Members', 'users')
