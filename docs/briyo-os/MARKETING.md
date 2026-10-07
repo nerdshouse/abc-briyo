@@ -11,7 +11,7 @@ Browser (Briyo OS)  ──►  /api/marketing/*  (requireAuth → requireComplet
                       lib/meta-ads.js
                         • Meta client (GET only, token in Authorization header, appsecret_proof)
                         • normalisation + metrics (one place)
-                        • short-lived cache: in-flight sharing, TTL, stale-if-error
+                        • short-lived cache: in-flight sharing, TTL by freshness, stale-if-error, shared failure backoff
                               │
                               ▼
                       graph.facebook.com/{version}/…
@@ -19,6 +19,7 @@ Browser (Briyo OS)  ──►  /api/marketing/*  (requireAuth → requireComplet
 
 - **No direct browser access:** the browser never calls Meta, and never sees the token, the app secret, or any raw Meta error.
 - **One service, two users:** the Admin Overview uses the same service and cache. It never makes its own Meta call.
+- **Server-side only:** Meta credentials stay in the server environment; the browser only talks to `/api/marketing/*`.
 - **Built for more channels:** `lib/meta-ads.js` exposes channel-neutral shapes (`totals`, `rows`, `trend`), so Google or TikTok can be added later as sibling services.
 
 ## 2. Meta requirements (researched October 2026)
@@ -35,7 +36,8 @@ Browser (Briyo OS)  ──►  /api/marketing/*  (requireAuth → requireComplet
 - **Throttling:** codes 4 (subcodes 1504022/1504039), 17, 613, 80000, 80003, 80004 and 80014. Headers `x-fb-ads-insights-throttle` and `x-business-use-case-usage` report usage. We back off and serve stale data.
 - **Pagination:** cursor-based. We follow `paging.cursors.after` and never use `paging.next`, because those URLs can embed the token. Pages are capped.
 - **Sync vs async:** version 1 queries are small (account, campaign, ad set or ad level, one date range, at most 31 daily buckets), so they are synchronous with a 15 s timeout. If timeouts appear on large accounts, the next step is async jobs (`report_run_id` + `async_status`).
-- **"Today":** `date_preset=today` follows the **ad account's timezone**. The page shows that timezone, plus fetch times in IST.
+- **Attribution:** every Insights request sends `use_unified_attribution_setting=true`, so figures follow each ad set's own attribution setting, as Ads Manager does.
+- **"Today" and the account timezone:** `date_preset=today` follows the **ad account's timezone**. Briyo OS uses the same account-local date for custom ranges: the picker's latest selectable day, the "no future dates" check, and whether a custom range is live. Example: at 00:30 IST on 7 Oct, an IST account's today is 7 Oct even though UTC is still 6 Oct. The page shows the account timezone; fetch times are shown in IST. Briyo OS's global timezone behaviour is unchanged.
 
 ## 3. Meta Business setup (done once by an admin, in Meta)
 
@@ -56,7 +58,7 @@ Browser (Briyo OS)  ──►  /api/marketing/*  (requireAuth → requireComplet
 - `name`, `status`, `effective_status`, `objective` (campaigns), `daily_budget`/`lifetime_budget`
 - Budgets are **not** shown in version 1.
 
-**Purchases and revenue:** exactly one action type is used, never summed: the first one present of `omni_purchase` → `purchase` → `offsite_conversion.fb_pixel_purchase`.
+**Purchases and revenue:** the purchase action type is resolved **once** per row, never summed: the first present (in either `actions` or `action_values`) of `omni_purchase` → `purchase` → `offsite_conversion.fb_pixel_purchase`. The purchase count and the conversion value both come from that same type; if that type has no entry in one list, that figure is 0 rather than taken from another type.
 - `omni_purchase` is what Ads Manager reports as "Purchases" across pixel, Conversions API and app.
 - Summing the types would double-count.
 
@@ -74,14 +76,36 @@ Metrics are computed from raw sums, never by averaging Meta's averages:
 - **Labelling:** revenue is always labelled **"Meta-attributed revenue"**. It is not Briyo's actual revenue.
 - **Reach:** reach is not additive across days, so it only comes from un-bucketed queries.
 
-## 5. Caching
+## 5. Freshness, caching and backoff
 
-- **Cache key:** in-process, keyed by account, endpoint, level, range, object id and filters.
-- **Lifetime:** ranges that include today expire after **45 s**. Ranges entirely in the past expire after **10 min**.
-- **Request sharing:** identical requests that arrive at the same moment share one in-flight Meta call. Many admins produce one call.
-- **Stale-if-error:** if Meta fails, the last good result (up to 24 h old) is served with `stale: true`, the reason, and the last successful fetch time.
-- **Visibility:** the UI shows "Data delayed · Last successful update …". With nothing cached, it shows an actionable error.
-- **Storage:** no database tables. Production runs as one instance, so the in-process cache is sufficient.
+| Range | Class | Cache | Auto-refresh |
+|---|---|---|---|
+| Today, This month, Custom ending on the account's today | Live | 45 s | Every 60 s while the page is visible |
+| Yesterday, Last 7 days, Last 30 days, Custom ending before the account's today | Closed | 10 min | No |
+
+- **Last 7 / Last 30** are complete days **excluding today** (Meta's `last_7d` / `last_30d` presets, sent unchanged); the page says so.
+- **Cache key:** in-process, keyed by account, endpoint, level, range, object id and filters. No database tables; production runs one instance.
+- **Request sharing:** identical concurrent requests share one in-flight Meta call.
+- **Refresh:** honoured only when the cached data is at least 10 s old, and never during a failure backoff.
+- **Stale-if-error:** if Meta fails, the last good result (up to 24 h old) is served with `stale: true`, the reason and the last successful fetch time.
+- **Failure backoff:** after a Meta failure (rate limit, timeout, temporary error, token or permission problem, malformed response) the service backs off for **45 s, shared by all requests and ranges**. During it no Meta call is made: requests get the last good data marked delayed, or an error if nothing is cached. After 45 s the next request retries; there is no permanent circuit breaker. Invalid input and internal errors do not start a backoff.
+
+### Freshness states
+
+| State | Where | Meaning |
+|---|---|---|
+| **Live** | Marketing page | Live range, served fresh from Meta (as fresh as Meta has it). |
+| **Data delayed** | Marketing page | Meta failed or is backing off; last good data shown with "Last successful update …". |
+| **Loading** | Overview card | Meta did not answer within the Overview budget; the figures appear on the next load. |
+| **Unavailable** | Marketing page / Overview | Meta failed and nothing is cached; an actionable message is shown. |
+| **Not connected** | Marketing page / Overview | No token or ad account is configured. |
+
+### Admin Overview
+
+- Marketing never blocks the rest of the Overview.
+- Cached data is shown immediately. A fresh fetch gets about **2 s**; past that the card shows **Loading** and every other department renders normally, with no alert raised.
+- The fetch keeps running in the background and fills the shared cache, so the next Overview (or the Marketing page) gets the figures at once.
+- The Marketing page itself is not subject to the 2 s budget (it uses the normal 15 s request timeout).
 
 ## 6. Navigation and screens
 
@@ -94,7 +118,7 @@ GROWTH → **Marketing**, with sub-items **Overview** and **Campaigns**.
 - **KPI cards:** Spend · Meta-attributed revenue · Meta ROAS · Purchases · Cost / purchase · CTR · CPC · CPM.
 - **Trend chart:** spend vs Meta-attributed revenue by day, for multi-day ranges. Today has no daily trend, and the chart says so.
 - **Campaign table:** search, status filter, sortable columns. Clicking a campaign opens its detail (KPIs, trend, ad sets). Clicking an ad set opens its ads.
-- **Auto-refresh:** every 60 s while the page is visible, for ranges that include today.
+- **Auto-refresh:** every 60 s while the page is visible, for live ranges only (see §5).
 
 ## 7. Colour and thresholds
 
@@ -136,5 +160,7 @@ None. Snapshots, a warehouse, blended ROAS and CAC are later phases.
 - **Token handling:** the token lives only in server memory and the environment. It is sent in an `Authorization: Bearer` header, never in a URL.
 - **Logging:** logs record the Meta error code, subcode and `fbtrace_id`, never the token or the full URL.
 - **Responses:** responses never include the token, the app secret, or Meta's raw error text.
-- **Read-only:** the client exposes `GET` only. There is no code path that writes to Meta, and the token's `ads_read` scope would refuse writes anyway.
+- **Signing:** every call carries `appsecret_proof` when `META_APP_SECRET` is set.
+- **Scope:** `ads_read` only; `ads_management` is never requested.
+- **Read-only:** version 1 is read-only. The client exposes `GET` only. There is no code path that writes to Meta, and the token's `ads_read` scope would refuse writes anyway.
 - **Bounded queries:** ranges are validated (custom ≤ 92 days, no future dates) and id parameters are digits only.
