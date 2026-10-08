@@ -6903,11 +6903,17 @@ await step('affiliate commissions: one per attribution, rate and base fixed at c
   if (c1[0].rate_bps !== 1250 || c1[0].commission_amount !== '21.67' || c1[0].base_amount !== '173.36') bad.push('rate change touched the commission');
   await expectErr('edit amount', () => pool.query('UPDATE affiliate_commissions SET commission_amount = 1 WHERE id = $1', [c1[0].id]), (e) => /fixed when it is created/.test(e.message));
   await expectErr('delete', () => pool.query('DELETE FROM affiliate_commissions WHERE id = $1', [c1[0].id]), (e) => /never deleted/.test(e.message));
-  // 4. Currency kept: a USD order → its own commission in USD, at the rate in effect when it was placed (12.5%, placed before the new rate).
+  // 4. Currency kept: a USD order → its own commission in USD, at the rate in effect when ITS attribution was
+  //    created — after the new 10% rate — while the earlier commission keeps 12.5%.
   const oUsd = await order('USD', { value: '20.00', cur: 'USD' });
   await attribute(oUsd, 'CM-CMAXQT');
   const cu = (await commissionsOf(oUsd))[0];
-  if (!cu || cu.currency !== 'USD' || cu.commission_amount !== '2.50' || cu.rate_bps !== 1250) bad.push(`USD ${JSON.stringify(cu)}`);
+  if (!cu || cu.currency !== 'USD' || cu.commission_amount !== '2.00' || cu.rate_bps !== 1000) bad.push(`USD ${JSON.stringify(cu)}`);
+  if ((await commissionsOf(o1))[0].rate_bps !== 1250) bad.push('earlier commission lost its rate');
+  // 4b. An order already cancelled / voided when attributed → no commission, logged.
+  const oVoid = await order('VOIDED', { value: '300.00', sub: '300.00', cancelled: true });
+  await attribute(oVoid, 'CM-CMAXQT');
+  if ((await commissionsOf(oVoid)).length) bad.push('commission on a cancelled order');
   // 5. No financial record → no commission (never ₹0), logged; created later by the backfill once the record exists.
   const oNone = await order('NOREC');
   await attribute(oNone, 'CM-CMAXQT');
@@ -6917,29 +6923,34 @@ await step('affiliate commissions: one per attribution, rate and base fixed at c
   await attribute(oNoRate, 'CM-CMNRQT');
   if ((await commissionsOf(oNoRate)).length) bad.push('commission without a rate');
   const skipped = (await pool.query(`SELECT metadata->>'skipped' AS s FROM affiliate_events WHERE action = 'commission_not_created' AND affiliate_id = ANY($1) ORDER BY id`, [[A, N]])).rows.map((r) => r.s);
-  if (skipped.join() !== 'no_financial_snapshot,no_rate') bad.push(`skip log ${skipped.join()}`);
+  if (skipped.join() !== 'order_cancelled,no_financial_snapshot,no_rate') bad.push(`skip log ${skipped.join()}`);
   gid += 1;
   await pool.query(`INSERT INTO order_financial_snapshots (order_id, shopify_order_gid, sequence, content_hash, shop_currency, presentment_currency, taxes_included,
       financial_status, current_subtotal, current_total_tax, current_shipping, current_total_discounts, current_total_price, total_price, total_refunded, total_refunded_shipping, money)
     VALUES ($1, $2, 1, $3, 'INR', 'INR', true, 'PAID', 80, 0, 0, 0, 80, 80, 0, 0, '{}')`, [oNone, `gid://shopify/Order/${gid}`, crypto.createHash('sha256').update('cm-late').digest('hex')]);
+  // A #2809-like attribution made before the ledger existed (no commission_not_created log) is never backfilled,
+  // even with a financial record; nor is the voided one (still cancelled).
+  const oPre = await order('PRELEDGER', { value: '273.00', sub: '215.00', tax: '41.64', ship: '58.00' });
+  await pool.query(`INSERT INTO affiliate_order_attributions (order_id, affiliate_id, attribution_method, order_placed_at, rule_version, attributed_at) VALUES ($1, $2, 'gokwik_full_url', now() - interval '1 hour', 'v2', now() - interval '1 hour')`, [oPre, A]);
   const bf = await backfillAffiliateCommissions({ actor: ACT });
   const bf2 = await backfillAffiliateCommissions({ actor: ACT });
   const late = (await commissionsOf(oNone))[0];
-  if (!late || late.commission_amount !== '10.00' || bf.created < 1 || bf2.created !== 0) bad.push(`backfill ${JSON.stringify([bf, bf2, late?.commission_amount])}`);
+  if (!late || late.commission_amount !== '8.00' || bf.created !== 1 || bf2.created !== 0) bad.push(`backfill ${JSON.stringify([bf, bf2, late?.commission_amount])}`);
+  if ((await commissionsOf(oPre)).length || (await commissionsOf(oVoid)).length) bad.push('pre-ledger or voided attribution backfilled');
   // 7. Cancelled after the commission: kept, flagged, not counted as earned; finance staff reverse it (reason required), amounts kept.
   const oCan = await order('CANCEL', { value: '400.00' });
   await attribute(oCan, 'CM-CMAXQT');
   await pool.query(`UPDATE orders SET order_status = 'cancelled' WHERE id = $1`, [oCan]);
   let perf = await getAffiliatePerformance('CMAXQT', { money: true });
   const inr = perf.totals.by_currency.find((x) => x.currency === 'INR');
-  // INR earned: 21.67 + 10.00 (cancelled 50.00 apart); order value 273 + 80 (cancelled 400 excluded).
-  if (inr.commission_earned !== 31.67 || inr.on_cancelled_orders !== 50 || inr.order_value !== 353 || !perf.orders.find((o) => o.order === '#CMCANCEL').cancelled) bad.push(`INR totals ${JSON.stringify(inr)}`);
-  if (perf.totals.by_currency.find((x) => x.currency === 'USD').commission_earned !== 2.5) bad.push('USD totals');
+  // INR earned: 21.67 (12.5%) + 8.00 (10% on ₹80); the cancelled order's 40.00 apart; order value 273 + 80 + 273 (pre-ledger, no commission).
+  if (inr.commission_earned !== 29.67 || inr.on_cancelled_orders !== 40 || inr.order_value !== 626 || !perf.orders.find((o) => o.order === '#CMCANCEL').cancelled) bad.push(`INR totals ${JSON.stringify(inr)}`);
+  if (perf.totals.by_currency.find((x) => x.currency === 'USD').commission_earned !== 2) bad.push('USD totals');
   const cc = (await commissionsOf(oCan))[0];
   await expectErr('reverse without reason', () => setCommissionStatus('CMAXQT', Number(cc.id), { status: 'reversed', actor: ACT }), (e) => e.status === 400);
   await setCommissionStatus('CMAXQT', Number(cc.id), { status: 'reversed', reason: 'Order cancelled', actor: ACT });
   const ccAfter = (await commissionsOf(oCan))[0];
-  if (ccAfter.status !== 'reversed' || ccAfter.commission_amount !== '50.00' || ccAfter.status_reason !== 'Order cancelled') bad.push('reversal');
+  if (ccAfter.status !== 'reversed' || ccAfter.commission_amount !== '40.00' || ccAfter.rate_bps !== 1000 || ccAfter.base_amount !== '400.00' || ccAfter.status_reason !== 'Order cancelled') bad.push('reversal');
   // 8. Status path pending → approved → paid; illegal moves refused; every move in the history and the activity log.
   await expectErr('pending → paid', () => setCommissionStatus('CMAXQT', Number(c1[0].id), { status: 'paid', actor: ACT }), (e) => e.status === 409);
   await setCommissionStatus('CMAXQT', Number(c1[0].id), { status: 'approved', actor: ACT });
@@ -6959,7 +6970,7 @@ await step('affiliate commissions: one per attribution, rate and base fixed at c
   if (fin.status !== 200 || !fin.body.money || !fin.body.canApprove || !fin.body.canPay) bad.push('finance view');
   const v = o2809(vw);
   if (vw.status !== 200 || vw.body.money || !v || 'order_value' in v || 'commission' in v || 'currency' in v || 'totals' in vw.body.performance) bad.push(`viewer saw money ${JSON.stringify(vw.body.performance)}`);
-  if (vw.body.performance?.clicks?.total === undefined || vw.body.performance.attributions.total !== 4) bad.push('viewer counts');
+  if (vw.body.performance?.clicks?.total === undefined || vw.body.performance.attributions.total !== 6) bad.push('viewer counts');
   const vMove = await af('viewer', 'POST', `/api/affiliates/CMAXQT/commissions/${late.id}/status`, { status: 'approved' });
   const mMove = await af('manager', 'POST', `/api/affiliates/CMAXQT/commissions/${late.id}/status`, { status: 'approved' });
   const fMove = await af('finance', 'POST', `/api/affiliates/CMAXQT/commissions/${late.id}/status`, { status: 'approved' });
@@ -6967,13 +6978,31 @@ await step('affiliate commissions: one per attribution, rate and base fixed at c
   // The activity log never shows amounts.
   const ev = await af('viewer', 'GET', '/api/affiliates/CMAXQT');
   if (/21\.67|173\.36|₹|commission_amount/.test(JSON.stringify(ev.body.events || ev.body))) bad.push('amounts in the activity log');
+  // "Clicks in the last 30 days" = the last 30 IST calendar days, today included: a click at 00:00 IST 29 days
+  // ago counts; one a second earlier does not (a rolling 30×24h window would count both or neither).
+  const { rows: [b30] } = await pool.query(`SELECT ((((now() AT TIME ZONE 'Asia/Kolkata')::date - 29)::timestamp) AT TIME ZONE 'Asia/Kolkata') AS since`);
+  const { rows: [asset] } = await pool.query(`SELECT id FROM affiliate_referral_assets WHERE affiliate_id = $1 LIMIT 1`, [A]);
+  const c30 = async () => (await getAffiliatePerformance('CMAXQT')).clicks;
+  const before30 = await c30();
+  await pool.query(`INSERT INTO affiliate_referral_clicks (public_id, affiliate_id, referral_asset_id, visitor_id, clicked_at) VALUES
+    ('cmIstBoundaryClick0001', $1, $2, 'cmIstBoundaryVisitor01', $3), ('cmIstBoundaryClick0002', $1, $2, 'cmIstBoundaryVisitor02', $3::timestamptz - interval '1 second')`, [A, asset.id, b30.since]);
+  const after30 = await c30();
+  if (after30.total - before30.total !== 2 || after30.last_30_days - before30.last_30_days !== 1) bad.push(`IST 30-day window ${JSON.stringify([before30, after30])}`);
+  if (new Date(b30.since).getUTCHours() !== 18 || new Date(b30.since).getUTCMinutes() !== 30) bad.push(`window does not start at 00:00 IST: ${new Date(b30.since).toISOString()}`);
+  // The New affiliate drawer keeps its fixes: padded form, scrolling body, in-drawer discard (no native confirm).
+  const afPage = await fsp.readFile(new URL('../public/affiliates.js', import.meta.url), 'utf8');
+  const afHtml = await fsp.readFile(new URL('../public/affiliates.html', import.meta.url), 'utf8');
+  const uiCss = await fsp.readFile(new URL('../public/ui.css', import.meta.url), 'utf8');
+  if (/window\.confirm\('Discard your unsaved changes\?'\)/.test(afPage) || !/state\.discardAsked/.test(afPage) || !afHtml.includes('id="dDiscard"') || !afHtml.includes('Keep editing')
+    || !afHtml.includes('class="drawer af-drawer"') || !/\.af-drawer \.drawer-body > form \{ padding/.test(uiCss) || !/\.drawer-body \{ overflow-y: auto; flex: 1; min-height: 0; \}/.test(uiCss)
+    || !/\$\('#dClose'\)\.addEventListener\('click'/.test(afPage) || !/drawerScrim'\)\.addEventListener\('click'/.test(afPage) || !/e\.key === 'Escape'\) closeDrawer\(\)/.test(afPage)) bad.push('drawer fixes');
   // Recorded tax larger than the subtotal → no commission (negative base), logged; never a guessed amount.
   const oNeg = await order('NEG', { value: '10.00', sub: '10.00', tax: '12.00' });
   await attribute(oNeg, 'CM-CMAXQT');
   if ((await commissionsOf(oNeg)).length) bad.push('commission on a negative base');
   await purgeTestOrders(P); await purgeTestAffiliates(ACT);
   if (bad.length) throw new Error(bad.join(' | '));
-  return 'base = subtotal ₹215.00 − recorded tax ₹41.64 = ₹173.36 (shipping ₹58 and tax excluded) × 12.5% → one ₹21.67 commission (rate 1250 kept after a new 10% rate; amounts and history immutable); negative base → none; USD kept as USD ₹→$2.50; no record / no rate → none, logged, backfilled once the record exists (idempotent); cancelled order flagged, not earned, reversed with a reason; pending→approved→paid audited, illegal moves 409; admin/finance see money, viewer gets no money fields and cannot move statuses; activity shows no amounts';
+  return 'base = subtotal ₹215.00 − recorded tax ₹41.64 = ₹173.36 (shipping ₹58 and tax excluded) × 12.5% → one ₹21.67 commission (rate 1250 kept after a new 10% rate; amounts and history immutable); negative base → none; USD kept as USD ₹→$2.50; no record / no rate / voided → none, logged; retried by the backfill only when skipped-and-logged (pre-ledger #2809-like never); cancelled order flagged, not earned, reversed with a reason; pending→approved→paid audited, illegal moves 409; admin/finance see money, viewer gets no money fields and cannot move statuses; activity shows no amounts';
 });
 
 await step('affiliates admin cleanup', async () => {

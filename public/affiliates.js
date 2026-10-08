@@ -249,7 +249,7 @@ function renderDetail() {
               <td>${r.reason ? esc(r.reason) : '<span class="soft">—</span>'}</td>
               <td>${by(r.created_at, r.created_by)}</td></tr>`).join('')}</tbody></table></div>`
     : `<div class="empty-note"><b>No rate yet.</b>${canManage() && !closed ? 'Add one with New rate. Rates are never edited: a change is a new row.' : 'An affiliate manager sets the rate.'}</div>`}
-          <div class="pane-foot">A commission uses the rate in effect when its order was placed, fixed when it is recorded. Adding a new rate never changes a recorded commission.</div>
+          <div class="pane-foot">A commission uses the rate in effect when its order was attributed, fixed when it is recorded. Adding a new rate never changes a recorded commission.</div>
         </div>
       </section>
 
@@ -623,7 +623,7 @@ function performanceCard() {
       ${P.orders.length ? `<div class="table-wrap"><table class="table"><thead>${head}</thead><tbody>${rows}</tbody></table></div>`
     : '<div class="empty-note"><b>No attributed orders yet.</b></div>'}
       <div class="pane-foot">${money
-    ? 'Order value is Shopify\'s current total for the order. Commission base = Shopify net subtotal excluding recorded tax (subtotal after discounts, without shipping, minus the tax Shopify recorded) — Shopify can record GST on shipping on product lines, so this is not an exact tax-exclusive merchandise value. Commission = base × the rate in effect when the order was placed, both fixed when recorded; a later rate change does not alter it. Payouts are not part of Briyo OS yet.'
+    ? 'Order value is Shopify\'s current total for the order. Commission base = Shopify net subtotal excluding recorded tax (subtotal after discounts, without shipping, minus the tax Shopify recorded) — Shopify can record GST on shipping on product lines, so this is not an exact tax-exclusive merchandise value. Commission = base × the rate in effect when the order was attributed, both fixed when recorded; cancelled orders earn none; a later rate change does not alter it. Payouts are not part of Briyo OS yet.'
     : 'Order values and commissions are visible to admins and affiliate finance staff.'}</div>
     </div>
   </section>`;
