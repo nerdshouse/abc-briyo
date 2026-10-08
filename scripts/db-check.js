@@ -4639,12 +4639,15 @@ await step('shopify oauth: APP_BASE_URL pins the callback; connecting stores the
     if ((await getPool().query(`SELECT count(*)::int n FROM order_imports WHERE kind = 'shopify_sync'`)).rows[0].n) bad.push('an order sync ran');
     if (/First Shopify pull|Shopify poll: every|Shopify orders poll: every/.test(log)) bad.push('a pull or poll started');
     if (log.includes(TOKEN) || log.includes(SECRET)) bad.push('token or secret in the server log');
+    // The Import page reads this to hide "Pull from Shopify now" while the abandoned-checkout poll is off.
+    const cfg = await (await fetch(`${base}/api/config`, { headers: { cookie: admin } })).json();
+    if (!cfg.shopifyAuthorized || cfg.shopifyPollEnabled !== false) bad.push(`config authorized=${cfg.shopifyAuthorized} pollEnabled=${cfg.shopifyPollEnabled}`);
   } finally {
     srv.kill(); stub.close();
     await getPool().query(`DELETE FROM system_state WHERE key = 'shopify_oauth_token'`);
   }
   if (bad.length) throw new Error(bad.join(' | '));
-  return 'install from the Render host → redirect_uri https://abc.briyo.xyz/auth/shopify/callback (APP_BASE_URL); non-admin refused; missing/wrong state and tampered HMAC → 403 with no token exchange; valid callback stores the token and redirects; then 0 Shopify queries, 0 carts, 0 order syncs, no poll started, no token in logs';
+  return 'install from the Render host → redirect_uri https://abc.briyo.xyz/auth/shopify/callback (APP_BASE_URL); non-admin refused; missing/wrong state and tampered HMAC → 403 with no token exchange; valid callback stores the token and redirects; then 0 Shopify queries, 0 carts, 0 order syncs, no poll started, no token in logs; /api/config reports polling off';
 });
 
 await step('hr: RBAC — HR manager, admin and multi-module reach HR; others refused; no accidental access', async () => {

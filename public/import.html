@@ -69,7 +69,7 @@
       <section class="card panel">
         <header class="card-head"><h2 class="card-title"><i data-lucide="refresh-cw"></i>Live Shopify sync</h2><span class="card-meta" id="shopifyState">checking…</span></header>
         <div class="pane pad">
-          <p class="hint">Shopify has no abandoned-checkout webhook, so Briyo OS <strong>polls</strong> Shopify instead. Once connected it pulls automatically; use this button when you don't want to wait for the next run. Carts pulled this way carry a working recovery link, which the CSV export does not.</p>
+          <p class="hint" id="pollHint">Shopify has no abandoned-checkout webhook, so Briyo OS <strong>polls</strong> Shopify instead. Once connected it pulls automatically; use this button when you don't want to wait for the next run. Carts pulled this way carry a working recovery link, which the CSV export does not.</p>
           <div class="form-actions">
             <a class="btn primary" id="connectBtn" href="/auth/shopify/install" hidden>Connect Shopify</a>
             <button type="button" class="btn primary" id="pullBtn">Pull from Shopify now</button>

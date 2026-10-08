@@ -545,6 +545,8 @@ app.get('/api/config', async (req, res) => {
     shopifyConnected: shopifyConfigured(),
     shopifyAuthorized: shopifyConfigured()
       && Boolean((await loadToken(process.env.SHOPIFY_STORE_DOMAIN).catch(() => null))?.token),
+    // The abandoned-checkout poll (lib/shopify-poll.js) — same test as startShopifyPoll. Off: GoKwik is the feed.
+    shopifyPollEnabled: process.env.SHOPIFY_POLL_ENABLED !== 'false',
     me: req.session?.phone ?? null,
     isAdmin: Boolean(req.session?.isAdmin),
   });
