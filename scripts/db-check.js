@@ -6451,6 +6451,20 @@ await step('referral: creating a link sets up the Shopify storefront redirect au
     calls.length = 0;
     const r4 = await createReferralLink(D, { actor: 'db-check', gql: fake([{ id: 'x', path: `/r/${D}`, target: 'https://elsewhere.example/' }]) });
     if (mutations().length || r4.storefront_setup?.reason !== 'conflict' || !r4.link || r4.link.storefront_redirect_set) bad.push(`conflict ${JSON.stringify(r4.storefront_setup)}`);
+    // An existing redirect to /R/{id} (capital R) is broken — the click host serves only lowercase /r/ — so it is a
+    // conflict: never adopted as configured, never overwritten.
+    const F = await newAff('Auto redirect capital R');
+    calls.length = 0;
+    const r6 = await createReferralLink(F, { actor: 'db-check', gql: fake([{ id: 'gid://shopify/UrlRedirect/99', path: `/r/${F}`, target: `https://go.test/R/${F}` }]) });
+    if (mutations().length || r6.storefront_setup?.reason !== 'conflict' || r6.link?.storefront_redirect_set || (await asset(F))?.storefront_redirect_gid) bad.push(`/R/ adopted ${JSON.stringify([r6.storefront_setup, (await asset(F))?.storefront_redirect_gid])}`);
+    // Only the id ignores case: the matching rule itself, for the forms that must and must not be adopted.
+    const { isClickTarget } = await import('../lib/affiliate-referrals.js');
+    const adopt = ['https://go.briyo.xyz/r/GPJ92U', 'https://go.briyo.xyz/r/gpj92u', 'https://go.briyo.xyz/r/GpJ92u', 'https://GO.briyo.xyz/r/GPJ92U', 'https://go.briyo.xyz/r/GPJ92U/'];
+    const refuse = ['https://go.briyo.xyz/R/GPJ92U', 'https://go.briyo.xyz/ref/GPJ92U', 'https://other.example/r/GPJ92U', 'http://go.briyo.xyz/r/GPJ92U',
+      'https://go.briyo.xyz/r/OTHER1', 'https://go.briyo.xyz:8443/r/GPJ92U', 'https://go.briyo.xyz/r/GPJ92U?next=https://evil.example', 'https://go.briyo.xyz.evil.example/r/GPJ92U',
+      'https://user@go.briyo.xyz/r/GPJ92U', '/r/GPJ92U', ''];
+    for (const u of adopt) if (!isClickTarget(u, 'go.briyo.xyz', 'GPJ92U')) bad.push(`should adopt ${u}`);
+    for (const u of refuse) if (isClickTarget(u, 'go.briyo.xyz', 'GPJ92U')) bad.push(`should refuse ${u}`);
     // 10. No caller can choose the destination: extra options are ignored; the target is always the click host + the same id.
     calls.length = 0;
     await syncStorefrontRedirect(D, { actor: 'db-check', target: 'https://evil.example/', path: '/x', gql: fake([]) });
@@ -6461,11 +6475,11 @@ await step('referral: creating a link sets up the Shopify storefront redirect au
     const api = await af('manager', 'POST', `/api/affiliates/${E}/referral`, { target: 'https://evil.example/' });
     if (api.status !== 201 || !api.body.referral?.link || api.body.referral.link.storefront_redirect_set || api.body.referral.storefront_setup?.ok !== false) bad.push(`api create ${api.status} ${JSON.stringify(api.body.referral?.storefront_setup)}`);
     // No click recorded by any of this.
-    const clicks = (await getPool().query(`SELECT count(*)::int n FROM affiliate_referral_clicks c JOIN affiliates a ON a.id = c.affiliate_id WHERE a.public_id = ANY($1)`, [[A, B, C, D, E]])).rows[0].n;
+    const clicks = (await getPool().query(`SELECT count(*)::int n FROM affiliate_referral_clicks c JOIN affiliates a ON a.id = c.affiliate_id WHERE a.public_id = ANY($1)`, [[A, B, C, D, E, F]])).rows[0].n;
     if (clicks) bad.push(`${clicks} clicks recorded`);
   } finally { if (keep === undefined) delete process.env.AFFILIATE_CLICK_HOST; else process.env.AFFILIATE_CLICK_HOST = keep; }
   if (bad.length) throw new Error(bad.join(' | '));
-  return 'create link → redirect /r/{id} → https://go.test/r/{id} created and stored; re-run creates nothing; missing permission → link kept (active), status missing_scope, logged, retry works; lowercase existing redirect adopted; conflicting one kept (not overwritten); caller cannot pick the target; API create 201 with setup status; no clicks';
+  return 'create link → redirect /r/{id} → https://go.test/r/{id} created and stored; re-run creates nothing; missing permission → link kept (active), status missing_scope, logged, retry works; lowercase existing redirect adopted; /R/ (broken) and other targets are conflicts, never adopted or overwritten; caller cannot pick the target; API create 201 with setup status; no clicks';
 });
 
 await step('referral: public redirect — 302 to the fixed storefront, opaque click and visitor ids, UTM allow-list, no open redirect, safe failures, isolated host', async () => {
