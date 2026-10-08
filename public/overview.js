@@ -30,9 +30,30 @@ const DEPTS = {
   support: { label: 'Support', icon: 'headset', href: '/?mode=tocall' },
   hr: { label: 'HR', icon: 'briefcase', href: '/hr/jobs' },
   team: { label: 'Team', icon: 'users', href: '/admin' },
+  // Commerce (one API section, shown as two modules) and parcels.
+  shopify: { label: 'Shopify', icon: 'shopping-bag', href: '/orders?channel=website' },
+  affiliate: { label: 'Affiliates', icon: 'link-2', href: '/affiliates' },
+  shipments: { label: 'Shipments', icon: 'package', href: '/orders' },
 };
 // Reading order. Pairs share a row on wide screens; a lone module takes the row.
-const ROWS = [['marketing'], ['logistics', 'inventory'], ['support', 'hr'], ['team']];
+// Reading order, in groups. Pairs share a row on wide screens; a lone module takes the row.
+const GROUPS = [
+  { rows: [['marketing']] },
+  { title: 'Commerce', rows: [['shopify', 'affiliate']] },
+  { title: 'Operations', rows: [['shipments', 'inventory'], ['logistics', 'support']] },
+  { rows: [['hr'], ['team']] },
+];
+const ROWS = GROUPS.flatMap((g) => g.rows);
+/** sections.commerce is one permission-gated API section; on the page it is two modules. */
+function pageSections(sections) {
+  const out = { ...sections };
+  const c = out.commerce;
+  delete out.commerce;
+  if (c && !c.ok) out.shopify = { ok: false };
+  if (c?.ok && c.shopify) out.shopify = { ok: true, ...c.shopify };
+  if (c?.ok && c.affiliate) out.affiliate = { ok: true, ...c.affiliate };
+  return out;
+}
 const SEV_LABEL = { critical: 'Critical', warning: 'Warning', attention: 'Review' };
 
 function greeting(tz) {
@@ -84,7 +105,14 @@ function marketingHealth(s) {
   const [tone, word] = deptHealth('marketing');
   return tone === 'healthy' ? ['healthy', 'Live'] : [tone, word];
 }
-const healthOf = (k, s) => (!s.ok ? ['critical', 'Unavailable'] : k === 'marketing' ? marketingHealth(s) : deptHealth(k));
+/** Shopify's header word is its sync state (admins only); stale is a warning, never an outage — polling is manual. */
+function shopifyHealth(s) {
+  if (!s.sync) return deptHealth('shopify');
+  if (s.sync.status === 'never') return ['warning', 'No successful sync'];
+  if (s.sync.status === 'stale') return ['warning', 'Sync stale'];
+  return ['healthy', 'Synced'];
+}
+const healthOf = (k, s) => (!s.ok ? ['critical', 'Unavailable'] : k === 'marketing' ? marketingHealth(s) : k === 'shopify' ? shopifyHealth(s) : deptHealth(k));
 
 // ------------------------------------------------------------------ Marketing
 
@@ -207,10 +235,92 @@ async function loadMarketingContext() {
   renderIcons();
 }
 
+// ------------------------------------------------------------------ Commerce and shipments
+
+/** Money in its own currency — one figure per currency, never summed across currencies. */
+const cash = (currency, v) => {
+  const d = Number.isInteger(v) ? 0 : 2;   // ₹1,800 · ₹3,487.50
+  return new Intl.NumberFormat('en-IN', { style: 'currency', currency, maximumFractionDigits: d, minimumFractionDigits: d }).format(v);
+};
+const SYNC_WORD = { ok: ['healthy', 'OK'], stale: ['warning', 'Stale'], never: ['warning', 'No successful sync'] };
+const RUN_WORD = { completed: 'Completed', partial: 'Partial', failed: 'Failed', running: 'Running' };
+
+function shopifyMoney(m) {
+  if (!m) return '';   // non-admins: the API leaves money out entirely
+  const multi = m.by_currency.length > 1;
+  const blocks = m.by_currency.map((c) => `<div class="ox-stats c3${multi ? ' ox-cur' : ''}" role="group" aria-label="Order value in ${esc(c.currency)}">
+      ${stat(`Current order value${multi ? ` · ${c.currency}` : ''}`, esc(cash(c.currency, c.current_order_value)), { note: `${n(c.orders)} active ${plural(c.orders, 'order', 'orders')}${c.refunded ? ` · ${esc(cash(c.currency, c.refunded))} refunded` : ''}` })}
+      ${stat('Paid', esc(cash(c.currency, c.paid)))}
+      ${stat('Pending', esc(cash(c.currency, c.pending)), { note: c.other ? `Other ${esc(cash(c.currency, c.other))} · ${esc(Object.keys(c.other_statuses).join(', ').toLowerCase().replaceAll('_', ' '))}` : 'Shopify payment status' })}
+    </div>`).join('');
+  const unknown = m.orders_without_snapshot ? `<p class="ox-quiet">${n(m.orders_without_snapshot)} active ${plural(m.orders_without_snapshot, 'order has', 'orders have')} no Shopify financial record yet — not counted above.</p>` : '';
+  return (blocks || '<p class="ox-quiet">No financial records yet.</p>') + unknown;
+}
+
+function shopifySync(y) {
+  if (!y) return '';   // admin only
+  const [tone, word] = SYNC_WORD[y.status] || ['neutral', y.status];
+  const r = y.last_run;
+  const run = r ? `${RUN_WORD[r.status] || esc(r.status)} · ${esc(istDateTime(r.completed_at || r.started_at))}${r.status !== 'failed' ? ` · ${n(r.orders_created)} new, ${n(r.orders_updated)} updated` : ''}` : 'None yet';
+  return `<div class="ox-sync">
+      <div class="ox-sync-head"><h3>Shopify sync</h3><span class="health ${tone}">${word}</span>${y.message ? `<span class="ox-sync-msg">${esc(y.message)}</span>` : ''}</div>
+      <dl class="ox-dl">
+        <div><dt>Last successful sync</dt><dd>${y.checkpoint_at ? esc(istDateTime(y.checkpoint_at)) : '—'}</dd></div>
+        <div><dt>Polling</dt><dd>${y.polling ? 'On' : 'Off'}</dd></div>
+        <div><dt>Latest run</dt><dd>${run}</dd></div>
+        <div><dt>Recent failed runs</dt><dd>${y.recent_runs ? `${n(y.recent_failed_runs)} of last ${n(y.recent_runs)}` : 'No runs yet'}</dd></div>
+        <div><dt>Retries, latest run</dt><dd>${r && r.retries !== null && r.retries !== undefined ? n(r.retries) : 'Not recorded'}</dd></div>
+      </dl>
+    </div>`;
+}
+
+function affiliateValue(v) {
+  if (!v) return '';   // admin only
+  const multi = v.by_currency.length > 1;
+  const notes = [v.cancelled_orders && `${n(v.cancelled_orders)} cancelled not counted`, v.orders_without_snapshot && `${n(v.orders_without_snapshot)} without a financial record`].filter(Boolean).join(' · ');
+  const figs = v.by_currency.length ? v.by_currency.map((c) => stat(`Attributed order value${multi ? ` · ${c.currency}` : ''}`, esc(cash(c.currency, c.value)), { note: `${n(c.orders)} ${plural(c.orders, 'order', 'orders')}${notes && !multi ? ` · ${notes}` : ''}` })).join('')
+    : stat('Attributed order value', '—', { note: notes || 'No attributed orders yet' });
+  return `<div class="ox-stats ${v.by_currency.length > 1 ? 'c3' : 'c1'}">${figs}</div>${multi && notes ? `<p class="ox-quiet">${notes}</p>` : ''}`;
+}
+
 // ------------------------------------------------------------------ Departments
 
 const BODIES = {
   marketing: marketingBody,
+
+  // Shopify orders (logistics.view); money and sync health only arrive for admins.
+  shopify: (s) => `
+    <p class="ox-scope"><span class="src-badge src-shopify">Shopify</span> All synced orders</p>
+    <div class="ox-stats c2">
+      ${stat('Active orders', n(s.orders.active), { note: 'Not cancelled' })}
+      ${stat('Cancelled orders', n(s.orders.cancelled))}
+    </div>
+    ${shopifyMoney(s.money)}
+    ${shopifySync(s.sync)}`,
+
+  // The programme only: commission and payouts do not exist yet, so the page shows nothing about them.
+  affiliate: (s) => `
+    <div class="ox-stats c4">
+      ${stat('Affiliates', n(s.affiliates.total), { href: '/affiliates', note: s.affiliates.pending_verification ? `${n(s.affiliates.pending_verification)} pending verification` : '' })}
+      ${stat('Active', n(s.affiliates.active), { href: '/affiliates', note: s.affiliates.suspended ? `${n(s.affiliates.suspended)} suspended` : '' })}
+      ${stat('Clicks', n(s.clicks.total), { note: `${n(s.clicks.last_30d)} in the last 30 days` })}
+      ${stat('Attributed orders', n(s.attributions.total))}
+    </div>
+    ${affiliateValue(s.attributed_order_value)}`,
+
+  // Parcels, not orders: a shared parcel counts once; cancelled orders' parcels stay apart.
+  shipments: (s) => {
+    const b = s.by_status;
+    return `<div class="ox-ship">
+        ${stat('Active parcels', n(s.active_total), { note: 'Live, every status except cancelled', cls: 'hero' })}
+        <div class="ox-kv c3" role="group" aria-label="Parcels by status">
+          ${[['Not ready', b.not_ready], ['Packed', b.packed], ['Dispatched', b.dispatched], ['In transit', b.in_transit],
+    ['Out for delivery', b.out_for_delivery], ['Delivered', b.delivered]].map(([k, v]) => `<div><span class="ox-k">${k}</span><span class="ox-v num">${n(v)}</span></div>`).join('')}
+        </div>
+      </div>
+      ${group('Exceptions', `${signal('Delivery failed', b.delivery_failed, { tone: 'critical' })}${signal('RTO', b.rto, { tone: 'critical' })}`)}
+      <p class="ox-quiet ox-ship-foot">Cancelled parcels ${n(b.cancelled)} · On cancelled orders ${n(s.on_cancelled_orders)} — not in active parcels.</p>`;
+  },
 
   // Flow first (where orders are), then the two exceptions that need a person.
   logistics: (s) => `
@@ -235,12 +345,18 @@ const BODIES = {
       </div>
       <div class="ox-split">
         ${group('Stock', tracked ? `${signal('Out of stock', s.out_of_stock, { href: '/inventory?stock=out', tone: 'warning' })}
-          ${signal('Low stock', s.low_stock, { href: '/inventory?stock=low', tone: 'attention' })}
-          ${row('Platform SKUs to map', s.platform_skus_to_map, { href: '/inventory?view=unmapped', note: 'Setup' })}`
-          : `<p class="ox-quiet">${waiting}.</p>${row('Platform SKUs to map', s.platform_skus_to_map, { href: '/inventory?view=unmapped', note: 'Setup' })}`)}
+          ${signal('Low stock', s.low_stock, { href: '/inventory?stock=low', tone: 'attention' })}`
+          : `<p class="ox-quiet">${waiting}.</p>`)}
         ${group('Batches', `${signal('Expired, still holding stock', s.expired_batches, { href: '/inventory?expiring=expired', tone: 'critical' })}
           ${signal('Expiring within 30 days', s.expiring_30, { href: '/inventory?expiring=30', tone: 'attention' })}`)}
-      </div>`;
+      </div>
+      ${s.mappings === undefined ? '' : group('Setup and ledger', `<div class="ox-kv c3">
+        <a href="/inventory"><span class="ox-k">Mappings</span><span class="ox-v num">${n(s.mappings)}</span></a>
+        <a href="/inventory?view=unmapped"><span class="ox-k">Platform SKUs to map</span><span class="ox-v num">${n(s.platform_skus_to_map)}</span></a>
+        <a href="/inventory"><span class="ox-k">Stock cutover</span><span class="ox-v ox-v-text">${s.cutover_at ? esc(istDateTime(s.cutover_at)) : 'Not set'}</span></a>
+        <div><span class="ox-k">Batches</span><span class="ox-v num">${n(s.batches)}</span></div>
+        <div><span class="ox-k">Movements</span><span class="ox-v num">${n(s.movements)}</span></div>
+        <div><span class="ox-k">Active reservations</span><span class="ox-v num">${n(s.active_reservations)}</span></div></div>`, 'ox-setup')}`;
   },
 
   // The queue is the job: what is waiting, what is late, who owns it, what got done.
@@ -291,12 +407,17 @@ const BODIES = {
   },
 };
 
+const SUBS = {
+  marketing: '<span class="ox-mod-sub">Meta Ads · today</span>',
+  affiliate: '<span class="ox-mod-sub">Programme</span>',
+  shipments: '<span class="ox-mod-sub">Parcels</span>',
+};
 function moduleHtml(k, s) {
   const dept = DEPTS[k];
   const [tone, word] = healthOf(k, s);
   const head = `<header class="ox-mod-head">
       <h2 id="ov-${k}"><a href="${dept.href}">${icon(dept.icon)}${esc(dept.label)}</a></h2>
-      ${k === 'marketing' ? '<span class="ox-mod-sub">Meta Ads · today</span>' : ''}
+      ${SUBS[k] || ''}
       <span class="health ${tone}">${word}</span>
       <a class="ox-open" href="${dept.href}" aria-label="Open ${esc(dept.label)}">Open ${icon('arrow-right')}</a>
     </header>`;
@@ -358,20 +479,23 @@ function render() {
   $('#ovSub').innerHTML = pulse(d);
   updated();
 
-  const keys = Object.keys(d.sections).filter((k) => DEPTS[k]);
+  const sections = pageSections(d.sections);
+  const keys = Object.keys(sections).filter((k) => DEPTS[k]);
   // Status strip: one line per visible department; each jumps to its module.
   $('#ovStatus').innerHTML = keys.length > 1 ? ROWS.flat().filter((k) => keys.includes(k)).map((k) => {
-    const [tone, word] = healthOf(k, d.sections[k]);
+    const [tone, word] = healthOf(k, sections[k]);
     return `<a class="ox-chip tone-${tone}" href="#mod-${k}" aria-label="${esc(DEPTS[k].label)}: ${esc(word)}"><span class="ox-chip-dot" aria-hidden="true"></span><span class="ox-chip-name">${esc(DEPTS[k].label)}</span><span class="ox-chip-word">${esc(word)}</span></a>`;
   }).join('') : '';
 
   const body = $('#ovDepts');
-  body.innerHTML = ROWS.map((row) => row.filter((k) => keys.includes(k)))
-    .filter((row) => row.length)
-    .map((row) => (row.length === 1 && (row[0] === 'marketing' || row[0] === 'team')
-      ? moduleHtml(row[0], d.sections[row[0]])
-      : `<div class="ox-row${row.length === 1 ? ' solo' : ''}">${row.map((k) => moduleHtml(k, d.sections[k])).join('')}</div>`))
-    .join('');
+  body.innerHTML = GROUPS.map((g) => {
+    const rows = g.rows.map((row) => row.filter((k) => keys.includes(k))).filter((row) => row.length);
+    if (!rows.length) return '';
+    const html = rows.map((row) => (row.length === 1 && (row[0] === 'marketing' || row[0] === 'team')
+      ? moduleHtml(row[0], sections[row[0]])
+      : `<div class="ox-row${row.length === 1 ? ' solo' : ''}">${row.map((k) => moduleHtml(k, sections[k])).join('')}</div>`)).join('');
+    return g.title ? `<h2 class="ox-group-head">${esc(g.title)}</h2>${html}` : html;
+  }).join('');
   body.removeAttribute('aria-busy');
   renderAttention(d);
   renderIcons();
