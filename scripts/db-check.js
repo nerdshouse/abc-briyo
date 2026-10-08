@@ -58,6 +58,8 @@ import { overviewFor } from '../lib/overview.js';
 import { ensureAffiliateSchema, newAffiliatePublicId, rateAt, getAffiliateSetting, setAffiliateSetting, purgeTestAffiliates, _resetAffiliateSchemaForTest, createAffiliate } from '../lib/affiliates.js';
 import { receiveOrdersCreate, processWebhookDelivery, processPendingWebhooks, verifyWebhookHmac, ensureShopifyWebhookSchema } from '../lib/shopify-webhooks.js';
 import { startIncrementalSync, shopifySyncStatus, startFullHistorySync, fullHistoryStatus, grantedAccessScopes, hasReadAllOrders, _resetScopeCache, assertNoSyncRunning } from '../lib/shopify-orders.js';
+import { createAmazonClient, amazonConfig, amazonConfigured, redact, ENDPOINTS, ORDERS_API_VERSION, LWA_TOKEN_URL, SEARCH_ORDERS_RATE } from '../lib/amazon-spapi.js';
+import { mapAmazonOrder, runAmazonSync, startAmazonIncrementalSync, amazonSyncStatus, amazonSyncBusy, assertNoAmazonSyncRunning, sharedAmazonClient } from '../lib/amazon-orders.js';
 import { runShopifySync, mapShopifyOrder, shopifyPaymentMethod, shopifyPaymentStatus, shopifyOrdersStatus, pollShopifyOrdersOnce, ordersPollMinutes } from '../lib/shopify-orders.js';
 import { ensureOrderFinancialSnapshotSchema, financialSnapshotFrom, addAmounts, FINANCIAL_TABLES } from '../lib/order-financial-snapshots.js';
 import { SHOPIFY_MAX_QUERY_COST, SHOPIFY_ORDER_QUERIES, LIMITS as SHOPIFY_LIMITS, shopifyOrderQuery, estimateShopifyOrderQueryCost } from '../lib/shopify-order-queries.js';
@@ -4670,6 +4672,488 @@ await step('orders page: Refresh only reloads, Shopify starts the full sync (no 
   if (bad.length) throw new Error(bad.join(' | '));
   return 'Refresh handler only reloads (no Shopify call); Shopify button → POST /api/orders/shopify/sync-updates (never sync-all), the old drawer and its code removed; logo uses .shopify-mark with no background (not the sidebar dark .brand-mark tile); the official SVG has no background shape';
 });
+// ---- Amazon SP-API (Phase 2b): client, mapping, incremental sync — offline, fake transport only ------------
+const AZS = (n) => `${TEST_ORDER}-AZSP-${n}`;
+const AZ_ACTOR = `${TEST_ORDER}-azsync`;
+const AZ_SECRETS = { clientId: 'amzn1.application-oa2-client.dbcheck0001', clientSecret: 'dbcheck-lwa-secret-7f3a9c', refreshToken: 'Atzr|dbcheck-refresh-0b1c2d3e',
+  sellerId: 'A1DBCHECKSELLER', marketplaceId: 'A21TJRUUN4KGV', region: 'eu', endpoint: 'https://sellingpartnerapi-eu.amazon.com' };
+const azMoney = (amount, currencyCode = 'INR') => ({ amount: String(amount), currencyCode });
+/** An Amazon order item as Orders v2026-01-01 returns it with includedData=PROCEEDS (tax shown separately). */
+const azItem = (id, { sku = 'SKU-1', qty = 1, item = '422.88', tax = '76.12', ship = null, disc = null, cur = 'INR', taxCur = cur } = {}) => ({
+  orderItemId: id, quantityOrdered: qty,
+  product: { sellerSku: sku, title: 'Test product', asin: 'B0DBCHECK1', ...(item === null ? {} : { price: { unitPrice: azMoney(item, cur) } }) },
+  proceeds: { breakdowns: [
+    ...(item === null ? [] : [{ type: 'ITEM', subtotal: azMoney(item, cur) }]),
+    ...(tax === null ? [] : [{ type: 'TAX', subtotal: azMoney(tax, taxCur), detailedBreakdowns: [{ subtype: 'ITEM', value: azMoney(tax, taxCur) }] }]),
+    ...(ship === null ? [] : [{ type: 'SHIPPING', subtotal: azMoney(ship, cur) }]),
+    ...(disc === null ? [] : [{ type: 'DISCOUNT', subtotal: azMoney(disc, cur), detailedBreakdowns: [{ subtype: 'ITEM', value: azMoney(disc, cur) }] }]),
+  ] },
+});
+const azOrder = (n, items, { status = 'UNSHIPPED', by = 'MERCHANT', updated = '2026-10-08T10:00:00Z' } = {}) => ({
+  orderId: AZS(n), createdTime: '2026-09-20T10:15:00Z', lastUpdatedTime: updated,
+  salesChannel: { marketplaceId: 'A21TJRUUN4KGV', channelName: 'AMAZON' },
+  fulfillment: { fulfillmentStatus: status, fulfilledBy: by },
+  proceeds: { grandTotal: azMoney('499.00') },
+  // What a buyer section would look like — never requested, and never stored if Amazon sent it anyway.
+  ...(n === 1 ? { buyer: { buyerEmail: 'dbcheck-buyer@example.invalid', buyerName: 'Dbcheck Buyer' }, recipient: { deliveryAddress: { addressLine1: 'DBCHECK STREET 1', phone: '9000000077' } } } : {}),
+  orderItems: items,
+});
+/** A fake Amazon: LWA + Orders API. `pages[token]` = { orders, next }; `script` = responses to return first, in order. */
+function fakeAmazon() {
+  const s = { issued: 0, lwa: 0, lwaBodies: [], calls: [], pages: { '': { orders: [] } }, script: [], lwaScript: [], expired: new Set(), hold: null };
+  s.transport = async (req) => {
+    if (req.url === LWA_TOKEN_URL) {
+      s.lwa += 1; s.lwaBodies.push(req.body);
+      const f = s.lwaScript.shift();
+      if (f) return f;
+      s.issued += 1;
+      return { status: 200, headers: {}, text: JSON.stringify({ access_token: `Atza|dbcheck-access-${s.issued}`, token_type: 'bearer', expires_in: 3600, refresh_token: AZ_SECRETS.refreshToken }) };
+    }
+    s.calls.push(req);
+    if (s.hold) await s.hold;
+    const f = s.script.shift();
+    if (f instanceof Error) throw f;
+    if (f) return f;
+    if (req.headers['x-amz-access-token'] !== `Atza|dbcheck-access-${s.issued}`) return { status: 401, headers: {}, text: JSON.stringify({ errors: [{ code: 'Unauthorized', message: 'The access token you provided has expired.' }] }) };
+    const u = new URL(req.url);
+    const one = u.pathname.match(/^\/orders\/2026-01-01\/orders\/(.+)$/);
+    if (one) return { status: 200, headers: {}, text: JSON.stringify({ order: { orderId: decodeURIComponent(one[1]) } }) };
+    const tok = u.searchParams.get('paginationToken') || '';
+    if (s.expired.has(tok)) return { status: 400, headers: {}, text: JSON.stringify({ errors: [{ code: 'InvalidInput', message: 'Invalid paginationToken: expired' }] }) };
+    const p = s.pages[tok];
+    if (!p) return { status: 400, headers: {}, text: JSON.stringify({ errors: [{ code: 'InvalidInput', message: 'Invalid Input' }] }) };
+    return { status: 200, headers: { 'x-amzn-ratelimit-limit': '0.0056' }, text: JSON.stringify({ orders: p.orders, ...(p.next ? { pagination: { nextToken: p.next } } : {}) }) };
+  };
+  return s;
+}
+const azClient = (s, extra = {}) => createAmazonClient({ config: AZ_SECRETS, transport: s.transport, backoffMs: 10, wait: async () => {}, ...extra });
+const azRow = async (n) => (await getPool().query(`SELECT * FROM orders WHERE channel = 'amazon' AND source_order_id = $1`, [AZS(n)])).rows[0];
+const azItems = async (n) => (await getPool().query(`SELECT oi.* FROM order_items oi JOIN orders o ON o.id = oi.order_id WHERE o.channel = 'amazon' AND o.source_order_id = $1 ORDER BY oi.source_line_item_id`, [AZS(n)])).rows;
+
+await step('amazon sp-api client: LWA exchange, in-memory token cache, 401 refresh once, India endpoint, request shapes, retry classes, secrets never shown', async () => {
+  const bad = [];
+  // Config and the India endpoint.
+  const env = amazonConfig({ AMAZON_SPAPI_REGION: 'eu', AMAZON_MARKETPLACE_ID: 'A21TJRUUN4KGV' });
+  if (env.endpoint !== 'https://sellingpartnerapi-eu.amazon.com' || amazonConfig({}).endpoint !== env.endpoint) bad.push('India/EU endpoint');
+  if (ENDPOINTS.na !== 'https://sellingpartnerapi-na.amazon.com' || ORDERS_API_VERSION !== '2026-01-01' || LWA_TOKEN_URL !== 'https://api.amazon.com/auth/o2/token') bad.push('constants');
+  if (amazonConfigured(amazonConfig({ AMAZON_LWA_CLIENT_ID: 'fake-lwa-client-id', AMAZON_LWA_CLIENT_SECRET: 'fake-lwa-client-secret', AMAZON_SPAPI_REFRESH_TOKEN: 'fake-refresh-token',
+    AMAZON_SELLER_ID: 'fake-seller-id', AMAZON_MARKETPLACE_ID: 'A21TJRUUN4KGV' }))) bad.push('.env.example placeholders count as configured');
+  if (!amazonConfigured(AZ_SECRETS)) bad.push('test config not configured');
+  const example = await fsp.readFile(new URL('../.env.example', import.meta.url), 'utf8');
+  for (const k of ['AMAZON_LWA_CLIENT_ID', 'AMAZON_LWA_CLIENT_SECRET', 'AMAZON_SPAPI_REFRESH_TOKEN', 'AMAZON_SELLER_ID', 'AMAZON_MARKETPLACE_ID', 'AMAZON_SPAPI_REGION=eu']) if (!example.includes(k)) bad.push(`.env.example lacks ${k}`);
+  // Capture everything the client prints.
+  const printed = [];
+  const [w0, e0, l0] = [console.warn, console.error, console.log];
+  console.warn = (...a) => printed.push(a.join(' ')); console.error = (...a) => printed.push(a.join(' '));
+  const thrown = [];
+  const catchMsg = async (p) => { try { await p; return null; } catch (e) { thrown.push(e.message); return e; } };
+  try {
+    // 1, 2. Exchange once; cached until near expiry; then exchanged again.
+    let clock = Date.now();
+    const s = fakeAmazon();
+    s.pages[''] = { orders: [] };
+    const c = azClient(s, { now: () => clock });
+    await c.searchOrders({ lastUpdatedAfter: '2026-10-08T00:00:00.000Z', lastUpdatedBefore: '2026-10-08T01:00:00.000Z', includedData: ['PROCEEDS', 'FULFILLMENT'] });
+    await c.searchOrders({ lastUpdatedAfter: '2026-10-08T00:00:00.000Z', lastUpdatedBefore: '2026-10-08T01:00:00.000Z' });
+    if (s.lwa !== 1 || !c.hasCachedToken()) bad.push(`cache: ${s.lwa} exchanges`);
+    const body = new URLSearchParams(s.lwaBodies[0]);
+    if (body.get('grant_type') !== 'refresh_token' || body.get('refresh_token') !== AZ_SECRETS.refreshToken || body.get('client_id') !== AZ_SECRETS.clientId || body.get('client_secret') !== AZ_SECRETS.clientSecret) bad.push('LWA body');
+    clock += 3600 * 1000;                                       // past expiry (less the minute of skew)
+    await c.searchOrders({ lastUpdatedAfter: '2026-10-08T00:00:00.000Z', lastUpdatedBefore: '2026-10-08T01:00:00.000Z' });
+    if (s.lwa !== 2) bad.push('not refreshed at expiry');
+    // 5. searchOrders request.
+    const q = new URL(s.calls[0].url);
+    const h = s.calls[0].headers;
+    if (s.calls[0].method !== 'GET' || q.origin !== 'https://sellingpartnerapi-eu.amazon.com' || q.pathname !== '/orders/2026-01-01/orders'
+      || q.searchParams.get('marketplaceIds') !== 'A21TJRUUN4KGV' || q.searchParams.get('lastUpdatedAfter') !== '2026-10-08T00:00:00.000Z'
+      || q.searchParams.get('lastUpdatedBefore') !== '2026-10-08T01:00:00.000Z' || q.searchParams.get('maxResultsPerPage') !== '100'
+      || q.searchParams.get('includedData') !== 'PROCEEDS,FULFILLMENT' || q.searchParams.has('paginationToken') || q.searchParams.has('createdAfter')) bad.push(`search url ${q}`);
+    if (h['x-amz-access-token'] !== 'Atza|dbcheck-access-1' || !/^\d{8}T\d{6}Z$/.test(h['x-amz-date']) || !h['user-agent'] || h.authorization) bad.push(`headers ${Object.keys(h)}`);
+    await c.searchOrders({ lastUpdatedAfter: 'A', lastUpdatedBefore: 'B', fulfillmentStatuses: ['UNSHIPPED', 'SHIPPED'], fulfilledBy: ['MERCHANT'], maxResultsPerPage: 50, paginationToken: 'TOK' })
+      .catch(() => {});
+    const q2 = new URL(s.calls[s.calls.length - 1].url);
+    if (q2.searchParams.get('fulfillmentStatuses') !== 'UNSHIPPED,SHIPPED' || q2.searchParams.get('fulfilledBy') !== 'MERCHANT'
+      || q2.searchParams.get('maxResultsPerPage') !== '50' || q2.searchParams.get('paginationToken') !== 'TOK') bad.push(`search url 2 ${q2}`);
+    // 6. getOrder.
+    const g = await c.getOrder('403-1234567-7654321', { includedData: ['PROCEEDS'] });
+    const gq = new URL(s.calls[s.calls.length - 1].url);
+    if (g.order?.orderId !== '403-1234567-7654321' || gq.pathname !== '/orders/2026-01-01/orders/403-1234567-7654321' || gq.searchParams.get('includedData') !== 'PROCEEDS') bad.push(`getOrder ${gq}`);
+    const n0 = s.calls.length;
+    if (!(await catchMsg(c.getOrder('../x'))) || s.calls.length !== n0) bad.push('bad order id sent');
+    // 3, 28. A 401 refreshes once and retries; a second 401 stands.
+    s.issued += 1;                                              // Amazon no longer accepts the cached token
+    const before = s.lwa;
+    await c.searchOrders({ lastUpdatedAfter: 'A', lastUpdatedBefore: 'B' });
+    if (s.lwa !== before + 1) bad.push('401 did not refresh');
+    s.script.push({ status: 401, headers: {}, text: '{}' }, { status: 401, headers: {}, text: '{}' });
+    const l1 = s.lwa; const c1 = s.calls.length;
+    const e401 = await catchMsg(c.searchOrders({ lastUpdatedAfter: 'A', lastUpdatedBefore: 'B' }));
+    if (!e401?.amazonAuth || s.lwa !== l1 + 1 || s.calls.length !== c1 + 2) bad.push(`second 401: lwa ${s.lwa - l1}, calls ${s.calls.length - c1}`);
+    // 24. 429 → throttled; waits one refill at the known rate (header or remembered, else documented), 2 retries.
+    const waits = [];
+    let vclock = Date.now();
+    let ct = azClient(s, { wait: async (ms) => { waits.push(ms); vclock += ms; }, now: () => vclock });
+    s.script.push({ status: 429, headers: { 'x-amzn-ratelimit-limit': '0.0056' }, text: '{"errors":[{"code":"QuotaExceeded","message":"You exceeded your quota"}]}' },
+      { status: 429, headers: {}, text: '{}' });
+    await ct.searchOrders({ lastUpdatedAfter: 'A', lastUpdatedBefore: 'B' });
+    if (waits.join() !== '178572,178572') bad.push(`429 waits ${waits}`);
+    for (let i = 0; i < 3; i += 1) s.script.push({ status: 429, headers: {}, text: '{}' });
+    const e429 = await catchMsg(ct.searchOrders({ lastUpdatedAfter: 'A', lastUpdatedBefore: 'B' }));
+    if (!e429?.throttled || s.script.length) bad.push('429 bound');
+    // 25, 26. 5xx and connection failures: 3 tries in all (a fresh client: a full allowance, so only retry waits show).
+    waits.length = 0;
+    vclock = Date.now();
+    ct = azClient(s, { wait: async (ms) => { waits.push(ms); vclock += ms; }, now: () => vclock });
+    s.script.push({ status: 500, headers: {}, text: '{}' }, { status: 503, headers: {}, text: '{}' });
+    await ct.searchOrders({ lastUpdatedAfter: 'A', lastUpdatedBefore: 'B' });
+    if (waits.join() !== '10,20') bad.push(`5xx waits ${waits}`);
+    s.script.push(Object.assign(new Error('fetch failed'), { cause: { code: 'ECONNRESET' } }), { status: 502, headers: {}, text: '{}' }, { status: 504, headers: {}, text: '{}' });
+    const eConn = await catchMsg(ct.searchOrders({ lastUpdatedAfter: 'A', lastUpdatedBefore: 'B' }));
+    if (!eConn?.transient || s.script.length) bad.push('transient bound');
+    s.script.push(Object.assign(new Error('fetch failed'), { cause: { code: 'ECONNRESET' } }));
+    await ct.searchOrders({ lastUpdatedAfter: 'A', lastUpdatedBefore: 'B' });
+    // 27. Permanent 4xx: one try.
+    for (const [st, code] of [[400, 'InvalidInput'], [403, 'AccessDenied'], [404, 'NotFound']]) {
+      const c0 = s.calls.length;
+      s.script.push({ status: st, headers: {}, text: JSON.stringify({ errors: [{ code, message: 'no' }] }) });
+      const e = await catchMsg(ct.searchOrders({ lastUpdatedAfter: 'A', lastUpdatedBefore: 'B' }));
+      if (!e || e.throttled || e.transient || s.calls.length !== c0 + 1) bad.push(`${st} retried`);
+    }
+    // 4. Secrets: a failing LWA answer that echoes them, an error body with a token — nothing reaches a message or a log.
+    const s2 = fakeAmazon();
+    s2.lwaScript.push({ status: 400, headers: {}, text: JSON.stringify({ error: 'invalid_grant', error_description: `bad ${AZ_SECRETS.refreshToken} / ${AZ_SECRETS.clientSecret}` }) });
+    const eL = await catchMsg(azClient(s2).searchOrders({ lastUpdatedAfter: 'A', lastUpdatedBefore: 'B' }));
+    if (!/invalid_grant/.test(eL?.message || '')) bad.push(`LWA error ${eL?.message}`);
+    s.script.push({ status: 400, headers: {}, text: JSON.stringify({ errors: [{ code: 'InvalidInput', message: `token Atza|dbcheck-access-${s.issued} rejected; secret ${AZ_SECRETS.clientSecret}` }] }) });
+    await catchMsg(ct.searchOrders({ lastUpdatedAfter: 'A', lastUpdatedBefore: 'B' }));
+    s.script.push(Object.assign(new Error(`socket closed for ${AZ_SECRETS.refreshToken}`), { cause: { message: `Atza|dbcheck-access-${s.issued}` } }),
+      Object.assign(new Error('x'), { cause: { message: `Atza|dbcheck-access-${s.issued}` } }), Object.assign(new Error('x'), { cause: { message: `${AZ_SECRETS.clientSecret}` } }));
+    await catchMsg(ct.searchOrders({ lastUpdatedAfter: 'A', lastUpdatedBefore: 'B' }));
+    const all = [...printed, ...thrown].join('\n');
+    for (const secret of [AZ_SECRETS.clientSecret, AZ_SECRETS.refreshToken, 'Atza|', 'dbcheck-refresh']) if (all.includes(secret)) bad.push(`secret shown: ${secret.slice(0, 8)}…`);
+    if (!thrown.length || !printed.some((p) => /transient failure/.test(p))) bad.push('nothing captured to check');
+    if (redact(`a ${AZ_SECRETS.clientSecret} Atza|abc.def Atzr|x1 refresh_token=zzz`, AZ_SECRETS) !== 'a [redacted] [redacted] [redacted] refresh_token=[redacted]') bad.push('redact()');
+  } finally { console.warn = w0; console.error = e0; console.log = l0; }
+  if (bad.length) throw new Error(bad.join(' | '));
+  return 'LWA refresh_token exchange (form body), token cached in memory until a minute before expiry; 401 → one refresh + retry, a second 401 stands; EU endpoint for India; searchOrders/getOrder URLs, form-style arrays, x-amz-access-token/x-amz-date/user-agent, no signing; 429 waits one refill (~178.6 s at 0.0056/s), 2 retries, then thrown; 500/502/503/504/connection 3 tries; 400/403/404 once; no secret or token in any message or log';
+});
+
+await step('amazon orders: mapping — file-import value formula, tax/shipping/discount, FBA, pending, mixed currency refused, no buyer data', async () => {
+  const bad = [];
+  const m = mapAmazonOrder(azOrder(1, [azItem('I1', { ship: '40', disc: '-50' })]));
+  const it = m.items?.[0] || {};
+  if (m.error || m.source_order_id !== AZS(1) || m.currency !== 'INR' || m.order_value !== 489 || !m.priced || m.cancelled) bad.push(`order ${JSON.stringify(m).slice(0, 200)}`);
+  if (it.source_line_item_id !== 'I1' || it.item_price !== 499 || it.price_excl_tax !== 422.88 || it.item_tax !== 76.12 || it.shipping_price !== 40
+    || it.promotion_discount !== -50 || it.sku !== 'SKU-1' || it.asin !== 'B0DBCHECK1' || it.quantity !== 1) bad.push(`item ${JSON.stringify(it)}`);
+  const pj = JSON.stringify(m.amazon_spapi);
+  if (/buyer|recipient|dbcheck-buyer|DBCHECK STREET|9000000077/i.test(pj)) bad.push('buyer data stored');
+  const noTax = mapAmazonOrder(azOrder(2, [azItem('I1', { item: '499.00', tax: null })]));
+  if (noTax.items[0].item_price !== 499 || noTax.items[0].item_tax !== null || noTax.items[0].price_excl_tax !== null) bad.push('tax-inclusive item');
+  const fba = mapAmazonOrder(azOrder(3, [azItem('I1')], { by: 'AMAZON', status: 'SHIPPED' }));
+  if (fba.fulfilled_by !== 'AMAZON' || fba.amazon_spapi.fulfilled_by !== 'AMAZON') bad.push('fba');
+  const pend = mapAmazonOrder(azOrder(4, [azItem('I1', { item: null, tax: null })], { status: 'PENDING' }));
+  if (pend.priced || pend.order_value !== null || pend.error) bad.push('pending');
+  const mixed = mapAmazonOrder(azOrder(5, [azItem('I1', { taxCur: 'USD' })]));
+  if (!/mixed currencies \(INR, USD\)/.test(mixed.error || '')) bad.push(`mixed ${mixed.error}`);
+  if (!mapAmazonOrder(azOrder(6, [azItem('I1', { item: 'abc' })])).error || !mapAmazonOrder({ orderId: '' }).error) bad.push('bad amounts/ids accepted');
+  if (bad.length) throw new Error(bad.join(' | '));
+  return 'value = Σ item incl. tax + shipping + discounts (negative), as the file import; ITEM excl. tax + TAX → item price incl. tax; FBA kept; pending = unpriced; mixed currency / bad amount → refused; buyer/recipient never stored';
+});
+
+await step('amazon orders: incremental sync — window, watermark, paging, checkpoint only on success, idempotent, FBA, SKUs, no stock/attribution/shipments, continuing failed and partial windows, expired page tokens, one at a time, CSV convergence', async () => {
+  const bad = [];
+  const db = getPool();
+  const CK = 'amazon_orders_checkpoint';
+  const saved = (await db.query('SELECT value FROM system_state WHERE key = $1', [CK])).rows[0]?.value ?? null;
+  const ck = async () => (await db.query('SELECT value FROM system_state WHERE key = $1', [CK])).rows[0]?.value ?? null;
+  const fx = async () => (await db.query(`SELECT (SELECT count(*) FROM inventory_movements)::int mv, (SELECT count(*) FROM inventory_reservations)::int rs,
+    (SELECT count(*) FROM order_shipments s JOIN orders o ON o.id = s.order_id WHERE o.source_order_id LIKE $1)::int sh,
+    (SELECT count(*) FROM affiliate_order_attributions a JOIN orders o ON o.id = a.order_id WHERE o.source_order_id LIKE $1)::int at`, [`${TEST_ORDER}-AZSP-%`])).rows[0];
+  const sku = await createSku({ sku: `${TS}-AZSP`, product_name: 'Amazon SP-API test' }, { actor: ACTOR });
+  await addPlatformMappings(sku.id, 'amazon', [`${TS}-AZSP-SELLER`], { actor: ACTOR });
+  try {
+    await db.query('DELETE FROM system_state WHERE key = $1', [CK]);
+    const s = fakeAmazon();
+    const client = azClient(s);
+    const fx0 = await fx();
+    // 37. Full history is not part of this phase; no checkpoint and no start date → refused.
+    await expectErr('full history', () => runAmazonSync({ window: { mode: 'all' }, client, actor: AZ_ACTOR }), (e) => e.status === 400 && /Full history/.test(e.message));
+    await expectErr('no checkpoint', () => runAmazonSync({ client, actor: AZ_ACTOR }), (e) => e.status === 409);
+    await expectErr('not configured', () => startAmazonIncrementalSync({ actor: AZ_ACTOR }), (e) => e.status === 400 && /not connected/.test(e.message));
+    // 16, 21, 22, 23, 36, 8, 12. First run from a start date: two pages.
+    s.pages[''] = { orders: [azOrder(1, [azItem('I1', { sku: `${TS}-AZSP-SELLER` })]), azOrder(2, [azItem('I1', { sku: `${TS}-AZSP-UNMAPPED` })]),
+      azOrder(3, [azItem('I1', { sku: `${TS}-AZSP-SELLER` })], { by: 'AMAZON', status: 'SHIPPED' }), azOrder(4, [azItem('I1', { item: null, tax: null })], { status: 'PENDING' }),
+      azOrder(5, [azItem('I1', { taxCur: 'USD' })])], next: 'P2' };
+    s.pages.P2 = { orders: [azOrder(6, [azItem('I1')], { status: 'CANCELLED' })] };   // SKU-1: unmapped too
+    const now1 = new Date();
+    const from = new Date(now1.getTime() - 2 * 86400000).toISOString();
+    const r1 = await runAmazonSync({ client, actor: AZ_ACTOR, startFrom: from, now: now1 });
+    const until1 = new Date(now1.getTime() - 3 * 60000).toISOString();
+    const [q1, q2] = s.calls.slice(-2).map((c) => new URL(c.url).searchParams);
+    if (r1.window.since !== from || r1.window.until !== until1) bad.push(`first window ${JSON.stringify(r1.window)}`);
+    if (q1.get('lastUpdatedAfter') !== from || q1.get('lastUpdatedBefore') !== until1 || q1.has('paginationToken')
+      || q2.get('paginationToken') !== 'P2' || q2.get('lastUpdatedAfter') !== from || q2.get('lastUpdatedBefore') !== until1 || /BUYER|RECIPIENT/.test(q1.get('includedData'))) bad.push('page requests');
+    if (r1.summary.created !== 4 || r1.summary.unpriced !== 1 || r1.summary.errors !== 1 || r1.summary.unmappedLines !== 2 || r1.summary.partial) bad.push(`run1 ${JSON.stringify(r1.summary)}`);
+    if (!/mixed currencies/.test(r1.errors[0]?.reason || '') || r1.errors[0]?.amazonOrderId !== AZS(5)) bad.push('mixed-currency order not refused by name');
+    if ((await ck()) !== until1) bad.push(`checkpoint ${await ck()} ≠ watermark`);
+    const o1 = await azRow(1); const o3 = await azRow(3); const o6 = await azRow(6);
+    if (o1.source !== 'amazon_spapi' || Number(o1.order_value) !== 499 || o1.currency !== 'INR' || o1.dispatch_type !== 'easy_ship' || o1.fulfillment_type !== 'merchant' || o1.order_status !== 'new') bad.push(`o1 ${JSON.stringify(o1).slice(0, 200)}`);
+    if (o1.customer_name || o1.customer_email || o1.customer_phone || /dbcheck-buyer|DBCHECK STREET|9000000077/.test(JSON.stringify(o1.source_payload))) bad.push('buyer data stored');
+    if (o3.dispatch_type !== null || o3.fulfillment_type !== 'marketplace' || o3.source_payload.amazon_spapi.fulfilled_by !== 'AMAZON') bad.push('FBA order');
+    if (o6.order_status !== 'cancelled' || await azRow(4) || await azRow(5)) bad.push('cancelled / pending / refused');
+    if ((await azItems(1))[0].sku_id !== sku.id || (await azItems(2))[0].sku_id !== null) bad.push('sku mapping');
+    const run1 = (await db.query('SELECT channel, status, details FROM order_imports WHERE id = $1', [r1.runId])).rows[0];
+    if (run1.channel !== 'amazon' || run1.status !== 'completed' || run1.details.window.mode !== 'incremental' || run1.details.cursor !== null) bad.push(`run row ${JSON.stringify(run1).slice(0, 200)}`);
+    // 15, 11, 10. Same orders again: nothing changes; the window starts 5 minutes before the checkpoint.
+    s.pages[''] = { orders: s.pages[''].orders, next: 'P2' };
+    const now2 = new Date(now1.getTime() + 60000);
+    const r2 = await runAmazonSync({ client, actor: AZ_ACTOR, now: now2 });
+    if (r2.window.since !== new Date(new Date(until1).getTime() - 5 * 60000).toISOString() || r2.window.until !== new Date(now2.getTime() - 3 * 60000).toISOString()) bad.push(`overlap ${JSON.stringify(r2.window)}`);
+    if (r2.summary.created || r2.summary.updated || r2.summary.itemsCreated || r2.summary.itemsUpdated || r2.summary.unchanged !== 4) bad.push(`repeat ${JSON.stringify(r2.summary)}`);
+    if ((await ck()) !== r2.window.until) bad.push('checkpoint after repeat');
+    // 17. Changed at Amazon: a new price; the pending order now has prices; the FBA one changes nothing in Briyo's dispatch.
+    s.pages[''] = { orders: [azOrder(1, [azItem('I1', { sku: `${TS}-AZSP-SELLER`, item: '440.00', tax: '79.20' })], { updated: '2026-10-08T11:00:00Z' }),
+      azOrder(4, [azItem('I1', { sku: `${TS}-AZSP-SELLER` })], { updated: '2026-10-08T11:00:00Z' })] };
+    const r3 = await runAmazonSync({ client, actor: AZ_ACTOR, now: new Date(now2.getTime() + 60000) });
+    if (r3.summary.updated !== 1 || r3.summary.created !== 1 || Number((await azRow(1)).order_value) !== 519.2 || Number((await azItems(1))[0].item_price) !== 519.2) bad.push(`update ${JSON.stringify(r3.summary)}`);
+    const ev = (await db.query(`SELECT event_type FROM order_events WHERE order_id = $1 ORDER BY id`, [(await azRow(1)).id])).rows.map((r) => r.event_type);
+    if (ev.join() !== 'order_created,amazon_sync_updated') bad.push(`events ${ev}`);
+    // 13, 14. A failed run leaves the checkpoint; the next start continues that same window and then moves it.
+    const ck3 = await ck();
+    s.script.push({ status: 400, headers: {}, text: JSON.stringify({ errors: [{ code: 'InvalidInput', message: 'Invalid Input' }] }) });
+    const nowF = new Date(now2.getTime() + 120000);
+    const fail = await runAmazonSync({ client, actor: AZ_ACTOR, now: nowF }).then(() => null, (e) => e);
+    if (!fail || (await ck()) !== ck3) bad.push('failed run moved the checkpoint');
+    const failedRow = (await db.query(`SELECT id, status, details FROM order_imports WHERE kind = 'amazon_sync' ORDER BY id DESC LIMIT 1`)).rows[0];
+    if (failedRow.status !== 'failed') bad.push('failed run not recorded');
+    s.pages[''] = { orders: [] };
+    const st = await startAmazonIncrementalSync({ client, actor: AZ_ACTOR });
+    const rC = await st.done;
+    if (st.resumedFrom !== Number(failedRow.id) || rC.window.since !== failedRow.details.window.since || rC.window.until !== failedRow.details.window.until) bad.push('failed window not continued');
+    if ((await ck()) !== failedRow.details.window.until) bad.push('checkpoint after the continued window');
+    // 9. Partial run: the page token is saved with its issue time; a fresh one is used to continue; checkpoint waits for the end.
+    s.pages[''] = { orders: [azOrder(7, [azItem('I1')])], next: 'T1' };
+    s.pages.T1 = { orders: [azOrder(8, [azItem('I1')])], next: 'T2' };
+    s.pages.T2 = { orders: [azOrder(9, [azItem('I1')])] };
+    const ck4 = await ck();
+    const p1 = await runAmazonSync({ client, actor: AZ_ACTOR, maxOrders: 1 });
+    const pRow = (await db.query('SELECT status, details FROM order_imports WHERE id = $1', [p1.runId])).rows[0];
+    if (!p1.summary.partial || pRow.status !== 'partial' || pRow.details.cursor?.token !== 'T1' || !pRow.details.cursor.issuedAt || (await ck()) !== ck4) bad.push(`partial ${JSON.stringify(pRow.details.cursor)}`);
+    const p2 = await runAmazonSync({ client, actor: AZ_ACTOR, maxOrders: 1, resumeRunId: p1.runId });
+    if (new URL(s.calls[s.calls.length - 1].url).searchParams.get('paginationToken') !== 'T1' || p2.window.until !== p1.window.until || (await ck()) !== ck4) bad.push('fresh token not used');
+    // A token older than 23 hours is not used: the same window again from its first page (idempotent).
+    await db.query(`UPDATE order_imports SET details = jsonb_set(details, '{cursor,issuedAt}', to_jsonb((now() - interval '25 hours')::text)) WHERE id = $1`, [p2.runId]);
+    const c0 = s.calls.length;
+    const p3 = await runAmazonSync({ client, actor: AZ_ACTOR, maxOrders: 1, resumeRunId: p2.runId });
+    const p3Row = (await db.query('SELECT details FROM order_imports WHERE id = $1', [p3.runId])).rows[0];
+    if (new URL(s.calls[c0].url).searchParams.has('paginationToken') || p3Row.details.restarted !== 'page token too old' || p3.summary.created !== 0 || p3.window.until !== p1.window.until) bad.push(`stale token ${JSON.stringify(p3Row.details).slice(0, 200)}`);
+    // Amazon rejects a token (expired early): restart the same window once, finish, checkpoint moves.
+    s.script.push({ status: 400, headers: {}, text: JSON.stringify({ errors: [{ code: 'InvalidInput', message: 'Invalid paginationToken: expired' }] }) });
+    const c1 = s.calls.length;
+    const p4 = await runAmazonSync({ client, actor: AZ_ACTOR, resumeRunId: p3.runId });
+    const used = s.calls.slice(c1).map((c) => new URL(c.url).searchParams.get('paginationToken') || '-');
+    if (used.join() !== 'T1,-,T1,T2' || p4.summary.restarts !== 1 || p4.summary.partial || (await ck()) !== p1.window.until || !(await azRow(9))) bad.push(`rejected token: ${used} restarts ${p4.summary.restarts} ck ${await ck()}`);
+    // Rejected again within the same run: the run fails (no endless loop) and the checkpoint stays.
+    s.pages[''] = { orders: [], next: 'T1' };
+    s.expired.add('T1');
+    const ck5 = await ck();
+    const p5 = await runAmazonSync({ client, actor: AZ_ACTOR }).then(() => null, (e) => e);
+    s.expired.clear();
+    const p5Row = (await db.query(`SELECT status, details FROM order_imports WHERE kind = 'amazon_sync' ORDER BY id DESC LIMIT 1`)).rows[0];
+    if (!p5 || p5Row.status !== 'failed' || (await ck()) !== ck5) bad.push('a token rejected twice did not fail the run');
+    s.pages[''] = { orders: [] };
+    await (await startAmazonIncrementalSync({ client, actor: AZ_ACTOR })).done;   // that failed window, continued and completed
+    // 29, 30, 31. One Amazon chain at a time; Amazon and Shopify never block each other; never resume a Shopify run.
+    s.pages[''] = { orders: [] };
+    let release;
+    s.hold = new Promise((r) => { release = r; });
+    const live = await startAmazonIncrementalSync({ client, actor: AZ_ACTOR });
+    await expectErr('second amazon start', () => startAmazonIncrementalSync({ client, actor: AZ_ACTOR }), (e) => e.status === 409 && e.syncRunning);
+    await assertNoSyncRunning(db);                              // Shopify: not blocked by the Amazon chain
+    if (!amazonSyncBusy()) bad.push('amazon not busy');
+    release(); s.hold = null;
+    await live.done;
+    const { rows: [shRun] } = await db.query(`INSERT INTO order_imports (channel, kind, status, started_at, imported_by, filename, rows_processed, orders_in_file, orders_created,
+       orders_updated, orders_unchanged, items_created, items_updated, promotion_rows, duplicate_rows, error_rows, details)
+       VALUES ('website', 'shopify_sync', 'running', now(), $1, 'dbcheck', 0,0,0,0,0,0,0,0,0,0, $2) RETURNING id`,
+      [AZ_ACTOR, JSON.stringify({ window: { mode: 'incremental', since: '2026-10-01T00:00:00Z', until: '2026-10-02T00:00:00Z' }, cursor: { token: 'X', issuedAt: new Date().toISOString() } })]);
+    try {
+      await assertNoAmazonSyncRunning(db);                      // Amazon: not blocked by a running Shopify sync
+      await expectErr('shopify blocked by its own run', () => assertNoSyncRunning(db), (e) => e.status === 409);
+      await expectErr('amazon resumes a shopify run', () => runAmazonSync({ client, actor: AZ_ACTOR, resumeRunId: Number(shRun.id) }), (e) => /cannot be continued/.test(e.message));
+    } finally { await db.query('DELETE FROM order_imports WHERE id = $1', [shRun.id]); }
+    const status = await amazonSyncStatus();
+    if (status.state !== 'completed' || status.mode !== 'incremental') bad.push(`status ${JSON.stringify(status)}`);
+    // 18, 20. File first, then the API: one order; the file's extra fields and payload stay; a locked order's lines don't move.
+    await commitAmazonImport(amzCsv([amzRow({ 'order-id': AZS(20), 'order-item-id': 'I1', 'item-promotion-id': 'PROMO-1', 'ship-city': 'PUNE' }),
+      amzRow({ 'order-id': AZS(21), 'order-item-id': 'I1' })]), 'azsp.csv', { actor: IMPORTER });
+    const o21 = await azRow(21);
+    await db.query(`INSERT INTO order_shipments (order_id, shipment_status, created_by) VALUES ($1, 'dispatched', $2)`, [o21.id, ACTOR]);
+    s.pages[''] = { orders: [azOrder(20, [azItem('I1'), azItem('I2', { sku: `${TS}-AZSP-SELLER`, item: '100.00', tax: '18.00' })]),
+      azOrder(21, [azItem('I1', { item: '300.00', tax: '54.00' })], { status: 'SHIPPED' })] };
+    const fx1a = await fx();
+    const rv = await runAmazonSync({ client, actor: AZ_ACTOR });
+    const o20 = await azRow(20); const it20 = await azItems(20); const it21 = await azItems(21);
+    if ((await db.query(`SELECT count(*)::int n FROM orders WHERE channel = 'amazon' AND source_order_id = ANY($1)`, [[AZS(20), AZS(21)]])).rows[0].n !== 2) bad.push('duplicate order');
+    if (o20.source !== 'amazon_import' || Number(o20.order_value) !== 617 || it20.length !== 2 || it20[0].promotion_id !== 'PROMO-1' || it20[1].sku_id !== sku.id) bad.push(`csv→api ${o20.source} ${o20.order_value} ${JSON.stringify(it20.map((i) => [i.source_line_item_id, i.promotion_id, i.item_price]))}`);
+    if (o20.source_payload?.amazon?.ship_to?.city !== 'PUNE' || o20.source_payload?.amazon_spapi?.order_id !== AZS(20)) bad.push('file payload replaced');
+    if (Number(it21[0].item_price) !== 499 || Number((await azRow(21)).order_value) !== 499 || rv.summary.conflicts !== 1) bad.push(`locked order changed ${it21[0].item_price}`);
+    const ce = (await db.query(`SELECT metadata->>'kind' k FROM order_events WHERE order_id = $1 AND event_type = 'amazon_sync_conflict' ORDER BY k`, [o21.id])).rows.map((r) => r.k);
+    if (ce.join() !== 'lines_locked,value_locked') bad.push(`conflicts ${ce}`);
+    // 19. API first, then the file: still one order; the file fills what the API never asked for.
+    s.pages[''] = { orders: [azOrder(22, [azItem('I1')])] };
+    await runAmazonSync({ client, actor: AZ_ACTOR });
+    await commitAmazonImport(amzCsv([amzRow({ 'order-id': AZS(22), 'order-item-id': 'I1' })]), 'azsp2.csv', { actor: IMPORTER });
+    const o22 = await azRow(22);
+    if ((await db.query(`SELECT count(*)::int n FROM orders WHERE channel = 'amazon' AND source_order_id = $1`, [AZS(22)])).rows[0].n !== 1
+      || o22.source !== 'amazon_spapi' || (await azItems(22)).length !== 1 || o22.customer_name !== 'Test Buyer' || !o22.source_payload.amazon_spapi) bad.push('api→csv');
+    // 32–35. Never stock, never shipments (beyond the one this test made), never attribution.
+    const fx1 = await fx();
+    if (fx1.mv !== fx0.mv || fx1.rs !== fx0.rs || fx1.sh !== 1 || fx1.at !== 0 || fx1a.sh !== 1) bad.push(`side effects ${JSON.stringify([fx0, fx1])}`);
+    const src = await fsp.readFile(new URL('../lib/amazon-orders.js', import.meta.url), 'utf8');
+    if (/attributeOrder|affiliate|reserveShipmentStock|dispatchShipmentStock|mirrorExternalFulfillments|recordFinancialSnapshot|INSERT INTO order_shipments/.test(src.replace(/^\s*(\*|\/\/).*$/gm, ''))) bad.push('amazon sync code reaches attribution/stock/shipments');
+    // No run row carries a secret or token.
+    const runs = JSON.stringify((await db.query(`SELECT errors, details FROM order_imports WHERE kind = 'amazon_sync' AND imported_by = $1`, [AZ_ACTOR])).rows);
+    if (runs.includes('Atza|') || runs.includes(AZ_SECRETS.clientSecret) || runs.includes(AZ_SECRETS.refreshToken)) bad.push('secret in run rows');
+  } finally {
+    if (saved === null) await db.query('DELETE FROM system_state WHERE key = $1', [CK]);
+    else await db.query('UPDATE system_state SET value = $2 WHERE key = $1', [CK, saved]);
+  }
+  if (bad.length) throw new Error(bad.join(' | '));
+  return 'first window from a start date to now − 3 min (Amazon: ≥ 2 min before the request); later windows checkpoint − 5 min; same parameters + paginationToken per page; checkpoint = watermark only after a complete window; repeat run changes nothing; price change updates order + line; pending created once priced; FBA → no dispatch type, fulfillment marketplace; mapped/unmapped SKUs; mixed currency refused by name; failed window continued as the same window; partial → token saved + used; >23 h token or Amazon-rejected token → same window from page 1; 409 for a second Amazon start; Amazon/Shopify independent; no Shopify resume; CSV→API and API→CSV converge on one order, file-only fields kept, locked lines/value kept with conflicts; no stock, shipments, attribution or secrets';
+});
+
+await step('amazon sp-api pacing: burst of 20 then one request per refill, remembered rate, 429 without a header waits a refill (not ~30 s)', async () => {
+  const bad = [];
+  const vc = () => { const c = { t: Date.parse('2026-10-09T00:00:00Z'), waits: [] }; c.wait = async (ms) => { c.waits.push(ms); c.t += ms; }; c.now = () => c.t; return c; };
+  const q = { lastUpdatedAfter: 'A', lastUpdatedBefore: 'B' };
+  // The burst: 20 requests at once, then the 21st waits one refill at the documented rate.
+  let c = vc(); let s = fakeAmazon(); s.pages[''] = { orders: [] };
+  const plain = { status: 200, headers: {}, text: JSON.stringify({ orders: [] }) };   // no rate-limit header
+  let cl = azClient(s, { wait: c.wait, now: c.now });
+  for (let i = 0; i < 20; i += 1) { s.script.push(plain); await cl.searchOrders(q); }
+  if (c.waits.length || cl.searchRate() !== SEARCH_ORDERS_RATE || cl.searchWaitMs() !== 178572) bad.push(`burst: waits ${c.waits} next ${cl.searchWaitMs()}`);
+  s.script.push(plain); await cl.searchOrders(q);
+  if (c.waits.join() !== '178572') bad.push(`21st waits ${c.waits}`);
+  // Never deliberately over the limit: 5 more requests take 5 refills, and not one 429 was provoked.
+  for (let i = 0; i < 5; i += 1) { s.script.push(plain); await cl.searchOrders(q); }
+  if (c.waits.length !== 6 || c.waits.some((w) => w < 178000)) bad.push(`paced waits ${c.waits}`);
+  // A reported rate is remembered and used for the following requests.
+  s.script.push({ status: 200, headers: { 'x-amzn-ratelimit-limit': '0.5' }, text: JSON.stringify({ orders: [] }) });
+  await cl.searchOrders(q);
+  if (cl.searchRate() !== 0.5) bad.push('rate not remembered');
+  c.waits.length = 0;
+  s.script.push(plain); await cl.searchOrders(q);
+  if (c.waits.join() !== '2000') bad.push(`remembered-rate wait ${c.waits}`);
+  // 429 with no header: the wait is one refill at the remembered rate (2 s here), then at the documented one on a fresh client.
+  c = vc(); s = fakeAmazon(); cl = azClient(s, { wait: c.wait, now: c.now });
+  s.script.push({ status: 429, headers: {}, text: '{}' }, plain);
+  await cl.searchOrders(q);
+  if (c.waits.join() !== '178572' || s.calls.length !== 2) bad.push(`429 no header: waits ${c.waits}, calls ${s.calls.length}`);
+  // Throttled throughout: 3 tries, two refills of waiting (~6 min), then a throttled error — not a ~30 s failure, no loop.
+  c = vc(); s = fakeAmazon(); cl = azClient(s, { wait: c.wait, now: c.now });
+  for (let i = 0; i < 3; i += 1) s.script.push({ status: 429, headers: {}, text: '{}' });
+  const e = await cl.searchOrders(q).then(() => null, (x) => x);
+  if (!e?.throttled || s.calls.length !== 3 || c.waits.join() !== '178572,178572' || c.waits.some((w) => w > 200000)) bad.push(`429 exhausted: waits ${c.waits} calls ${s.calls.length}`);
+  // The process keeps one client: the same instance every time.
+  if (sharedAmazonClient() !== sharedAmazonClient()) bad.push('shared client not shared');
+  if (bad.length) throw new Error(bad.join(' | '));
+  return '20 requests without waiting, the 21st waits 178.6 s (0.0056/s), later ones one refill each, no 429 provoked; x-amzn-RateLimit-Limit 0.5 remembered → 2 s; 429 without a header waits one refill (178.6 s), not 2–16 s; still throttled → 3 tries, ≤ 200 s each, then a throttled error; one shared client per process';
+});
+
+await step('amazon sync catch-up: 2,050 orders across chained runs on one window, page 21 after a refill, allowance kept between runs, run budget, throttled runs end partial, checkpoint only at the end', async () => {
+  const bad = [];
+  const db = getPool();
+  const CK = 'amazon_orders_checkpoint';
+  const saved = (await db.query('SELECT value FROM system_state WHERE key = $1', [CK])).rows[0]?.value ?? null;
+  const ck = async () => (await db.query('SELECT value FROM system_state WHERE key = $1', [CK])).rows[0]?.value ?? null;
+  const vc = { t: Date.now(), waits: [] };
+  const wait = async (ms) => { vc.waits.push(ms); vc.t += ms; };
+  const now = () => vc.t;
+  const runRows = async (since) => (await db.query(`SELECT id, status, rows_processed, details FROM order_imports WHERE kind = 'amazon_sync' AND id > $1 ORDER BY id`, [since])).rows;
+  const lastId = async () => Number((await db.query(`SELECT coalesce(max(id), 0) id FROM order_imports`)).rows[0].id);
+  try {
+    await db.query('DELETE FROM system_state WHERE key = $1', [CK]);
+    // 21 pages: 20 × 100 + 50 = 2,050 orders, one fixed window.
+    const s = fakeAmazon();
+    const big = (n) => azOrder(1000 + n, [azItem('I1')]);
+    for (let p = 0; p < 21; p += 1) {
+      s.pages[p ? `G${p}` : ''] = { orders: Array.from({ length: p < 20 ? 100 : 50 }, (_, i) => big(p * 100 + i)), ...(p < 20 ? { next: `G${p + 1}` } : {}) };
+    }
+    const client = azClient(s, { wait, now });
+    const from = new Date(Date.now() - 86400000).toISOString();
+    const id0 = await lastId();
+    // Run 1: pages 1–20 inside the burst, no waiting; partial with the page-21 token; checkpoint unchanged (none yet).
+    const r1 = await runAmazonSync({ client, actor: AZ_ACTOR, startFrom: from });
+    if (!r1.summary.partial || r1.summary.fetched !== 2000 || vc.waits.length || (await ck()) !== null) bad.push(`run 1 ${JSON.stringify(r1.summary)} waits ${vc.waits}`);
+    const [row1] = await runRows(id0);
+    if (row1.details.cursor?.token !== 'G20' || row1.details.window.until !== r1.window.until) bad.push(`run 1 cursor ${JSON.stringify(row1.details.cursor)}`);
+    // The chain continues with the same client: it knows the burst is spent and waits one refill before page 21.
+    const st = await startAmazonIncrementalSync({ client, actor: AZ_ACTOR });
+    const r2 = await st.done;
+    const rows = await runRows(id0);
+    const page21 = s.calls.findIndex((c) => new URL(c.url).searchParams.get('paginationToken') === 'G20');
+    if (st.resumedFrom !== Number(row1.id) || rows.length !== 2 || rows[1].status !== 'completed' || r2.window.until !== r1.window.until || r2.window.since !== r1.window.since) bad.push(`chain ${rows.map((r) => r.status)}`);
+    if (vc.waits.join() !== '178572' || page21 < 0) bad.push(`page 21 waits ${vc.waits}`);
+    if ((await ck()) !== r1.window.until) bad.push('checkpoint not the window\'s end after the last page');
+    const n = (await db.query(`SELECT count(*)::int n FROM orders WHERE channel = 'amazon' AND source_order_id = ANY($1)`, [Array.from({ length: 2050 }, (_, i) => AZS(1000 + i))])).rows[0].n;
+    if (n !== 2050) bad.push(`${n} orders imported`);
+    // A fresh client (a restarted process) assumes a full burst; the shared one would have waited — the allowance lives in the client.
+    // Run budget: with the allowance spent, a run takes pages while its waiting stays under 15 minutes, then ends partial.
+    await db.query('DELETE FROM system_state WHERE key = $1', [CK]);
+    const s2 = fakeAmazon();
+    for (let p = 0; p < 30; p += 1) s2.pages[p ? `H${p}` : ''] = { orders: [azOrder(5000 + p, [azItem('I1')])], ...(p < 29 ? { next: `H${p + 1}` } : {}) };
+    vc.waits.length = 0;
+    const c2 = azClient(s2, { wait, now });
+    const t0 = vc.t;
+    const b1 = await runAmazonSync({ client: c2, actor: AZ_ACTOR, startFrom: from });
+    const runMs = vc.t - t0;
+    if (!b1.summary.partial || b1.summary.endedBy !== 'allowance' || b1.summary.fetched !== 25 || runMs > 15 * 60000 || (await ck()) !== null) bad.push(`budget ${JSON.stringify(b1.summary)} ${runMs}`);
+    // A run that processes a page and is then throttled ends partial with the no-progress count at 0.
+    const thr = { status: 429, headers: {}, text: '{}' };
+    const idT = await lastId();
+    s2.script.push(null, thr, thr, thr);                        // null: the page is served normally, then 429s
+    const pr = await runAmazonSync({ client: c2, actor: AZ_ACTOR, resumeRunId: b1.runId });
+    const [prRow] = (await runRows(idT)).slice(-1);
+    if (prRow.status !== 'partial' || pr.summary.endedBy !== 'throttled' || pr.summary.fetched !== 1 || prRow.details.throttle_streak !== 0 || prRow.details.cursor?.token !== 'H26') bad.push(`progress then throttled: ${prRow.status} ${JSON.stringify(prRow.details.cursor)} streak ${prRow.details.throttle_streak}`);
+    // Then throttled before a page, run after run: 1, 2 → partial; the third no-progress run in a row fails. Cursor and window kept.
+    let prevRun = pr.runId;
+    for (let i = 1; i <= 3; i += 1) {
+      for (let k = 0; k < 3; k += 1) s2.script.push(thr);
+      const res = await runAmazonSync({ client: c2, actor: AZ_ACTOR, resumeRunId: prevRun }).then((x) => x, (e) => e);
+      const [row] = (await runRows(idT)).slice(-1);
+      prevRun = Number(row.id);
+      const want = i < 3 ? 'partial' : 'failed';
+      if (row.status !== want || row.details.throttle_streak !== i || row.details.cursor?.token !== 'H26' || row.details.window.until !== b1.window.until
+        || (i < 3 && res.summary?.endedBy !== 'throttled') || (i === 3 && !/3 runs in a row without a page/.test(res.message || ''))) bad.push(`throttled run ${i}: ${row.status} streak ${row.details.throttle_streak} ${JSON.stringify(row.details.cursor)}`);
+    }
+    if ((await ck()) !== null) bad.push('checkpoint moved by throttled runs');
+    // A person starts it again: the count starts at 0, so one more throttled run is partial (not an instant failure) and the
+    // chain carries on from the saved cursor and window, finishes it, and only then moves the checkpoint.
+    for (let k = 0; k < 3; k += 1) s2.script.push(thr);
+    const idM = await lastId();
+    const manual = await startAmazonIncrementalSync({ client: c2, actor: AZ_ACTOR });
+    const done = await manual.done;
+    const mRows = await runRows(idM);
+    if (manual.resumedFrom !== prevRun || mRows[0].status !== 'partial' || mRows[0].details.throttle_streak !== 1 || mRows[0].details.cursor?.token !== 'H26'
+      || mRows[0].details.window.since !== b1.window.since || mRows[mRows.length - 1].status !== 'completed') bad.push(`manual retry: ${mRows.map((r) => `${r.status}/${r.details.throttle_streak}`)}`);
+    if (done.window.until !== b1.window.until || (await ck()) !== b1.window.until) bad.push('throttled window not completed');
+    const total = (await db.query(`SELECT count(*)::int n FROM orders WHERE channel = 'amazon' AND source_order_id = ANY($1)`, [Array.from({ length: 30 }, (_, i) => AZS(5000 + i))])).rows[0].n;
+    if (total !== 30) bad.push(`${total} of 30 budget-test orders`);
+  } finally {
+    if (saved === null) await db.query('DELETE FROM system_state WHERE key = $1', [CK]);
+    else await db.query('UPDATE system_state SET value = $2 WHERE key = $1', [CK, saved]);
+  }
+  if (bad.length) throw new Error(bad.join(' | '));
+  return '2,050 orders: run 1 = 20 pages in the burst → partial with the page-21 token, no checkpoint; the chain reuses the client, waits one refill (178.6 s) before page 21 and completes the same window; checkpoint = window end only then; a run stops taking paced pages before 15 min of waiting (partial); a run that processed a page then hit 429s → partial, no-progress count 0; then 429s before a page: runs 1, 2 partial, the 3rd in a row fails (cursor and window kept, checkpoint untouched); a person\'s retry starts the count at 0 (partial, not an instant failure), the chain resumes the same cursor/window and completes, then the checkpoint moves';
+});
+
+await step('amazon sp-api cleanup', async () => {
+  await purgeTestOrders(`${TEST_ORDER}-AZSP`);
+  await getPool().query(`DELETE FROM order_imports WHERE kind = 'amazon_sync' AND imported_by = $1`, [AZ_ACTOR]);
+  return 'test orders and sync runs removed (test SKU goes with inventory cleanup)';
+});
+
 await step('shopify orders cleanup', async () => {
   await purgeTestOrders(SH_PREFIX);
   await getPool().query(`DELETE FROM order_imports WHERE kind = 'shopify_sync' AND imported_by = $1`, [SH_ACTOR]);
