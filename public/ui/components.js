@@ -378,7 +378,6 @@ function sidebarHtml(me) {
   return `
     <a class="brand" href="/overview" aria-label="Briyo OS — overview">
       <img class="brand-logo" src="/brand/briyo-logo.png" alt="Briyo Supplements" width="512" height="154" />
-      <div class="brand-sub">Briyo OS · Operating system</div>
     </a>
     ${support ? `<form class="side-search" id="sideSearchForm" role="search" data-context="recovery">
       <i data-lucide="search"></i>
@@ -404,6 +403,7 @@ function sidebarHtml(me) {
         + navLink('/api/admin/report.csv?period=day', 'Export report', 'download', { download: true }) : '')}
     </nav>
     <div class="sidebar-foot">
+      <div class="sidebar-app">Briyo OS</div>
       <a class="user-card" href="/profile" title="Your profile">
         <span class="avatar" id="userAvatar">·<span class="live"></span></span>
         <div style="min-width:0">
