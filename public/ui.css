@@ -1051,7 +1051,9 @@ a.brand { color: var(--text); }
 .nav-dept + .nav-dept { margin-top: 2px; }
 .nav-dept > .nav-item { font-weight: 500; }
 .nav-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.sidebar-foot { display: flex; align-items: center; gap: 6px; }
+.sidebar-foot { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; }
+/* The product name, above the profile card: its own full-width line in the footer. */
+.sidebar-app { flex: 0 0 100%; padding: 0 6px 2px; font-size: var(--fs-meta); font-weight: 600; letter-spacing: -0.005em; color: var(--text-3); }
 .sidebar-foot .user-card { flex: 1; min-width: 0; color: var(--text); }
 .sidebar-foot .user-card:hover { background: var(--surface-2); }
 .avatar { overflow: hidden; }
