@@ -58,8 +58,8 @@ import { overviewFor } from '../lib/overview.js';
 import { ensureAffiliateSchema, newAffiliatePublicId, rateAt, getAffiliateSetting, setAffiliateSetting, purgeTestAffiliates, _resetAffiliateSchemaForTest, createAffiliate } from '../lib/affiliates.js';
 import { receiveOrdersCreate, processWebhookDelivery, processPendingWebhooks, verifyWebhookHmac, ensureShopifyWebhookSchema } from '../lib/shopify-webhooks.js';
 import { startIncrementalSync, shopifySyncStatus, startFullHistorySync, fullHistoryStatus, grantedAccessScopes, hasReadAllOrders, _resetScopeCache, assertNoSyncRunning } from '../lib/shopify-orders.js';
-import { createAmazonClient, amazonConfig, amazonConfigured, redact, ENDPOINTS, ORDERS_API_VERSION, LWA_TOKEN_URL } from '../lib/amazon-spapi.js';
-import { mapAmazonOrder, runAmazonSync, startAmazonIncrementalSync, amazonSyncStatus, amazonSyncBusy, assertNoAmazonSyncRunning } from '../lib/amazon-orders.js';
+import { createAmazonClient, amazonConfig, amazonConfigured, redact, ENDPOINTS, ORDERS_API_VERSION, LWA_TOKEN_URL, SEARCH_ORDERS_RATE } from '../lib/amazon-spapi.js';
+import { mapAmazonOrder, runAmazonSync, startAmazonIncrementalSync, amazonSyncStatus, amazonSyncBusy, assertNoAmazonSyncRunning, sharedAmazonClient } from '../lib/amazon-orders.js';
 import { runShopifySync, mapShopifyOrder, shopifyPaymentMethod, shopifyPaymentStatus, shopifyOrdersStatus, pollShopifyOrdersOnce, ordersPollMinutes } from '../lib/shopify-orders.js';
 import { ensureOrderFinancialSnapshotSchema, financialSnapshotFrom, addAmounts, FINANCIAL_TABLES } from '../lib/order-financial-snapshots.js';
 import { SHOPIFY_MAX_QUERY_COST, SHOPIFY_ORDER_QUERIES, LIMITS as SHOPIFY_LIMITS, shopifyOrderQuery, estimateShopifyOrderQueryCost } from '../lib/shopify-order-queries.js';
@@ -4789,18 +4789,21 @@ await step('amazon sp-api client: LWA exchange, in-memory token cache, 401 refre
     const l1 = s.lwa; const c1 = s.calls.length;
     const e401 = await catchMsg(c.searchOrders({ lastUpdatedAfter: 'A', lastUpdatedBefore: 'B' }));
     if (!e401?.amazonAuth || s.lwa !== l1 + 1 || s.calls.length !== c1 + 2) bad.push(`second 401: lwa ${s.lwa - l1}, calls ${s.calls.length - c1}`);
-    // 24. 429 → throttled, retried with Amazon's rate-limit header as the wait (capped), bounded.
+    // 24. 429 → throttled; waits one refill at the known rate (header or remembered, else documented), 2 retries.
     const waits = [];
-    const ct = azClient(s, { wait: async (ms) => { waits.push(ms); } });
+    let vclock = Date.now();
+    let ct = azClient(s, { wait: async (ms) => { waits.push(ms); vclock += ms; }, now: () => vclock });
     s.script.push({ status: 429, headers: { 'x-amzn-ratelimit-limit': '0.0056' }, text: '{"errors":[{"code":"QuotaExceeded","message":"You exceeded your quota"}]}' },
       { status: 429, headers: {}, text: '{}' });
     await ct.searchOrders({ lastUpdatedAfter: 'A', lastUpdatedBefore: 'B' });
-    if (waits.join() !== '60000,20') bad.push(`429 waits ${waits}`);
-    for (let i = 0; i < 5; i += 1) s.script.push({ status: 429, headers: {}, text: '{}' });
+    if (waits.join() !== '178572,178572') bad.push(`429 waits ${waits}`);
+    for (let i = 0; i < 3; i += 1) s.script.push({ status: 429, headers: {}, text: '{}' });
     const e429 = await catchMsg(ct.searchOrders({ lastUpdatedAfter: 'A', lastUpdatedBefore: 'B' }));
     if (!e429?.throttled || s.script.length) bad.push('429 bound');
-    // 25, 26. 5xx and connection failures: 3 tries in all.
+    // 25, 26. 5xx and connection failures: 3 tries in all (a fresh client: a full allowance, so only retry waits show).
     waits.length = 0;
+    vclock = Date.now();
+    ct = azClient(s, { wait: async (ms) => { waits.push(ms); vclock += ms; }, now: () => vclock });
     s.script.push({ status: 500, headers: {}, text: '{}' }, { status: 503, headers: {}, text: '{}' });
     await ct.searchOrders({ lastUpdatedAfter: 'A', lastUpdatedBefore: 'B' });
     if (waits.join() !== '10,20') bad.push(`5xx waits ${waits}`);
@@ -4832,7 +4835,7 @@ await step('amazon sp-api client: LWA exchange, in-memory token cache, 401 refre
     if (redact(`a ${AZ_SECRETS.clientSecret} Atza|abc.def Atzr|x1 refresh_token=zzz`, AZ_SECRETS) !== 'a [redacted] [redacted] [redacted] refresh_token=[redacted]') bad.push('redact()');
   } finally { console.warn = w0; console.error = e0; console.log = l0; }
   if (bad.length) throw new Error(bad.join(' | '));
-  return 'LWA refresh_token exchange (form body), token cached in memory until a minute before expiry; 401 → one refresh + retry, a second 401 stands; EU endpoint for India; searchOrders/getOrder URLs, form-style arrays, x-amz-access-token/x-amz-date/user-agent, no signing; 429 waits Amazon\'s rate-limit hint (capped 60 s), 4 retries; 500/502/503/504/connection 3 tries; 400/403/404 once; no secret or token in any message or log';
+  return 'LWA refresh_token exchange (form body), token cached in memory until a minute before expiry; 401 → one refresh + retry, a second 401 stands; EU endpoint for India; searchOrders/getOrder URLs, form-style arrays, x-amz-access-token/x-amz-date/user-agent, no signing; 429 waits one refill (~178.6 s at 0.0056/s), 2 retries, then thrown; 500/502/503/504/connection 3 tries; 400/403/404 once; no secret or token in any message or log';
 });
 
 await step('amazon orders: mapping — file-import value formula, tax/shipping/discount, FBA, pending, mixed currency refused, no buyer data', async () => {
@@ -5018,6 +5021,118 @@ await step('amazon orders: incremental sync — window, watermark, paging, check
   }
   if (bad.length) throw new Error(bad.join(' | '));
   return 'first window from a start date to now − 3 min (Amazon: ≥ 2 min before the request); later windows checkpoint − 5 min; same parameters + paginationToken per page; checkpoint = watermark only after a complete window; repeat run changes nothing; price change updates order + line; pending created once priced; FBA → no dispatch type, fulfillment marketplace; mapped/unmapped SKUs; mixed currency refused by name; failed window continued as the same window; partial → token saved + used; >23 h token or Amazon-rejected token → same window from page 1; 409 for a second Amazon start; Amazon/Shopify independent; no Shopify resume; CSV→API and API→CSV converge on one order, file-only fields kept, locked lines/value kept with conflicts; no stock, shipments, attribution or secrets';
+});
+
+await step('amazon sp-api pacing: burst of 20 then one request per refill, remembered rate, 429 without a header waits a refill (not ~30 s)', async () => {
+  const bad = [];
+  const vc = () => { const c = { t: Date.parse('2026-10-09T00:00:00Z'), waits: [] }; c.wait = async (ms) => { c.waits.push(ms); c.t += ms; }; c.now = () => c.t; return c; };
+  const q = { lastUpdatedAfter: 'A', lastUpdatedBefore: 'B' };
+  // The burst: 20 requests at once, then the 21st waits one refill at the documented rate.
+  let c = vc(); let s = fakeAmazon(); s.pages[''] = { orders: [] };
+  const plain = { status: 200, headers: {}, text: JSON.stringify({ orders: [] }) };   // no rate-limit header
+  let cl = azClient(s, { wait: c.wait, now: c.now });
+  for (let i = 0; i < 20; i += 1) { s.script.push(plain); await cl.searchOrders(q); }
+  if (c.waits.length || cl.searchRate() !== SEARCH_ORDERS_RATE || cl.searchWaitMs() !== 178572) bad.push(`burst: waits ${c.waits} next ${cl.searchWaitMs()}`);
+  s.script.push(plain); await cl.searchOrders(q);
+  if (c.waits.join() !== '178572') bad.push(`21st waits ${c.waits}`);
+  // Never deliberately over the limit: 5 more requests take 5 refills, and not one 429 was provoked.
+  for (let i = 0; i < 5; i += 1) { s.script.push(plain); await cl.searchOrders(q); }
+  if (c.waits.length !== 6 || c.waits.some((w) => w < 178000)) bad.push(`paced waits ${c.waits}`);
+  // A reported rate is remembered and used for the following requests.
+  s.script.push({ status: 200, headers: { 'x-amzn-ratelimit-limit': '0.5' }, text: JSON.stringify({ orders: [] }) });
+  await cl.searchOrders(q);
+  if (cl.searchRate() !== 0.5) bad.push('rate not remembered');
+  c.waits.length = 0;
+  s.script.push(plain); await cl.searchOrders(q);
+  if (c.waits.join() !== '2000') bad.push(`remembered-rate wait ${c.waits}`);
+  // 429 with no header: the wait is one refill at the remembered rate (2 s here), then at the documented one on a fresh client.
+  c = vc(); s = fakeAmazon(); cl = azClient(s, { wait: c.wait, now: c.now });
+  s.script.push({ status: 429, headers: {}, text: '{}' }, plain);
+  await cl.searchOrders(q);
+  if (c.waits.join() !== '178572' || s.calls.length !== 2) bad.push(`429 no header: waits ${c.waits}, calls ${s.calls.length}`);
+  // Throttled throughout: 3 tries, two refills of waiting (~6 min), then a throttled error — not a ~30 s failure, no loop.
+  c = vc(); s = fakeAmazon(); cl = azClient(s, { wait: c.wait, now: c.now });
+  for (let i = 0; i < 3; i += 1) s.script.push({ status: 429, headers: {}, text: '{}' });
+  const e = await cl.searchOrders(q).then(() => null, (x) => x);
+  if (!e?.throttled || s.calls.length !== 3 || c.waits.join() !== '178572,178572' || c.waits.some((w) => w > 200000)) bad.push(`429 exhausted: waits ${c.waits} calls ${s.calls.length}`);
+  // The process keeps one client: the same instance every time.
+  if (sharedAmazonClient() !== sharedAmazonClient()) bad.push('shared client not shared');
+  if (bad.length) throw new Error(bad.join(' | '));
+  return '20 requests without waiting, the 21st waits 178.6 s (0.0056/s), later ones one refill each, no 429 provoked; x-amzn-RateLimit-Limit 0.5 remembered → 2 s; 429 without a header waits one refill (178.6 s), not 2–16 s; still throttled → 3 tries, ≤ 200 s each, then a throttled error; one shared client per process';
+});
+
+await step('amazon sync catch-up: 2,050 orders across chained runs on one window, page 21 after a refill, allowance kept between runs, run budget, throttled runs end partial, checkpoint only at the end', async () => {
+  const bad = [];
+  const db = getPool();
+  const CK = 'amazon_orders_checkpoint';
+  const saved = (await db.query('SELECT value FROM system_state WHERE key = $1', [CK])).rows[0]?.value ?? null;
+  const ck = async () => (await db.query('SELECT value FROM system_state WHERE key = $1', [CK])).rows[0]?.value ?? null;
+  const vc = { t: Date.now(), waits: [] };
+  const wait = async (ms) => { vc.waits.push(ms); vc.t += ms; };
+  const now = () => vc.t;
+  const runRows = async (since) => (await db.query(`SELECT id, status, rows_processed, details FROM order_imports WHERE kind = 'amazon_sync' AND id > $1 ORDER BY id`, [since])).rows;
+  const lastId = async () => Number((await db.query(`SELECT coalesce(max(id), 0) id FROM order_imports`)).rows[0].id);
+  try {
+    await db.query('DELETE FROM system_state WHERE key = $1', [CK]);
+    // 21 pages: 20 × 100 + 50 = 2,050 orders, one fixed window.
+    const s = fakeAmazon();
+    const big = (n) => azOrder(1000 + n, [azItem('I1')]);
+    for (let p = 0; p < 21; p += 1) {
+      s.pages[p ? `G${p}` : ''] = { orders: Array.from({ length: p < 20 ? 100 : 50 }, (_, i) => big(p * 100 + i)), ...(p < 20 ? { next: `G${p + 1}` } : {}) };
+    }
+    const client = azClient(s, { wait, now });
+    const from = new Date(Date.now() - 86400000).toISOString();
+    const id0 = await lastId();
+    // Run 1: pages 1–20 inside the burst, no waiting; partial with the page-21 token; checkpoint unchanged (none yet).
+    const r1 = await runAmazonSync({ client, actor: AZ_ACTOR, startFrom: from });
+    if (!r1.summary.partial || r1.summary.fetched !== 2000 || vc.waits.length || (await ck()) !== null) bad.push(`run 1 ${JSON.stringify(r1.summary)} waits ${vc.waits}`);
+    const [row1] = await runRows(id0);
+    if (row1.details.cursor?.token !== 'G20' || row1.details.window.until !== r1.window.until) bad.push(`run 1 cursor ${JSON.stringify(row1.details.cursor)}`);
+    // The chain continues with the same client: it knows the burst is spent and waits one refill before page 21.
+    const st = await startAmazonIncrementalSync({ client, actor: AZ_ACTOR });
+    const r2 = await st.done;
+    const rows = await runRows(id0);
+    const page21 = s.calls.findIndex((c) => new URL(c.url).searchParams.get('paginationToken') === 'G20');
+    if (st.resumedFrom !== Number(row1.id) || rows.length !== 2 || rows[1].status !== 'completed' || r2.window.until !== r1.window.until || r2.window.since !== r1.window.since) bad.push(`chain ${rows.map((r) => r.status)}`);
+    if (vc.waits.join() !== '178572' || page21 < 0) bad.push(`page 21 waits ${vc.waits}`);
+    if ((await ck()) !== r1.window.until) bad.push('checkpoint not the window\'s end after the last page');
+    const n = (await db.query(`SELECT count(*)::int n FROM orders WHERE channel = 'amazon' AND source_order_id = ANY($1)`, [Array.from({ length: 2050 }, (_, i) => AZS(1000 + i))])).rows[0].n;
+    if (n !== 2050) bad.push(`${n} orders imported`);
+    // A fresh client (a restarted process) assumes a full burst; the shared one would have waited — the allowance lives in the client.
+    // Run budget: with the allowance spent, a run takes pages while its waiting stays under 15 minutes, then ends partial.
+    await db.query('DELETE FROM system_state WHERE key = $1', [CK]);
+    const s2 = fakeAmazon();
+    for (let p = 0; p < 30; p += 1) s2.pages[p ? `H${p}` : ''] = { orders: [azOrder(5000 + p, [azItem('I1')])], ...(p < 29 ? { next: `H${p + 1}` } : {}) };
+    vc.waits.length = 0;
+    const c2 = azClient(s2, { wait, now });
+    const t0 = vc.t;
+    const b1 = await runAmazonSync({ client: c2, actor: AZ_ACTOR, startFrom: from });
+    const runMs = vc.t - t0;
+    if (!b1.summary.partial || b1.summary.endedBy !== 'allowance' || b1.summary.fetched !== 25 || runMs > 15 * 60000 || (await ck()) !== null) bad.push(`budget ${JSON.stringify(b1.summary)} ${runMs}`);
+    // Throttled before a page, run after run: each run ends partial (cursor and window kept), the third fails; checkpoint never moves.
+    const thr = { status: 429, headers: {}, text: '{}' };
+    const idT = await lastId();
+    let prevRun = b1.runId;
+    for (let i = 1; i <= 3; i += 1) {
+      for (let k = 0; k < 3; k += 1) s2.script.push(thr);
+      const res = await runAmazonSync({ client: c2, actor: AZ_ACTOR, resumeRunId: prevRun }).then((x) => x, (e) => e);
+      const [row] = (await runRows(idT)).slice(-1);
+      prevRun = Number(row.id);
+      const want = i < 3 ? 'partial' : 'failed';
+      if (row.status !== want || row.details.cursor?.token !== 'H25' || row.details.window.until !== b1.window.until || (i < 3 && res.summary?.endedBy !== 'throttled')) bad.push(`throttled run ${i}: ${row.status} ${JSON.stringify(row.details.cursor)}`);
+    }
+    if ((await ck()) !== null) bad.push('checkpoint moved by throttled runs');
+    // Recovery: the failed run is continued from its saved token, the window finishes, then the checkpoint moves.
+    const done = await (await startAmazonIncrementalSync({ client: c2, actor: AZ_ACTOR })).done;
+    if (done.window.until !== b1.window.until || (await ck()) !== b1.window.until) bad.push('throttled window not completed');
+    const total = (await db.query(`SELECT count(*)::int n FROM orders WHERE channel = 'amazon' AND source_order_id = ANY($1)`, [Array.from({ length: 30 }, (_, i) => AZS(5000 + i))])).rows[0].n;
+    if (total !== 30) bad.push(`${total} of 30 budget-test orders`);
+  } finally {
+    if (saved === null) await db.query('DELETE FROM system_state WHERE key = $1', [CK]);
+    else await db.query('UPDATE system_state SET value = $2 WHERE key = $1', [CK, saved]);
+  }
+  if (bad.length) throw new Error(bad.join(' | '));
+  return '2,050 orders: run 1 = 20 pages in the burst → partial with the page-21 token, no checkpoint; the chain reuses the client, waits one refill (178.6 s) before page 21 and completes the same window; checkpoint = window end only then; a run stops taking paced pages before 15 min of waiting (partial); 429s before a page end runs partial with cursor and window kept, the third in a row fails, checkpoint untouched; resumed → done, then the checkpoint moves';
 });
 
 await step('amazon sp-api cleanup', async () => {
