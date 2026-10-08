@@ -1748,18 +1748,27 @@ const syncNote = (html, tone = '') => {
   el.innerHTML = html;
   el.hidden = !html;
 };
-const shopifyBusy = (on) => {
+/**
+ * The Shopify button: 'idle' → Shopify; 'starting' → disabled while the start request is out; 'running' → a red
+ * "Stop Shopify Sync" (one click asks the server to stop); 'stopping' → disabled until the current page finishes.
+ */
+const shopifyBusy = (on, mode = on ? 'running' : 'idle') => {
   const b = $('#shopifyOrders');
-  b.disabled = on;
+  const stop = mode === 'running' || mode === 'stopping';
+  b.dataset.mode = mode;
+  b.disabled = mode === 'starting' || mode === 'stopping';
+  b.classList.toggle('danger', stop);
   b.setAttribute('aria-busy', on ? 'true' : 'false');
-  $('#shopifyLabel').textContent = on ? 'Syncing…' : 'Shopify';
+  b.title = stop ? 'Stop the Shopify sync after the current page' : 'Sync new and changed Shopify orders';
+  b.querySelector('.shopify-mark').hidden = stop;
+  $('#shopifyLabel').textContent = mode === 'running' ? 'Stop Shopify Sync' : mode === 'stopping' ? 'Stopping…' : mode === 'starting' ? 'Syncing…' : 'Shopify';
 };
 const duration = (ms) => (ms === null || ms === undefined ? '' : ms < 60000 ? `${Math.max(1, Math.round(ms / 1000))} s` : `${Math.round(ms / 60000)} min`);
 
 /** Syncs orders changed since the last sync (the server refuses a second sync with 409) and follows it to the end. */
 async function startShopifySync() {
   if ($('#shopifyOrders').disabled) return;
-  shopifyBusy(true);
+  shopifyBusy(true, 'starting');
   syncNote('Syncing new and changed Shopify orders…');
   try {
     await api('/api/orders/shopify/sync-updates', { method: 'POST' });
@@ -1770,12 +1779,26 @@ async function startShopifySync() {
   followShopifySync();
 }
 
+/** The red button: one stop request; the page in progress finishes, then the sync ends and the banner says so. */
+async function stopShopifySync() {
+  const b = $('#shopifyOrders');
+  if (b.dataset.mode !== 'running' || b.disabled) return;
+  shopifyBusy(true, 'stopping');
+  syncNote('Stopping the Shopify sync after the current page…');
+  try { await api('/api/orders/shopify/sync/cancel', { method: 'POST' }); } catch (err) {
+    // Nothing running any more (it just finished): the status poll shows how it ended.
+    if (err.status !== 409) { shopifyBusy(true); syncNote(esc(err.message), 'error'); }
+  }
+}
+const onShopifyClick = () => ($('#shopifyOrders').dataset.mode === 'running' ? stopShopifySync() : startShopifySync());
+
 async function followShopifySync() {
   let s;
   try { s = await api('/api/orders/shopify/sync-updates'); } catch (err) { shopifyBusy(false); syncNote(esc(err.message), 'error'); return; }
   if (s.state === 'running') {
-    shopifyBusy(true);
-    syncNote(`Syncing new and changed Shopify orders… <span class="soft">${count(s.fetched || 0)} fetched so far</span>`);
+    shopifyBusy(true, s.stopping || $('#shopifyOrders').dataset.mode === 'stopping' ? 'stopping' : 'running');
+    syncNote(s.stopping ? `Stopping the Shopify sync after the current page… <span class="soft">${count(s.fetched || 0)} fetched so far</span>`
+      : `Syncing new and changed Shopify orders… <span class="soft">${count(s.fetched || 0)} fetched so far</span>`);
     setTimeout(followShopifySync, 2500);
     return;
   }
@@ -1785,6 +1808,9 @@ async function followShopifySync() {
       <span>${count(s.fetched)} fetched</span><span>${count(s.created)} new</span><span>${count(s.updated)} updated</span>
       <span>${count(s.conflicts)} conflict${s.conflicts === 1 ? '' : 's'}</span><span>${count(s.unmappedLines)} unmapped line${s.unmappedLines === 1 ? '' : 's'}</span>
       <span>BWA shipments: ${count(s.externalCreated)} created, ${count(s.externalUpdated)} updated</span></div>`, 'success');
+    load();
+  } else if (s.state === 'partial' && s.stopped) {
+    syncNote(`<b>Shopify sync stopped</b><div class="sync-facts stop-facts"><span>${count(s.fetched)} fetched</span><span>${count(s.created)} new</span><span>${count(s.updated)} updated</span></div>Click Shopify to continue.`);
     load();
   } else if (s.state === 'failed' || s.state === 'partial') {
     syncNote(`<b>Shopify sync stopped</b> after ${count(s.fetched)} orders${s.failure ? ` — ${esc(s.failure)}` : ''}. Click Shopify again to continue from where it stopped.`, 'error');
@@ -1938,7 +1964,7 @@ function bind() {
   $('#importOrders').addEventListener('click', openImport);
   $('#iClose').addEventListener('click', closeImport);
   // One click: sync orders changed in Shopify since the last sync (no panel). Refresh above only reloads the list.
-  $('#shopifyOrders').addEventListener('click', startShopifySync);
+  $('#shopifyOrders').addEventListener('click', onShopifyClick);
   // One click: sync Amazon orders (no panel). Only the very first sync asks for a start date.
   $('#amazonOrders').addEventListener('click', () => startAmazonSync());
   $('#iCancel').addEventListener('click', closeImport);

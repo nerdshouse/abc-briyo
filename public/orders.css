@@ -482,3 +482,5 @@ html.scroll-locked .drawer-scrim { touch-action: none; }
 .amazon-start { display: inline-flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 6px 8px 6px 0; }
 .amazon-start .input { width: auto; min-width: 0; }
 .amazon-facts { display: flex; flex-wrap: wrap; gap: 4px 14px; margin-top: 4px; font-size: 12.5px; }
+/* Shopify sync stopped: the short summary under the heading */
+.stop-facts { display: flex; flex-wrap: wrap; gap: 4px 14px; margin: 4px 0; font-size: 12.5px; }
