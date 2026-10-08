@@ -57,7 +57,7 @@ import { metricsFrom, rawFromRow, rangeParams, classifyMetaError, createMetaClie
 import { overviewFor } from '../lib/overview.js';
 import { ensureAffiliateSchema, newAffiliatePublicId, rateAt, getAffiliateSetting, setAffiliateSetting, purgeTestAffiliates, _resetAffiliateSchemaForTest, createAffiliate } from '../lib/affiliates.js';
 import { receiveOrdersCreate, processWebhookDelivery, processPendingWebhooks, verifyWebhookHmac, ensureShopifyWebhookSchema } from '../lib/shopify-webhooks.js';
-import { startFullHistorySync, fullHistoryStatus, grantedAccessScopes, hasReadAllOrders, _resetScopeCache, assertNoSyncRunning } from '../lib/shopify-orders.js';
+import { startIncrementalSync, shopifySyncStatus, startFullHistorySync, fullHistoryStatus, grantedAccessScopes, hasReadAllOrders, _resetScopeCache, assertNoSyncRunning } from '../lib/shopify-orders.js';
 import { runShopifySync, mapShopifyOrder, shopifyPaymentMethod, shopifyPaymentStatus, shopifyOrdersStatus, pollShopifyOrdersOnce, ordersPollMinutes } from '../lib/shopify-orders.js';
 import { ensureOrderFinancialSnapshotSchema, financialSnapshotFrom, addAmounts, FINANCIAL_TABLES } from '../lib/order-financial-snapshots.js';
 import { SHOPIFY_MAX_QUERY_COST, SHOPIFY_ORDER_QUERIES, LIMITS as SHOPIFY_LIMITS, shopifyOrderQuery, estimateShopifyOrderQueryCost } from '../lib/shopify-order-queries.js';
@@ -3538,7 +3538,7 @@ const shFake = (store, { denyPii = false, calls = [], scopes = ['read_orders'] }
   const le = (field) => (q.match(new RegExp(`${field}:<='([^']+)'`)) || [])[1];
   const idq = (q.match(/(?:^|\s)id:(\d+)/) || [])[1];   // a single order by its numeric id, as Shopify's search does
   const rows = store().filter((x) => (!idq || x.id.split('/').pop() === idq) && (!ge('created_at') || x.createdAt >= ge('created_at')) && (!le('created_at') || x.createdAt <= le('created_at'))
-    && (!ge('updated_at') || x.updatedAt >= ge('updated_at'))).sort((a, b) => a.updatedAt.localeCompare(b.updatedAt) || a.id.localeCompare(b.id));
+    && (!ge('updated_at') || x.updatedAt >= ge('updated_at')) && (!le('updated_at') || x.updatedAt <= le('updated_at'))).sort((a, b) => a.updatedAt.localeCompare(b.updatedAt) || a.id.localeCompare(b.id));
   const page = shPage(rows, first, vars.after);
   // Like Shopify: fields that were not asked for are not returned (detail fields come from their own query).
   const shaped = page.nodes.map((x) => {
@@ -4477,6 +4477,91 @@ await step('shopify orders: one-click full history — needs read_all_orders as 
   if (bad.length) throw new Error(bad.join(' | '));
   return 'live scopes read from Shopify (cached; override honoured); without read_all_orders full history and >60-day windows refused, nothing recorded; with it a long window is allowed; a chain failing part-way leaves the checkpoint, the next click resumes and pages to 130 orders over ≥3 runs; second click / Sync now 409 and the poll skipped while it runs; checkpoint set to the chain start; unmapped lines summed across pages; BWA fulfilment mirrored once (delivered), manual shipment untouched on a re-run, no orders duplicated; no movements or reservations; #2823 pattern unattributed, no commission';
 });
+await step('shopify orders: the Shopify button syncs incrementally — checkpoint to a fixed watermark, only after success, idempotent, BWA updates mirrored, one at a time', async () => {
+  const bad = [];
+  const CK = 'shopify_orders_checkpoint';
+  const ckNow = async () => (await getPool().query('SELECT value FROM system_state WHERE key = $1', [CK])).rows[0]?.value ?? null;
+  const setCk = (v) => getPool().query(`INSERT INTO system_state (key, value, updated_at) VALUES ($1, $2, now()) ON CONFLICT (key) DO UPDATE SET value = $2, updated_at = now()`, [CK, v]);
+  const savedCk = await ckNow();
+  const iso = (msAgo) => new Date(Date.now() - msAgo).toISOString();
+  const ATS = 'Amazon Transportation Services';
+  const store = [
+    { ...shOrder(3001, { created: iso(86400000) }), updatedAt: iso(86400000) },        // changed before the checkpoint: not fetched
+    { ...shOrder(3002, { created: iso(1800000) }), updatedAt: iso(1800000) },           // new since the checkpoint
+  ];
+  const bwaF = { id: `gid://shopify/Fulfillment/${SH_NUM}9301`, name: '#3003-F1', status: 'SUCCESS', displayStatus: 'IN_TRANSIT', createdAt: iso(1200000), updatedAt: iso(1200000),
+    inTransitAt: iso(1200000), deliveredAt: null, estimatedDeliveryAt: null, trackingInfo: [{ company: ATS, number: '374199999901', url: 'https://www.swiship.co.uk/track?id=374199999901' }] };
+  store.push({ ...shOrder(3003, { created: iso(1500000) }), tags: ['Buy with Amazon'], fulfillments: [bwaF], updatedAt: iso(1200000) });
+  let late = null;   // an order Shopify changes while the run is paging through
+  const gql = shFake(() => store);
+  const watching = async (q, v) => {
+    if (/^query BriyoOrdersPage/.test(q) && !late) {
+      late = { ...shOrder(3004, { created: new Date(Date.now() + 100).toISOString() }), updatedAt: new Date(Date.now() + 100).toISOString() };
+      store.push(late);
+    }
+    return gql(q, v);
+  };
+  const gidOf = (n) => `${SH_PREFIX}${String(n).padStart(4, '0')}`;
+  const has = async (n) => (await getPool().query('SELECT 1 FROM orders WHERE source_order_id = $1', [gidOf(n)])).rows.length === 1;
+  const fx = async () => (await getPool().query(`SELECT (SELECT count(*) FROM inventory_movements)::int mv, (SELECT count(*) FROM inventory_reservations)::int rs`)).rows[0];
+  const lastRun = async () => (await getPool().query(`SELECT id, status, details FROM order_imports WHERE kind = 'shopify_sync' ORDER BY id DESC LIMIT 1`)).rows[0];
+  try {
+    const fx0 = await fx();
+    // a, f. From the last successful checkpoint: the order changed since is imported, the older one is not.
+    await setCk(iso(3600000));
+    const r1 = await startIncrementalSync({ actor: SH_ACTOR, gql: watching, backoffMs: 1 });
+    await r1.done;
+    const run1 = await lastRun();
+    if (r1.mode !== 'incremental' || run1.details.window.mode !== 'incremental' || !run1.details.window.until) bad.push(`run ${JSON.stringify(run1.details.window)}`);
+    if (!(await has(3002)) || !(await has(3003)) || await has(3001)) bad.push(`window ${[await has(3001), await has(3002), await has(3003)]}`);
+    // b. The order changed mid-run (after the watermark) was not fetched by this run...
+    if (await has(3004)) bad.push('a change after the watermark was taken by the same run');
+    // c. ...and the checkpoint moved to the watermark, only now that the run completed.
+    if (await ckNow() !== run1.details.window.until || run1.status !== 'completed') bad.push(`checkpoint ${await ckNow()} vs until ${run1.details.window.until}`);
+    const st = await shopifySyncStatus();
+    if (st.state !== 'completed' || st.mode !== 'incremental' || st.created !== 2 || st.externalCreated !== 1) bad.push(`status ${JSON.stringify(st)}`);
+    // b (cont.). The next run starts at the watermark (less the overlap) and picks the mid-run change up.
+    await new Promise((r) => setTimeout(r, 250));
+    const r2 = await startIncrementalSync({ actor: SH_ACTOR, gql, backoffMs: 1 });
+    await r2.done;
+    if (!(await has(3004))) bad.push('the mid-run change was skipped');
+    // e. Repeated with nothing new: nothing created, nothing duplicated.
+    const r3 = await startIncrementalSync({ actor: SH_ACTOR, gql, backoffMs: 1 });
+    const res3 = await r3.done;
+    if (res3.summary.ordersCreated !== 0 || res3.summary.externalShipmentsCreated !== 0) bad.push(`repeat ${JSON.stringify(res3.summary)}`);
+    // g, h. An updated order and a BWA fulfilment that moved on: updated, the shipment advanced (still one).
+    const o3 = store.find((o) => o.id === gidOf(3003));
+    o3.fulfillments = [{ ...bwaF, displayStatus: 'DELIVERED', deliveredAt: new Date().toISOString(), updatedAt: new Date().toISOString() }];
+    o3.note = 'changed in Shopify';
+    o3.updatedAt = new Date().toISOString();
+    const r4 = await startIncrementalSync({ actor: SH_ACTOR, gql, backoffMs: 1 });
+    const res4 = await r4.done;
+    const sh = (await getPool().query(`SELECT s.shipment_status FROM order_shipments s JOIN orders o ON o.id = s.order_id WHERE o.source_order_id = $1`, [gidOf(3003)])).rows;
+    if (res4.summary.changed < 1 || res4.summary.externalShipmentsUpdated !== 1 || sh.length !== 1 || sh[0].shipment_status !== 'delivered') bad.push(`update ${JSON.stringify({ s: res4.summary, sh })}`);
+    // d. A run that fails leaves the checkpoint; the next run re-covers the same window.
+    const before = await ckNow();
+    store.push({ ...shOrder(3005, { created: new Date().toISOString() }), updatedAt: new Date().toISOString() });
+    const broken = async (q, v) => { if (/^query BriyoOrdersPage/.test(q)) throw Object.assign(new Error('Shopify HTTP 400: Bad request'), { status: 400 }); return gql(q, v); };
+    const r5 = await startIncrementalSync({ actor: SH_ACTOR, gql: broken, backoffMs: 1 });
+    await r5.done.then(() => bad.push('broken run succeeded'), () => {});
+    if (await ckNow() !== before || (await lastRun()).status !== 'failed' || await has(3005)) bad.push('a failed run moved the checkpoint or imported');
+    const r6 = await startIncrementalSync({ actor: SH_ACTOR, gql, backoffMs: 1 });
+    await r6.done;
+    if (!(await has(3005)) || await ckNow() === before) bad.push('the retry did not cover the window');
+    // j. One at a time.
+    const r7 = await startIncrementalSync({ actor: SH_ACTOR, gql, backoffMs: 1 });
+    await expectErr('second click', () => startIncrementalSync({ actor: SH_ACTOR, gql }), (e) => e.status === 409 && e.syncRunning);
+    await expectErr('full history meanwhile', () => startFullHistorySync({ actor: SH_ACTOR, gql }), (e) => e.status === 409 && e.syncRunning);
+    await r7.done;
+    // i. No stock side effects.
+    const fx1 = await fx();
+    if (fx1.mv !== fx0.mv || fx1.rs !== fx0.rs) bad.push(`stock ${JSON.stringify([fx0, fx1])}`);
+  } finally {
+    if (savedCk === null) await getPool().query('DELETE FROM system_state WHERE key = $1', [CK]); else await setCk(savedCk);
+  }
+  if (bad.length) throw new Error(bad.join(' | '));
+  return 'from the last successful checkpoint only (older change not fetched); a change made mid-run falls after the fixed watermark and is taken by the next run; checkpoint = the watermark, set only on success; repeat run creates nothing; changed order updated and its BWA fulfilment advanced to delivered (one shipment); a failed run leaves the checkpoint and the next re-covers the window; second click and a full-history start refused while running; no movements or reservations';
+});
 await step('orders page: Refresh only reloads, Shopify starts the full sync (no panel), the Shopify logo has no dark tile', async () => {
   const bad = [];
   const js = await fsp.readFile(new URL('../public/orders.js', import.meta.url), 'utf8');
@@ -4485,7 +4570,9 @@ await step('orders page: Refresh only reloads, Shopify starts the full sync (no 
   const refresh = js.match(/\$\('#refresh'\)\.addEventListener\('click', ([^\n]+)\);/)?.[1] || '';
   if (!refresh || /shopify|sync/i.test(refresh)) bad.push(`refresh handler: ${refresh}`);
   if (!/\$\('#shopifyOrders'\)\.addEventListener\('click', startShopifySync\)/.test(js) || /\$\('#shopifyOrders'\)\.addEventListener\('click', openShopify\)/.test(js)) bad.push('Shopify button not wired to the direct sync');
-  if (!/api\('\/api\/orders\/shopify\/sync-all', \{ method: 'POST' \}\)/.test(js)) bad.push('sync-all not called');
+  if (!/api\('\/api\/orders\/shopify\/sync-updates', \{ method: 'POST' \}\)/.test(js)) bad.push('incremental sync not called');
+  // k. The normal button never runs full history: the page never calls the recovery route.
+  if (/shopify\/sync-all/.test(js)) bad.push('the page calls the full-history route');
   if (/class="brand-mark" src="\/brand\/shopify-bag\.svg"/.test(html) || (html.match(/class="shopify-mark"/g) || []).length !== 1) bad.push('logo still uses the dark brand-mark tile class');
   // The old sync drawer is gone, with its code: nothing left that could open it.
   if (/id="shopifyDrawer"/.test(html) || /openShopify|closeShopify|sfRun|#shopifyDrawer|#sf[A-Z]/.test(js)) bad.push('old Shopify drawer or its code still present');
@@ -4494,7 +4581,7 @@ await step('orders page: Refresh only reloads, Shopify starts the full sync (no 
   const svg = await fsp.readFile(new URL('../public/brand/shopify-bag.svg', import.meta.url), 'utf8');
   if (/<rect/.test(svg)) bad.push('the logo file has a background rectangle');
   if (bad.length) throw new Error(bad.join(' | '));
-  return 'Refresh handler only reloads (no Shopify call); Shopify button → POST /api/orders/shopify/sync-all, the old drawer and its code removed; logo uses .shopify-mark with no background (not the sidebar dark .brand-mark tile); the official SVG has no background shape';
+  return 'Refresh handler only reloads (no Shopify call); Shopify button → POST /api/orders/shopify/sync-updates (never sync-all), the old drawer and its code removed; logo uses .shopify-mark with no background (not the sidebar dark .brand-mark tile); the official SVG has no background shape';
 });
 await step('shopify orders cleanup', async () => {
   await purgeTestOrders(SH_PREFIX);
