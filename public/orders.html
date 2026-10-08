@@ -41,12 +41,13 @@
         </div>
         <div class="page-actions">
           <button class="icon-btn" id="refresh" type="button" title="Refresh" aria-label="Refresh"><i data-lucide="refresh-cw"></i></button>
-          <button class="btn" id="shopifyOrders" type="button" hidden><img class="brand-mark" src="/brand/shopify-bag.svg" alt="" aria-hidden="true" width="16" height="18" />Shopify</button>
+          <button class="btn" id="shopifyOrders" type="button" hidden title="Sync all Shopify orders"><img class="shopify-mark" src="/brand/shopify-bag.svg" alt="" aria-hidden="true" width="16" height="18" /><span id="shopifyLabel">Shopify</span></button>
           <button class="btn" id="importOrders" type="button" data-cap="logistics.edit"><i data-lucide="upload"></i>Import</button>
           <button class="btn primary" id="newShipment" type="button" data-cap="logistics.edit"><i data-lucide="plus"></i>New shipment</button>
         </div>
       </div>
 
+      <div class="banner" id="shopifySync" role="status" aria-live="polite" hidden></div>
       <div id="alerts"></div>
 
       <section class="card">
@@ -318,7 +319,7 @@
 
 <aside class="drawer drawer-wide" id="shopifyDrawer" hidden aria-label="Shopify orders">
   <div class="drawer-head">
-    <div><h2 class="drawer-title"><img class="brand-mark" src="/brand/shopify-bag.svg" alt="" aria-hidden="true" width="16" height="18" />Shopify orders</h2><div class="drawer-sub">Website orders from Shopify. Preview first — nothing is saved until you import.</div></div>
+    <div><h2 class="drawer-title"><img class="shopify-mark" src="/brand/shopify-bag.svg" alt="" aria-hidden="true" width="16" height="18" />Shopify orders</h2><div class="drawer-sub">Website orders from Shopify. Preview first — nothing is saved until you import.</div></div>
     <div class="drawer-nav"><button class="icon-btn" id="sfClose" type="button" title="Close" aria-label="Close"><i data-lucide="x"></i></button></div>
   </div>
   <div class="drawer-body">

@@ -57,6 +57,7 @@ import { metricsFrom, rawFromRow, rangeParams, classifyMetaError, createMetaClie
 import { overviewFor } from '../lib/overview.js';
 import { ensureAffiliateSchema, newAffiliatePublicId, rateAt, getAffiliateSetting, setAffiliateSetting, purgeTestAffiliates, _resetAffiliateSchemaForTest, createAffiliate } from '../lib/affiliates.js';
 import { receiveOrdersCreate, processWebhookDelivery, processPendingWebhooks, verifyWebhookHmac, ensureShopifyWebhookSchema } from '../lib/shopify-webhooks.js';
+import { startFullHistorySync, fullHistoryStatus, grantedAccessScopes, hasReadAllOrders, _resetScopeCache, assertNoSyncRunning } from '../lib/shopify-orders.js';
 import { runShopifySync, mapShopifyOrder, shopifyPaymentMethod, shopifyPaymentStatus, shopifyOrdersStatus, pollShopifyOrdersOnce, ordersPollMinutes } from '../lib/shopify-orders.js';
 import { ensureOrderFinancialSnapshotSchema, financialSnapshotFrom, addAmounts, FINANCIAL_TABLES } from '../lib/order-financial-snapshots.js';
 import { SHOPIFY_MAX_QUERY_COST, SHOPIFY_ORDER_QUERIES, LIMITS as SHOPIFY_LIMITS, shopifyOrderQuery, estimateShopifyOrderQueryCost } from '../lib/shopify-order-queries.js';
@@ -3512,8 +3513,9 @@ const shPage = (conn, first, after) => {
  * per-order detail, follow-up line pages, and refund detail. Page sizes come
  * from the query text, so the test checks what is actually sent.
  */
-const shFake = (store, { denyPii = false, calls = [] } = {}) => async (query, vars) => {
+const shFake = (store, { denyPii = false, calls = [], scopes = ['read_orders'] } = {}) => async (query, vars) => {
   const kind = (query.match(/^query (\w+)/) || [])[1];
+  if (kind === 'BriyoAccessScopes') { calls.push({ kind }); return { currentAppInstallation: { accessScopes: scopes.map((handle) => ({ handle })) } }; }
   const first = Number((query.match(/(?:orders|lineItems)\(first: (\d+)/) || [])[1]);
   calls.push({ kind, first, after: vars.after, q: vars.query, pii: /shippingAddress \{/.test(query) });
   const find = (id) => store().find((x) => x.id === id);
@@ -4382,6 +4384,115 @@ await step('shopify orders: Buy with Amazon fulfilments mirrored as external shi
   }
   if (bad.length) throw new Error(bad.join(' | '));
   return 'BWA tag + Amazon carrier → 1 shipment per fulfilment GID (in_transit, Shopify tracking + URL, provider bwa, no courier row made); non-BWA tag and other carrier → none; 2 fulfilments → 2 shipments; no tracking → none invented; unmapped SKU no obstacle; re-sync and concurrent syncs → no duplicates; manual shipment + BWA fulfilment → both (manual untouched), + a second BWA fulfilment → 3 records, repeated/concurrent syncs keep 3; tracking update applied; DELAYED keeps in_transit; OUT_FOR_DELIVERY, DELIVERED forward, never back; cancelled in Shopify → cancelled (kept), replacement → new shipment; reserve refused, dispatch deducts nothing, no other order can join; no movements, reservations, stock or courier changes; tag configurable';
+});
+await step('shopify orders: one-click full history — needs read_all_orders as Shopify reports it, pages and resumes, one at a time, BWA mirrored once, #2823 unattributed, no stock', async () => {
+  const bad = [];
+  const CK = 'shopify_orders_checkpoint';
+  const savedCk = (await getPool().query('SELECT value FROM system_state WHERE key = $1', [CK])).rows[0]?.value ?? null;
+  const keepEnv = process.env.SHOPIFY_READ_ALL_ORDERS; delete process.env.SHOPIFY_READ_ALL_ORDERS;
+  const gidOf = (n) => `${SH_PREFIX}${String(n).padStart(4, '0')}`;
+  const ATS = 'Amazon Transportation Services';
+  // 130 orders back to 2023 (3 pages of 50 at most; runs of 50 so the chain resumes), one BWA, one #2823 pattern.
+  const store = [];
+  for (let i = 0; i < 130; i += 1) {
+    const n = 2001 + i;
+    const at = new Date(Date.UTC(2023, 1, 2) + i * 6 * 86400000).toISOString();
+    store.push({ ...shOrder(n, { created: at, lines: [{ sku: `${TS}-FULL-UNMAPPED`, qty: 1 }] }), updatedAt: at });
+  }
+  const bwa = store[5];
+  bwa.tags = ['Buy with Amazon', 'COD'];
+  bwa.fulfillments = [{ id: `gid://shopify/Fulfillment/${SH_NUM}9001`, name: '#B-F1', status: 'SUCCESS', displayStatus: 'DELIVERED', createdAt: bwa.createdAt, updatedAt: bwa.updatedAt,
+    inTransitAt: bwa.createdAt, deliveredAt: bwa.updatedAt, estimatedDeliveryAt: null, trackingInfo: [{ company: ATS, number: '374100000001', url: 'https://www.swiship.co.uk/track?id=374100000001' }] }];
+  const amb = store[7];   // #2823: stale /r/X path beside another affiliate's UTMs, no click id
+  amb.customAttributes = [{ key: 'full_url', value: 'https://briyo-supp.myshopify.com/r/B7K4P9?utm_source=affiliate&utm_campaign=C8M5Q2&utm_medium=referral' },
+    { key: 'utm_source', value: 'affiliate' }, { key: 'utm_campaign', value: 'C8M5Q2' }];
+  const granted = shFake(() => store, { scopes: ['read_orders', 'read_all_orders'] });
+  const notGranted = shFake(() => store, { scopes: ['read_orders', 'write_online_store_navigation'] });
+  const ours = async () => (await getPool().query(`SELECT count(*)::int n FROM orders WHERE source_order_id = ANY($1)`, [store.map((o) => o.id)])).rows[0].n;
+  const fx = async () => (await getPool().query(`SELECT (SELECT count(*) FROM inventory_movements)::int mv, (SELECT count(*) FROM inventory_reservations)::int rs`)).rows[0];
+  try {
+    const fx0 = await fx();
+    // 7. Shopify's live scopes, not the stored string; cached; the env override still forces it.
+    _resetScopeCache();
+    if (!(await grantedAccessScopes({ gql: granted })).includes('read_all_orders') || !(await hasReadAllOrders({ gql: granted }))) bad.push('granted scope not detected');
+    _resetScopeCache();
+    if (await hasReadAllOrders({ gql: notGranted })) bad.push('absent scope reported as granted');
+    process.env.SHOPIFY_READ_ALL_ORDERS = 'true';
+    if (!(await hasReadAllOrders({ gql: notGranted }))) bad.push('override ignored');
+    delete process.env.SHOPIFY_READ_ALL_ORDERS;
+    // 5–6. Without read_all_orders: full history refused (409, nothing recorded); windows over 60 days refused as before.
+    _resetScopeCache();
+    const runs0 = (await getPool().query(`SELECT count(*)::int n FROM order_imports WHERE kind = 'shopify_sync'`)).rows[0].n;
+    await expectErr('full history without scope', () => startFullHistorySync({ actor: SH_ACTOR, gql: notGranted }), (e) => e.status === 409 && e.readAllOrders === false && /read_all_orders/.test(e.message));
+    await expectErr('direct all without scope', () => runShopifySync({ window: { mode: 'all' }, dryRun: true, gql: notGranted }), (e) => e.status === 409);
+    await expectErr('90 days without scope', () => runShopifySync({ window: { days: 90 }, dryRun: true, gql: notGranted }), (e) => e.status === 400 && /60 days/.test(e.message));
+    if ((await getPool().query(`SELECT count(*)::int n FROM order_imports WHERE kind = 'shopify_sync'`)).rows[0].n !== runs0) bad.push('a refused sync recorded a run');
+    // 4. With it, a long window is allowed (preview, nothing written).
+    _resetScopeCache();
+    const p90 = await runShopifySync({ window: { days: 900 }, dryRun: true, gql: granted });
+    if (p90.runId !== null || p90.summary.window.mode !== 'window') bad.push('long window refused with the scope');
+    // 9. A chain that fails part-way, then 8. a click that resumes it and pages to the end (runs of 50 → 3 runs).
+    let calls = 0;
+    const flaky = async (q, v) => { if (/^query BriyoOrdersPage/.test(q) && v.after && (calls += 1) === 5) throw Object.assign(new Error('Shopify HTTP 400: Bad request'), { status: 400 }); return granted(q, v); };
+    const first = await startFullHistorySync({ actor: SH_ACTOR, gql: flaky, maxOrders: 50, backoffMs: 1 });
+    await first.done.then(() => bad.push('the flaky chain did not fail'), () => {});
+    const st1 = await fullHistoryStatus();
+    if (st1.state !== 'failed' || (await ours()) !== 50) bad.push(`after failure ${st1.state} ${await ours()}`);
+    if ((await getPool().query('SELECT value FROM system_state WHERE key = $1', [CK])).rows[0]?.value !== savedCk) bad.push('a failed chain moved the checkpoint');
+    // 11. One at a time: a second click, Sync now and the poll are refused or skipped while it runs.
+    const second = await startFullHistorySync({ actor: SH_ACTOR, gql: granted, maxOrders: 50, backoffMs: 1 });
+    if (!second.resumedFrom) bad.push('did not resume the failed chain');
+    await expectErr('second click', () => startFullHistorySync({ actor: SH_ACTOR, gql: granted }), (e) => e.status === 409 && e.syncRunning);
+    await expectErr('Sync now meanwhile', () => assertNoSyncRunning(), (e) => e.status === 409 && e.syncRunning);
+    if (!(await pollShopifyOrdersOnce({ gql: granted })).skipped) bad.push('poll ran during a full sync');
+    await second.done;
+    const st2 = await fullHistoryStatus();
+    if (st2.state !== 'completed' || (await ours()) !== 130 || st2.runs < 3) bad.push(`complete ${JSON.stringify({ state: st2.state, runs: st2.runs, n: await ours() })}`);
+    if (st2.fetched < 130 || st2.created !== 130 || st2.externalCreated !== 1 || !st2.durationMs && st2.durationMs !== 0) bad.push(`totals ${JSON.stringify(st2)}`);
+    const chainStart = (await getPool().query(`SELECT details->'window'->>'chain_started_at' t FROM order_imports WHERE kind = 'shopify_sync' AND details->'window'->>'mode' = 'all' ORDER BY id LIMIT 1`)).rows[0].t;
+    if ((await getPool().query('SELECT value FROM system_state WHERE key = $1', [CK])).rows[0]?.value !== chainStart) bad.push('checkpoint not at the chain start');
+    // 10. Running summary: unmapped lines counted across all pages without holding the orders.
+    if (st2.unmappedLines !== 130) bad.push(`unmapped across pages ${st2.unmappedLines}`);
+    // 12–14, 16. BWA mirrored once; a second full history duplicates nothing; manual shipment untouched; no stock.
+    const dl = (await listCouriers()).find((c) => c.name === 'Delhivery');
+    const man = await createShipment({ ...R('website'), channel: 'website', source_order_id: bwa.id, courier_partner_id: dl.id, tracking_id: 'MAN-FULL-1', shipment_status: 'packed' }, { actor: ACTOR, addToExisting: true });
+    const manV = (await getPool().query('SELECT version FROM order_shipments WHERE id = $1', [man.shipmentId])).rows[0].version;
+    const again = await startFullHistorySync({ actor: SH_ACTOR, gql: granted, maxOrders: 50, backoffMs: 1 });
+    await again.done;
+    const sh = (await getPool().query(`SELECT s.id, s.external_fulfillment_id, s.shipment_status, s.version FROM order_shipments s JOIN orders o ON o.id = s.order_id WHERE o.source_order_id = $1 ORDER BY s.id`, [bwa.id])).rows;
+    if (sh.length !== 2 || sh.filter((x) => x.external_fulfillment_id).length !== 1 || sh.find((x) => x.external_fulfillment_id)?.shipment_status !== 'delivered'
+      || sh.find((x) => x.id === String(man.shipmentId))?.version !== manV) bad.push(`BWA ${JSON.stringify(sh)}`);
+    if ((await ours()) !== 130) bad.push('re-run duplicated orders');
+    const fx1 = await fx();
+    if (fx1.mv !== fx0.mv || fx1.rs !== fx0.rs) bad.push(`stock touched ${JSON.stringify([fx0, fx1])}`);
+    // 15. #2823 pattern in history: imported, unattributed, no commission, conflict kept.
+    const a = (await getPool().query(`SELECT o.source_payload->'shopify'->'referral' r, (SELECT count(*) FROM affiliate_order_attributions t WHERE t.order_id = o.id)::int n FROM orders o WHERE o.source_order_id = $1`, [amb.id])).rows[0];
+    if (a?.n !== 0 || a.r?.conflict !== true || a.r.commission !== false) bad.push(`#2823 pattern ${JSON.stringify(a)}`);
+  } finally {
+    if (keepEnv === undefined) delete process.env.SHOPIFY_READ_ALL_ORDERS; else process.env.SHOPIFY_READ_ALL_ORDERS = keepEnv;
+    _resetScopeCache();
+    if (savedCk === null) await getPool().query('DELETE FROM system_state WHERE key = $1', [CK]);
+    else await getPool().query(`UPDATE system_state SET value = $2 WHERE key = $1`, [CK, savedCk]);
+  }
+  if (bad.length) throw new Error(bad.join(' | '));
+  return 'live scopes read from Shopify (cached; override honoured); without read_all_orders full history and >60-day windows refused, nothing recorded; with it a long window is allowed; a chain failing part-way leaves the checkpoint, the next click resumes and pages to 130 orders over ≥3 runs; second click / Sync now 409 and the poll skipped while it runs; checkpoint set to the chain start; unmapped lines summed across pages; BWA fulfilment mirrored once (delivered), manual shipment untouched on a re-run, no orders duplicated; no movements or reservations; #2823 pattern unattributed, no commission';
+});
+await step('orders page: Refresh only reloads, Shopify starts the full sync (no panel), the Shopify logo has no dark tile', async () => {
+  const bad = [];
+  const js = await fsp.readFile(new URL('../public/orders.js', import.meta.url), 'utf8');
+  const html = await fsp.readFile(new URL('../public/orders.html', import.meta.url), 'utf8');
+  const css = await fsp.readFile(new URL('../public/orders.css', import.meta.url), 'utf8');
+  const refresh = js.match(/\$\('#refresh'\)\.addEventListener\('click', ([^\n]+)\);/)?.[1] || '';
+  if (!refresh || /shopify|sync/i.test(refresh)) bad.push(`refresh handler: ${refresh}`);
+  if (!/\$\('#shopifyOrders'\)\.addEventListener\('click', startShopifySync\)/.test(js) || /\$\('#shopifyOrders'\)\.addEventListener\('click', openShopify\)/.test(js)) bad.push('Shopify button not wired to the direct sync');
+  if (!/api\('\/api\/orders\/shopify\/sync-all', \{ method: 'POST' \}\)/.test(js)) bad.push('sync-all not called');
+  if (/class="brand-mark" src="\/brand\/shopify-bag\.svg"/.test(html) || (html.match(/class="shopify-mark"/g) || []).length !== 2) bad.push('logo still uses the dark brand-mark tile class');
+  if (!/\.shopify-mark \{[^}]*background: none/.test(css)) bad.push('logo background not cleared');
+  if (/\.shopify-mark \{[^}]*var\(--ink\)/.test(css)) bad.push('logo has an ink background');
+  const svg = await fsp.readFile(new URL('../public/brand/shopify-bag.svg', import.meta.url), 'utf8');
+  if (/<rect/.test(svg)) bad.push('the logo file has a background rectangle');
+  if (bad.length) throw new Error(bad.join(' | '));
+  return 'Refresh handler only reloads (no Shopify call); Shopify button → POST /api/orders/shopify/sync-all, the drawer no longer opened by it; logo uses .shopify-mark with no background (not the sidebar dark .brand-mark tile); the official SVG has no background shape';
 });
 await step('shopify orders cleanup', async () => {
   await purgeTestOrders(SH_PREFIX);

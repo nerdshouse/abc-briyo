@@ -1756,6 +1756,58 @@ function sfWindow() {
   return { mode: 'window', days: Number(m) };
 }
 
+/* ------------------------------------------------------------------ Shopify button: full-history sync */
+
+const syncNote = (html, tone = '') => {
+  const el = $('#shopifySync');
+  el.className = `banner${tone ? ` ${tone}` : ''}`;
+  el.innerHTML = html;
+  el.hidden = !html;
+};
+const shopifyBusy = (on) => {
+  const b = $('#shopifyOrders');
+  b.disabled = on;
+  b.setAttribute('aria-busy', on ? 'true' : 'false');
+  $('#shopifyLabel').textContent = on ? 'Syncing…' : 'Shopify';
+};
+const duration = (ms) => (ms === null || ms === undefined ? '' : ms < 60000 ? `${Math.max(1, Math.round(ms / 1000))} s` : `${Math.round(ms / 60000)} min`);
+
+/** Starts the full-history sync (the server refuses a second one with 409) and follows it to the end. */
+async function startShopifySync() {
+  if ($('#shopifyOrders').disabled) return;
+  shopifyBusy(true);
+  syncNote('Syncing Shopify orders…');
+  try {
+    await api('/api/orders/shopify/sync-all', { method: 'POST' });
+  } catch (err) {
+    // Already running (another click, another admin, or the poll): follow that run instead.
+    if (!(err.status === 409 && err.data?.syncRunning)) { shopifyBusy(false); syncNote(esc(err.message), 'error'); return; }
+  }
+  followShopifySync();
+}
+
+async function followShopifySync() {
+  let s;
+  try { s = await api('/api/orders/shopify/sync-all'); } catch (err) { shopifyBusy(false); syncNote(esc(err.message), 'error'); return; }
+  if (s.state === 'running') {
+    shopifyBusy(true);
+    syncNote(`Syncing Shopify orders… <span class="soft">${count(s.fetched || 0)} fetched so far</span>`);
+    setTimeout(followShopifySync, 2500);
+    return;
+  }
+  shopifyBusy(false);
+  if (s.state === 'completed') {
+    syncNote(`<b>Shopify sync complete</b>${s.durationMs ? ` · ${esc(duration(s.durationMs))}` : ''}<div class="sync-facts">
+      <span>${count(s.fetched)} fetched</span><span>${count(s.created)} new</span><span>${count(s.updated)} updated</span>
+      <span>${count(s.conflicts)} conflict${s.conflicts === 1 ? '' : 's'}</span><span>${count(s.unmappedLines)} unmapped line${s.unmappedLines === 1 ? '' : 's'}</span>
+      <span>BWA shipments: ${count(s.externalCreated)} created, ${count(s.externalUpdated)} updated</span></div>`, 'success');
+    load();
+  } else if (s.state === 'failed' || s.state === 'partial') {
+    syncNote(`<b>Shopify sync stopped</b> after ${count(s.fetched)} orders${s.failure ? ` — ${esc(s.failure)}` : ''}. Click Shopify again to continue from where it stopped.`, 'error');
+    load();
+  }
+}
+
 async function openShopify() {
   Object.assign(sf, { preview: null, done: false });
   sfError(''); $('#sfResult').innerHTML = ''; $('#sfSaved').textContent = '';
@@ -1919,7 +1971,8 @@ function bind() {
   $('#newShipment').addEventListener('click', openCreate);
   $('#importOrders').addEventListener('click', openImport);
   $('#iClose').addEventListener('click', closeImport);
-  $('#shopifyOrders').addEventListener('click', openShopify);
+  // One click: sync the whole Shopify order history (no panel). Refresh above only reloads the list.
+  $('#shopifyOrders').addEventListener('click', startShopifySync);
   $('#sfClose').addEventListener('click', closeShopify);
   $('#sfPreview').addEventListener('click', () => sfRun('preview'));
   $('#sfSubmit').addEventListener('click', () => (sf.done ? closeShopify() : sfRun('sync')));
@@ -1979,6 +2032,8 @@ function bind() {
     initShell(me);
     // Shopify connection and sync are admin-only (the API enforces it too).
     $('#shopifyOrders').hidden = !me.isAdmin;
+    // A sync already under way (started elsewhere, or before a reload): show it and follow it.
+    if (me.isAdmin) api('/api/orders/shopify/sync-all').then((st) => { if (st.state === 'running') followShopifySync(); }).catch(() => {});
     fillFilters();
     bind();
     await load({ pending: firstOrders });

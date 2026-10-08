@@ -474,5 +474,8 @@ html.scroll-locked .drawer-scrim { touch-action: none; }
 @media (max-width: 640px) { .ml-row .btn { flex: 1 1 100%; } }
 
 /* Shopify mark beside Shopify order controls: decorative, text-sized, no badge. */
-.brand-mark { display: inline-block; width: 16px; height: 18px; flex: 0 0 auto; }
-.drawer-title:has(> .brand-mark) { display: flex; align-items: center; gap: 8px; }
+/* The Shopify logo: its own class — "brand-mark" is the sidebar's dark logo tile (ui.css), which gave it a black square. */
+.shopify-mark { display: inline-block; width: 16px; height: 18px; flex: 0 0 auto; background: none; border-radius: 0; }
+.drawer-title:has(> .shopify-mark) { display: flex; align-items: center; gap: 8px; }
+#shopifyOrders[aria-busy="true"] { cursor: progress; }
+#shopifySync .sync-facts { display: flex; flex-wrap: wrap; gap: 4px 14px; margin-top: 4px; font-size: 12.5px; }
