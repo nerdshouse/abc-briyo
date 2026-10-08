@@ -37,6 +37,9 @@ const day = (d) => {
   const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(d || ''));
   return m ? DAY_FMT.format(Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3]))) : '—';
 };
+// An order's date (a timestamp), shown as the day it was in India.
+const SEEN_FMT = new Intl.DateTimeFormat('en-IN', { day: 'numeric', month: 'short', year: 'numeric', timeZone: 'Asia/Kolkata' });
+const seenDate = (t) => (t && !Number.isNaN(new Date(t).getTime()) ? SEEN_FMT.format(new Date(t)) : '—');
 const amount = (v) => (v === null || v === undefined ? '—' : money(v));
 const requestId = () => (crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random().toString(16).slice(2)}`);
 
@@ -124,10 +127,11 @@ function render() {
   // Unmapped seller SKUs: orders that cannot be dispatched until mapped.
   $('#unmapped').innerHTML = unmapped.length ? `<section class="card unmapped-card${state.view === 'unmapped' ? ' focus' : ''}" id="unmappedCard">
     <header class="card-head"><h2 class="card-title">${icon('triangle-alert')}Unmapped platform SKUs <span class="card-meta">${count(unmapped.length)} code${unmapped.length > 1 ? 's' : ''} on orders that match no master SKU · those orders cannot be dispatched until mapped</span></h2></header>
-    <div class="pane"><div class="table-wrap"><table class="table"><thead><tr><th>Platform SKU</th><th>Platform</th><th>Item</th><th class="r">Orders</th><th class="r">Units</th><th class="r"></th></tr></thead><tbody>
+    <div class="pane"><div class="table-wrap"><table class="table"><thead><tr><th>Platform SKU</th><th>Platform</th><th>Item</th><th class="r">Orders</th><th class="r">Units</th><th>First seen</th><th>Last seen</th><th class="r"></th></tr></thead><tbody>
     ${unmapped.map((u) => `<tr><td class="mono">${esc(u.code)}${u.asin ? `<span class="cell-sub muted">ASIN ${esc(u.asin)}</span>` : ''}</td>
       <td>${esc(u.platform_label)}</td>
       <td><span class="cell-text">${esc(u.title || '—')}</span></td><td class="r num">${count(u.orders)}</td><td class="r num">${count(u.units)}</td>
+      <td class="num">${seenDate(u.first_seen)}</td><td class="num">${seenDate(u.last_seen)}</td>
       <td class="r">${!canCatalog() ? '<span class="soft">Ask an Inventory manager</span>'
         : u.mappable ? `<button class="btn" type="button" data-map="${esc(u.code)}" data-platform="${esc(u.channel)}" data-platform-label="${esc(u.platform_label)}" data-title="${esc(u.title || '')}" data-asin="${esc(u.asin || '')}">Map to master SKU</button>`
           : `<span class="soft" title="${esc(u.platform_label)} orders use master SKU codes directly. Create a master SKU with this code, or add ${esc(u.platform_label)} as a platform.">Not a mapped platform</span>`}</td></tr>`).join('')}
@@ -578,6 +582,38 @@ function renderImportPreview(p) {
   $('#fSubmit').textContent = s.errorCount ? 'Fix the errors first' : changes ? 'Import' : 'Nothing new to import';
 }
 
+// Stock cutover: orders placed before it are historical and never reserve or consume stock.
+const CUT_FMT = new Intl.DateTimeFormat('en-IN', { day: 'numeric', month: 'short', year: 'numeric', hour: 'numeric', minute: '2-digit', timeZone: 'Asia/Kolkata' });
+async function renderCutover() {
+  const el = $('#cutover');
+  try {
+    const c = await api('/api/inventory/cutover');
+    state.cutover = c;
+    el.innerHTML = `<b>Stock cutover:</b> ${c.cutover_at
+      ? `${esc(CUT_FMT.format(new Date(c.cutover_at)))} IST — orders placed before this are historical and never reserve or use stock.`
+      : 'not set — every order takes part in stock.'}${canCatalog() ? ` <button type="button" class="linkish" id="cutoverEdit">${c.cutover_at ? 'Change' : 'Set'}</button>` : ''}`;
+  } catch (err) { el.textContent = `Stock cutover: ${err.message}`; }
+}
+async function editCutover() {
+  const cur = state.cutover;
+  const input = window.prompt('Stock cutover, in IST, as YYYY-MM-DD HH:MM (e.g. 2026-10-15 00:00). Type CLEAR to remove it.', '');
+  if (input === null) return;
+  const v = input.trim();
+  let iso = null;
+  if (v.toUpperCase() !== 'CLEAR') {
+    const m = /^(\d{4}-\d{2}-\d{2})[ T](\d{2}):(\d{2})$/.exec(v);
+    if (!m) { window.alert('Use YYYY-MM-DD HH:MM, e.g. 2026-10-15 00:00.'); return; }
+    iso = `${m[1]}T${m[2]}:${m[3]}:00+05:30`;
+  }
+  const was = cur.cutover_at ? `${CUT_FMT.format(new Date(cur.cutover_at))} IST` : 'not set';
+  const to = iso ? `${CUT_FMT.format(new Date(iso))} IST` : 'not set';
+  if (!window.confirm(`Change the stock cutover from ${was} to ${to}?\n\nOrders placed before the cutover will never reserve or use stock.`)) return;
+  try {
+    await api('/api/inventory/cutover', { method: 'PUT', body: JSON.stringify({ cutover_at: iso, confirm: true, version: cur.version }) });
+  } catch (err) { window.alert(err.message); }
+  renderCutover();
+}
+
 async function refreshMeta() { state.meta = await api('/api/inventory/meta'); }
 
 /**
@@ -860,6 +896,8 @@ function bind() {
     fillFilters();
     bind();
     await load();
+    renderCutover();
+    $('#cutover').addEventListener('click', (e) => { if (e.target.closest('#cutoverEdit')) editCutover(); });
     if (state.view === 'unmapped') $('#unmappedCard')?.scrollIntoView({ block: 'start' });
     if (state.openSku) openSku(state.openSku);
   } catch (err) {
