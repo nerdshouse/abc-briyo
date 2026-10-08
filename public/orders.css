@@ -397,7 +397,8 @@ html.scroll-locked .drawer-scrim { touch-action: none; }
 .af-table tbody tr { cursor: pointer; }
 .af-title-tag { display: inline-flex; vertical-align: middle; margin-left: 8px; font-size: 13px; }
 .af-title-tag .status { font-size: 12.5px; }
-.af-detail { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.2fr); grid-template-areas: "profile activity" "verify verify" "referral referral" "rates rates"; gap: 16px; align-items: start; }
+.af-detail { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.2fr); grid-template-areas: "perf perf" "profile activity" "verify verify" "referral referral" "rates rates"; gap: 16px; align-items: start; }
+.af-detail .af-perf { grid-area: perf; }
 .af-detail .af-referral { grid-area: referral; }
 .af-detail .af-verify { grid-area: verify; }
 .af-detail .af-profile { grid-area: profile; }
@@ -418,7 +419,7 @@ html.scroll-locked .drawer-scrim { touch-action: none; }
 .af-when label { display: flex; align-items: center; gap: 6px; font-size: 13px; }
 .af-when .input { width: 180px; }
 @media (max-width: 1024px) {
-  .af-detail { grid-template-columns: minmax(0, 1fr); grid-template-areas: "profile" "verify" "referral" "rates" "activity"; }
+  .af-detail { grid-template-columns: minmax(0, 1fr); grid-template-areas: "perf" "profile" "verify" "referral" "rates" "activity"; }
   .af-ref-grid { grid-template-columns: minmax(0, 1fr); }
   .af-verify-grid { grid-template-columns: minmax(0, 1fr); }
 }

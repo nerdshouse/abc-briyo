@@ -185,8 +185,9 @@ async function loadDetail() {
   $('#alerts').innerHTML = '';
   try {
     const pid = encodeURIComponent(state.publicId);
-    const [data, ver, ref] = await Promise.all([api(`/api/affiliates/${pid}`), api(`/api/affiliates/${pid}/verification`), api(`/api/affiliates/${pid}/referral`)]);
-    state.detail = data; state.ver = ver; state.ref = ref;
+    const [data, ver, ref, perf] = await Promise.all([api(`/api/affiliates/${pid}`), api(`/api/affiliates/${pid}/verification`), api(`/api/affiliates/${pid}/referral`),
+      api(`/api/affiliates/${pid}/performance`).catch(() => null)]);
+    state.detail = data; state.ver = ver; state.ref = ref; state.perf = perf;
     renderDetail();
   } catch (err) {
     if (err.status === 404) {
@@ -248,10 +249,11 @@ function renderDetail() {
               <td>${r.reason ? esc(r.reason) : '<span class="soft">—</span>'}</td>
               <td>${by(r.created_at, r.created_by)}</td></tr>`).join('')}</tbody></table></div>`
     : `<div class="empty-note"><b>No rate yet.</b>${canManage() && !closed ? 'Add one with New rate. Rates are never edited: a change is a new row.' : 'An affiliate manager sets the rate.'}</div>`}
-          <div class="pane-foot">A rate is the share the partner would earn once commissions exist. Nothing is calculated or paid yet.</div>
+          <div class="pane-foot">A commission uses the rate in effect when its order was placed, fixed when it is recorded. Adding a new rate never changes a recorded commission.</div>
         </div>
       </section>
 
+      ${performanceCard()}
       ${verificationCard()}
       ${referralCard()}
 
@@ -277,13 +279,24 @@ function showDrawer(title, sub, body, buttons) {
   $('#dTitle').textContent = title; $('#dSub').textContent = sub || '';
   $('#dBody').innerHTML = body; $('#dButtons').innerHTML = buttons;
   $('#dSaved').textContent = ''; $('#dSaved').className = 'saved';
-  state.dirty = false;
+  state.dirty = false; state.discardAsked = false; $('#dDiscard').hidden = true;
   renderIcons();
   $('#dBody').querySelector('input:not([type=hidden]), select, textarea')?.focus();
 }
+/**
+ * Unsaved changes are confirmed inside the drawer, not with window.confirm: a
+ * browser that suppresses native dialogs would otherwise leave the drawer stuck
+ * open. A second close (×, Cancel, Escape, backdrop) while asked discards.
+ */
 function closeDrawer({ force = false } = {}) {
   if ($('#drawer').hidden) return;
-  if (!force && state.dirty && !window.confirm('Discard your unsaved changes?')) return;
+  if (!force && state.dirty && !state.discardAsked) {
+    state.discardAsked = true;
+    $('#dDiscard').hidden = false;
+    $('#dDiscardYes').focus();
+    return;
+  }
+  $('#dDiscard').hidden = true; state.discardAsked = false;
   $('#drawer').hidden = true; $('#drawerScrim').hidden = true;
   document.documentElement.classList.remove('scroll-locked');
   state.form = null; state.dirty = false;
@@ -365,6 +378,7 @@ async function saveForm() {
     }
     if (VER_FORMS.includes(state.form?.ver)) { await saveVerification(); return; }
     if (state.form?.ref) { await saveReferral(); return; }
+    if (state.form?.cm) { await saveCommission(); return; }
     let out;
     if (state.form === 'edit') out = await send(`/api/affiliates/${a.public_id}`, 'PATCH', { ...formData(), version: a.version });
     else if (state.form === 'rate') {
@@ -553,6 +567,90 @@ async function saveVerification() {
   renderDetail();
 }
 
+// ------------------------------------------------------------------ performance and commissions (Phase 2A)
+
+/** Money in its own currency; never summed across currencies. */
+const cash = (currency, v) => new Intl.NumberFormat('en-IN', { style: 'currency', currency, maximumFractionDigits: 2, minimumFractionDigits: 2 }).format(v);
+const COMMISSION_TAG = { pending: ['noresp', 'Pending'], approved: ['attention', 'Approved'], paid: ['recovered', 'Paid'], reversed: ['lost', 'Reversed'] };
+const commissionTag = (st) => `<span class="status ${COMMISSION_TAG[st]?.[0] || ''}"><span class="dot"></span>${esc(COMMISSION_TAG[st]?.[1] || st)}</span>`;
+
+function performanceCard() {
+  const P = state.perf?.performance;
+  if (!P) return '';
+  const money = state.perf.money;
+  const T = P.totals;
+  const fig = (label, value, note = '') => `<div class="af-fig"><span class="af-fig-label">${esc(label)}</span><span class="af-fig-value num">${value}</span>${note ? `<span class="af-fig-note">${note}</span>` : ''}</div>`;
+  const perCur = (fn) => (T.by_currency.length ? T.by_currency.map(fn).join('<br>') : '—');
+  const figs = [
+    fig('Clicks', count(P.clicks.total), `${count(P.clicks.last_30_days)} in 30 days`),
+    fig('Attributed orders', count(P.attributions.total), P.attributions.cancelled ? `${count(P.attributions.cancelled)} cancelled` : ''),
+  ];
+  if (money) {
+    figs.push(fig('Attributed order value', perCur((c) => esc(cash(c.currency, c.order_value))),
+      ['Current Shopify value, cancelled orders excluded', T.orders_without_financial_record ? `${count(T.orders_without_financial_record)} without a financial record` : ''].filter(Boolean).join(' · ')));
+    figs.push(fig('Commission earned', perCur((c) => esc(cash(c.currency, c.commission_earned))),
+      perCur((c) => [...['pending', 'approved', 'paid'].filter((k) => c.by_status[k]).map((k) => `${COMMISSION_TAG[k][1]} ${esc(cash(c.currency, c.by_status[k]))}`),
+        c.on_cancelled_orders ? `${esc(cash(c.currency, c.on_cancelled_orders))} on cancelled orders, not counted` : ''].filter(Boolean).join(' · ')) || 'Excludes reversed and cancelled'));
+  }
+  const acts = (o) => {
+    const c = o.commission;
+    if (!c || c.status === 'reversed') return '';
+    const b = [];
+    if (state.perf.canApprove && c.status === 'pending') b.push(`<button class="btn" type="button" data-cm="approved" data-cm-id="${c.id}">Approve</button>`);
+    if (state.perf.canPay && c.status === 'approved') b.push(`<button class="btn" type="button" data-cm="paid" data-cm-id="${c.id}">Mark paid</button>`);
+    if (state.perf.canApprove) b.push(`<button class="btn" type="button" data-cm="reversed" data-cm-id="${c.id}">Reverse</button>`);
+    return b.join(' ');
+  };
+  const anyActs = money && (state.perf.canApprove || state.perf.canPay);
+  const rows = P.orders.map((o) => {
+    const c = o.commission;
+    const orderCell = `${esc(o.order || '—')}${o.cancelled ? ' <span class="mini-tag warn">Cancelled</span>' : ''}`;
+    if (!money) return `<tr><td>${orderCell}</td><td>${esc(istDateTime(o.attributed_at))}</td><td>${esc(METHOD[o.method] || o.method)}</td></tr>`;
+    const value = o.has_financial_record ? esc(cash(o.currency, o.order_value)) : '<span class="soft" title="No Shopify financial record yet — not ₹0">Unknown</span>';
+    const rate = c ? esc(pct(c.rate_bps)) : '<span class="soft">—</span>';
+    const amount = c ? `<b>${esc(cash(c.currency, c.amount))}</b><span class="cell-sub" title="Commission base: Shopify net subtotal excluding recorded tax, fixed when recorded">on ${esc(cash(c.currency, c.base_amount))}</span>` : '<span class="soft">Not recorded</span>';
+    const st = c ? `${commissionTag(c.status)}${c.reason ? `<span class="cell-sub">${esc(c.reason)}</span>` : ''}` : '<span class="soft">—</span>';
+    return `<tr><td>${orderCell}</td><td>${esc(istDateTime(o.attributed_at))}</td><td class="r num">${value}</td><td>${o.currency || c?.currency || '—'}</td>
+      <td class="r num">${rate}</td><td class="r num">${amount}</td><td>${st}</td>${anyActs ? `<td class="r af-cm-acts">${acts(o)}</td>` : ''}</tr>`;
+  }).join('');
+  const head = money
+    ? `<tr><th>Order</th><th>Attributed</th><th class="r">Order value</th><th>Currency</th><th class="r">Rate</th><th class="r">Commission</th><th>Status</th>${anyActs ? '<th></th>' : ''}</tr>`
+    : '<tr><th>Order</th><th>Attributed</th><th>Method</th></tr>';
+  return `<section class="card af-perf">
+    <header class="card-head"><h2 class="card-title">${icon('trending-up')}Performance</h2></header>
+    <div class="af-figs c${figs.length}">${figs.join('')}</div>
+    <div class="pane">
+      ${P.orders.length ? `<div class="table-wrap"><table class="table"><thead>${head}</thead><tbody>${rows}</tbody></table></div>`
+    : '<div class="empty-note"><b>No attributed orders yet.</b></div>'}
+      <div class="pane-foot">${money
+    ? 'Order value is Shopify\'s current total for the order. Commission base = Shopify net subtotal excluding recorded tax (subtotal after discounts, without shipping, minus the tax Shopify recorded) — Shopify can record GST on shipping on product lines, so this is not an exact tax-exclusive merchandise value. Commission = base × the rate in effect when the order was placed, both fixed when recorded; a later rate change does not alter it. Payouts are not part of Briyo OS yet.'
+    : 'Order values and commissions are visible to admins and affiliate finance staff.'}</div>
+    </div>
+  </section>`;
+}
+
+function openCommissionForm(status, id) {
+  const a = state.detail.affiliate;
+  const o = state.perf.performance.orders.find((x) => x.commission?.id === Number(id));
+  const c = o.commission;
+  state.form = { cm: true, status, id, version: c.version };
+  const label = { approved: 'Approve commission', paid: 'Mark commission paid', reversed: 'Reverse commission' }[status];
+  showDrawer(label, `${a.display_name} · Order ${o.order}`, `<form id="afForm" novalidate><div class="form-grid">
+      <p class="wide">${esc(cash(c.currency, c.amount))} on ${esc(cash(c.currency, c.base_amount))} at ${esc(pct(c.rate_bps))} · now <b>${esc(COMMISSION_TAG[c.status][1])}</b>.
+        ${status === 'reversed' ? 'The record and its amount are kept; it stops counting as earned.' : ''}</p>
+      ${inp('reason', status === 'reversed' ? 'Reason' : 'Note', '', { req: status === 'reversed', attrs: 'maxlength="500"' })}
+    </div></form>`, `<button class="btn" type="button" data-close>Cancel</button><button class="btn ${status === 'reversed' ? 'danger' : 'primary'}" type="button" id="dSave">${esc(label)}</button>`);
+}
+
+async function saveCommission() {
+  const f = state.form;
+  await send(`/api/affiliates/${encodeURIComponent(state.publicId)}/commissions/${f.id}/status`, 'POST', { status: f.status, reason: formData().reason, version: f.version });
+  state.dirty = false; closeDrawer({ force: true });
+  state.perf = await api(`/api/affiliates/${encodeURIComponent(state.publicId)}/performance`).catch(() => state.perf);
+  state.detail = await api(`/api/affiliates/${encodeURIComponent(state.publicId)}`).catch(() => state.detail);
+  renderDetail();
+}
+
 // ------------------------------------------------------------------ referral link (Phase 1E)
 
 const METHOD = { coupon: 'Coupon', referral_click: 'Referral click', gokwik_full_url: 'Referral link (GoKwik)' };
@@ -595,7 +693,7 @@ function referralCard() {
       ${R.history.length ? `<details class="more af-gap"><summary>${icon('chevron-right')}Disabled links <span class="soft">— ${R.history.length}, kept</span></summary>
         ${R.history.map((h) => `<div class="af-hist">${kv('Created', by(h.created_at, h.created_by))}${kv('Disabled', by(h.disabled_at, h.disabled_by))}${kv('Reason', esc(h.disable_reason || '—'))}</div>`).join('')}</details>` : ''}
       ${actions.length && a.status !== 'closed' ? `<div class="af-ver-actions">${actions.join('')}</div>` : ''}
-      <p class="soft af-note">Attribution credit only: no commission is calculated or paid.</p>
+      <p class="soft af-note">Order values and commissions are under Performance.</p>
     </div>
   </section>`;
 }
@@ -666,6 +764,7 @@ function bind() {
     if (t?.dataset.open) { openForm(t.dataset.open); return; }
     if (t?.dataset.ver) { openForm('ver', t.dataset.ver); return; }
     if (t?.dataset.ref) { openForm('ref', t.dataset.ref); return; }
+    if (t?.dataset.cm) { openCommissionForm(t.dataset.cm, t.dataset.cmId); return; }
     if (t?.dataset.copyLink !== undefined) { copyLink(t); return; }
     go(e);
   });
@@ -692,6 +791,8 @@ function bind() {
     if (t.dataset.close !== undefined) closeDrawer();
   });
   $('#dClose').addEventListener('click', () => closeDrawer());
+  $('#dDiscardYes').addEventListener('click', () => closeDrawer({ force: true }));
+  $('#dDiscardNo').addEventListener('click', () => { state.discardAsked = false; $('#dDiscard').hidden = true; $('#dBody').querySelector('input, select, textarea')?.focus(); });
   $('#drawerScrim').addEventListener('click', () => closeDrawer());
   document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeDrawer(); }, sig);
   window.addEventListener('beforeunload', (e) => { if (state.dirty) e.preventDefault(); }, sig);

@@ -577,7 +577,30 @@ button { font: inherit; color: inherit; }
 .drawer-head { display: flex; align-items: center; justify-content: space-between; padding: 14px 16px; border-bottom: 1px solid var(--border); background-image: var(--pattern); }
 .drawer-title { font-size: 15px; font-weight: 600; margin: 0; }
 .drawer-sub { font-size: 12px; color: var(--text-3); margin-top: 2px; }
-.drawer-body { overflow-y: auto; flex: 1; }
+.drawer-body { overflow-y: auto; flex: 1; min-height: 0; }
+/* Affiliate forms sit straight in the drawer body: give them the drawer's padding; actions always reachable. */
+.af-drawer { height: 100dvh; max-height: 100dvh; }
+.af-drawer .drawer-head, .af-drawer .drawer-foot, .af-discard { flex: none; }
+.af-drawer .drawer-body > form { padding: 14px 16px 20px; }
+.af-drawer .drawer-head > div:first-child { min-width: 0; overflow-wrap: anywhere; }
+.af-drawer .drawer-foot { flex-wrap: wrap; }
+.af-discard { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px 12px; padding: 10px 16px; border-top: 1px solid #FEDF89; background: var(--warning-soft); color: var(--warning-text); font-size: 13px; }
+.af-discard-actions { display: flex; gap: 8px; }
+/* Affiliate performance figures */
+.af-figs { display: grid; grid-template-columns: repeat(var(--n, 2), minmax(0, 1fr)); border-bottom: 1px solid var(--border-soft); }
+.af-figs.c2 { --n: 2; } .af-figs.c4 { --n: 4; }
+.af-fig { display: flex; flex-direction: column; gap: 3px; min-width: 0; padding: 12px 16px; }
+.af-fig + .af-fig { box-shadow: inset 1px 0 var(--border-soft); }
+.af-fig-label { font-size: 12px; color: var(--text-2); }
+.af-fig-value { font-size: 20px; font-weight: 600; letter-spacing: -0.02em; font-variant-numeric: tabular-nums; line-height: 1.2; }
+.af-fig-note { font-size: 11.5px; color: var(--text-3); line-height: 1.35; }
+.af-cm-acts { white-space: nowrap; }
+.af-cm-acts .btn { height: 28px; padding: 0 10px; }
+@media (max-width: 760px) {
+  .af-figs.c4 { --n: 2; }
+  .af-figs.c4 > :nth-child(3) { box-shadow: none; }
+  .af-figs.c4 > :nth-child(n+3) { border-top: 1px solid var(--border-soft); }
+}
 .drow { display: flex; align-items: center; gap: 12px; padding: 12px 16px; border-bottom: 1px solid var(--border-soft); }
 .drow .grow { min-width: 0; flex: 1; }
 .drow .amt { font-weight: 600; font-variant-numeric: tabular-nums; }
