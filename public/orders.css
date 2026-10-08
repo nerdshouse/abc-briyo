@@ -463,3 +463,12 @@ html.scroll-locked .drawer-scrim { touch-action: none; }
 .af-link { margin-bottom: 14px; }
 .af-ref-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 4px 32px; }
 .af-note { font-size: 12px; margin: 14px 0 0; }
+
+/* Products on a hand-entered order (Add product / inventory line). */
+.ml-row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+.ml-row .select { flex: 1 1 240px; min-width: 0; max-width: 100%; }
+.ml-qty { width: 84px !important; padding: 0 8px !important; }
+.item-row .n.ml-edit { display: flex; align-items: center; gap: 8px; justify-content: flex-end; flex: 0 0 auto; }
+.ml-edit .ml-qty { width: 64px !important; }
+@media (max-width: 480px) { .item-row:has(.ml-edit) { flex-direction: column; } .item-row .n.ml-edit { justify-content: flex-start; } }
+@media (max-width: 640px) { .ml-row .btn { flex: 1 1 100%; } }
