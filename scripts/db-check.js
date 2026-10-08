@@ -3941,6 +3941,9 @@ await step('shopify orders: transient Shopify failures (503, connection reset) a
     reset((k, next, n) => (k === 'BriyoOrdersPage' && !next && n === 1 ? '503' : 'ok'));
     const r9 = await run(false);
     if (r9.summary.ordersCreated !== 0 || r9.summary.unchanged !== 12 || (await created()) !== 12 || (await snaps()) !== 12) bad.push(`9 idempotent ${JSON.stringify([r9.summary.ordersCreated, r9.summary.unchanged])}`);
+    // The retry count survives on each run record (order_imports.details).
+    const kept = async (r) => (await getPool().query('SELECT details FROM order_imports WHERE id = $1', [r.runId])).rows[0]?.details?.shopify_transient_retries;
+    if ((await kept(r8)) !== 1 || (await kept(r9)) !== 1) bad.push(`retries not persisted ${await kept(r8)}/${await kept(r9)}`);
     if (!warnings.some((w) => /transient failure, retry 1 of 2/.test(w)) || warnings.some((w) => w.includes('shpat_DBCHECK'))) bad.push('retry logging');
   } finally {
     console.warn = warn;
@@ -5154,7 +5157,7 @@ await step('careers host detection behind a proxy — the Host header decides, n
 await step('overview: each member sees only their departments; numbers match the records; signed out refused', async () => {
   const bad = [];
   const keys = async (who) => { const r = await internal(who, 'GET', '/api/overview'); return r.status === 200 ? Object.keys(r.body.sections).sort().join() : `HTTP ${r.status}`; };
-  const want = { mgr: 'hr', multi: 'hr,inventory,logistics', nonHr: 'support', adm: 'hr,ingest,inventory,logistics,marketing,support,team' };
+  const want = { mgr: 'hr', multi: 'commerce,hr,inventory,logistics,shipments', nonHr: 'support', adm: 'commerce,hr,ingest,inventory,logistics,marketing,shipments,support,team' };
   for (const [who, k] of Object.entries(want)) { const got = await keys(who); if (got !== k) bad.push(`${who}: ${got} ≠ ${k}`); }
   if ((await internal(null, 'GET', '/api/overview')).status !== 401) bad.push('signed out not refused');
   const page = await internal(null, 'GET', '/overview');
@@ -6596,9 +6599,140 @@ await step('referral: storefront snippet — stores bref/bclid, writes private c
   return 'valid bref/bclid → stored (localStorage + cookie) and written once as __briyo_ref/__briyo_click; identical cart not rewritten; 6 malformed inputs ignored; storage blocked → cookie fallback; later page reapplies; 30-day expiry; network failure swallowed; no pricing, checkout or PII code';
 });
 
+await step('overview commerce: Shopify counts and money (per currency, cancelled out, unknown ≠ 0), sync health, affiliate programme and attributed value, shipments as parcels, light inventory — money and sync admin-only', async () => {
+  const bad = [];
+  const pool = getPool();
+  const P = `${TEST_ORDER}-CMX`;
+  const ACT = 'db-check-overview-commerce';
+  const admin = { phone: RB.adm, isAdmin: true, caps: CAPABILITIES };
+  const logi = { phone: RB.log, isAdmin: false, caps: ['logistics.view', 'logistics.edit', 'affiliate.view', 'inventory.view'] };
+  const ov = async (who = admin) => overviewFor(who, { slaHours: 6 });
+  // Leftovers from an interrupted run.
+  await pool.query('DELETE FROM order_shipments WHERE created_by = $1', [ACT]);
+  await purgeTestOrders(P);
+  await purgeTestAffiliates(ACT);
+  const cur = (o, c) => o.sections.commerce.shopify.money?.by_currency.find((x) => x.currency === c) || { orders: 0, current_order_value: 0, paid: 0, pending: 0, other: 0, other_statuses: {}, refunded: 0 };
+  const av = (o, c) => o.sections.commerce.affiliate.attributed_order_value?.by_currency.find((x) => x.currency === c) || { orders: 0, value: 0 };
+  const before = await ov();
+  const shipBefore = before.sections.shipments;
+  // Shopify orders, written directly (no Shopify call): each with the snapshot under test.
+  let gid = 990000100;
+  const order = async (tag, { cancelled = false, snap = null } = {}) => {
+    const { rows: [o] } = await pool.query(`INSERT INTO orders (channel, source_order_id, source, order_status, order_date, created_by)
+      VALUES ('website', $1, 'shopify_sync', $2, now(), $3) RETURNING id`, [`${P}-${tag}`, cancelled ? 'cancelled' : 'new', ACT]);
+    if (snap) {
+      gid += 1;
+      await pool.query(`INSERT INTO order_financial_snapshots (order_id, shopify_order_gid, sequence, content_hash, shop_currency, presentment_currency, taxes_included,
+          financial_status, cancelled_at, current_subtotal, current_total_tax, current_shipping, current_total_discounts, current_total_price, total_price, total_refunded, total_refunded_shipping, money)
+        VALUES ($1, $2, 1, $3, $4, $4, true, $5, $6, $7, 0, 0, 0, $7, $8, $9, 0, '{}')`,
+      [o.id, `gid://shopify/Order/${gid}`, crypto.createHash('sha256').update(tag).digest('hex'), snap.cur || 'INR', snap.status, cancelled ? new Date() : null,
+        snap.value, snap.original ?? snap.value, snap.refunded || 0]);
+      // A second, older-looking snapshot must not be counted twice: only the latest sequence is.
+      if (snap.history) {
+        await pool.query(`INSERT INTO order_financial_snapshots (order_id, shopify_order_gid, sequence, content_hash, shop_currency, presentment_currency, taxes_included,
+            financial_status, current_subtotal, current_total_tax, current_shipping, current_total_discounts, current_total_price, total_price, total_refunded, total_refunded_shipping, money)
+          VALUES ($1, $2, 0 + 2, $3, 'INR', 'INR', true, 'PAID', 1, 0, 0, 0, 1, 1, 0, 0, '{}')`, [o.id, `gid://shopify/Order/${gid}`, crypto.createHash('sha256').update(`${tag}-2`).digest('hex')]);
+      }
+    }
+    return o.id;
+  };
+  const paid = await order('PAID', { snap: { status: 'PAID', value: '100.00' } });
+  const pending = await order('PEND', { snap: { status: 'PENDING', value: '50.50' } });
+  await order('PART', { snap: { status: 'PARTIALLY_REFUNDED', value: '30.00', original: '40.00', refunded: '10.00' } });
+  await order('USD', { snap: { status: 'PAID', value: '20.00', cur: 'USD' } });
+  const hist = await order('HIST', { snap: { status: 'PENDING', value: '5.00', history: true } });   // latest = sequence 2, PAID 1.00
+  const voided = await order('VOID', { cancelled: true, snap: { status: 'VOIDED', value: '0.00', original: '99.00' } });
+  const nosnap = await order('NOSNAP');
+  // Affiliate: one attributed order per case — paid INR, cancelled, no snapshot, USD.
+  const { rows: [cat] } = await pool.query('SELECT key FROM affiliate_categories ORDER BY sort LIMIT 1');
+  const { rows: [aff] } = await pool.query(`INSERT INTO affiliates (public_id, category, display_name, status, created_by) VALUES ('CMXQVR', $1, 'DBCHECK-AF overview commerce', 'active', $2) RETURNING id`, [cat.key, ACT]);
+  for (const o of [paid, voided, nosnap, (await pool.query(`SELECT id FROM orders WHERE source_order_id = $1`, [`${P}-USD`])).rows[0].id]) {
+    await pool.query(`INSERT INTO affiliate_order_attributions (order_id, affiliate_id, attribution_method, order_placed_at, rule_version) VALUES ($1, $2, 'coupon', now(), 'v1')`, [o, aff.id]);
+  }
+  const { rows: [asset] } = await pool.query(`INSERT INTO affiliate_referral_assets (public_id, affiliate_id, type, created_by) VALUES ('CMXQVRAB23', $1, 'link', $2) RETURNING id`, [aff.id, ACT]);
+  await pool.query(`INSERT INTO affiliate_referral_clicks (public_id, affiliate_id, referral_asset_id, visitor_id, landing_url) VALUES ('cmxOverviewClick000001', $1, $2, 'cmxOverviewVisitor0001', '/')`, [aff.id, asset.id]);
+  // Shipments: two parcels on one live order, one on the cancelled order, one cancelled parcel.
+  for (const st of ['packed', 'dispatched']) await pool.query('INSERT INTO order_shipments (order_id, shipment_status, created_by) VALUES ($1, $2, $3)', [pending, st, ACT]);
+  await pool.query('INSERT INTO order_shipments (order_id, shipment_status, created_by) VALUES ($1, $2, $3)', [voided, 'in_transit', ACT]);
+  await pool.query('INSERT INTO order_shipments (order_id, shipment_status, created_by) VALUES ($1, $2, $3)', [hist, 'cancelled', ACT]);
+  const after = await ov();
+  const S = after.sections.commerce.shopify; const S0 = before.sections.commerce.shopify;
+  const d = (k) => +(cur(after, 'INR')[k] - cur(before, 'INR')[k]).toFixed(2);
+  if (S.scope !== 'all_synced' || S.orders.active - S0.orders.active !== 6 || S.orders.cancelled - S0.orders.cancelled !== 1) bad.push(`counts ${JSON.stringify([S.orders, S0.orders])}`);
+  // INR: 100 paid + 50.50 pending + 30 partially refunded + 1.00 (latest of HIST, PAID); the voided order and USD are not in INR.
+  if (d('current_order_value') !== 181.5 || d('paid') !== 101 || d('pending') !== 50.5 || d('other') !== 30 || d('refunded') !== 10 || d('orders') !== 4) bad.push(`INR ${JSON.stringify(['current_order_value', 'paid', 'pending', 'other', 'refunded', 'orders'].map(d))}`);
+  if (+(cur(after, 'INR').other_statuses.PARTIALLY_REFUNDED - (cur(before, 'INR').other_statuses.PARTIALLY_REFUNDED || 0)).toFixed(2) !== 30) bad.push('other status kept by name');
+  if (+(cur(after, 'USD').paid - cur(before, 'USD').paid).toFixed(2) !== 20) bad.push('USD kept separate');
+  if (S.money.orders_without_snapshot - S0.money.orders_without_snapshot !== 1) bad.push('missing snapshot not counted as unknown');
+  if (JSON.stringify(S).match(/revenue/i)) bad.push('"revenue" wording');
+  // Sync health.
+  if (!S.sync || !['ok', 'stale', 'never'].includes(S.sync.status) || S.sync.stale_after_hours !== 24) bad.push(`sync ${JSON.stringify(S.sync)}`);
+  const keepCp = (await pool.query(`SELECT value FROM system_state WHERE key = 'shopify_orders_checkpoint'`)).rows[0];
+  const setCp = (v) => pool.query(`INSERT INTO system_state (key, value, updated_at) VALUES ('shopify_orders_checkpoint', $1, now()) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`, [v]);
+  try {
+    await setCp(new Date(Date.now() - 25 * 3600000).toISOString());
+    const st = (await ov()).sections.commerce.shopify.sync;
+    if (st.status !== 'stale' || st.message !== 'Shopify sync is stale') bad.push(`25h ${JSON.stringify(st)}`);
+    await setCp(new Date(Date.now() - 2 * 3600000).toISOString());
+    const ok = (await ov()).sections.commerce.shopify.sync;
+    if (ok.status !== 'ok' || ok.message !== null) bad.push(`2h ${JSON.stringify(ok)}`);
+    await pool.query(`DELETE FROM system_state WHERE key = 'shopify_orders_checkpoint'`);
+    const nv = (await ov()).sections.commerce.shopify.sync;
+    if (nv.status !== 'never' || nv.message !== 'No successful Shopify sync') bad.push(`never ${JSON.stringify(nv)}`);
+  } finally {
+    if (keepCp) await pool.query(`INSERT INTO system_state (key, value, updated_at) VALUES ('shopify_orders_checkpoint', $1, now()) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`, [keepCp.value]);
+    else await pool.query(`DELETE FROM system_state WHERE key = 'shopify_orders_checkpoint'`);
+  }
+  // Affiliate.
+  const A = after.sections.commerce.affiliate; const A0 = before.sections.commerce.affiliate;
+  if (A.affiliates.total - A0.affiliates.total !== 1 || A.affiliates.active - A0.affiliates.active !== 1 || A.clicks.total - A0.clicks.total !== 1 || A.clicks.last_30d - A0.clicks.last_30d !== 1) bad.push(`affiliate counts ${JSON.stringify([A.affiliates, A.clicks])}`);
+  if (A.attributions.total - A0.attributions.total !== 4 || (A.attributions.by_method.coupon || 0) - (A0.attributions.by_method.coupon || 0) !== 4) bad.push('attributions');
+  const V = A.attributed_order_value; const V0 = A0.attributed_order_value;
+  if (+(av(after, 'INR').value - av(before, 'INR').value).toFixed(2) !== 100 || +(av(after, 'USD').value - av(before, 'USD').value).toFixed(2) !== 20
+    || V.cancelled_orders - V0.cancelled_orders !== 1 || V.orders_without_snapshot - V0.orders_without_snapshot !== 1) bad.push(`attributed value ${JSON.stringify([V, V0])}`);
+  if (/commission|payable|payout|approved|revenue/i.test(JSON.stringify(A))) bad.push('commission/revenue fields present');
+  // Shipments: parcels, cancelled orders' parcels apart, cancelled parcels apart from the operational total.
+  const sh = after.sections.shipments; const dS = (k) => sh.by_status[k] - shipBefore.by_status[k];
+  if (dS('packed') !== 1 || dS('dispatched') !== 1 || dS('in_transit') !== 0 || dS('cancelled') !== 1 || sh.on_cancelled_orders - shipBefore.on_cancelled_orders !== 1
+    || sh.active_total - shipBefore.active_total !== 2) bad.push(`shipments ${JSON.stringify([sh, shipBefore])}`);
+  const direct = (await pool.query(`SELECT count(*)::int n FROM order_shipments s JOIN orders o ON o.id = s.order_id WHERE o.order_status <> 'cancelled' AND s.shipment_status <> 'cancelled'`)).rows[0].n;
+  if (sh.active_total !== direct) bad.push(`active parcels ${sh.active_total} vs ${direct}`);
+  // Inventory: lightweight counts equal direct counts; cutover untouched; nothing written by reading.
+  const I = after.sections.inventory;
+  const one = async (q) => (await pool.query(q)).rows[0].n;
+  const want = {
+    master_skus: await one('SELECT count(*)::int n FROM skus WHERE active'), mappings: await one('SELECT count(*)::int n FROM sku_platform_mappings'),
+    batches: await one('SELECT count(*)::int n FROM inventory_batches'), movements: await one('SELECT count(*)::int n FROM inventory_movements'),
+    active_reservations: await one(`SELECT count(*)::int n FROM inventory_reservations WHERE status = 'active'`),
+    platform_skus_to_map: (await unmappedSkus()).length,
+  };
+  for (const [k, v] of Object.entries(want)) if (I[k] !== v) bad.push(`inventory ${k} ${I[k]} vs ${v}`);
+  if (I.cutover_at !== null || (await getInventoryCutover()).cutover_at !== null) bad.push('cutover changed');
+  const full = (await inventoryOverview({})).cards;
+  if (I.low_stock !== full.lowStock || I.out_of_stock !== full.outOfStock || I.expired_batches !== full.expired || I.expiring_30 !== full.expiring30
+    || I.available_units !== full.availableUnits || I.reserved_units !== full.reservedUnits || I.master_skus !== full.totalSkus) bad.push(`stock flags differ from the Inventory page ${JSON.stringify([I, full])}`);
+  const counts = async () => JSON.stringify((await pool.query(`SELECT (SELECT count(*) FROM inventory_batches) b, (SELECT count(*) FROM inventory_movements) m, (SELECT count(*) FROM inventory_reservations) r, (SELECT count(*) FROM sku_platform_mappings) p, (SELECT count(*) FROM order_items WHERE sku_id IS NOT NULL) i`)).rows[0]);
+  const c0 = await counts(); await ov(); await ov(logi); if ((await counts()) !== c0) bad.push('reading the overview changed data');
+  // Permissions: non-admins get counts, never money or sync health — the fields are absent, not zero.
+  const L = await ov(logi);
+  const LS = L.sections.commerce?.shopify; const LA = L.sections.commerce?.affiliate;
+  if (!LS || 'money' in LS || 'sync' in LS || !LA || 'attributed_order_value' in LA || !L.sections.shipments || !L.sections.inventory) bad.push(`non-admin ${JSON.stringify(L.sections.commerce)}`);
+  if (LS && LS.orders.active !== S.orders.active) bad.push('non-admin counts differ');
+  const noLog = await ov({ phone: RB.invOnly, isAdmin: false, caps: ['inventory.view'] });
+  if (noLog.sections.commerce || noLog.sections.shipments) bad.push('inventory-only member saw commerce/shipments');
+  const affOnly = await ov({ phone: RB.invOnly, isAdmin: false, caps: ['affiliate.view'] });
+  if (affOnly.sections.commerce?.shopify || !affOnly.sections.commerce?.affiliate || 'attributed_order_value' in affOnly.sections.commerce.affiliate) bad.push('affiliate-only member');
+  // Clean up the fixtures.
+  await pool.query('DELETE FROM order_shipments WHERE created_by = $1', [ACT]);
+  await purgeTestOrders(P);
+  await purgeTestAffiliates(ACT);
+  if (bad.length) throw new Error(bad.join(' | '));
+  return 'active/cancelled counts; INR value 181.50 = paid 101 + pending 50.50 + other 30 (PARTIALLY_REFUNDED), refunded 10, latest snapshot only; USD separate; no-snapshot order unknown; stale >24h / ok / never; affiliate counts, clicks, 4 attributions, value INR 100 + USD 20, cancelled and no-snapshot apart, no commission fields; parcels by status, cancelled-order parcel apart; inventory counts = DB and = Inventory page flags, cutover NULL, no writes; non-admins: no money or sync fields';
+});
+
 await step('affiliates admin cleanup', async () => {
   let n = 0;
-  for (const actor of [...Object.values(AFN), 'HR admin']) {
+  for (const actor of [...Object.values(AFN), 'HR admin', 'db-check-overview-commerce']) {
     const r = await purgeTestAffiliates(actor);
     n += r.affiliates;
     // Verification documents written by these tests (the throwaway local store).
