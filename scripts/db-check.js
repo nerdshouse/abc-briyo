@@ -7183,7 +7183,9 @@ await step('referral: GoKwik full_url never attributes (evidence only, #2823 con
     const ref = async (n) => (await getPool().query('SELECT source_payload FROM orders WHERE source_order_id = $1', [`${SH_PREFIX}${String(n).padStart(4, '0')}`])).rows[0]?.source_payload.shopify.referral;
     const r921 = await ref(921); const r935 = await ref(935);
     if (r921?.landing_ref !== X || r921.source !== 'gokwik_full_url' || r921.attributed !== false || r921.conflict !== false) bad.push(`921 evidence ${JSON.stringify(r921)}`);
-    if (r935?.landing_ref !== X || r935.utm_campaign !== M || r935.conflict !== true || r935.attributed !== false) bad.push(`935 evidence ${JSON.stringify(r935)}`);
+    if (r935?.landing_ref !== X || r935.utm_campaign !== M || r935.conflict !== true || r935.attributed !== false || r935.commission !== false
+      || r935.trusted_click_id !== null || !/^conflict:/.test(r935.reason || '')) bad.push(`935 evidence ${JSON.stringify(r935)}`);
+    if (r921.trusted_click_id !== null || r921.commission !== false || !/no trusted click id/.test(r921.reason || '')) bad.push(`921 reason ${JSON.stringify(r921)}`);
     // No commission for any full_url-only order.
     const comm = (await getPool().query(`SELECT count(*)::int n FROM affiliate_commissions c JOIN affiliate_order_attributions t ON t.id = c.attribution_id JOIN orders o ON o.id = t.order_id
       WHERE o.source_order_id = ANY($1)`, [[921, 930, 935].map((n) => `${SH_PREFIX}${String(n).padStart(4, '0')}`)])).rows[0].n;
@@ -7302,7 +7304,8 @@ await step('shopify orders/create webhook: HMAC, idempotent deliveries, the exis
     // 7. #2823 via webhook: imported, not attributed, conflict kept as evidence. 8. Plain order: none.
     const d4 = await deliver(964); await processWebhookDelivery(d4.deliveryId, { gql });
     const r4 = (await getPool().query('SELECT source_payload FROM orders WHERE source_order_id = $1', [gid(964)])).rows[0]?.source_payload.shopify.referral;
-    if (await attrsOf(964) !== 0 || r4?.conflict !== true || r4.landing_ref !== B || r4.utm_campaign !== A) bad.push(`#2823 pattern ${await attrsOf(964)} ${JSON.stringify(r4)}`);
+    if (await attrsOf(964) !== 0 || await commOf(964) !== 0 || await ordersOf(964) !== 1 || r4?.conflict !== true || r4.landing_ref !== B || r4.utm_campaign !== A
+      || r4.trusted_click_id !== null || r4.attributed !== false || r4.commission !== false) bad.push(`#2823 pattern ${await attrsOf(964)} ${JSON.stringify(r4)}`);
     const d5 = await deliver(965); await processWebhookDelivery(d5.deliveryId, { gql });
     if (await ordersOf(965) !== 1 || await attrsOf(965) !== 0) bad.push('plain order');
     // Created after the Sync race above, so only the webhook can bring them in.
@@ -7324,8 +7327,29 @@ await step('shopify orders/create webhook: HMAC, idempotent deliveries, the exis
     if (f7.status !== 'failed' || f7.attempts !== 1 || await ordersOf(967) !== 0) bad.push(`failure ${JSON.stringify(f7)}`);
     const sweep = await processPendingWebhooks({ gql, olderThanMs: 0 });
     if (sweep.processed < 1 || await ordersOf(967) !== 1) bad.push(`sweep ${JSON.stringify(sweep)}`);
+    // Crash after the durable row, before processing: the delivery is pending and is imported exactly once,
+    // even by two sweeps at once; a claim left by a dead process goes stale and is picked up.
+    SH.store.push(shOrder(968, { created: now(), attributes: direct }));
+    SH.store.push(shOrder(969, { created: now() }));
+    const d8 = await deliver(968);                       // stored and acknowledged; never processed (the "crash")
+    const d9 = await deliver(969);
+    await getPool().query(`UPDATE shopify_webhook_deliveries SET status = 'processing', attempts = 1, claimed_at = now() - interval '11 minutes' WHERE webhook_id = $1`, [d9.wid]);
+    const [s1, s2] = await Promise.all([processPendingWebhooks({ gql, olderThanMs: 0 }), processPendingWebhooks({ gql, olderThanMs: 0 })]);
+    await once(968, 'after restart'); await once(969, 'stale claim');
+    const st8 = (await getPool().query('SELECT status, attempts FROM shopify_webhook_deliveries WHERE webhook_id = ANY($1) ORDER BY webhook_id', [[d8.wid, d9.wid]])).rows;
+    if (st8.some((x) => x.status !== 'processed') || s1.processed + s2.processed !== 2) bad.push(`restart ${JSON.stringify({ st8, s1, s2 })}`);
+    const s3 = await processPendingWebhooks({ gql, olderThanMs: 0 });
+    if (s3.pending !== 0) bad.push(`processed deliveries swept again ${JSON.stringify(s3)}`);
+    // A live claim (not stale) is never taken by a second worker.
+    SH.store.push(shOrder(970, { created: now() }));
+    const d10 = await deliver(970);
+    await getPool().query(`UPDATE shopify_webhook_deliveries SET status = 'processing', attempts = 1, claimed_at = now() WHERE webhook_id = $1`, [d10.wid]);
+    if (!(await processWebhookDelivery(d10.wid, { gql })).skipped || await ordersOf(970) !== 0) bad.push('a live claim was taken twice');
+    // Wrong topic: stored as ignored and never processed, even by the sweep.
+    const ignRow = (await getPool().query('SELECT status, attempts FROM shopify_webhook_deliveries WHERE webhook_id = $1', [ign.wid])).rows[0];
+    if (ignRow.status !== 'ignored' || ignRow.attempts !== 0) bad.push(`ignored delivery processed ${JSON.stringify(ignRow)}`);
     // 11. No shipments, reservations, movements; carts untouched. Webhook runs never move the checkpoint.
-    const ships = (await getPool().query(`SELECT count(*)::int n FROM order_shipments s JOIN orders o ON o.id = s.order_id WHERE o.source_order_id = ANY($1)`, [[961, 962, 963, 964, 965, 967].map(gid)])).rows[0].n;
+    const ships = (await getPool().query(`SELECT count(*)::int n FROM order_shipments s JOIN orders o ON o.id = s.order_id WHERE o.source_order_id = ANY($1)`, [[961, 962, 963, 964, 965, 967, 968, 969].map(gid)])).rows[0].n;
     const fx1 = await keyFx();
     if (ships || fx1.mv !== fx0.mv || fx1.rs !== fx0.rs || fx1.carts !== fx0.carts) bad.push(`side effects ${JSON.stringify({ ships, fx0, fx1 })}`);
     const ckRuns = (await getPool().query(`SELECT count(*)::int n FROM order_imports WHERE imported_by = 'shopify-webhook' AND details->'window'->>'mode' <> 'order'`)).rows[0].n;
@@ -7340,7 +7364,7 @@ await step('shopify orders/create webhook: HMAC, idempotent deliveries, the exis
     for (const [k, v] of [['SHOPIFY_CLIENT_SECRET', keep.secret], ['SHOPIFY_STORE_DOMAIN', keep.shop]]) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }
   }
   if (bad.length) throw new Error(bad.join(' | '));
-  return 'forged signature 401, other shop 403; valid delivery → 1 order, 1 line, 1 snapshot, referral_click to its click, 1 commission, run "shopify-webhook"; same delivery id ignored; redelivery, webhook+poll and webhook+Sync races → still 1 of each, 1 attribution, 1 commission; #2823 pattern imported unattributed with the conflict kept; plain order unattributed; manual website duplicate held back; other topics stored as ignored; a failed import is retried by the sweep; no shipments, reservations, movements; carts and SHOPIFY_POLL_ENABLED untouched';
+  return 'forged signature 401, other shop 403; valid delivery → 1 order, 1 line, 1 snapshot, referral_click to its click, 1 commission, run "shopify-webhook"; same delivery id ignored; redelivery, webhook+poll and webhook+Sync races → still 1 of each, 1 attribution, 1 commission; #2823 pattern imported unattributed with the conflict kept; plain order unattributed; manual website duplicate held back; other topics stored as ignored; a failed import is retried by the sweep; a delivery stored but never processed (crash) and a stale claim are each imported exactly once by two concurrent sweeps, a live claim is never taken twice; no shipments, reservations, movements; carts and SHOPIFY_POLL_ENABLED untouched';
 });
 
 await step('referral: storefront snippet — stores bref/bclid, writes private cart attributes once, ignores bad input, never throws', async () => {
