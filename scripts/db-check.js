@@ -21,6 +21,7 @@ import {
   orderShipments, addOrderNote, removeDocument, orderDocuments, getDocument, listCouriers, saveCourier,
   trackingUrlFor, purgeTestOrders, zonedToUtc, listDestinations, saveDestination, DISPATCH_TYPES,
   shipmentMembers, sharedShipmentOf, attachToShipment, detachFromShipment, attachableOrders, createShipmentForOrders,
+  addManualOrderLine, updateManualOrderLine, removeManualOrderLine, manualLineSkuOptions,
 } from '../lib/orders.js';
 import { saveUploadedDocument } from '../lib/orders-routes.js';
 import { planAmazon, readTable, previewAmazonImport, commitAmazonImport } from '../lib/amazon-import.js';
@@ -3021,6 +3022,185 @@ await step('stock cutover: test cutover cleared', async () => {
   await getPool().query('UPDATE inventory_settings SET cutover_at = NULL WHERE id');
   return 'cutover NULL for the rest of the suite';
 });
+// ---- manual order lines + the post-cutover dispatch guard ----------------------------
+const ML = {};
+const mlOrder = async (number, { channel = 'blinkit', at = null } = {}) => createOrder({ ...R(channel), channel, source_order_id: `${TEST_ORDER}-ML-${number}`,
+  order_date: at, order_value: 100 }, { actor: ACTOR });
+const mlShip = async (number, { channel = 'blinkit', status = 'packed' } = {}) => {
+  const dl = (await listCouriers()).find((x) => x.name === 'Delhivery');
+  return createShipment({ ...R(channel), channel, source_order_id: `${TEST_ORDER}-ML-${number}`, courier_partner_id: dl.id, tracking_id: `AWB-ML-${number}`, shipment_status: status },
+    { actor: ACTOR, addToExisting: true });
+};
+const mlDispatch = async (orderId) => {
+  const sh = (await orderShipments(orderId))[0];
+  return updateShipment(orderId, sh.id, { shipment_status: 'dispatched' }, { actor: ACTOR, version: sh.version });
+};
+await step('manual order lines: a master SKU and a whole quantity; one line per product; only hand-entered, non-Amazon orders', async () => {
+  ML.a = (await createSku({ sku: `${TS}-ML-A`, product_name: 'Manual line A', variant_name: '60 caps' }, { actor: ACTOR })).id;
+  ML.b = (await createSku({ sku: `${TS}-ML-B`, product_name: 'Manual line B' }, { actor: ACTOR })).id;
+  ML.off = (await createSku({ sku: `${TS}-ML-OFF`, product_name: 'Manual line inactive' }, { actor: ACTOR })).id;
+  await updateSku(ML.off, { active: false }, { actor: ACTOR, version: (await getSku(ML.off)).version });
+  const opts = await manualLineSkuOptions();
+  if (!opts.some((k) => k.id === ML.a) || opts.some((k) => k.id === ML.off)) throw new Error('options must list active SKUs only');
+  const o = await mlOrder('1');
+  const r = await addManualOrderLine(o, { sku_id: ML.a, quantity: '2' }, { actor: ACTOR });
+  let items = await orderItems(o);
+  if (items.length !== 1 || items[0].sku_id !== ML.a || items[0].quantity !== 2 || items[0].sku !== `${TS}-ML-A` || items[0].title !== 'Manual line A — 60 caps') throw new Error(JSON.stringify(items));
+  for (const q of [0, -1, '1.5', 'abc', '', null, 100001]) await expectErr(`qty ${q}`, () => addManualOrderLine(o, { sku_id: ML.b, quantity: q }, { actor: ACTOR }), (e) => e.status === 400);
+  await expectErr('inactive', () => addManualOrderLine(o, { sku_id: ML.off, quantity: 1 }, { actor: ACTOR }), (e) => e.status === 400 && /inactive/.test(e.message));
+  await expectErr('unknown', () => addManualOrderLine(o, { sku_id: 99999999, quantity: 1 }, { actor: ACTOR }), (e) => e.status === 404);
+  await expectErr('no sku', () => addManualOrderLine(o, { quantity: 1 }, { actor: ACTOR }), (e) => e.status === 400);
+  await expectErr('duplicate', () => addManualOrderLine(o, { sku_id: ML.a, quantity: 5 }, { actor: ACTOR }), (e) => e.status === 409 && /already on this order/.test(e.message));
+  if ((await orderItems(o)).length !== 1 || (await orderItems(o))[0].quantity !== 2) throw new Error('a refused add changed the order');
+  await updateManualOrderLine(o, r.itemId, { quantity: 3 }, { actor: ACTOR });
+  await expectErr('update qty 0', () => updateManualOrderLine(o, r.itemId, { quantity: 0 }, { actor: ACTOR }), (e) => e.status === 400);
+  const b = await addManualOrderLine(o, { sku_id: ML.b, quantity: 1 }, { actor: ACTOR });
+  await removeManualOrderLine(o, b.itemId, { actor: ACTOR });
+  items = await orderItems(o);
+  if (items.length !== 1 || items[0].quantity !== 3) throw new Error(JSON.stringify(items));
+  const ev = (await orderEvents(o)).map((e) => e.event_type);
+  for (const t of ['item_added', 'item_quantity_changed', 'item_removed']) if (!ev.includes(t)) throw new Error(`no ${t} event`);
+  // Not on Amazon (its report adds the real lines) nor on imported orders; import lines cannot be edited here.
+  const amz = await mlOrder('AMZ', { channel: 'amazon' });
+  await expectErr('amazon', () => addManualOrderLine(amz, { sku_id: ML.a, quantity: 1 }, { actor: ACTOR }), (e) => e.status === 409 && /Amazon/.test(e.message));
+  const imp = await mlOrder('IMP', { channel: 'website' });
+  await getPool().query(`UPDATE orders SET source = 'shopify_sync' WHERE id = $1`, [imp]);
+  await expectErr('imported', () => addManualOrderLine(imp, { sku_id: ML.a, quantity: 1 }, { actor: ACTOR }), (e) => e.status === 409);
+  const web = await mlOrder('WEB', { channel: 'website' });
+  await addManualOrderLine(web, { sku_id: ML.a, quantity: 1 }, { actor: ACTOR });   // allowed: the Shopify sync never adds lines to a hand-entered order
+  const other = await lineOn('blinkit', 'ML-IMPLINE', `${TS}-ML-IMPCODE`, 1);
+  const impLine = (await orderItems(other))[0];
+  await expectErr('import line', () => updateManualOrderLine(other, impLine.id, { quantity: 2 }, { actor: ACTOR }), (e) => e.status === 409);
+  ML.o1 = o;
+  return 'line = master code + title, quantity 2; 0/−1/1.5/abc/blank/null/too large refused; inactive, unknown, missing SKU refused; same SKU twice refused (no merge); quantity edit and remove audited; Amazon and imported orders refused; hand-entered website order allowed; import lines not editable';
+});
+await step('manual order lines: master units directly — no platform multiplier, even when the SKU has a ×3 listing on the channel', async () => {
+  await addPlatformMappings(ML.a, PF.blinkit, [`${TS}-ML-A-PACK3`], { actor: ACTOR, unitsPerListing: 3 });
+  const { shipmentId } = await mlShip('1');
+  ML.s1 = shipmentId;
+  const st = await shipmentStock(shipmentId);
+  if (st.lines.length !== 1 || st.lines[0].sku_id !== ML.a || st.lines[0].required !== 3) throw new Error(JSON.stringify(st.lines));
+  // The ×3 listing still multiplies its own lines (existing behaviour).
+  const plat = await lineOn('blinkit', 'ML-PACK3', `${TS}-ML-A-PACK3`, 2);
+  const { shipmentId: ps } = await createShipment({ ...R('blinkit'), channel: 'blinkit', source_order_id: `${TEST_ORDER}-ML-PACK3`, courier_partner_id: (await listCouriers()).find((x) => x.name === 'Delhivery').id, tracking_id: 'AWB-ML-PACK3', shipment_status: 'packed' }, { actor: ACTOR, addToExisting: true });
+  const pst = await shipmentStock(ps);
+  if (pst.lines[0].required !== 6) throw new Error(`platform line ${pst.lines[0].required}`);
+  if (!plat) throw new Error('setup');
+  return 'manual line of 3 needs 3 (not 9) though the SKU has a ×3 Blinkit listing; that listing\'s own line of 2 still needs 6';
+});
+await step('post-cutover dispatch: a manual order with products reserves and deducts exactly its quantity; insufficient stock and line edits under reservation refused', async () => {
+  await setCut(CUT_AT);
+  ML.bA = (await receiveInventory({ sku_id: ML.a, batch_number: 'ML-1', expiry_date: dayOffset(400), quantity: 10, unit_cost: 5, request_id: rid() }, { actor: ACTOR })).batchId;
+  const before = await ledgerSum(ML.a);
+  await expectErr('insufficient', () => reserveShipmentStock(ML.s1, [{ batch_id: ML.bA, quantity: 11 }], { actor: ACTOR }), (e) => e.status === 409 || e.status === 400);
+  await reserveShipmentStock(ML.s1, [{ batch_id: ML.bA, quantity: 3 }], { actor: ACTOR });
+  const line = (await orderItems(ML.o1))[0];
+  await expectErr('edit while reserved', () => updateManualOrderLine(ML.o1, line.id, { quantity: 4 }, { actor: ACTOR }), (e) => e.status === 409);
+  await expectErr('add while reserved', () => addManualOrderLine(ML.o1, { sku_id: ML.b, quantity: 1 }, { actor: ACTOR }), (e) => e.status === 409);
+  await mlDispatch(ML.o1);
+  if (await ledgerSum(ML.a) !== before - 3) throw new Error(`deducted ${before - (await ledgerSum(ML.a))}`);
+  if ((await stockOf(ML.a)).on !== 7 || (await stockOf(ML.a)).res !== 0) throw new Error(JSON.stringify(await stockOf(ML.a)));
+  await expectErr('edit after dispatch', () => updateManualOrderLine(ML.o1, line.id, { quantity: 1 }, { actor: ACTOR }), (e) => e.status === 409);
+  // Two products on one order: each deducted by its own quantity.
+  ML.bB = (await receiveInventory({ sku_id: ML.b, batch_number: 'ML-B1', expiry_date: dayOffset(400), quantity: 5, unit_cost: 5, request_id: rid() }, { actor: ACTOR })).batchId;
+  const o2 = await mlOrder('2');
+  await addManualOrderLine(o2, { sku_id: ML.a, quantity: 2 }, { actor: ACTOR });
+  await addManualOrderLine(o2, { sku_id: ML.b, quantity: 4 }, { actor: ACTOR });
+  const { shipmentId: s2 } = await mlShip('2');
+  await reserveShipmentStock(s2, [{ batch_id: ML.bA, quantity: 2 }, { batch_id: ML.bB, quantity: 4 }], { actor: ACTOR });
+  await mlDispatch(o2);
+  if ((await stockOf(ML.a)).on !== 5 || (await stockOf(ML.b)).on !== 1) throw new Error(JSON.stringify([await stockOf(ML.a), await stockOf(ML.b)]));
+  // Cancelling the shipment releases what was reserved for it.
+  const o3 = await mlOrder('3');
+  await addManualOrderLine(o3, { sku_id: ML.a, quantity: 1 }, { actor: ACTOR });
+  const { shipmentId: s3 } = await mlShip('3');
+  await reserveShipmentStock(s3, [{ batch_id: ML.bA, quantity: 1 }], { actor: ACTOR });
+  if ((await stockOf(ML.a)).res !== 1) throw new Error('not reserved');
+  const sh3 = (await orderShipments(o3))[0];
+  await updateShipment(o3, sh3.id, { shipment_status: 'cancelled' }, { actor: ACTOR, version: sh3.version });
+  if ((await stockOf(ML.a)).res !== 0 || (await stockOf(ML.a)).on !== 5) throw new Error(JSON.stringify(await stockOf(ML.a)));
+  return 'qty 3 reserved and dispatched → on hand 10 → 7 (−3, not −9); reserving 11 of 10 refused; lines locked while reserved and after dispatch; A×2 + B×4 → −2 and −4; cancelled shipment released its 1';
+});
+await step('post-cutover dispatch guard: no lines (or only code-less ones) → refused with a clear message; before the cutover and historical orders unchanged', async () => {
+  const MSG = 'Cannot dispatch — this order has no inventory lines. Add the products and quantities before dispatching.';
+  // B. A current order with no products: dispatch refused, nothing changes.
+  const none = await mlOrder('NONE');
+  await mlShip('NONE');
+  const mv = (await getPool().query('SELECT count(*)::int n FROM inventory_movements')).rows[0].n;
+  await expectErr('no lines', () => mlDispatch(none), (e) => e.status === 409 && e.message === MSG && e.noInventoryLines);
+  if ((await orderShipments(none))[0].shipment_status !== 'packed') throw new Error('status changed');
+  // Created directly as dispatched: refused too, and nothing is created (all or nothing).
+  await expectErr('created dispatched', () => mlShip('NONE-DIRECT', { status: 'dispatched' }), (e) => e.message === MSG);
+  if ((await getPool().query(`SELECT 1 FROM orders WHERE source_order_id = $1`, [`${TEST_ORDER}-ML-NONE-DIRECT`])).rows.length) throw new Error('order created despite the refusal');
+  // Lines that resolve to nothing (no SKU code at all) do not count either.
+  const blank = await mlOrder('BLANK');
+  await getPool().query(`INSERT INTO order_items (order_id, source_line_item_id, sku, title, quantity) VALUES ($1, 'L-BLANK', NULL, 'Sample sachet', 1)`, [blank]);
+  await mlShip('BLANK');
+  await expectErr('code-less only', () => mlDispatch(blank), (e) => e.message === MSG);
+  // Riding along in a parcel that has already left: refused.
+  const lead = await mlOrder('LEAD');
+  await addManualOrderLine(lead, { sku_id: ML.a, quantity: 1 }, { actor: ACTOR });
+  const { shipmentId: ls } = await mlShip('LEAD');
+  await reserveShipmentStock(ls, [{ batch_id: ML.bA, quantity: 1 }], { actor: ACTOR });
+  await mlDispatch(lead);
+  const rider = await mlOrder('RIDER');
+  await expectErr('attach to shipped', () => attachToShipment(ls, { orderIds: [rider] }, { actor: ACTOR }), (e) => e.message === MSG);
+  if ((await getPool().query('SELECT count(*)::int n FROM inventory_movements')).rows[0].n !== mv + 1) throw new Error('unexpected movements');
+  // A. Historical (before the cutover): dispatches as before, deducting nothing.
+  const old = await mlOrder('OLD', { at: '2026-01-01T10:00:00+05:30' });
+  const { shipmentId: os } = await mlShip('OLD');
+  const r = await mlDispatch(old);
+  if ((await orderShipments(old))[0].shipment_status !== 'dispatched' || await movementsFor(os) !== 0 || !r) throw new Error('historical dispatch changed');
+  // Cutover unset: the existing behaviour — a line-less shipment dispatches with nothing deducted.
+  await getPool().query('UPDATE inventory_settings SET cutover_at = NULL WHERE id');
+  await mlDispatch(none);
+  const { shipmentId: ns } = await mlShip('NONE-PRE');
+  if ((await orderShipments(none))[0].shipment_status !== 'dispatched' || await movementsFor(ns) !== 0) throw new Error('pre-cutover behaviour changed');
+  const plain = await mlOrder('PLAIN', { channel: 'hyugalife' });
+  if (!plain) throw new Error('a non-website manual order could not be created');
+  return `after cutover: no-lines dispatch refused ("${MSG.slice(0, 40)}…"), direct-dispatched create refused and rolled back, code-less-only refused, line-less order cannot join a dispatched parcel; historical order and no-cutover dispatch unchanged (0 movements); non-website manual orders unaffected`;
+});
+await step('manual order lines: channel and order number are fixed while the order has manual products (no route onto an Amazon order)', async () => {
+  const MSG = 'Cannot change channel or order number while this order has manual products. Remove the products first.';
+  const o = await mlOrder('MOVE');
+  const add = await addManualOrderLine(o, { sku_id: ML.a, quantity: 2 }, { actor: ACTOR });
+  const before = JSON.stringify(await orderItems(o));
+  const v = async () => (await getOrder(o)).version;
+  await expectErr('channel', async () => updateOrder(o, { channel: 'zepto', ...R('zepto') }, { actor: ACTOR, version: await v() }), (e) => e.status === 409 && e.message === MSG);
+  await expectErr('number', async () => updateOrder(o, { source_order_id: `${TEST_ORDER}-ML-MOVED` }, { actor: ACTOR, version: await v() }), (e) => e.status === 409 && e.message === MSG);
+  // D. Not onto Amazon either, under a real-looking Amazon order ID.
+  await expectErr('to amazon', async () => updateOrder(o, { channel: 'amazon', ...R('amazon'), source_order_id: AZ('ML-MOVE') }, { actor: ACTOR, version: await v() }), (e) => e.status === 409 && e.message === MSG);
+  const cur = await getOrder(o);
+  if (cur.channel !== 'blinkit' || cur.source_order_id !== `${TEST_ORDER}-ML-MOVE` || JSON.stringify(await orderItems(o)) !== before) throw new Error('order or lines changed');
+  // Other edits still work; once the products are removed, the order can move again.
+  await updateOrder(o, { order_value: 250 }, { actor: ACTOR, version: await v() });
+  await removeManualOrderLine(o, add.itemId, { actor: ACTOR });
+  await updateOrder(o, { source_order_id: `${TEST_ORDER}-ML-MOVED` }, { actor: ACTOR, version: await v() });
+  // B. No manual products: channel and number change as before.
+  const free = await mlOrder('FREE');
+  await updateOrder(free, { channel: 'zepto', ...R('zepto') }, { actor: ACTOR, version: (await getOrder(free)).version });
+  await updateOrder(free, { source_order_id: `${TEST_ORDER}-ML-FREE2` }, { actor: ACTOR, version: (await getOrder(free)).version });
+  const f = await getOrder(free);
+  if (f.channel !== 'zepto' || f.source_order_id !== `${TEST_ORDER}-ML-FREE2`) throw new Error(JSON.stringify(f));
+  return 'with a manual product: channel, number and a move onto an Amazon order ID refused (409, order and line unchanged); value edit fine; products removed → number changes; no products → channel and number change as before';
+});
+await step('manual order lines: a hand-entered Amazon order (no manual products possible) gets its Amazon lines from the import exactly once', async () => {
+  const id = await createOrder({ ...R('amazon'), channel: 'amazon', source_order_id: AZ('ML-HAND'), order_value: 1 }, { actor: ACTOR });
+  await expectErr('manual line', () => addManualOrderLine(id, { sku_id: ML.a, quantity: 1 }, { actor: ACTOR }), (e) => e.status === 409);
+  const file = amzCsv([amzRow({ 'order-id': AZ('ML-HAND'), 'order-item-id': 'MLH-1', sku: 'SKU-MLH', 'quantity-purchased': '2' })]);
+  const r = await commitAmazonImport(file, 'ml-hand.csv', { actor: IMPORTER });
+  let items = await orderItems(id);
+  if (r.summary.ordersUpdated !== 1 || items.length !== 1 || items[0].source_line_item_id !== 'MLH-1' || items[0].quantity !== 2 || items[0].sku !== 'SKU-MLH') throw new Error(JSON.stringify({ s: r.summary, items }));
+  const again = await commitAmazonImport(file, 'ml-hand.csv', { actor: IMPORTER });
+  items = await orderItems(id);
+  if (items.length !== 1 || again.summary.lineItemsAdded) throw new Error(`rerun: ${items.length} lines, added ${again.summary.lineItemsAdded}`);
+  if ((await getOrder(id)).source !== 'manual') throw new Error('source changed');
+  return 'manual line refused on the Amazon order; import matched it and added its 1 Amazon line (qty 2, Amazon code); rerun added nothing; order stays hand-entered';
+});
+await step('manual order lines: test cutover cleared', async () => {
+  await getPool().query('UPDATE inventory_settings SET cutover_at = NULL WHERE id');
+  return 'cutover NULL for the rest of the suite';
+});
 await step('master SKU import: parser — Briyo SKU + Product Name only; platform columns ignored with a warning', async () => {
   const two = planSkuSheet([['Briyo SKU', 'Product Name'], ['A1', 'Alpha'], ['', ''], ['A2', '  Beta   capsules ']]);
   if (two.errors.length || two.warnings.length || two.masters.map((m) => `${m.sku}:${m.name}`).join('|') !== 'A1:Alpha|A2:Beta capsules') throw new Error(JSON.stringify(two));
@@ -4703,6 +4883,9 @@ await step('hr: RBAC — HR manager, admin and multi-module reach HR; others ref
     // SKU mapping is an Inventory catalog decision: no one else can map (refused before anything is read).
     ['POST', '/api/inventory/skus/1/platform-skus', { platform: 'amazon', platform_skus: ['RBAC-PROBE'], from_order: true }, { mgr: 403, nonHr: 403, '': 401 }],
     ['GET', '/api/inventory/unmapped', null, { mgr: 403, '': 401 }],
+    // Products on a hand-entered order: Logistics editors only (refused before anything is read).
+    ['POST', '/api/orders/1/items', { sku_id: 1, quantity: 1 }, { mgr: 403, nonHr: 403, '': 401 }],
+    ['GET', '/api/orders/line-skus', null, { mgr: 403, '': 401 }],
   ];
   const bad = [];
   for (const [m, p, b, exp] of M) for (const [who, want] of Object.entries(exp)) {

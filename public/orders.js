@@ -56,6 +56,7 @@ const FILTER_KEYS = ['q', 'channel', 'destination', 'status', 'shipment', 'couri
 
 const state = {
   meta: null,
+  lineSkus: null,    // active master SKUs, for products on hand-entered orders (loaded on first use)
   type: '',          // dispatch type tab: '' = all
   view: '',
   f: Object.fromEntries(FILTER_KEYS.map((k) => [k, ''])),
@@ -285,6 +286,9 @@ async function openOrder(id, { shipmentId = null } = {}) {
   }
   try {
     state.detail = await api(`/api/orders/${id}`);
+    if (!state.lineSkus && manualLinesOpen(state.detail.order)) {
+      state.lineSkus = (await api('/api/orders/line-skus').catch(() => ({ skus: [] }))).skus || [];
+    }
     renderDrawer();
   } catch (err) {
     $('#dBody').innerHTML = `<div class="empty-note"><b>Could not open this order.</b>${esc(err.message)}</div>`;
@@ -580,19 +584,44 @@ function lineSkus(o) {
 }
 
 /** Line items, as the marketplace listed them. Manual orders have none. */
+const PARCEL_LEFT = new Set(['dispatched', 'in_transit', 'out_for_delivery', 'delivered', 'delivery_failed', 'rto']);
+/** Hand-entered orders take products here (not Amazon: its report import adds them). lib/orders.js decides again. */
+const takesManualLines = (o) => o.source === 'manual' && o.channel !== 'amazon';
+const manualLinesOpen = (o) => takesManualLines(o) && canEdit() && o.order_status !== 'cancelled'
+  && !(state.detail?.shipments || []).some((x) => PARCEL_LEFT.has(x.shipment_status));
+
+/** Line items, as the marketplace listed them — or, on a hand-entered order, the products staff added. */
 function itemsSection(o, items) {
-  if (!items.length) return '';
+  const manual = takesManualLines(o);
+  if (!items.length && !manual) return '';
+  const open = manualLinesOpen(o);
   const units = items.reduce((n, it) => n + it.quantity, 0);
-  return `<section class="dsec">
-      <h3 class="dsec-title">Items <span class="dsec-meta soft">${count(items.length)} line${items.length === 1 ? '' : 's'} · ${count(units)} unit${units === 1 ? '' : 's'}</span></h3>
-      <div class="item-list">${items.map((it) => `
+  const row = (it) => {
+    const own = open && String(it.source_line_item_id || '').startsWith('manual:');
+    return `
         <div class="item-row">
           <div class="t"><div>${esc(it.title || it.sku || 'Item')}</div>
             <div class="muted" style="font-size:12px">${[skuLine(o, it),
               it.promotion_discount ? `Discount ${esc(money(it.promotion_discount))}` : '',
               it.shipping_price ? `Shipping ${esc(money(it.shipping_price))}` : ''].filter(Boolean).join(' · ')}</div></div>
-          <div class="n"><div>× ${esc(it.quantity)}</div><div class="muted" style="font-size:12px">${esc(amount(it.item_price))}</div></div>
-        </div>`).join('')}</div>
+          ${own ? `<div class="n ml-edit"><input class="input ml-qty" type="number" min="1" step="1" inputmode="numeric" value="${esc(it.quantity)}" aria-label="Quantity of ${esc(it.sku)}" data-line-qty="${it.id}" />
+            <button class="btn" type="button" data-line-save="${it.id}">Save</button><button class="linkish" type="button" data-line-remove="${it.id}" data-line-sku="${esc(it.sku)}">Remove</button></div>`
+          : `<div class="n"><div>× ${esc(it.quantity)}</div><div class="muted" style="font-size:12px">${esc(amount(it.item_price))}</div></div>`}
+        </div>`;
+  };
+  const skus = state.lineSkus || [];
+  return `<section class="dsec" id="dItems">
+      <h3 class="dsec-title">${manual ? 'Products' : 'Items'} <span class="dsec-meta soft">${count(items.length)} line${items.length === 1 ? '' : 's'} · ${count(units)} unit${units === 1 ? '' : 's'}</span></h3>
+      ${items.length ? `<div class="item-list">${items.map(row).join('')}</div>` : ''}
+      ${manual && !items.length && !open ? '<p class="muted" style="margin:0">No products recorded on this order.</p>' : ''}
+      ${open ? `<div class="ml-add">
+        <p class="muted" style="margin:${items.length ? '12px' : '0'} 0 8px">Add product / inventory line — the master SKU and how many units travel. After the stock cutover a parcel cannot be dispatched until its products are here.</p>
+        <div class="ml-row">
+          <select class="select" id="mlSku" aria-label="Product (master SKU)"><option value="">Choose a product</option>${skus.map((k) => `<option value="${k.id}">${esc(k.sku)} — ${esc([k.product_name, k.variant_name].filter(Boolean).join(' '))}</option>`).join('')}</select>
+          <input class="input ml-qty" id="mlQty" type="number" min="1" step="1" inputmode="numeric" value="1" aria-label="Quantity (units)" />
+          <button class="btn" type="button" id="mlAdd">Add product / inventory line</button>
+        </div></div>`
+      : manual && items.length ? '<p class="muted" style="margin:10px 0 0;font-size:12px">Products are fixed once stock is reserved or the parcel has left.</p>' : ''}
     </section>`;
 }
 
@@ -771,6 +800,9 @@ function describeEvent(e) {
     }
     case 'shopify_sync_conflict': return ['triangle-alert', 'warn', `Shopify sync conflict: ${esc(md.detail || md.kind)}`];
     case 'note_added': return ['message-square-text', '', `Note: ${esc(md.note)}`];
+    case 'item_added': return ['package-plus', 'info', `Product added · ${esc(md.sku)} × ${esc(md.quantity)}`];
+    case 'item_quantity_changed': return ['pencil', '', `Product quantity · ${esc(md.sku)}: ${esc(md.from)} → <b>${esc(md.to)}</b>`];
+    case 'item_removed': return ['package-minus', 'warn', `Product removed · ${esc(md.sku)} × ${esc(md.quantity)}`];
     case 'stock_released': return ['package-open', 'warn', `Reserved stock released${md.reason === 'order cancelled' ? ' — order cancelled' : ''}`];
     case 'amazon_import_lines_locked': return ['lock', 'warn', `Amazon import did not change ${md.lines} item${md.lines > 1 ? 's' : ''}: stock for this order has already been dispatched`];
     default: return ['activity', '', esc(label(e.event_type))];
@@ -944,6 +976,36 @@ dBody.addEventListener('click', async (e) => {
     if (e.target.closest('#dShipNew')) return openShipNew();
     return closeDrawer();
   }
+  // Products on a hand-entered order: nothing is saved until a product and quantity are chosen and added.
+  const lineAct = e.target.closest('#mlAdd, [data-line-save], [data-line-remove]');
+  if (lineAct) {
+    const oid = state.detail.order.id;
+    let req; let done;
+    if (lineAct.id === 'mlAdd') {
+      if (!$('#mlSku').value) { $('#dSaved').className = 'saved failed'; $('#dSaved').textContent = 'Choose the product first.'; return; }
+      req = [`/api/orders/${oid}/items`, { method: 'POST', body: JSON.stringify({ sku_id: $('#mlSku').value, quantity: $('#mlQty').value }) }];
+      done = 'Product added';
+    } else if (lineAct.dataset.lineSave) {
+      req = [`/api/orders/${oid}/items/${lineAct.dataset.lineSave}`, { method: 'PATCH', body: JSON.stringify({ quantity: $(`[data-line-qty="${lineAct.dataset.lineSave}"]`).value }) }];
+      done = 'Quantity saved';
+    } else {
+      if (!confirm(`Remove ${lineAct.dataset.lineSku} from this order?`)) return;
+      req = [`/api/orders/${oid}/items/${lineAct.dataset.lineRemove}`, { method: 'DELETE' }];
+      done = 'Product removed';
+    }
+    lineAct.disabled = true;
+    try {
+      await api(...req);
+      await openOrder(oid);
+      $('#dSaved').className = 'saved';
+      $('#dSaved').textContent = done;
+    } catch (err) {
+      lineAct.disabled = false;
+      $('#dSaved').className = 'saved failed';
+      $('#dSaved').textContent = err.message;
+    }
+    return;
+  }
   if (e.target.closest('#dNoteAdd')) {
     const note = $('#dNote').value.trim();
     if (!note) return;
@@ -1105,12 +1167,24 @@ function fillRoute(form, fieldId, { type = '', channel = '', destination = '', r
   const chans = channelsFor(type);
   if (channel && !chans.some((c) => c.key === channel)) channel = '';
   form.channel.innerHTML = opt('', 'Choose channel', !channel) + chans.map((c) => opt(c.key, c.label, c.key === channel)).join('');
-  if (!channel && chans.length === 1) form.channel.value = chans[0].key;
+  // A sole channel is picked for you — except the website: its orders normally come through Shopify Sync.
+  if (!channel && chans.length === 1 && chans[0].key !== 'website') form.channel.value = chans[0].key;
   const needs = m.dispatchTypes.find((t) => t.key === type)?.needsDestination;
   const dests = needs ? destinationsFor(form.channel.value, type) : [];
   form.destination_id.innerHTML = opt('', form.channel.value ? 'Choose destination' : 'Choose the channel first', !destination)
     + dests.map((d) => opt(d.id, d.name, String(d.id) === String(destination))).join('');
   $(fieldId).hidden = !needs;
+  websiteWarning(form);
+}
+
+/**
+ * A website order typed in by hand blocks the real one: Shopify Sync holds back an
+ * order whose number already exists (lib/shopify-orders.js), so its products never
+ * arrive. Allowed, but never by accident.
+ */
+function websiteWarning(form) {
+  const w = form.querySelector('.website-warn');
+  if (w) w.hidden = form.channel.value !== 'website';
 }
 
 function routeChanged(form, fieldId, changed, required) {
