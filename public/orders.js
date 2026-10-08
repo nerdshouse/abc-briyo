@@ -101,7 +101,8 @@ const courierById = (id) => state.meta.couriers.find((c) => c.id === Number(id))
 function readUrl() {
   const u = new URLSearchParams(window.location.search);
   state.type = u.get('type') || '';
-  state.view = u.get('view') || '';
+  // pending_dispatch is the old name of awaiting_dispatch (lib/orders.js VIEW_ALIASES).
+  state.view = u.get('view') === 'pending_dispatch' ? 'awaiting_dispatch' : (u.get('view') || '');
   for (const k of FILTER_KEYS) state.f[k] = u.get(k) || '';
   const open = u.get('open');
   state.openId = open && /^\d+$/.test(open) ? Number(open) : null;

@@ -2047,11 +2047,12 @@ await step('amazon import: orders show in the Orders list and filters', async ()
 await step('amazon import → no shipments → pick 3 orders → one Shree Tirupati shipment', async () => {
   const [a, b, c] = await Promise.all([amzOrder(2), amzOrder(3), amzOrder(4)]);
   if ([a, b, c].some((o) => o.shipment_id !== null)) throw new Error('imported orders already have shipments');
-  // They wait in Pending dispatch and under "No shipment yet".
-  const waiting = await listOrders({ view: 'pending_dispatch', q: `${TEST_ORDER}-AMZ` });
+  // With no in-app shipment they are listed under "No shipment yet", not as Awaiting dispatch
+  // (a marketplace order may have been fulfilled elsewhere).
+  const waiting = await listOrders({ view: 'awaiting_dispatch', q: `${TEST_ORDER}-AMZ` });
   const none = await listOrders({ shipment: 'none', q: `${TEST_ORDER}-AMZ` });
   for (const o of [a, b, c]) {
-    if (!waiting.orders.some((x) => x.id === o.id) || !none.orders.some((x) => x.id === o.id)) throw new Error('not listed as waiting');
+    if (waiting.orders.some((x) => x.id === o.id) || !none.orders.some((x) => x.id === o.id)) throw new Error('no-shipment order listed as awaiting dispatch');
   }
   const stc = (await listCouriers()).find((x) => x.name === 'Shree Tirupati Courier');
   const r = await createShipmentForOrders([a.id, b.id, c.id], { courier_partner_id: stc.id, tracking_id: 'AWB-AMZ-STC' }, { actor: ACTOR });
@@ -5153,7 +5154,7 @@ await step('careers host detection behind a proxy — the Host header decides, n
 await step('overview: each member sees only their departments; numbers match the records; signed out refused', async () => {
   const bad = [];
   const keys = async (who) => { const r = await internal(who, 'GET', '/api/overview'); return r.status === 200 ? Object.keys(r.body.sections).sort().join() : `HTTP ${r.status}`; };
-  const want = { mgr: 'hr', multi: 'hr,inventory,logistics', nonHr: 'support', adm: 'hr,ingest,inventory,logistics,marketing,people,support' };
+  const want = { mgr: 'hr', multi: 'hr,inventory,logistics', nonHr: 'support', adm: 'hr,ingest,inventory,logistics,marketing,support,team' };
   for (const [who, k] of Object.entries(want)) { const got = await keys(who); if (got !== k) bad.push(`${who}: ${got} ≠ ${k}`); }
   if ((await internal(null, 'GET', '/api/overview')).status !== 401) bad.push('signed out not refused');
   const page = await internal(null, 'GET', '/overview');
@@ -5168,11 +5169,15 @@ await step('overview: each member sees only their departments; numbers match the
     ['support not called', S.support.not_called, await one("SELECT count(*)::int n FROM abandoned_carts WHERE status = 'Not called'")],
     ['hr open jobs', S.hr.open_jobs, await one("SELECT count(*)::int n FROM hr_jobs WHERE status = 'published'")],
     ['hr awaiting review', S.hr.awaiting_review, await one("SELECT count(*)::int n FROM hr_applications WHERE completed_at IS NOT NULL AND status = 'applied'")],
-    ['people active', S.people.active, await one('SELECT count(*)::int n FROM allowed_users WHERE active')],
+    ['team active', S.team.active, await one('SELECT count(*)::int n FROM allowed_users WHERE active')],
     ['inventory skus', S.inventory.master_skus, await one('SELECT count(*)::int n FROM skus WHERE active')],
   ];
   const meta = (await internal('adm', 'GET', '/api/orders/meta')).body;
-  for (const k of ['pending_dispatch', 'in_transit', 'delivered', 'failed']) cmp.push([`logistics ${k}`, S.logistics[k], meta.viewCounts[k]]);
+  // Failed equals the Orders view; the others are app shipment work only (see the next step).
+  cmp.push(['logistics failed', S.logistics.failed, meta.viewCounts.failed]);
+  cmp.push(['logistics awaiting dispatch', S.logistics.awaiting_dispatch, meta.viewCounts.awaiting_dispatch]);
+  for (const k of ['in_transit', 'delivered']) if (!(S.logistics[k] <= meta.viewCounts[k])) bad.push(`logistics ${k} above its Orders view`);
+  if ('without_shipment' in S.logistics || 'pending_dispatch' in S.logistics) bad.push('old logistics keys still returned');
   for (const [label, a, b] of cmp) if (a !== b) bad.push(`${label}: ${a} vs ${b}`);
   // Attention: only non-zero items, sorted critical → warning → attention, each with a link.
   const order = ['critical', 'warning', 'attention'];
@@ -5181,9 +5186,81 @@ await step('overview: each member sees only their departments; numbers match the
   if (ov.timezone !== (process.env.BOARD_TIMEZONE || process.env.BOARD_TZ || 'Asia/Kolkata')) bad.push('timezone');
   void pool;
   if (bad.length) throw new Error(bad.join(' | '));
-  return `HR manager → hr; multi-module → hr, inventory, logistics; support → support; admin → all + people + ingest; signed out 401 / login; careers host 404; ${cmp.length} numbers equal their source counts; ${ov.attention.length} attention items, non-zero, sorted, linked`;
+  return `HR manager → hr; multi-module → hr, inventory, logistics; support → support; admin → all + team + ingest; signed out 401 / login; careers host 404; ${cmp.length} numbers equal their source counts; ${ov.attention.length} attention items, non-zero, sorted, linked`;
 });
 
+await step('overview: app shipment work only — no-shipment orders never "awaiting dispatch", cancelled orders never in transit or delivered; SKU mapping is setup, not a blocker; Team is admin-only', async () => {
+  const bad = [];
+  const pool = getPool();
+  const admin = { phone: RB.adm, isAdmin: true, caps: CAPABILITIES };
+  const L = async () => (await overviewFor(admin, { slaHours: 6 })).sections.logistics;
+  const before = await L();
+  const mk = async (tag, status, shipment) => {
+    const id = await createOrder({ ...R('website'), channel: 'website', source_order_id: `${TEST_ORDER}-OVX-${tag}`, order_date: NOW(), order_value: 100 }, { actor: ACTOR });
+    if (status !== 'new') await pool.query('UPDATE orders SET order_status = $2 WHERE id = $1', [id, status]);
+    // createOrder may open a shipment of its own: set it to the state under test, or remove it for "no shipment".
+    const { rows: own } = await pool.query('SELECT id FROM order_shipments WHERE order_id = $1 ORDER BY id', [id]);
+    if (!shipment) await pool.query('DELETE FROM order_shipments WHERE order_id = $1', [id]);
+    else if (own.length) await pool.query('UPDATE order_shipments SET shipment_status = $2 WHERE id = $1', [own[0].id, shipment]);
+    else await pool.query('INSERT INTO order_shipments (order_id, shipment_status, created_by) VALUES ($1, $2, $3)', [id, shipment, ACTOR]);
+    return id;
+  };
+  const noShip = await mk('NOSHIP', 'new', null);  // e.g. fulfilled outside the app: not shipment work
+  // A line with a code no master SKU knows, so there is a platform SKU to map.
+  await pool.query(`INSERT INTO order_items (order_id, source_line_item_id, sku, title, quantity, item_price) VALUES ($1, 'L1', $2, 'Overview test line', 1, 100)`, [noShip, `${TS}-OVX-UNMAPPED`]);
+  const packed = await mk('PACKED', 'new', 'packed');   // awaiting dispatch
+  const unready = await mk('UNREADY', 'new', 'not_ready'); // awaiting dispatch
+  await mk('TRANSIT', 'new', 'in_transit');
+  await mk('DELIV', 'new', 'delivered');
+  await mk('XTRANSIT', 'cancelled', 'in_transit'); // cancelled: never in transit
+  await mk('XDELIV', 'cancelled', 'delivered');    // cancelled: never delivered
+  const after = await L();
+  const d = (k) => after[k] - before[k];
+  if (d('awaiting_dispatch') !== 2) bad.push(`awaiting dispatch +${d('awaiting_dispatch')} (want +2: not ready + packed, not the no-shipment order)`);
+  if (d('in_transit') !== 1) bad.push(`in transit +${d('in_transit')} (want +1: cancelled excluded)`);
+  if (d('delivered') !== 1) bad.push(`delivered +${d('delivered')} (want +1: cancelled excluded)`);
+  if (d('today') !== 7) bad.push(`orders today +${d('today')} (want +7, unchanged meaning)`);
+  // One definition: the Orders view lists exactly the Overview's population, old link name included.
+  const view = await listOrders({ view: 'awaiting_dispatch' }, { limit: 500 });
+  const legacy = await listOrders({ view: 'pending_dispatch' }, { limit: 1 });
+  if (view.total !== after.awaiting_dispatch || legacy.total !== view.total || view.viewCounts.awaiting_dispatch !== view.total) bad.push(`Orders ${view.total} / legacy ${legacy.total} vs Overview ${after.awaiting_dispatch}`);
+  const ids = new Set(view.orders.map((o) => o.id));
+  if (!ids.has(packed) || !ids.has(unready) || ids.has(noShip)) bad.push('Orders view population');
+  const ovPage = await fsp.readFile(new URL('../public/overview.js', import.meta.url), 'utf8');
+  const ovApi = await fsp.readFile(new URL('../lib/overview.js', import.meta.url), 'utf8');
+  if (!ovPage.includes("href: '/orders?view=awaiting_dispatch'") || !ovApi.includes("'/orders?view=awaiting_dispatch'") || /view=pending_dispatch/.test(ovPage + ovApi)) bad.push('Overview links');
+  const om = (await internal('adm', 'GET', '/api/orders/meta')).body;
+  if (om.views.awaiting_dispatch !== 'Awaiting dispatch' || 'pending_dispatch' in om.views) bad.push(`Orders view label ${JSON.stringify(om.views)}`);
+  const linked = await internal('adm', 'GET', '/api/orders?view=awaiting_dispatch&limit=1');
+  if (linked.body.total !== after.awaiting_dispatch) bad.push(`linked view ${linked.body.total}`);
+  // The Orders page views are untouched: they still list every order the way they did.
+  const meta = await internal('adm', 'GET', '/api/orders/meta');
+  if (meta.body.viewCounts.delivered < after.delivered + 1) bad.push('Orders delivered view changed');
+  const ov = await overviewFor(admin, { slaHours: 6 });
+  // No "without a shipment" or "pending dispatch" alarm.
+  if (ov.attention.some((a) => /without a shipment|pending dispatch/.test(a.text))) bad.push('misleading logistics wording in attention');
+  // Platform SKUs to map: a setup item with a count, never an attention item or "blocking".
+  const I = ov.sections.inventory;
+  if (!(I.platform_skus_to_map > 0) || 'unmapped_skus' in I) bad.push(`inventory keys ${JSON.stringify(Object.keys(I))}`);
+  if (ov.attention.some((a) => /unmapped|mapping|blocking/i.test(a.text))) bad.push('SKU mapping still in attention');
+  const su = ov.setup.find((x) => x.dept === 'inventory' && x.count !== null);
+  // Inventory cutover: a setup item while unset, never an alarm; gone once set.
+  const cutItem = (o) => o.setup.find((x) => x.text === 'Inventory cutover · Not set');
+  if ((await getInventoryCutover()).cutover_at !== null || !cutItem(ov) || ov.attention.some((a) => /cutover/i.test(a.text))) bad.push('cutover setup item while unset');
+  await setInventoryCutover('2026-01-01T00:00:00+05:30', { actor: ACTOR, confirm: true, version: (await getInventoryCutover()).version });
+  const withCut = await overviewFor(admin, { slaHours: 6 });
+  await getPool().query('UPDATE inventory_settings SET cutover_at = NULL WHERE id');
+  if (cutItem(withCut) || withCut.attention.some((a) => /cutover/i.test(a.text))) bad.push('cutover item shown after it was set');
+  if (!su || su.count !== I.platform_skus_to_map || su.text !== (su.count === 1 ? 'platform SKU needs mapping' : 'platform SKUs need mapping') || /block/i.test(su.text)) bad.push(`setup ${JSON.stringify(ov.setup)}`);
+  // Team: admins only; nobody else gets the section or its attention items.
+  const nonAdmin = await overviewFor({ phone: RB.multi, isAdmin: false, caps: CAPABILITIES.filter((c) => c !== 'marketing.view') }, { slaHours: 6 });
+  if (!ov.sections.team?.ok || 'people' in ov.sections) bad.push('admin Team section');
+  if (nonAdmin.sections.team || nonAdmin.sections.people || nonAdmin.attention.some((a) => a.dept === 'team')) bad.push('non-admin saw Team');
+  const page = await fsp.readFile(new URL('../public/overview.js', import.meta.url), 'utf8');
+  if (!page.includes("team: { label: 'Team'") || /Pending dispatch|without a shipment|Unmapped platform SKUs/.test(page)) bad.push('page wording');
+  if (bad.length) throw new Error(bad.join(' | '));
+  return 'no-shipment order not counted; not ready + packed → +2 awaiting dispatch; Orders view (and old pending_dispatch link) = Overview, same orders; cancelled in-transit/delivered excluded; orders today +7; SKU mapping and unset cutover are setup items, never attention; cutover set → item gone; Team admin-only';
+});
 await step('profiles: incomplete member is held at /profile until name, email and photo are in; photos validated; admin controls', async () => {
   const bad = [];
   const pool = getPool();
@@ -5286,7 +5363,7 @@ await step('profiles: existing members keep working with an incomplete profile a
   const fp = await fresh('GET', '/'); const fa = await fresh('GET', '/api/carts?days=1');
   if (fp.status !== 302 || fp.headers.get('location') !== '/profile' || fa.status !== 403 || (await fa.json()).code !== 'PROFILE_INCOMPLETE') bad.push(`new member not held ${fp.status}/${fa.status}`);
   // E. Overview counts incomplete active profiles exactly.
-  const ov = (await internal('adm', 'GET', '/api/overview')).body.sections.people;
+  const ov = (await internal('adm', 'GET', '/api/overview')).body.sections.team;
   const { rows: [{ n }] } = await pool.query(`SELECT count(*)::int n FROM allowed_users WHERE active AND (photo_key IS NULL OR coalesce(btrim(email), '') = '' OR coalesce(btrim(name), '') IN ('', 'Team'))`);
   if (ov.incomplete_profiles !== n) bad.push(`overview incomplete ${ov.incomplete_profiles} vs ${n}`);
   await pool.query(`DELETE FROM member_log WHERE target_phone = '919000000308'`);
@@ -5489,7 +5566,7 @@ await step('marketing: the Overview never waits for Meta (2 s budget), other dep
     const t0 = Date.now(); const ov = await overviewFor(session, { slaHours: 6 }); const took = Date.now() - t0;
     if (took > 3500) bad.push(`overview took ${took} ms with slow Meta`);
     if (!ov.sections.marketing?.pending) bad.push(`marketing not pending: ${JSON.stringify(ov.sections.marketing)}`);
-    for (const k of ['logistics', 'inventory', 'support', 'hr', 'people']) if (!ov.sections[k]?.ok) bad.push(`${k} affected`);
+    for (const k of ['logistics', 'inventory', 'support', 'hr', 'team']) if (!ov.sections[k]?.ok) bad.push(`${k} affected`);
     if (ov.attention.some((a) => a.dept === 'marketing')) bad.push('loading raised an alarm');
     // The slow fetch keeps going in the background and fills the cache: the next Overview is instant and complete.
     await new Promise((r) => setTimeout(r, 4500));
