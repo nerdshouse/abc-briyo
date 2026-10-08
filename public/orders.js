@@ -1792,6 +1792,87 @@ async function followShopifySync() {
   }
 }
 
+/* ------------------------------------------------------------------ Amazon button: sync new and changed orders */
+
+const amazonNote = (html, tone = '') => {
+  const el = $('#amazonSync');
+  el.className = `banner${tone ? ` ${tone}` : ''}`;
+  el.innerHTML = html;
+  el.hidden = !html;
+};
+const amazonBusy = (on) => {
+  const b = $('#amazonOrders');
+  b.disabled = on;
+  b.setAttribute('aria-busy', on ? 'true' : 'false');
+  $('#amazonLabel').textContent = on ? 'Syncing…' : 'Amazon';
+};
+const amazonFacts = (s) => `<div class="sync-facts amazon-facts">
+  <span>${count(s.fetched || 0)} fetched</span><span>${count(s.created || 0)} new</span><span>${count(s.updated || 0)} updated</span>
+  <span>${count(s.conflicts || 0)} conflict${s.conflicts === 1 ? '' : 's'}</span><span>${count(s.unmappedLines || 0)} unmapped line${s.unmappedLines === 1 ? '' : 's'}</span>
+  ${s.runs > 1 ? `<span>${count(s.runs)} runs</span>` : ''}${s.durationMs ? `<span>${esc(duration(s.durationMs))}</span>` : ''}</div>`;
+let amazonFollowing = false;
+
+/**
+ * One click: the server continues an unfinished window or syncs orders changed since the last sync (it refuses a
+ * second sync with 409). The page never sends a window; only the very first sync asks for a start date.
+ */
+async function startAmazonSync(initialSince = null) {
+  if ($('#amazonOrders').disabled) return;
+  amazonBusy(true);
+  amazonNote('<b>Amazon Syncing…</b>');
+  try {
+    await api('/api/orders/amazon/sync', { method: 'POST', body: JSON.stringify(initialSince ? { initial_since: initialSince } : {}) });
+  } catch (err) {
+    if (err.status === 409 && err.data?.needsInitialSince) { amazonBusy(false); askAmazonStart(); return; }
+    // Already running (another click or another admin): follow that sync instead.
+    if (!(err.status === 409 && err.data?.syncRunning)) { amazonBusy(false); amazonNote(esc(err.message), 'error'); return; }
+  }
+  followAmazonSync();
+}
+
+/** The first sync only: Amazon has no checkpoint yet, so an admin picks how far back to start (up to 90 days). */
+function askAmazonStart() {
+  const today = new Date();
+  const ymd = (d) => d.toISOString().slice(0, 10);
+  amazonNote(`<b>First Amazon sync.</b> Import Amazon orders changed since:
+    <span class="amazon-start"><input class="input" type="date" id="amazonSince" min="${ymd(new Date(today - 89 * 86400000))}" max="${ymd(today)}" value="${ymd(new Date(today - 7 * 86400000))}" />
+    <button class="btn primary" id="amazonStartBtn" type="button">Start sync</button></span>
+    <span class="soft">After this, Amazon always continues from its last sync.</span>`);
+  $('#amazonStartBtn').addEventListener('click', () => {
+    const v = $('#amazonSince').value;
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(v)) return;
+    startAmazonSync(`${v}T00:00:00+05:30`);                     // the start of that IST day
+  });
+}
+
+async function followAmazonSync() {
+  if (amazonFollowing) return;
+  amazonFollowing = true;
+  let s;
+  try { s = await api('/api/orders/amazon/sync/status'); } catch (err) { amazonFollowing = false; amazonBusy(false); amazonNote(esc(err.message), 'error'); return; }
+  amazonFollowing = false;
+  if (s.state === 'running') {
+    amazonBusy(true);
+    // A chain past its first run is working through a large window, run by run (Amazon allows ~1 page per 3 minutes after a burst).
+    amazonNote(`<b>${s.runs > 1 ? 'Amazon sync continuing…' : 'Amazon Syncing…'}</b> <span class="soft">${count(s.fetched || 0)} fetched so far</span>`);
+    setTimeout(followAmazonSync, 2500);
+    return;
+  }
+  amazonBusy(false);
+  if (s.state === 'completed') {
+    amazonNote(`<b>Amazon orders up to date</b>${amazonFacts(s)}`, 'success');
+    load();
+  } else if (s.state === 'partial') {
+    amazonNote(`<b>Amazon sync paused part-way</b> after ${count(s.fetched)} orders${s.throttled ? ' — Amazon asked us to slow down' : ''}. Click Amazon to continue from where it stopped.${amazonFacts(s)}`);
+    load();
+  } else if (s.state === 'failed') {
+    const why = s.throttled ? 'Amazon kept limiting requests. Wait a few minutes, then click Amazon to continue from where it stopped.'
+      : `${esc(s.failure || 'The sync stopped')}${/[.!?]$/.test(s.failure || '') ? '' : '.'} Click Amazon to continue from where it stopped.`;
+    amazonNote(`<b>Amazon sync stopped</b> — ${why}${amazonFacts(s)}`, 'error');
+    load();
+  }
+}
+
 function bind() {
   const ids = { status: 'fstatus', shipment: 'fshipment', courier: 'fcourier', invoice: 'finvoice', tracking: 'ftracking', from: 'ffrom', to: 'fto' };
   for (const [k, id] of Object.entries(ids)) {
@@ -1858,6 +1939,8 @@ function bind() {
   $('#iClose').addEventListener('click', closeImport);
   // One click: sync orders changed in Shopify since the last sync (no panel). Refresh above only reloads the list.
   $('#shopifyOrders').addEventListener('click', startShopifySync);
+  // One click: sync Amazon orders (no panel). Only the very first sync asks for a start date.
+  $('#amazonOrders').addEventListener('click', () => startAmazonSync());
   $('#iCancel').addEventListener('click', closeImport);
   $('#iFile').addEventListener('change', (e) => { imp.file = e.target.files[0] || null; imp.done = false; previewImport(); });
   $('#iSubmit').addEventListener('click', () => (imp.done ? closeImport() : commitImport()));
@@ -1906,6 +1989,9 @@ function bind() {
     $('#shopifyOrders').hidden = !me.isAdmin;
     // A sync already under way (started elsewhere, or before a reload): show it and follow it.
     if (me.isAdmin) api('/api/orders/shopify/sync-updates').then((st) => { if (st.state === 'running') followShopifySync(); }).catch(() => {});
+    // Amazon sync is admin-only too (the API enforces it); follow one already running.
+    $('#amazonOrders').hidden = !me.isAdmin;
+    if (me.isAdmin) api('/api/orders/amazon/sync/status').then((st) => { if (st.state === 'running') followAmazonSync(); }).catch(() => {});
     fillFilters();
     bind();
     await load({ pending: firstOrders });
