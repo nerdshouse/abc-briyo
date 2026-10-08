@@ -4294,7 +4294,9 @@ await step('shopify orders: Buy with Amazon fulfilments mirrored as external shi
     const r1 = await sync();
     const dl = (await listCouriers()).find((c) => c.name === 'Delhivery');
     const manual = await createShipment({ ...R('website'), channel: 'website', source_order_id: gid(989), courier_partner_id: dl.id, tracking_id: 'BRIYO-AWB-989', shipment_status: 'packed' }, { actor: ACTOR, addToExisting: true });
+    const manualBefore = (await getPool().query('SELECT version FROM order_shipments WHERE id = $1', [manual.shipmentId])).rows[0];
     store.find((o) => o.id === gid(989)).fulfillments = [ful(989, 1)];
+    store.find((o) => o.id === gid(989)).updatedAt = new Date(Date.now() + 500).toISOString();
     // 1, 4. One BWA fulfilment → exactly one shipment, in_transit, Shopify's tracking and URL, provider bwa, no courier row made.
     const s981 = await ships(981);
     if (r1.summary.externalShipmentsCreated !== 6 || s981.length !== 1) bad.push(`created ${r1.summary.externalShipmentsCreated}, 981 has ${s981.length}`);
@@ -4316,11 +4318,19 @@ await step('shopify orders: Buy with Amazon fulfilments mirrored as external shi
     // 2. Sync again: nothing new, nothing changed.
     const r2 = await sync();
     const total = async () => (await getPool().query(`SELECT count(*)::int n FROM order_shipments WHERE external_fulfillment_id LIKE $1`, [`gid://shopify/Fulfillment/${SH_NUM}%`])).rows[0].n;
-    if (r2.summary.externalShipmentsCreated !== 0 || r2.summary.externalShipmentsUpdated !== 0 || await total() !== 6) bad.push(`resync ${JSON.stringify([r2.summary.externalShipmentsCreated, r2.summary.externalShipmentsUpdated, await total()])}`);
-    // 9. The manual Briyo shipment is kept; Amazon's fulfilment is not added beside it.
+    if (r2.summary.externalShipmentsCreated !== 1 || r2.summary.externalShipmentsUpdated !== 0 || await total() !== 7) bad.push(`resync ${JSON.stringify([r2.summary.externalShipmentsCreated, r2.summary.externalShipmentsUpdated, await total()])}`);
+    // 9. Manual shipment + BWA fulfilment → both exist; the manual one untouched (same row, AWB, status, version).
     const s989 = await ships(989);
-    if (s989.length !== 1 || s989[0].id !== String(manual.shipmentId) || s989[0].tracking_id !== 'BRIYO-AWB-989' || s989[0].external_fulfillment_id !== null
-      || r2.summary.externalShipmentsSkipped < 1) bad.push(`manual ${JSON.stringify(s989.map((x) => [x.tracking_id, x.external_fulfillment_id]))} skipped ${r2.summary.externalShipmentsSkipped}`);
+    const man = s989.find((x) => x.id === String(manual.shipmentId)); const ext989 = s989.find((x) => x.external_fulfillment_id === FGID(989, 1));
+    if (s989.length !== 2 || !man || man.tracking_id !== 'BRIYO-AWB-989' || man.shipment_status !== 'packed' || man.external_fulfillment_id !== null || man.version !== manualBefore.version
+      || ext989?.shipment_status !== 'in_transit' || ext989.tracking_id !== '374146769891') bad.push(`manual + BWA ${JSON.stringify(s989.map((x) => [x.tracking_id, x.shipment_status, x.external_fulfillment_id]))}`);
+    // Two BWA fulfilments + an existing manual shipment → three records; repeated syncs keep three.
+    const o989 = store.find((o) => o.id === gid(989));
+    o989.fulfillments.push(ful(989, 2)); o989.updatedAt = new Date(Date.now() + 1000).toISOString();
+    await sync(); await sync(); await Promise.all([sync(), sync('shopify-poll')]);
+    const s989b = await ships(989);
+    if (s989b.length !== 3 || s989b.filter((x) => x.external_fulfillment_id).length !== 2 || (s989b.find((x) => x.id === String(manual.shipmentId))?.version) !== manualBefore.version)
+      bad.push(`two BWA + manual ${JSON.stringify(s989b.map((x) => [x.tracking_id, x.external_fulfillment_id]))}`);
     // 3, 7, 5, 6. Same fulfilment, updated: tracking follows; DELAYED keeps the status; OUT_FOR_DELIVERY, DELIVERED move forward; an older state never moves it back.
     const f981 = store.find((o) => o.id === gid(981)).fulfillments[0];
     const step = async (patch) => { Object.assign(f981, patch, { updatedAt: new Date(Date.now() + 1000).toISOString() }); store.find((o) => o.id === gid(981)).updatedAt = new Date().toISOString(); await sync(); return (await ships(981))[0]; };
@@ -4369,7 +4379,7 @@ await step('shopify orders: Buy with Amazon fulfilments mirrored as external shi
     await getPool().query(`DELETE FROM order_imports WHERE kind = 'shopify_sync' AND imported_by = 'shopify-poll' AND started_at > now() - interval '1 hour'`);
   }
   if (bad.length) throw new Error(bad.join(' | '));
-  return 'BWA tag + Amazon carrier → 1 shipment per fulfilment GID (in_transit, Shopify tracking + URL, provider bwa, no courier row made); non-BWA tag and other carrier → none; 2 fulfilments → 2 shipments; no tracking → none invented; unmapped SKU no obstacle; re-sync and concurrent syncs → no duplicates; manual Briyo shipment kept, mirror skipped; tracking update applied; DELAYED keeps in_transit; OUT_FOR_DELIVERY, DELIVERED forward, never back; cancelled in Shopify → cancelled (kept), replacement → new shipment; reserve refused, dispatch deducts nothing, no other order can join; no movements, reservations, stock or courier changes; tag configurable';
+  return 'BWA tag + Amazon carrier → 1 shipment per fulfilment GID (in_transit, Shopify tracking + URL, provider bwa, no courier row made); non-BWA tag and other carrier → none; 2 fulfilments → 2 shipments; no tracking → none invented; unmapped SKU no obstacle; re-sync and concurrent syncs → no duplicates; manual shipment + BWA fulfilment → both (manual untouched), + a second BWA fulfilment → 3 records, repeated/concurrent syncs keep 3; tracking update applied; DELAYED keeps in_transit; OUT_FOR_DELIVERY, DELIVERED forward, never back; cancelled in Shopify → cancelled (kept), replacement → new shipment; reserve refused, dispatch deducts nothing, no other order can join; no movements, reservations, stock or courier changes; tag configurable';
 });
 await step('shopify orders cleanup', async () => {
   await purgeTestOrders(SH_PREFIX);
