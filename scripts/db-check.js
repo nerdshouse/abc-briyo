@@ -7053,7 +7053,7 @@ await step('referral: GoKwik fallback (rule v2) — /r/{id} in full_url + a reco
   return '#2809 replica → gokwik_full_url / v2 to the recorded click; UTMs alone, full_url without /r/, foreign host, http, no click, click after order, 40-day-old click, unknown affiliate, suspended affiliate → none; latest of two clicks wins; __briyo_click orders still v1 (and a v1 mismatch is not overridden); plain order none; preview = commit (3); no clicks created; idempotent';
 });
 
-await step('referral: storefront snippet — stores bref/bclid, writes private cart attributes once, ignores bad input, never throws', async () => {
+await step('referral: storefront snippet — stores bref/bclid, writes the private and readable cart attribute pairs once, ignores bad input, never throws', async () => {
   const bad = [];
   const src = (await fsp.readFile(new URL('../storefront/briyo-referral.liquid', import.meta.url), 'utf8'));
   const code = src.match(/<script>([\s\S]*?)<\/script>/)[1];
@@ -7079,11 +7079,28 @@ await step('referral: storefront snippet — stores bref/bclid, writes private c
   const CLICK = 'abcDEF123_-xyzXYZ98765';
   const ok = await run(`?bref=b7k4p9&bclid=${CLICK}&utm_source=x`);
   const upd = ok.calls.find((c) => c.url === '/cart/update.js');
-  if (!upd || JSON.stringify(upd.body) !== JSON.stringify({ attributes: { __briyo_ref: 'B7K4P9', __briyo_click: CLICK } })) bad.push(`cart write ${JSON.stringify(upd?.body)}`);
+  // 1–2. All four keys, the readable pair identical to the private pair.
+  const four = { __briyo_ref: 'B7K4P9', __briyo_click: CLICK, _briyo_ref: 'B7K4P9', _briyo_click: CLICK };
+  if (!upd || JSON.stringify(upd.body) !== JSON.stringify({ attributes: four })) bad.push(`cart write ${JSON.stringify(upd?.body)}`);
+  if (upd && (upd.body.attributes._briyo_ref !== upd.body.attributes.__briyo_ref || upd.body.attributes._briyo_click !== upd.body.attributes.__briyo_click)) bad.push('readable pair differs');
+  if (ok.calls.filter((c) => c.url === '/cart/update.js').length !== 1) bad.push('more than one cart write');
   if (!ok.store.get('briyo_ref_v1')?.includes('B7K4P9') || !/^briyo_ref=B7K4P9\./.test(ok.jar)) bad.push('not stored');
-  const same = await run(`?bref=B7K4P9&bclid=${CLICK}`, { cart: { __briyo_ref: 'B7K4P9', __briyo_click: CLICK } });
+  // 3. The readable pair already on the cart: no write. (/cart.js never returns the private pair.)
+  const same = await run(`?bref=B7K4P9&bclid=${CLICK}`, { cart: { _briyo_ref: 'B7K4P9', _briyo_click: CLICK } });
   if (same.calls.some((c) => c.url === '/cart/update.js')) bad.push('rewrote identical attributes');
+  // Only the private pair "visible" (it never is through /cart.js): written, so the readable pair gets set.
+  const privOnly = await run(`?bref=B7K4P9&bclid=${CLICK}`, { cart: { __briyo_ref: 'B7K4P9', __briyo_click: CLICK } });
+  if (!privOnly.calls.some((c) => c.url === '/cart/update.js')) bad.push('readable pair not written when only the private pair was set');
+  // A different (older) referral on the cart: replaced by the latest.
+  const stale = await run(`?bref=B7K4P9&bclid=${CLICK}`, { cart: { _briyo_ref: 'C8M5Q2', _briyo_click: 'zzzZZZ999_-aaaAAA11111' } });
+  const su = stale.calls.find((c) => c.url === '/cart/update.js');
+  if (JSON.stringify(su?.body) !== JSON.stringify({ attributes: four })) bad.push(`stale not replaced ${JSON.stringify(su?.body)}`);
+  // 5. Other cart attributes: never sent, so Shopify keeps them (cart/update.js merges by key).
+  const other = await run(`?bref=B7K4P9&bclid=${CLICK}`, { cart: { gift_note: 'Happy birthday', gokwik_cid: 'abc' } });
+  const ou = other.calls.find((c) => c.url === '/cart/update.js');
+  if (!ou || Object.keys(ou.body.attributes).sort().join() !== '__briyo_click,__briyo_ref,_briyo_click,_briyo_ref') bad.push(`other attributes touched ${JSON.stringify(ou?.body)}`);
   for (const qs of ['?bref=B7K4P9', `?bclid=${CLICK}`, '?bref=<x>&bclid=<y>', `?bref=B0K4P9&bclid=${CLICK}`, '?bref=B7K4P9&bclid=short', '']) {
+    // 4. Missing or invalid referral: no cart read, no write, none of the four keys.
     const x = await run(qs);
     if (x.calls.length) bad.push(`acted on "${qs}"`);
   }
@@ -7096,7 +7113,7 @@ await step('referral: storefront snippet — stores bref/bclid, writes private c
   try { await run(`?bref=B7K4P9&bclid=${CLICK}`, { failFetch: true }); } catch (err) { bad.push(`threw: ${err.message}`); }
   if (/price|discount|checkout|email|phone|alert\(/i.test(code.replace(/\/\/.*$/gm, ''))) bad.push('snippet touches pricing, checkout or PII');
   if (bad.length) throw new Error(bad.join(' | '));
-  return 'valid bref/bclid → stored (localStorage + cookie) and written once as __briyo_ref/__briyo_click; identical cart not rewritten; 6 malformed inputs ignored; storage blocked → cookie fallback; later page reapplies; 30-day expiry; network failure swallowed; no pricing, checkout or PII code';
+  return 'valid bref/bclid → stored (localStorage + cookie) and written once as __briyo_ref/__briyo_click + identical _briyo_ref/_briyo_click; readable pair already on the cart → no write; private-only or older pair → written; other cart attributes never sent; 6 malformed inputs ignored; storage blocked → cookie fallback; later page reapplies; 30-day expiry; network failure swallowed; no pricing, checkout or PII code';
 });
 
 await step('overview commerce: Shopify counts and money (per currency, cancelled out, unknown ≠ 0), sync health, affiliate programme and attributed value, shipments as parcels, light inventory — money and sync admin-only', async () => {

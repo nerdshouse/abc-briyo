@@ -9,7 +9,11 @@
   What it does, and nothing else:
     - reads bref (affiliate public id) and bclid (click id) from the landing URL, checks their format;
     - remembers the latest pair for 30 days in first-party storage (localStorage, cookie as a fallback);
-    - writes them to the Shopify cart as private attributes __briyo_ref and __briyo_click, once per cart.
+    - writes them to the Shopify cart, once per cart, as two pairs with identical values:
+        __briyo_ref / __briyo_click  private (kept by Shopify's own checkout; not readable through /cart.js);
+        _briyo_ref  / _briyo_click   readable through /cart.js, which GoKwik's checkout reads.
+      Whether GoKwik copies them into the Shopify order is verified by a real test order before relying on it.
+      Only these four keys are sent: other cart attributes are left as they are.
   No personal data, no pricing or discount change, no visible UI. Any failure is silent: shopping and
   checkout continue exactly as without it. Browser privacy controls (e.g. Safari) may shorten storage.
 {%- endcomment -%}
@@ -41,11 +45,12 @@
     window.fetch(root + 'cart.js', { credentials: 'same-origin' })
       .then(function (r) { return r.json(); })
       .then(function (cart) {
+        // Private (__) attributes are never returned by /cart.js, so "already set" is read from the readable pair.
         var a = (cart && cart.attributes) || {};
-        if (a.__briyo_ref === cur.ref && a.__briyo_click === cur.click) return null;
+        if (a._briyo_ref === cur.ref && a._briyo_click === cur.click) return null;
         return window.fetch(root + 'cart/update.js', {
           method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ attributes: { __briyo_ref: cur.ref, __briyo_click: cur.click } }),
+          body: JSON.stringify({ attributes: { __briyo_ref: cur.ref, __briyo_click: cur.click, _briyo_ref: cur.ref, _briyo_click: cur.click } }),
         });
       })
       .catch(function () { /* never block shopping */ });
