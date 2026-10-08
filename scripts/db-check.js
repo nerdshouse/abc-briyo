@@ -6730,6 +6730,54 @@ await step('overview commerce: Shopify counts and money (per currency, cancelled
   return 'active/cancelled counts; INR value 181.50 = paid 101 + pending 50.50 + other 30 (PARTIALLY_REFUNDED), refunded 10, latest snapshot only; USD separate; no-snapshot order unknown; stale >24h / ok / never; affiliate counts, clicks, 4 attributions, value INR 100 + USD 20, cancelled and no-snapshot apart, no commission fields; parcels by status, cancelled-order parcel apart; inventory counts = DB and = Inventory page flags, cutover NULL, no writes; non-admins: no money or sync fields';
 });
 
+await step('units per listing through the Inventory API and page: create (default 1, 2, 10), reject 0 / −1 / 1.5, show and edit, managers only, nothing automatic', async () => {
+  const bad = [];
+  const pool = getPool();
+  const sku = (await createSku({ sku: `${TS}-UIU`, product_name: 'Units UI test' }, { actor: ACTOR })).id;
+  const maps0 = (await pool.query('SELECT count(*)::int n FROM sku_platform_mappings')).rows[0].n;
+  const add = (code, units) => internal('adm', 'POST', `/api/inventory/skus/${sku}/platform-skus`, { platform: 'amazon', platform_skus: [code], ...(units === undefined ? {} : { units_per_listing: units }) });
+  for (const [code, units, want] of [[`${TS}-UIU-D`, undefined, 1], [`${TS}-UIU-2`, '2', 2], [`${TS}-UIU-10`, '10', 10]]) {
+    const r = await add(code, units);
+    if (r.status !== 201) bad.push(`${code}: ${r.status} ${JSON.stringify(r.body)}`);
+  }
+  for (const v of ['0', '-1', '1.5', '', 0, -3]) {
+    const r = await add(`${TS}-UIU-BAD`, v);
+    if (r.status !== 400 || !/whole number/.test(r.body.error || '')) bad.push(`accepted ${JSON.stringify(v)}: ${r.status}`);
+  }
+  const shown = async () => Object.fromEntries((await internal('adm', 'GET', `/api/inventory/skus/${sku}`)).body.sku.platform_skus.map((m) => [m.platform_sku, m]));
+  let m = await shown();
+  if (m[`${TS}-UIU-D`]?.units_per_listing !== 1 || m[`${TS}-UIU-2`]?.units_per_listing !== 2 || m[`${TS}-UIU-10`]?.units_per_listing !== 10 || m[`${TS}-UIU-BAD`]) bad.push(`stored ${JSON.stringify(Object.values(m).map((x) => [x.platform_sku, x.units_per_listing]))}`);
+  // Edit (PATCH, the same endpoint the page's Edit units form uses).
+  const e = await internal('adm', 'PATCH', `/api/inventory/platform-skus/${m[`${TS}-UIU-2`].id}`, { units_per_listing: '3' });
+  if (e.status !== 200 || (await shown())[`${TS}-UIU-2`].units_per_listing !== 3) bad.push(`edit ${e.status}`);
+  const e0 = await internal('adm', 'PATCH', `/api/inventory/platform-skus/${m[`${TS}-UIU-2`].id}`, { units_per_listing: '0' });
+  if (e0.status !== 400) bad.push(`edit to 0: ${e0.status}`);
+  // Locked while an order using it has stock reserved: 3 ordered × 3 per listing = 9 inventory units; the order line stays 3.
+  const b = (await receiveInventory({ sku_id: sku, batch_number: 'UIU-1', expiry_date: dayOffset(300), quantity: 20, unit_cost: 10, request_id: rid() }, { actor: ACTOR })).batchId;
+  const order = await lineOn('amazon', 'UIU-1', `${TS}-UIU-2`, 3);
+  const dl = (await listCouriers()).find((x) => x.name === 'Delhivery');
+  const sid = (await createShipment({ ...R('amazon'), channel: 'amazon', source_order_id: `${TEST_ORDER}-UIU-1`, courier_partner_id: dl.id, tracking_id: 'AWB-UIU-1', shipment_status: 'packed' }, { actor: ACTOR, addToExisting: true })).shipmentId;
+  if ((await shipmentStock(sid)).lines[0]?.required !== 9) bad.push('3 × 3 should need 9 inventory units');
+  await reserveShipmentStock(sid, [{ batch_id: b, quantity: 9 }], { actor: ACTOR });
+  const locked = await internal('adm', 'PATCH', `/api/inventory/platform-skus/${m[`${TS}-UIU-2`].id}`, { units_per_listing: '4' });
+  if (locked.status !== 409) bad.push(`edit while reserved: ${locked.status}`);
+  if ((await pool.query('SELECT quantity FROM order_items WHERE order_id = $1', [order])).rows[0].quantity !== 3) bad.push('order quantity changed');
+  await releaseShipmentStock(sid, { actor: ACTOR });
+  // Audited; no member without Inventory access can create or edit; nothing was mapped automatically.
+  const audits = (await pool.query(`SELECT action FROM inventory_audit WHERE sku_id = $1 AND action IN ('platform_skus_added', 'platform_sku_units_changed')`, [sku])).rows.map((r) => r.action);
+  if (audits.filter((a) => a === 'platform_skus_added').length !== 3 || !audits.includes('platform_sku_units_changed')) bad.push(`audit ${audits.join(',')}`);
+  const deny = await internal('mgr', 'POST', `/api/inventory/skus/${sku}/platform-skus`, { platform: 'amazon', platform_skus: [`${TS}-UIU-X`], units_per_listing: '2' });
+  const denyEdit = await internal('mgr', 'PATCH', `/api/inventory/platform-skus/${m[`${TS}-UIU-10`].id}`, { units_per_listing: '2' });
+  if (deny.status !== 403 || denyEdit.status !== 403) bad.push(`non-inventory member ${deny.status}/${denyEdit.status}`);
+  if ((await pool.query('SELECT count(*)::int n FROM sku_platform_mappings')).rows[0].n !== maps0 + 3) bad.push('a mapping was created that nobody asked for');
+  // The page: the field, its helper, the label on each mapping, and an edit form (not a browser prompt).
+  const page = await fsp.readFile(new URL('../public/inventory.js', import.meta.url), 'utf8');
+  for (const t of ['Units per listing', 'How many inventory units are represented by one platform listing.', 'Units/listing: ', "openForm('units'", 'units_per_listing']) if (!page.includes(t)) bad.push(`page missing ${t}`);
+  if (/window\.prompt\(`Units per listing/.test(page)) bad.push('still a prompt');
+  if (bad.length) throw new Error(bad.join(' | '));
+  return 'API: omitted → 1, 2, 10 stored; 0 / −1 / 1.5 / empty refused (400); shown on the master; edited 2 → 3; 0 refused; locked (409) while reserved; 3 ordered × 3 = 9 inventory units, order line still 3; audited; non-Inventory member 403; only the 3 asked-for mappings exist; page has the field, helper, "Units/listing" label and an edit form';
+});
+
 await step('affiliates admin cleanup', async () => {
   let n = 0;
   for (const actor of [...Object.values(AFN), 'HR admin', 'db-check-overview-commerce']) {
