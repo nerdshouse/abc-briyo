@@ -234,13 +234,11 @@ Run by the **existing** Shopify order sync (`lib/shopify-orders.js`), inside the
 2. **Referral click.**
    - The order's `__briyo_click` must be a click recorded by Briyo OS, and the order's `__briyo_ref` (when present) must name that click's affiliate.
    - Then the **latest** click by the same visitor wins, provided it was made no later than the order (5-minute clock tolerance), within `affiliate_settings.attribution_window_days` before the order (30 days, read on every run, never hard-coded), with an active link and an affiliate eligible now. An ineligible affiliate's click is skipped in favour of the visitor's previous eligible one.
-3. **GoKwik fallback (rule `v2`, method `gokwik_full_url`).** It runs only when the order carries **none** of our referral attributes; an order with them is decided by step 2 alone, even when step 2 finds nothing.
-   - **Why it exists:** GoKwik checkout drops the private cart attributes, as verified on order #2809. It keeps its own `full_url` attribute: the landing URL of the session.
-   - **The landing path:** `full_url` must be HTTPS on our storefront (apex or `www`) or the store's myshopify domain, with the path `/r/{affiliate public id}`.
-   - **The click:** that affiliate must have a click recorded by Briyo OS, made no later than the order (no clock tolerance), within `attribution_window_days` before it, on an active link, and the affiliate must be eligible now. The latest such click is credited.
-   - **What is recorded:** `rule_version = 'v2'`. The metadata records `source: gokwik_full_url`, the landing path and `click_match: latest_affiliate_click_before_order`.
-   - **The credit is the affiliate's.** GoKwik drops our click ID, so the credited click is the affiliate's latest qualifying one, not proven to be this visitor's.
-   - **UTM values alone never attribute.** Nor does a `full_url` without `/r/{id}`, on another host, or over plain HTTP. No click is ever created or changed.
+3. **GoKwik `full_url`: evidence only, never attribution (since 08-10-2026).** Rule `v2` (method `gokwik_full_url`) no longer credits anyone.
+   - **Why:** order #2823 was placed 20 seconds after a GPJ92U click. Its `full_url` was `…/r/5TAZW4?utm_source=affiliate&utm_campaign=GPJ92U…`. The same browser had visited 5TAZW4's link the day before, so GoKwik kept a stale path beside the latest visit's UTMs. The path is not last-click evidence.
+   - **What happens instead:** the order is left unattributed. Its `/r/` path is kept on the order (`source_payload.shopify.referral`: `landing_ref`, `utm_campaign`, `conflict`, `attributed: false`) for review. `conflict` is true when `utm_source=affiliate` names a different affiliate than the path. Agreeing UTMs are not proof either.
+   - **Existing records:** attributions already recorded under `v2` (e.g. #2809) stay as they are; `gokwik_full_url` remains a valid method for them.
+   - **The fix is upstream:** GoKwik must carry `__briyo_ref` / `__briyo_click` (or `bref` / `bclid`) into the order's note attributes. See "GoKwik" below.
 4. Otherwise **no attribution.** Browser values alone are never trusted.
 
 **`cart_token` (investigated, not used).** GoKwik also keeps Shopify's `cart_token`. Briyo OS does not record cart tokens: the click happens on the click host before any cart exists, and the snippet writes to the cart without reporting its token. So there is nothing to join it against, and a `cart_token` join would need the snippet to send `{cart_token, bclid}` to Briyo OS. That is a possible future change, not implemented.

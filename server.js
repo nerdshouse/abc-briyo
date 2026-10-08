@@ -51,6 +51,7 @@ import { startKeepAlive } from './lib/keepalive.js';
 import { startSlaAlerts, isIngestSilent } from './lib/sla-alert.js';
 import { startShopifyPoll, pollShopifyOnce } from './lib/shopify-poll.js';
 import { startShopifyOrdersPoll } from './lib/shopify-orders.js';
+import { receiveOrdersCreate, processWebhookDelivery, startShopifyWebhookSweep } from './lib/shopify-webhooks.js';
 import { shopifyConfigured, authMode, apiVersionWarning, getAccessToken } from './lib/shopify.js';
 import {
   SCOPES as SHOPIFY_SCOPES, normaliseShop, installUrl, verifyHmac, exchangeCode,
@@ -145,6 +146,25 @@ function secretMatches(candidate, expected) {
   for (let i = 0; i < candidate.length; i += 1) diff |= candidate.charCodeAt(i) ^ expected.charCodeAt(i);
   return diff === 0;
 }
+
+/**
+ * Shopify orders/create (lib/shopify-webhooks.js): verified and stored, acknowledged, then imported through
+ * the existing order sync for that one order. The body is never logged and never imported as-is.
+ */
+app.post('/api/webhook/shopify/orders-create', async (req, res) => {
+  if (MOCK) return res.status(503).json({ ok: false, error: 'Needs a database.' });
+  let r;
+  try { r = await receiveOrdersCreate({ rawBody: typeof req.body === 'string' ? req.body : '', headers: req.headers }); } catch (err) {
+    console.error('Shopify webhook not stored:', String(err.message).slice(0, 200));
+    return res.status(500).json({ ok: false });   // Shopify retries: nothing was recorded
+  }
+  res.status(r.status).json(r.body);
+  if (r.deliveryId) {
+    setImmediate(() => processWebhookDelivery(r.deliveryId).catch((err) => {
+      console.error('Shopify webhook import failed (will be retried):', String(err.message).slice(0, 200));
+    }));
+  }
+});
 
 app.post('/api/webhook/gokwik/abandoned-cart', async (req, res) => {
   const expected = process.env.WEBHOOK_SECRET;
@@ -1275,4 +1295,5 @@ app.listen(port, async () => {
   if (!MOCK) startShopifyPoll();
   // Shopify ORDERS (not carts): opt-in with SHOPIFY_ORDERS_POLL_ENABLED=true, and only after an initial import.
   if (!MOCK) startShopifyOrdersPoll();
+  if (!MOCK) startShopifyWebhookSweep();
 });

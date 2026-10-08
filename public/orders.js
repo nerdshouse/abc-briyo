@@ -626,6 +626,19 @@ function itemsSection(o, items) {
     </section>`;
 }
 
+/**
+ * The affiliate evidence a Shopify order carried. A trusted click id (our own __briyo_ref/__briyo_click) is what
+ * attributes; GoKwik's landing path and UTMs are shown as evidence only, with why nobody was credited.
+ */
+function referralText(r) {
+  if (!r) return '';
+  if (r.ref || r.click) return `Trusted referral ${r.ref || '—'} · click ${r.click || '—'}`;
+  if (r.source !== 'gokwik_full_url') return '';
+  const facts = [`GoKwik landing /r/${r.landing_ref}`, r.utm_campaign ? `utm_campaign ${r.utm_campaign}` : '', r.conflict ? 'conflict' : '',
+    'no trusted click id', 'not attributed', 'no commission'].filter(Boolean);
+  return `${facts.join(' · ')}${r.reason ? ` — ${r.reason}` : ''}`;
+}
+
 /** What the Amazon report said beyond the order's own fields. */
 /** Shopify's own record, for reference. Its fulfilments are not Briyo shipments. */
 function shopifyDetails(s) {
@@ -641,6 +654,7 @@ function shopifyDetails(s) {
     ['Shipping', (s.shipping_lines || []).map((l) => [l.title, l.price !== null && l.price !== undefined ? money(l.price) : null].filter(Boolean).join(' ')).join(', ')],
     ['Cancelled in Shopify', s.cancelled_at ? `${dateTime(s.cancelled_at)}${s.cancel_reason ? ` · ${label(s.cancel_reason.toLowerCase())}` : ''}` : ''],
     ['Tags', (s.tags || []).join(', ')],
+    ['Affiliate referral', referralText(s.referral)],
     ['Shopify Note', s.note],
   ].filter(([, v]) => v);
   return rows.map(([k, v]) => `<dt>${k}</dt><dd>${esc(v)}</dd>`).join('');

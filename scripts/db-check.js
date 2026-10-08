@@ -56,6 +56,7 @@ import nodeCrypto from 'node:crypto';
 import { metricsFrom, rawFromRow, rangeParams, classifyMetaError, createMetaClient, createCache, MetaError, createMetaService, metaConfig, todayIn, resolvePurchaseType, _resetMetaService, billingFrom } from '../lib/meta-ads.js';
 import { overviewFor } from '../lib/overview.js';
 import { ensureAffiliateSchema, newAffiliatePublicId, rateAt, getAffiliateSetting, setAffiliateSetting, purgeTestAffiliates, _resetAffiliateSchemaForTest, createAffiliate } from '../lib/affiliates.js';
+import { receiveOrdersCreate, processWebhookDelivery, processPendingWebhooks, verifyWebhookHmac, ensureShopifyWebhookSchema } from '../lib/shopify-webhooks.js';
 import { runShopifySync, mapShopifyOrder, shopifyPaymentMethod, shopifyPaymentStatus, shopifyOrdersStatus, pollShopifyOrdersOnce, ordersPollMinutes } from '../lib/shopify-orders.js';
 import { ensureOrderFinancialSnapshotSchema, financialSnapshotFrom, addAmounts, FINANCIAL_TABLES } from '../lib/order-financial-snapshots.js';
 import { SHOPIFY_MAX_QUERY_COST, SHOPIFY_ORDER_QUERIES, LIMITS as SHOPIFY_LIMITS, shopifyOrderQuery, estimateShopifyOrderQueryCost } from '../lib/shopify-order-queries.js';
@@ -3533,7 +3534,8 @@ const shFake = (store, { denyPii = false, calls = [] } = {}) => async (query, va
   const q = vars.query || '';
   const ge = (field) => (q.match(new RegExp(`${field}:>='([^']+)'`)) || [])[1];
   const le = (field) => (q.match(new RegExp(`${field}:<='([^']+)'`)) || [])[1];
-  const rows = store().filter((x) => (!ge('created_at') || x.createdAt >= ge('created_at')) && (!le('created_at') || x.createdAt <= le('created_at'))
+  const idq = (q.match(/(?:^|\s)id:(\d+)/) || [])[1];   // a single order by its numeric id, as Shopify's search does
+  const rows = store().filter((x) => (!idq || x.id.split('/').pop() === idq) && (!ge('created_at') || x.createdAt >= ge('created_at')) && (!le('created_at') || x.createdAt <= le('created_at'))
     && (!ge('updated_at') || x.updatedAt >= ge('updated_at'))).sort((a, b) => a.updatedAt.localeCompare(b.updatedAt) || a.id.localeCompare(b.id));
   const page = shPage(rows, first, vars.after);
   // Like Shopify: fields that were not asked for are not returned (detail fields come from their own query).
@@ -5069,8 +5071,23 @@ await step('shopify oauth: APP_BASE_URL pins the callback; connecting stores the
     // The Import page reads this to hide "Pull from Shopify now" while the abandoned-checkout poll is off.
     const cfg = await (await fetch(`${base}/api/config`, { headers: { cookie: admin } })).json();
     if (!cfg.shopifyAuthorized || cfg.shopifyPollEnabled !== false) bad.push(`config authorized=${cfg.shopifyAuthorized} pollEnabled=${cfg.shopifyPollEnabled}`);
+    // The orders/create webhook over real HTTP: the signature is checked against the exact body bytes
+    // (non-ASCII included), a forged one is refused, a good one is stored and acknowledged.
+    const whBody = JSON.stringify({ id: 990001, admin_graphql_api_id: 'gid://shopify/Order/990001', name: '#WH₹-1', note: 'ünïcødé' });
+    const whPost = (sig, id) => fetch(`${base}/api/webhook/shopify/orders-create`, { method: 'POST', body: whBody, headers: { 'content-type': 'application/json',
+      'x-shopify-hmac-sha256': sig, 'x-shopify-shop-domain': SHOP, 'x-shopify-topic': 'orders/create', 'x-shopify-webhook-id': id } });
+    const goodSig = nodeCrypto.createHmac('sha256', SECRET).update(Buffer.from(whBody, 'utf8')).digest('base64');
+    const forgedWh = await whPost(nodeCrypto.createHmac('sha256', 'wrong').update(whBody).digest('base64'), 'dbcheck-wh-http-forged');
+    const goodWh = await whPost(goodSig, 'dbcheck-wh-http-1');
+    const again = await (await whPost(goodSig, 'dbcheck-wh-http-1')).json();
+    const row = (await getPool().query(`SELECT order_gid FROM shopify_webhook_deliveries WHERE webhook_id = 'dbcheck-wh-http-1'`)).rows[0];
+    if (forgedWh.status !== 401 || goodWh.status !== 200 || !again.duplicate || row?.order_gid !== 'gid://shopify/Order/990001') bad.push(`webhook http ${forgedWh.status}/${goodWh.status}/${JSON.stringify(again)}/${row?.order_gid}`);
+    if ((await getPool().query(`SELECT 1 FROM shopify_webhook_deliveries WHERE webhook_id = 'dbcheck-wh-http-forged'`)).rows.length) bad.push('forged webhook stored');
+    if (log.includes('ünïcødé') || log.includes('#WH₹-1')) bad.push('webhook body in the server log');
   } finally {
     srv.kill(); stub.close();
+    await getPool().query(`DELETE FROM shopify_webhook_deliveries WHERE webhook_id LIKE 'dbcheck-wh-http-%'`).catch(() => {});
+    await getPool().query(`DELETE FROM order_imports WHERE imported_by = 'shopify-webhook'`).catch(() => {});
     await getPool().query(`DELETE FROM system_state WHERE key = 'shopify_oauth_token'`);
   }
   if (bad.length) throw new Error(bad.join(' | '));
@@ -7099,7 +7116,7 @@ await step('affiliate commissions through the real Shopify sync: snapshot → at
   return `runShopifySync: snapshot 1, attribution 1, commission 1 at 12.5% on ${c.sub} − ${c.tax} = ${c.base_amount} → ${c.commission_amount} INR (pending); re-run: attributions 1, commissions 1, commission unchanged`;
 });
 
-await step('referral: GoKwik fallback (rule v2) — /r/{id} in full_url + a recorded click; UTMs alone never; v1 unchanged', async () => {
+await step('referral: GoKwik full_url never attributes (evidence only, #2823 conflict flagged); UTMs never; v1 click-id attribution unchanged', async () => {
   const bad = [];
   const keepShop = process.env.SHOPIFY_STORE_DOMAIN;
   process.env.SHOPIFY_STORE_DOMAIN = 'briyo-supp.myshopify.com';
@@ -7131,7 +7148,7 @@ await step('referral: GoKwik fallback (rule v2) — /r/{id} in full_url + a reco
     await af('manager', 'POST', `/api/affiliates/${S}/status`, { action: 'suspend', reason: 'db-check' });
     const now = () => new Date().toISOString();
     const cases = {
-      921: [{ created: now(), attributes: gk(X) }, { aff: X, m: 'gokwik_full_url', v: 'v2', click: xClick }],                       // #2809 replica
+      921: [{ created: now(), attributes: gk(X) }, null],                                                                             // #2809 replica: full_url alone → nobody
       922: [{ created: now(), attributes: gk(null) }, null],                                                                          // UTMs only
       923: [{ created: now(), attributes: gk(null, [{ key: 'full_url', value: `https://briyo-supp.myshopify.com/?utm_campaign=${X}` }]) }, null], // full_url without /r/
       924: [{ created: now(), attributes: gk(null, [{ key: 'full_url', value: `https://evil.example/r/${X}` }]) }, null],             // foreign host
@@ -7140,7 +7157,11 @@ await step('referral: GoKwik fallback (rule v2) — /r/{id} in full_url + a reco
       927: [{ created: now(), attributes: gk(W) }, null],                                                                             // click outside 30 days
       928: [{ created: now(), attributes: gk('ZZZZZZ') }, null],                                                                     // unknown affiliate
       929: [{ created: now(), attributes: gk(S) }, null],                                                                             // suspended at import
-      930: [{ created: now(), attributes: gk(M) }, { aff: M, m: 'gokwik_full_url', v: 'v2', click: m2 }],                            // latest click wins
+      930: [{ created: now(), attributes: gk(M) }, null],                                                                             // a recorded click is still not enough
+      // #2823 exactly: GPJ92U's UTMs beside a stale /r/5TAZW4 path from the same browser's earlier visit.
+      935: [{ created: now(), attributes: gk(null, [{ key: 'full_url', value: `https://briyo-supp.myshopify.com/r/${X}?utm_source=affiliate&utm_campaign=${M}&utm_medium=referral` }]).map((a) => (a.key === 'utm_campaign' ? { ...a, value: M } : a)) }, null],
+      // ...and the same order carrying our own click id: v1 decides, the stale path is irrelevant.
+      936: [{ created: now(), attributes: [{ key: '__briyo_ref', value: V }, { key: '__briyo_click', value: vClick }, { key: 'full_url', value: `https://briyo-supp.myshopify.com/r/${X}?utm_source=affiliate&utm_campaign=${V}&utm_medium=referral` }, { key: 'utm_source', value: 'affiliate' }, { key: 'utm_campaign', value: V }] }, { aff: V, m: 'referral_click', v: 'v1', click: vClick }],
       931: [{ created: now(), attributes: [{ key: '__briyo_ref', value: V }, { key: '__briyo_click', value: vClick }, ...gk(X)] }, { aff: V, m: 'referral_click', v: 'v1', click: vClick }], // v1 decides
       932: [{ created: now(), attributes: [{ key: '__briyo_ref', value: X }, { key: '__briyo_click', value: vClick }, ...gk(X)] }, null], // v1 mismatch: no fallback override
       933: [{ created: now() }, null],                                                                                                // plain order
@@ -7158,11 +7179,24 @@ await step('referral: GoKwik fallback (rule v2) — /r/{id} in full_url + a reco
         bad.push(`order ${n}: ${got ? `${got.aff}/${got.m}/${got.v}/${got.click_id === m1 ? 'older click' : got.click_id}` : 'none'}`);
       }
     }
-    const g = await who(921);
-    if (g && (g.metadata.source !== 'gokwik_full_url' || g.metadata.landing_path !== `/r/${X}` || g.metadata.click_match !== 'latest_affiliate_click_before_order')) bad.push(`metadata ${JSON.stringify(g.metadata)}`);
-    if (pre.summary.newAffiliateAttributions !== 3 || r.summary.affiliateAttributionsRecorded !== 3) bad.push(`preview ${pre.summary.newAffiliateAttributions} / recorded ${r.summary.affiliateAttributionsRecorded}`);
-    const o921 = (await getPool().query('SELECT source_payload FROM orders WHERE source_order_id = $1', [`${SH_PREFIX}0921`])).rows[0];
-    if (o921?.source_payload.shopify.referral?.landing_ref !== X || o921.source_payload.shopify.referral.source !== 'gokwik_full_url') bad.push('landing referral not kept on the order');
+    if (pre.summary.newAffiliateAttributions !== 2 || r.summary.affiliateAttributionsRecorded !== 2) bad.push(`preview ${pre.summary.newAffiliateAttributions} / recorded ${r.summary.affiliateAttributionsRecorded}`);
+    const ref = async (n) => (await getPool().query('SELECT source_payload FROM orders WHERE source_order_id = $1', [`${SH_PREFIX}${String(n).padStart(4, '0')}`])).rows[0]?.source_payload.shopify.referral;
+    const r921 = await ref(921); const r935 = await ref(935);
+    if (r921?.landing_ref !== X || r921.source !== 'gokwik_full_url' || r921.attributed !== false || r921.conflict !== false) bad.push(`921 evidence ${JSON.stringify(r921)}`);
+    if (r935?.landing_ref !== X || r935.utm_campaign !== M || r935.conflict !== true || r935.attributed !== false || r935.commission !== false
+      || r935.trusted_click_id !== null || !/^conflict:/.test(r935.reason || '')) bad.push(`935 evidence ${JSON.stringify(r935)}`);
+    if (r921.trusted_click_id !== null || r921.commission !== false || !/no trusted click id/.test(r921.reason || '')) bad.push(`921 reason ${JSON.stringify(r921)}`);
+    // No commission for any full_url-only order.
+    const comm = (await getPool().query(`SELECT count(*)::int n FROM affiliate_commissions c JOIN affiliate_order_attributions t ON t.id = c.attribution_id JOIN orders o ON o.id = t.order_id
+      WHERE o.source_order_id = ANY($1)`, [[921, 930, 935].map((n) => `${SH_PREFIX}${String(n).padStart(4, '0')}`)])).rows[0].n;
+    if (comm) bad.push(`${comm} commission(s) on full_url-only orders`);
+    // referralEvidence on its own: conflict only when utm_source=affiliate names someone else; agreeing UTMs are not proof.
+    const { referralEvidence } = await import('../lib/affiliate-referrals.js');
+    const evc = referralEvidence([{ key: 'full_url', value: `https://briyo-supp.myshopify.com/r/${X}` }, { key: 'utm_source', value: 'affiliate' }, { key: 'utm_campaign', value: X }]);
+    if (!evc || evc.conflict || evc.utm_campaign !== X) bad.push(`agreeing ${JSON.stringify(evc)}`);
+    const evf = referralEvidence([{ key: 'full_url', value: `https://briyo-supp.myshopify.com/r/${X}` }, { key: 'utm_source', value: 'facebook' }, { key: 'utm_campaign', value: M }]);
+    if (!evf || evf.conflict || evf.utm_campaign !== null) bad.push(`non-affiliate utm ${JSON.stringify(evf)}`);
+    if (referralEvidence([{ key: 'utm_source', value: 'affiliate' }, { key: 'utm_campaign', value: X }]) !== null) bad.push('evidence without full_url');
     // No synthetic clicks, no click changes; idempotent.
     const clicks = (await getPool().query(`SELECT count(*)::int n FROM affiliate_referral_clicks k JOIN affiliates a ON a.id = k.affiliate_id WHERE a.public_id = ANY($1)`, [[X, Y, Z, W, S, M, V]])).rows[0].n;
     if (clicks !== 7) bad.push(`clicks ${clicks}`);
@@ -7176,7 +7210,161 @@ await step('referral: GoKwik fallback (rule v2) — /r/{id} in full_url + a reco
       || landingReferral([{ key: 'utm_campaign', value: X }]) !== null) bad.push('landingReferral parsing');
   } finally { if (keepShop === undefined) delete process.env.SHOPIFY_STORE_DOMAIN; else process.env.SHOPIFY_STORE_DOMAIN = keepShop; }
   if (bad.length) throw new Error(bad.join(' | '));
-  return '#2809 replica → gokwik_full_url / v2 to the recorded click; UTMs alone, full_url without /r/, foreign host, http, no click, click after order, 40-day-old click, unknown affiliate, suspended affiliate → none; latest of two clicks wins; __briyo_click orders still v1 (and a v1 mismatch is not overridden); plain order none; preview = commit (3); no clicks created; idempotent';
+  return 'full_url-only orders (#2809 replica, with a recorded click, unknown, suspended, old, late, foreign, http) → nobody, no commission; #2823 pattern (stale /r/X path + utm_campaign Y) → nobody, conflict flagged on the order; same order with __briyo_click → v1 to its click; __briyo mismatch not overridden; preview = commit (2); no clicks created; idempotent';
+});
+// The webhook test sets and restores the order checkpoint around its poll race.
+let savedCkForWebhookTest;
+async function setCkForWebhookTest(v, restore = false) {
+  const K = 'shopify_orders_checkpoint';
+  if (!restore && savedCkForWebhookTest === undefined) savedCkForWebhookTest = (await getPool().query('SELECT value FROM system_state WHERE key = $1', [K])).rows[0]?.value ?? null;
+  const val = restore ? savedCkForWebhookTest : v;
+  if (restore && savedCkForWebhookTest === undefined) return;
+  if (val === null) await getPool().query('DELETE FROM system_state WHERE key = $1', [K]);
+  else await getPool().query(`INSERT INTO system_state (key, value, updated_at) VALUES ($1, $2, now()) ON CONFLICT (key) DO UPDATE SET value = $2, updated_at = now()`, [K, val]);
+}
+await step('shopify orders/create webhook: HMAC, idempotent deliveries, the existing import path (attribution, commission once), races with poll and Sync, no stock side effects', async () => {
+  const bad = [];
+  const SECRET = 'dbcheck-webhook-secret-0123456789';
+  const keep = { secret: process.env.SHOPIFY_CLIENT_SECRET, shop: process.env.SHOPIFY_STORE_DOMAIN };
+  Object.assign(process.env, { SHOPIFY_CLIENT_SECRET: SECRET, SHOPIFY_STORE_DOMAIN: 'briyo-supp.myshopify.com' });
+  const gid = (n) => `${SH_PREFIX}${String(n).padStart(4, '0')}`;
+  const sign = (body, secret = SECRET) => nodeCrypto.createHmac('sha256', secret).update(body).digest('base64');
+  let seq = 0;
+  const deliver = async (n, { id, secret, topic = 'orders/create', shop = 'briyo-supp.myshopify.com', body } = {}) => {
+    const raw = body ?? JSON.stringify({ id: Number(gid(n).split('/').pop()), admin_graphql_api_id: gid(n), name: `#WH${n}`, email: 'buyer@example.test' });
+    const wid = id || `dbcheck-wh-${SH_NUM}-${n}-${seq += 1}`;
+    const r = await receiveOrdersCreate({ rawBody: raw, headers: { 'x-shopify-hmac-sha256': sign(raw, secret), 'x-shopify-shop-domain': shop, 'x-shopify-topic': topic, 'x-shopify-webhook-id': wid } });
+    return { ...r, wid };
+  };
+  const count = async (sql, n) => (await getPool().query(sql, [gid(n)])).rows[0].n;
+  const ordersOf = (n) => count('SELECT count(*)::int n FROM orders WHERE source_order_id = $1', n);
+  const snapsOf = (n) => count('SELECT count(*)::int n FROM order_financial_snapshots s JOIN orders o ON o.id = s.order_id WHERE o.source_order_id = $1', n);
+  const attrsOf = (n) => count('SELECT count(*)::int n FROM affiliate_order_attributions t JOIN orders o ON o.id = t.order_id WHERE o.source_order_id = $1', n);
+  const commOf = (n) => count(`SELECT count(*)::int n FROM affiliate_commissions c JOIN affiliate_order_attributions t ON t.id = c.attribution_id JOIN orders o ON o.id = t.order_id WHERE o.source_order_id = $1`, n);
+  const linesOf = (n) => count('SELECT count(*)::int n FROM order_items i JOIN orders o ON o.id = i.order_id WHERE o.source_order_id = $1', n);
+  const once = async (n, label) => {
+    const got = [await ordersOf(n), await linesOf(n), await snapsOf(n)];
+    if (got.join() !== '1,1,1') bad.push(`${label}: orders/lines/snapshots ${got.join('/')}`);
+  };
+  const keyFx = async () => (await getPool().query(`SELECT (SELECT count(*) FROM inventory_movements)::int mv, (SELECT count(*) FROM inventory_reservations)::int rs,
+    (SELECT count(*) FROM abandoned_carts)::int carts, (SELECT value FROM system_state WHERE key = 'shopify_orders_checkpoint') ck`)).rows[0];
+  try {
+    const fx0 = await keyFx();
+    // An affiliate with a 10% rate and a real click; its order carries our click id.
+    const A = await eligibleAffiliate('WH direct');
+    await af('manager', 'POST', `/api/affiliates/${A}/rates`, { rate_percent: '10', reason: 'db-check webhook' });
+    const aClick = clickOf(await goReq(`/r/${A}`, { ip: '203.0.113.61' }));
+    const B = await eligibleAffiliate('WH stale path');
+    await goReq(`/r/${B}`, { ip: '203.0.113.62' });
+    const now = () => new Date().toISOString();
+    const direct = [{ key: '__briyo_ref', value: A }, { key: '__briyo_click', value: aClick }];
+    SH.store.push(shOrder(961, { created: now(), attributes: direct }));
+    SH.store.push(shOrder(962, { created: now() }));
+    SH.store.push(shOrder(963, { created: now() }));
+    // #2823 exactly: B's stale /r/ path beside A's affiliate UTMs, no click id.
+    SH.store.push(shOrder(964, { created: now(), attributes: [{ key: 'full_url', value: `https://briyo-supp.myshopify.com/r/${B}?utm_source=affiliate&utm_campaign=${A}&utm_medium=referral` },
+      { key: 'utm_source', value: 'affiliate' }, { key: 'utm_campaign', value: A }, { key: 'utm_medium', value: 'referral' }] }));
+    SH.store.push(shOrder(965, { created: now() }));
+    const gql = shFake(() => SH.store);
+    // 2. Bad signature, other shop, missing id: refused, nothing stored.
+    await ensureShopifyWebhookSchema();
+    const stored = async () => (await getPool().query('SELECT count(*)::int n FROM shopify_webhook_deliveries')).rows[0].n;
+    const before = await stored();
+    const forged = await deliver(961, { secret: 'not-the-secret' });
+    const other = await deliver(961, { shop: 'someone-else.myshopify.com' });
+    if (forged.status !== 401 || other.status !== 403 || await stored() !== before) bad.push(`refusals ${forged.status}/${other.status}, stored ${await stored() - before}`);
+    if (!verifyWebhookHmac('x', sign('x')) || verifyWebhookHmac('x', '') || verifyWebhookHmac('x', sign('y'))) bad.push('hmac helper');
+    // 1, 6, 10. A valid delivery imports the order through the existing path: lines, snapshot, attribution, commission.
+    const d1 = await deliver(961);
+    if (d1.status !== 200 || !d1.deliveryId) bad.push(`valid ${d1.status}`);
+    const p1 = await processWebhookDelivery(d1.deliveryId, { gql });
+    await once(961, 'webhook');
+    const t = (await getPool().query(`SELECT t.attribution_method m, a.public_id aff, t.click_id FROM affiliate_order_attributions t JOIN affiliates a ON a.id = t.affiliate_id JOIN orders o ON o.id = t.order_id WHERE o.source_order_id = $1`, [gid(961)])).rows[0];
+    if (t?.aff !== A || t.m !== 'referral_click' || t.click_id !== aClick || await commOf(961) !== 1) bad.push(`attribution ${JSON.stringify(t)} commissions ${await commOf(961)}`);
+    const run = (await getPool().query('SELECT imported_by, filename, status FROM order_imports WHERE id = $1', [p1.runId])).rows[0];
+    if (run?.imported_by !== 'shopify-webhook' || run.status !== 'completed' || run.filename !== 'Shopify webhook order') bad.push(`run ${JSON.stringify(run)}`);
+    // 3. The same delivery again: acknowledged, not re-processed. 9. A new delivery for the same order: nothing duplicated.
+    const dup = await deliver(961, { id: d1.wid });
+    if (dup.status !== 200 || !dup.body.duplicate || dup.deliveryId) bad.push('duplicate delivery processed');
+    if (!(await processWebhookDelivery(d1.wid, { gql })).skipped) bad.push('processed delivery re-run');
+    const d1b = await deliver(961);
+    await processWebhookDelivery(d1b.deliveryId, { gql });
+    await once(961, 'second delivery');
+    if (await attrsOf(961) !== 1 || await commOf(961) !== 1) bad.push(`after redelivery: attributions ${await attrsOf(961)}, commissions ${await commOf(961)}`);
+    // 4. Webhook racing the poll. 5. Webhook racing a manual Sync.
+    const d2 = await deliver(962);
+    await setCkForWebhookTest(new Date(Date.now() - 3600000).toISOString());
+    await Promise.all([processWebhookDelivery(d2.deliveryId, { gql }), pollShopifyOrdersOnce({ gql })]);
+    await once(962, 'webhook + poll');
+    const d3 = await deliver(963);
+    await Promise.all([processWebhookDelivery(d3.deliveryId, { gql }), runShopifySync({ window: { days: 1 }, dryRun: false, gql, actor: SH_ACTOR })]);
+    await once(963, 'webhook + Sync');
+    await once(961, 'after Sync');
+    if (await attrsOf(961) !== 1 || await commOf(961) !== 1) bad.push('race duplicated attribution/commission');
+    // 7. #2823 via webhook: imported, not attributed, conflict kept as evidence. 8. Plain order: none.
+    const d4 = await deliver(964); await processWebhookDelivery(d4.deliveryId, { gql });
+    const r4 = (await getPool().query('SELECT source_payload FROM orders WHERE source_order_id = $1', [gid(964)])).rows[0]?.source_payload.shopify.referral;
+    if (await attrsOf(964) !== 0 || await commOf(964) !== 0 || await ordersOf(964) !== 1 || r4?.conflict !== true || r4.landing_ref !== B || r4.utm_campaign !== A
+      || r4.trusted_click_id !== null || r4.attributed !== false || r4.commission !== false) bad.push(`#2823 pattern ${await attrsOf(964)} ${JSON.stringify(r4)}`);
+    const d5 = await deliver(965); await processWebhookDelivery(d5.deliveryId, { gql });
+    if (await ordersOf(965) !== 1 || await attrsOf(965) !== 0) bad.push('plain order');
+    // Created after the Sync race above, so only the webhook can bring them in.
+    SH.store.push(shOrder(966, { created: now(), name: `${TEST_ORDER}-WHDUP` }));
+    SH.store.push(shOrder(967, { created: now() }));
+    // A hand-entered website order with the Shopify number still holds the webhook's order back.
+    const manual = await createOrder({ ...R('website'), channel: 'website', source_order_id: `${TEST_ORDER}-WHDUP` }, { actor: ACTOR });
+    const d6 = await deliver(966); const p6 = await processWebhookDelivery(d6.deliveryId, { gql });
+    if (await ordersOf(966) !== 0 || p6.summary.possibleDuplicates !== 1 || (await getOrder(manual)).source !== 'manual') bad.push('manual duplicate not held back');
+    // Not an orders/create delivery: stored as ignored, never processed.
+    const ign = await deliver(967, { topic: 'orders/updated' });
+    const ir = (await getPool().query('SELECT status FROM shopify_webhook_deliveries WHERE webhook_id = $1', [ign.wid])).rows[0];
+    if (ign.status !== 200 || ign.deliveryId || ir?.status !== 'ignored') bad.push(`ignored topic ${JSON.stringify(ir)}`);
+    // A failed import stays pending and the sweep retries it (a restart after the 200 is the same case).
+    const d7 = await deliver(967);
+    const broken = async (q, v) => { if (/^query BriyoOrdersPage/.test(q)) throw Object.assign(new Error('Shopify HTTP 400: Bad request'), { status: 400 }); return gql(q, v); };
+    await processWebhookDelivery(d7.deliveryId, { gql: broken, backoffMs: 1 }).then(() => bad.push('broken import succeeded'), () => {});
+    const f7 = (await getPool().query('SELECT status, attempts FROM shopify_webhook_deliveries WHERE webhook_id = $1', [d7.wid])).rows[0];
+    if (f7.status !== 'failed' || f7.attempts !== 1 || await ordersOf(967) !== 0) bad.push(`failure ${JSON.stringify(f7)}`);
+    const sweep = await processPendingWebhooks({ gql, olderThanMs: 0 });
+    if (sweep.processed < 1 || await ordersOf(967) !== 1) bad.push(`sweep ${JSON.stringify(sweep)}`);
+    // Crash after the durable row, before processing: the delivery is pending and is imported exactly once,
+    // even by two sweeps at once; a claim left by a dead process goes stale and is picked up.
+    SH.store.push(shOrder(968, { created: now(), attributes: direct }));
+    SH.store.push(shOrder(969, { created: now() }));
+    const d8 = await deliver(968);                       // stored and acknowledged; never processed (the "crash")
+    const d9 = await deliver(969);
+    await getPool().query(`UPDATE shopify_webhook_deliveries SET status = 'processing', attempts = 1, claimed_at = now() - interval '11 minutes' WHERE webhook_id = $1`, [d9.wid]);
+    const [s1, s2] = await Promise.all([processPendingWebhooks({ gql, olderThanMs: 0 }), processPendingWebhooks({ gql, olderThanMs: 0 })]);
+    await once(968, 'after restart'); await once(969, 'stale claim');
+    const st8 = (await getPool().query('SELECT status, attempts FROM shopify_webhook_deliveries WHERE webhook_id = ANY($1) ORDER BY webhook_id', [[d8.wid, d9.wid]])).rows;
+    if (st8.some((x) => x.status !== 'processed') || s1.processed + s2.processed !== 2) bad.push(`restart ${JSON.stringify({ st8, s1, s2 })}`);
+    const s3 = await processPendingWebhooks({ gql, olderThanMs: 0 });
+    if (s3.pending !== 0) bad.push(`processed deliveries swept again ${JSON.stringify(s3)}`);
+    // A live claim (not stale) is never taken by a second worker.
+    SH.store.push(shOrder(970, { created: now() }));
+    const d10 = await deliver(970);
+    await getPool().query(`UPDATE shopify_webhook_deliveries SET status = 'processing', attempts = 1, claimed_at = now() WHERE webhook_id = $1`, [d10.wid]);
+    if (!(await processWebhookDelivery(d10.wid, { gql })).skipped || await ordersOf(970) !== 0) bad.push('a live claim was taken twice');
+    // Wrong topic: stored as ignored and never processed, even by the sweep.
+    const ignRow = (await getPool().query('SELECT status, attempts FROM shopify_webhook_deliveries WHERE webhook_id = $1', [ign.wid])).rows[0];
+    if (ignRow.status !== 'ignored' || ignRow.attempts !== 0) bad.push(`ignored delivery processed ${JSON.stringify(ignRow)}`);
+    // 11. No shipments, reservations, movements; carts untouched. Webhook runs never move the checkpoint.
+    const ships = (await getPool().query(`SELECT count(*)::int n FROM order_shipments s JOIN orders o ON o.id = s.order_id WHERE o.source_order_id = ANY($1)`, [[961, 962, 963, 964, 965, 967, 968, 969].map(gid)])).rows[0].n;
+    const fx1 = await keyFx();
+    if (ships || fx1.mv !== fx0.mv || fx1.rs !== fx0.rs || fx1.carts !== fx0.carts) bad.push(`side effects ${JSON.stringify({ ships, fx0, fx1 })}`);
+    const ckRuns = (await getPool().query(`SELECT count(*)::int n FROM order_imports WHERE imported_by = 'shopify-webhook' AND details->'window'->>'mode' <> 'order'`)).rows[0].n;
+    if (ckRuns) bad.push('a webhook run was not single-order');
+    // 13. The abandoned-checkout poll flag is untouched by all of this.
+    if (process.env.SHOPIFY_POLL_ENABLED === 'true') bad.push('SHOPIFY_POLL_ENABLED changed');
+    if (before === undefined) bad.push('setup');
+  } finally {
+    await setCkForWebhookTest(null, true);
+    await getPool().query(`DELETE FROM order_imports WHERE kind = 'shopify_sync' AND imported_by IN ('shopify-webhook', 'shopify-poll', $1) AND started_at > now() - interval '1 hour'`, [SH_ACTOR]);
+    await getPool().query(`DELETE FROM shopify_webhook_deliveries WHERE webhook_id LIKE 'dbcheck-wh-%'`);
+    for (const [k, v] of [['SHOPIFY_CLIENT_SECRET', keep.secret], ['SHOPIFY_STORE_DOMAIN', keep.shop]]) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }
+  }
+  if (bad.length) throw new Error(bad.join(' | '));
+  return 'forged signature 401, other shop 403; valid delivery → 1 order, 1 line, 1 snapshot, referral_click to its click, 1 commission, run "shopify-webhook"; same delivery id ignored; redelivery, webhook+poll and webhook+Sync races → still 1 of each, 1 attribution, 1 commission; #2823 pattern imported unattributed with the conflict kept; plain order unattributed; manual website duplicate held back; other topics stored as ignored; a failed import is retried by the sweep; a delivery stored but never processed (crash) and a stale claim are each imported exactly once by two concurrent sweeps, a live claim is never taken twice; no shipments, reservations, movements; carts and SHOPIFY_POLL_ENABLED untouched';
 });
 
 await step('referral: storefront snippet — stores bref/bclid, writes private cart attributes once, ignores bad input, never throws', async () => {
