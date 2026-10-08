@@ -472,3 +472,7 @@ html.scroll-locked .drawer-scrim { touch-action: none; }
 .ml-edit .ml-qty { width: 64px !important; }
 @media (max-width: 480px) { .item-row:has(.ml-edit) { flex-direction: column; } .item-row .n.ml-edit { justify-content: flex-start; } }
 @media (max-width: 640px) { .ml-row .btn { flex: 1 1 100%; } }
+
+/* Shopify mark beside Shopify order controls: decorative, text-sized, no badge. */
+.brand-mark { display: inline-block; width: 16px; height: 18px; flex: 0 0 auto; }
+.drawer-title:has(> .brand-mark) { display: flex; align-items: center; gap: 8px; }
