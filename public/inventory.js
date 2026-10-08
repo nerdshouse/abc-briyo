@@ -16,6 +16,7 @@ const FILTERS = ['q', 'warehouse', 'location', 'status', 'expiring', 'stock'];
 const state = {
   me: null, meta: null, data: null, view: '', f: Object.fromEntries(FILTERS.map((k) => [k, ''])),
   openSku: null, detail: null, form: null,
+  um: { platform: '', q: '' },   // SKU Mapping worklist filters (this page only)
 };
 
 const api = async (url, opts = {}) => {
@@ -90,6 +91,54 @@ async function load() {
   }
 }
 
+/**
+ * The SKU Mapping worklist: unmapped order lines, one row per platform code (every line with that code resolves
+ * together). Read-only until a person picks "Map to master SKU" and saves the form — nothing is ever pre-selected.
+ */
+function renderUnmapped() {
+  const all = state.data.unmapped || [];
+  const noCode = state.data.unmappedNoCode || [];
+  if (!all.length && !noCode.length) {
+    $('#unmapped').innerHTML = state.view === 'unmapped' ? '<section class="card"><div class="pane"><div class="empty-note"><b>Every SKU on an order is mapped.</b>Nothing to resolve.</div></div></section>' : '';
+    return;
+  }
+  const lines = all.reduce((n, u) => n + u.lines, 0) + noCode.length;
+  const platforms = [...new Map(all.map((u) => [u.channel, u.platform_label])).entries()];
+  $('#unmapped').innerHTML = `<section class="card unmapped-card${state.view === 'unmapped' ? ' focus' : ''}" id="unmappedCard">
+    <header class="card-head"><h2 class="card-title">${icon('triangle-alert')}SKU mapping <span class="card-meta">${count(lines)} unmapped order line${lines === 1 ? '' : 's'} · ${count(all.length)} platform code${all.length === 1 ? '' : 's'}${noCode.length ? ` · ${count(noCode.length)} without a code` : ''} · those orders cannot be dispatched until mapped</span></h2></header>
+    <div class="pane">
+      <div class="form-actions" style="margin:0 0 10px">
+        <select id="umPlatform" aria-label="Platform"><option value="">All platforms</option>${platforms.map(([k, l]) => `<option value="${esc(k)}"${state.um.platform === k ? ' selected' : ''}>${esc(l)}</option>`).join('')}</select>
+        <input id="umQ" type="search" placeholder="Search code, product or order" aria-label="Search unmapped lines" value="${esc(state.um.q)}">
+      </div>
+      <p class="soft" style="margin:0 0 10px">Mapping a code points every order line with it at the master SKU you choose. Nothing is mapped until you save, and stock is not touched.</p>
+      <div class="table-wrap"><table class="table"><thead><tr><th>Platform SKU</th><th>Platform</th><th>Item</th><th>Orders</th><th class="r">Lines</th><th class="r">Units</th><th>First seen</th><th>Last seen</th><th class="r"></th></tr></thead><tbody id="umRows"></tbody></table></div>
+      ${noCode.length ? `<h3 class="dsec-title" style="margin-top:16px">Lines without a SKU code <span class="dsec-meta">${count(noCode.length)} · nothing to map them by; fix the product's SKU at the source and re-sync</span></h3>
+      <div class="table-wrap"><table class="table"><thead><tr><th>Order</th><th>Platform</th><th>Item</th><th class="r">Qty</th><th>Line ID</th><th>Ordered</th></tr></thead><tbody>
+      ${noCode.map((l) => `<tr><td class="mono">${esc(l.order_ref)}</td><td>${esc(l.platform_label)}</td><td><span class="cell-text">${esc(l.title || '—')}</span>${l.asin ? `<span class="cell-sub muted">ASIN ${esc(l.asin)}</span>` : ''}</td>
+        <td class="r num">${count(l.quantity)}</td><td class="mono soft">${esc(l.source_line_item_id || '—')}</td><td class="num">${seenDate(l.order_date)}</td></tr>`).join('')}
+      </tbody></table></div>` : ''}
+    </div></section>`;
+  renderUnmappedRows();
+}
+
+function renderUnmappedRows() {
+  const q = state.um.q.trim().toLowerCase();
+  const rows = (state.data.unmapped || []).filter((u) => (!state.um.platform || u.channel === state.um.platform)
+    && (!q || [u.code, u.title, ...(u.titles || []), ...(u.order_refs || []), u.asin, ...(u.listing_ids || [])].some((v) => String(v || '').toLowerCase().includes(q))));
+  const refs = (u) => { const r = u.order_refs || []; return r.length ? `${r.slice(0, 3).map(esc).join(', ')}${u.orders > 3 ? ` <span class="soft">+${count(u.orders - 3)}</span>` : ''}` : '—'; };
+  $('#umRows').innerHTML = rows.length ? rows.map((u) => `<tr><td class="mono">${esc(u.code)}${u.asin ? `<span class="cell-sub muted">ASIN ${esc(u.asin)}</span>` : ''}${(u.listing_ids || []).length ? `<span class="cell-sub muted">Listing ${u.listing_ids.map(esc).join(', ')}</span>` : ''}</td>
+      <td>${esc(u.platform_label)}</td>
+      <td><span class="cell-text">${esc(u.title || '—')}</span>${(u.titles || []).length > 1 ? `<span class="cell-sub muted" title="${esc(u.titles.join(' · '))}">${count(u.titles.length)} titles on these lines</span>` : ''}</td>
+      <td class="mono" title="${esc((u.order_refs || []).join(', '))}">${refs(u)}</td>
+      <td class="r num">${count(u.lines)}</td><td class="r num">${count(u.units)}</td>
+      <td class="num">${seenDate(u.first_seen)}</td><td class="num">${seenDate(u.last_seen)}</td>
+      <td class="r">${!canCatalog() ? '<span class="soft">Ask an Inventory manager</span>'
+        : u.mappable ? `<button class="btn" type="button" data-map="${esc(u.code)}" data-platform="${esc(u.channel)}" data-platform-label="${esc(u.platform_label)}" data-title="${esc(u.title || '')}" data-asin="${esc(u.asin || '')}">Map to master SKU</button>`
+          : `<span class="soft" title="${esc(u.platform_label)} orders use master SKU codes directly. Create a master SKU with this code, or add ${esc(u.platform_label)} as a platform.">Not a mapped platform</span>`}</td></tr>`).join('')
+    : '<tr><td colspan="9"><span class="soft">No unmapped codes match this filter.</span></td></tr>';
+}
+
 function render() {
   const { cards: c, rows, unmapped } = state.data;
   const title = state.view === 'unmapped' ? 'Unmapped SKUs' : state.f.stock === 'low' ? 'Low stock'
@@ -120,18 +169,7 @@ function render() {
   $('#formula').textContent = `On hand ${count(c.onHandUnits)} = sellable ${count(c.sellableUnits)} + expired ${count(c.expiredUnits)} + quarantined ${count(c.quarantinedUnits)} + blocked ${count(c.blockedUnits)}.`
     + ` Available to dispatch ${count(c.availableUnits)} = sellable ${count(c.sellableUnits)} − reserved ${count(c.reservedSellableUnits)}.`;
 
-  // Unmapped seller SKUs: orders that cannot be dispatched until mapped.
-  $('#unmapped').innerHTML = unmapped.length ? `<section class="card unmapped-card${state.view === 'unmapped' ? ' focus' : ''}" id="unmappedCard">
-    <header class="card-head"><h2 class="card-title">${icon('triangle-alert')}Unmapped platform SKUs <span class="card-meta">${count(unmapped.length)} code${unmapped.length > 1 ? 's' : ''} on orders that match no master SKU · those orders cannot be dispatched until mapped</span></h2></header>
-    <div class="pane"><div class="table-wrap"><table class="table"><thead><tr><th>Platform SKU</th><th>Platform</th><th>Item</th><th class="r">Orders</th><th class="r">Units</th><th>First seen</th><th>Last seen</th><th class="r"></th></tr></thead><tbody>
-    ${unmapped.map((u) => `<tr><td class="mono">${esc(u.code)}${u.asin ? `<span class="cell-sub muted">ASIN ${esc(u.asin)}</span>` : ''}</td>
-      <td>${esc(u.platform_label)}</td>
-      <td><span class="cell-text">${esc(u.title || '—')}</span></td><td class="r num">${count(u.orders)}</td><td class="r num">${count(u.units)}</td>
-      <td class="num">${seenDate(u.first_seen)}</td><td class="num">${seenDate(u.last_seen)}</td>
-      <td class="r">${!canCatalog() ? '<span class="soft">Ask an Inventory manager</span>'
-        : u.mappable ? `<button class="btn" type="button" data-map="${esc(u.code)}" data-platform="${esc(u.channel)}" data-platform-label="${esc(u.platform_label)}" data-title="${esc(u.title || '')}" data-asin="${esc(u.asin || '')}">Map to master SKU</button>`
-          : `<span class="soft" title="${esc(u.platform_label)} orders use master SKU codes directly. Create a master SKU with this code, or add ${esc(u.platform_label)} as a platform.">Not a mapped platform</span>`}</td></tr>`).join('')}
-    </tbody></table></div></div></section>` : (state.view === 'unmapped' ? '<section class="card"><div class="pane"><div class="empty-note"><b>Every SKU on an order is mapped.</b>Nothing to resolve.</div></div></section>' : '');
+  renderUnmapped();
 
   $('#resultNote').textContent = `${count(rows.length)} ${rows.length === 1 ? 'row' : 'rows'}${anyFilter() ? ' matching the filters' : ''} · one row per batch, earliest expiry first`;
   $('#fclear').hidden = !anyFilter();
@@ -780,6 +818,12 @@ function bind() {
     host.addEventListener('click', rowOpen);
     host.addEventListener('keydown', (e) => { if (e.key === 'Enter') rowOpen(e); });
   }
+  $('#unmapped').addEventListener('input', (e) => {
+    if (e.target.id === 'umQ') { state.um.q = e.target.value; renderUnmappedRows(); }
+  });
+  $('#unmapped').addEventListener('change', (e) => {
+    if (e.target.id === 'umPlatform') { state.um.platform = e.target.value; renderUnmappedRows(); }
+  });
   $('#unmapped').addEventListener('click', (e) => {
     const b = e.target.closest('[data-map]');
     if (b) openForm('map', { code: b.dataset.map, platform: b.dataset.platform, platformLabel: b.dataset.platformLabel, title: b.dataset.title, asin: b.dataset.asin });

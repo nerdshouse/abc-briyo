@@ -28,7 +28,7 @@ import { orderItems } from '../lib/orders.js';
 import {
   ensureInventorySchema, createSku, updateSku, getSku, skuDetail, receiveInventory, adjustStock, transferStock, updateBatch,
   uploadBatchDocument, getBatchDocument, shipmentStock, reserveShipmentStock, releaseShipmentStock, dispatchShipmentStock,
-  inventoryOverview, resolveSkuIds, purgeTestInventory, saveWarehouse, unmappedSkus, fefoSuggest,
+  inventoryOverview, resolveSkuIds, purgeTestInventory, saveWarehouse, unmappedSkus, unmappedLinesWithoutCode, fefoSuggest,
   addPlatformMappings, removePlatformMapping, savePlatform, listPlatforms, splitPlatformCell, migrateLegacyAmazonSkus, mappingUsage,
   updateMappingUnits, unitsPerListingOf, getInventoryCutover, setInventoryCutover, isInventoryEligible,
 } from '../lib/inventory.js';
@@ -2625,6 +2625,46 @@ await step('platform SKUs: unmapped lines stay unmapped (code kept, nothing crea
   if ((await getPool().query('SELECT count(*)::int n FROM skus')).rows[0].n !== before) throw new Error('a SKU was created');
   return 'Blinkit line kept its code, listed as unmapped, no SKU made; mapping resolved it at once (no re-import)';
 });
+await step('SKU mapping worklist: unmapped lines listed with their orders; mapping is explicit, idempotent and never touches stock', async () => {
+  const code = `${TS}-WL-AMZ`;
+  const stockState = async () => (await getPool().query(`SELECT
+      (SELECT count(*) FROM inventory_movements)::int mv, (SELECT count(*) FROM inventory_reservations)::int rs,
+      (SELECT count(*) FROM inventory_batches)::int bt, (SELECT coalesce(sum(on_hand), 0) FROM inventory_batches)::int qty,
+      (SELECT count(*) FROM skus)::int skus, (SELECT count(*) FROM sku_platform_mappings)::int maps,
+      (SELECT count(*) FROM order_shipments)::int ships, (SELECT string_agg(shipment_status, ',' ORDER BY id) FROM order_shipments) ship_states`)).rows[0];
+  const cut = await getInventoryCutover();
+  const o1 = await lineOn('amazon', 'WL-1', code, 2);
+  const o2 = await lineOn('amazon', 'WL-2', code, 1);
+  // A line with no SKU code at all: listed, never mappable through a platform SKU.
+  const o3 = await createOrder({ ...R('amazon'), channel: 'amazon', source_order_id: `${TEST_ORDER}-WL-3`, order_date: NOW(), order_value: 100 }, { actor: ACTOR });
+  await getPool().query(`INSERT INTO order_items (order_id, source_line_item_id, sku, title, quantity, item_price) VALUES ($1, 'L-NOCODE', NULL, 'No code line', 1, 100)`, [o3]);
+  const before = await stockState();
+  // Listed: one row for the code, both lines and both orders; listing twice maps nothing.
+  const row = (await unmappedSkus()).find((u) => u.code === code);
+  if (!row || row.lines !== 2 || row.orders !== 2 || row.units !== 3 || !row.mappable
+    || !row.order_refs.includes(`${TEST_ORDER}-WL-1`) || !row.order_refs.includes(`${TEST_ORDER}-WL-2`)) throw new Error(JSON.stringify(row));
+  const nc = (await unmappedLinesWithoutCode()).find((l) => Number(l.order_id) === o3);
+  if (!nc || nc.order_ref !== `${TEST_ORDER}-WL-3` || nc.source_line_item_id !== 'L-NOCODE' || nc.quantity !== 1) throw new Error(JSON.stringify(nc));
+  await unmappedSkus(); await unmappedLinesWithoutCode();
+  if ((await lineOf(o1)).sku_id !== null || (await lineOf(o2)).sku_id !== null) throw new Error('listing mapped a line');
+  if (JSON.stringify(await stockState()) !== JSON.stringify(before)) throw new Error('listing changed state');
+  // Explicit mapping to the SKU a person chose: both lines resolve, the code is kept.
+  const r = await addPlatformMappings(INV.m2, PF.amazon, [code], { actor: ACTOR, fromOrder: true });
+  if (r.added[0] !== code || r.orderItemsMapped !== 2 || (await lineOf(o1)).sku_id !== INV.m2 || (await lineOf(o2)).sku_id !== INV.m2 || (await lineOf(o1)).sku !== code) throw new Error(JSON.stringify(r));
+  // Repeated: a no-op.
+  const again = await addPlatformMappings(INV.m2, PF.amazon, [code], { actor: ACTOR, fromOrder: true });
+  if (again.added.length || again.existing[0] !== code || again.orderItemsMapped !== 0) throw new Error(JSON.stringify(again));
+  const after = await stockState();
+  if (after.maps !== before.maps + 1) throw new Error(`mappings ${before.maps} → ${after.maps}`);
+  for (const k of ['mv', 'rs', 'bt', 'qty', 'skus', 'ships', 'ship_states']) if (after[k] !== before[k]) throw new Error(`${k} changed: ${before[k]} → ${after[k]}`);
+  const cut2 = await getInventoryCutover();
+  if (String(cut2.cutover_at) !== String(cut.cutover_at) || cut2.version !== cut.version) throw new Error('cutover changed');
+  if ((await unmappedSkus()).some((u) => u.code === code)) throw new Error('still listed after mapping');
+  // The code-less line is untouched by any mapping.
+  if (!(await unmappedLinesWithoutCode()).some((l) => Number(l.order_id) === o3)) throw new Error('code-less line vanished');
+  if ((await getPool().query('SELECT sku_id FROM order_items WHERE order_id = $1', [o3])).rows[0].sku_id !== null) throw new Error('code-less line was mapped');
+  return '2 Amazon lines on 2 orders listed as one code with their order refs; a code-less line listed separately; listing changed nothing; explicit map resolved both lines; repeat = no-op; 0 movements, 0 reservations, stock, SKUs, shipments and cutover unchanged';
+});
 await step('platform SKUs: Amazon and Blinkit orders draw on one stock pool', async () => {
   const b = (await receiveInventory({ sku_id: INV.m, batch_number: 'PF-POOL', expiry_date: '12/2030', quantity: 10, unit_cost: 50, request_id: rid() }, { actor: ACTOR })).batchId;
   const amzOrder2 = await lineOn('amazon', 'PF-AMZ1', `${TS}-ABC-123`, 3);
@@ -4660,6 +4700,9 @@ await step('hr: RBAC — HR manager, admin and multi-module reach HR; others ref
     ['POST', '/api/inventory/receive', {}, { multi: 403 }],
     ['GET', '/api/carts?days=1', null, { mgr: 403, multi: 403, nonHr: 200 }],
     ['GET', '/api/members', null, { mgr: 403, adm: 200 }],
+    // SKU mapping is an Inventory catalog decision: no one else can map (refused before anything is read).
+    ['POST', '/api/inventory/skus/1/platform-skus', { platform: 'amazon', platform_skus: ['RBAC-PROBE'], from_order: true }, { mgr: 403, nonHr: 403, '': 401 }],
+    ['GET', '/api/inventory/unmapped', null, { mgr: 403, '': 401 }],
   ];
   const bad = [];
   for (const [m, p, b, exp] of M) for (const [who, want] of Object.entries(exp)) {
