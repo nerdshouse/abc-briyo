@@ -477,3 +477,8 @@ html.scroll-locked .drawer-scrim { touch-action: none; }
 .shopify-mark { display: inline-block; width: 16px; height: 18px; flex: 0 0 auto; background: none; border-radius: 0; }
 #shopifyOrders[aria-busy="true"] { cursor: progress; }
 #shopifySync .sync-facts { display: flex; flex-wrap: wrap; gap: 4px 14px; margin-top: 4px; font-size: 12.5px; }
+
+/* Amazon button: first-sync start date, inline in its banner */
+.amazon-start { display: inline-flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 6px 8px 6px 0; }
+.amazon-start .input { width: auto; min-width: 0; }
+.amazon-facts { display: flex; flex-wrap: wrap; gap: 4px 14px; margin-top: 4px; font-size: 12.5px; }

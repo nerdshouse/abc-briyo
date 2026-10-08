@@ -23,7 +23,7 @@ import {
   shipmentMembers, sharedShipmentOf, attachToShipment, detachFromShipment, attachableOrders, createShipmentForOrders,
   addManualOrderLine, updateManualOrderLine, removeManualOrderLine, manualLineSkuOptions,
 } from '../lib/orders.js';
-import { saveUploadedDocument } from '../lib/orders-routes.js';
+import { saveUploadedDocument, router as ordersRouterForTest } from '../lib/orders-routes.js';
 import { planAmazon, readTable, previewAmazonImport, commitAmazonImport } from '../lib/amazon-import.js';
 import { orderItems } from '../lib/orders.js';
 import {
@@ -59,7 +59,7 @@ import { ensureAffiliateSchema, newAffiliatePublicId, rateAt, getAffiliateSettin
 import { receiveOrdersCreate, processWebhookDelivery, processPendingWebhooks, verifyWebhookHmac, ensureShopifyWebhookSchema } from '../lib/shopify-webhooks.js';
 import { startIncrementalSync, shopifySyncStatus, startFullHistorySync, fullHistoryStatus, grantedAccessScopes, hasReadAllOrders, _resetScopeCache, assertNoSyncRunning } from '../lib/shopify-orders.js';
 import { createAmazonClient, amazonConfig, amazonConfigured, redact, ENDPOINTS, ORDERS_API_VERSION, LWA_TOKEN_URL, SEARCH_ORDERS_RATE } from '../lib/amazon-spapi.js';
-import { mapAmazonOrder, runAmazonSync, startAmazonIncrementalSync, amazonSyncStatus, amazonSyncBusy, assertNoAmazonSyncRunning, sharedAmazonClient } from '../lib/amazon-orders.js';
+import { mapAmazonOrder, runAmazonSync, startAmazonIncrementalSync, amazonSyncStatus, amazonSyncBusy, assertNoAmazonSyncRunning, sharedAmazonClient, _setSharedAmazonClientForTest } from '../lib/amazon-orders.js';
 import { runShopifySync, mapShopifyOrder, shopifyPaymentMethod, shopifyPaymentStatus, shopifyOrdersStatus, pollShopifyOrdersOnce, ordersPollMinutes } from '../lib/shopify-orders.js';
 import { ensureOrderFinancialSnapshotSchema, financialSnapshotFrom, addAmounts, FINANCIAL_TABLES } from '../lib/order-financial-snapshots.js';
 import { SHOPIFY_MAX_QUERY_COST, SHOPIFY_ORDER_QUERIES, LIMITS as SHOPIFY_LIMITS, shopifyOrderQuery, estimateShopifyOrderQueryCost } from '../lib/shopify-order-queries.js';
@@ -5146,6 +5146,125 @@ await step('amazon sync catch-up: 2,050 orders across chained runs on one window
   }
   if (bad.length) throw new Error(bad.join(' | '));
   return '2,050 orders: run 1 = 20 pages in the burst → partial with the page-21 token, no checkpoint; the chain reuses the client, waits one refill (178.6 s) before page 21 and completes the same window; checkpoint = window end only then; a run stops taking paced pages before 15 min of waiting (partial); a run that processed a page then hit 429s → partial, no-progress count 0; then 429s before a page: runs 1, 2 partial, the 3rd in a row fails (cursor and window kept, checkpoint untouched); a person\'s retry starts the count at 0 (partial, not an instant failure), the chain resumes the same cursor/window and completes, then the checkpoint moves';
+});
+
+await step('amazon admin API: POST /api/orders/amazon/sync + status — admin only, 409 while running, first-sync start date only before a checkpoint, no browser window, import/update/converge/idempotent, FBA no shipment/stock, no attribution or snapshots, no secrets', async () => {
+  const bad = [];
+  const db = getPool();
+  const CK = 'amazon_orders_checkpoint';
+  const saved = (await db.query('SELECT value FROM system_state WHERE key = $1', [CK])).rows[0]?.value ?? null;
+  const ck = async () => (await db.query('SELECT value FROM system_state WHERE key = $1', [CK])).rows[0]?.value ?? null;
+  const firstRun = Number((await db.query('SELECT coalesce(max(id), 0) id FROM order_imports')).rows[0].id);
+  const s = fakeAmazon();
+  _setSharedAmazonClientForTest(azClient(s));
+  const app = express();
+  app.use((req, _res, next) => { req.session = JSON.parse(req.get('x-test-session') || '{}'); next(); });
+  app.use('/api/orders', ordersRouterForTest);
+  const server = app.listen(0);
+  const base = `http://127.0.0.1:${server.address().port}/api/orders`;
+  const ADMIN = { isAdmin: true, caps: ['logistics.view', 'logistics.edit'] };
+  const OPERATOR = { isAdmin: false, caps: ['logistics.view', 'logistics.edit'] };
+  const call = async (method, path, who, body) => {
+    const r = await fetch(`${base}${path}`, { method, headers: { 'x-test-session': JSON.stringify(who), ...(body !== undefined ? { 'content-type': 'application/json' } : {}) },
+      body: body !== undefined ? JSON.stringify(body) : undefined });
+    const text = await r.text();
+    if (/Atza\||Atzr\||dbcheck-lwa-secret/.test(text)) bad.push(`secret in ${method} ${path}`);
+    return { status: r.status, body: JSON.parse(text) };
+  };
+  const settle = async () => { for (let i = 0; i < 200; i += 1) { const st = await amazonSyncStatus(); if (st.state !== 'running') return st; await new Promise((ok) => setTimeout(ok, 25)); } return null; };
+  const fxq = async () => (await db.query(`SELECT (SELECT count(*) FROM inventory_movements)::int mv, (SELECT count(*) FROM inventory_reservations)::int rs,
+    (SELECT count(*) FROM order_shipments s JOIN orders o ON o.id = s.order_id WHERE o.source_order_id LIKE $1)::int sh,
+    (SELECT count(*) FROM affiliate_order_attributions a JOIN orders o ON o.id = a.order_id WHERE o.source_order_id LIKE $1)::int at,
+    (SELECT count(*) FROM order_financial_snapshots f JOIN orders o ON o.id = f.order_id WHERE o.source_order_id LIKE $1)::int fs`, [`${TEST_ORDER}-AZSP-4%`])).rows[0];
+  try {
+    await db.query('DELETE FROM system_state WHERE key = $1', [CK]);
+    const fx0 = await fxq();
+    // Admin only.
+    if ((await call('POST', '/amazon/sync', OPERATOR, {})).status !== 403 || (await call('GET', '/amazon/sync/status', OPERATOR)).status !== 403) bad.push('non-admin not 403');
+    if ((await call('POST', '/amazon/sync', { isAdmin: false, caps: ['logistics.view'] }, {})).status !== 403) bad.push('viewer not 403');
+    // The browser never sets the window.
+    for (const b of [{ since: '2026-10-01T00:00:00Z' }, { until: '2026-10-02T00:00:00Z' }, { initial_since: new Date(Date.now() - 86400000).toISOString(), until: 'x' }, { mode: 'all' }, { from: '2026-01-01' }]) {
+      const r = await call('POST', '/amazon/sync', ADMIN, b);
+      if (r.status !== 400) bad.push(`accepted ${JSON.stringify(b)} → ${r.status}`);
+    }
+    // No checkpoint: a start date is required, and must be a valid ISO time within 90 days and in the past.
+    const none = await call('POST', '/amazon/sync', ADMIN, {});
+    if (none.status !== 409 || !none.body.needsInitialSince) bad.push(`no start date → ${none.status}`);
+    for (const v of [new Date(Date.now() - 91 * 86400000).toISOString(), new Date(Date.now() + 3600000).toISOString(), '2026-09-01', 'yesterday', 123]) {
+      const r = await call('POST', '/amazon/sync', ADMIN, { initial_since: v });
+      if (r.status !== 400) bad.push(`initial_since ${v} → ${r.status}`);
+    }
+    if (!(await call('GET', '/amazon/sync/status', ADMIN)).body.needsInitialSince) bad.push('status does not say a start date is needed');
+    if ((await db.query(`SELECT count(*)::int n FROM order_imports WHERE kind = 'amazon_sync' AND id > $1`, [firstRun])).rows[0].n) bad.push('a refused request recorded a run');
+    // First sync: a merchant order and an FBA order. While it runs, a second start is 409 and status says running.
+    s.pages[''] = { orders: [azOrder(40, [azItem('I1')]), azOrder(41, [azItem('I1')], { by: 'AMAZON', status: 'SHIPPED' })] };
+    let release; s.hold = new Promise((ok) => { release = ok; });
+    const initial = new Date(Date.now() - 2 * 86400000).toISOString();
+    const started = await call('POST', '/amazon/sync', ADMIN, { initial_since: initial });
+    if (started.status !== 202 || !started.body.started || started.body.status?.state !== 'running') bad.push(`start ${started.status} ${JSON.stringify(started.body).slice(0, 160)}`);
+    const again = await call('POST', '/amazon/sync', ADMIN, {});
+    if (again.status !== 409 || !again.body.syncRunning) bad.push(`second start ${again.status}`);
+    if ((await call('GET', '/amazon/sync/status', ADMIN)).body.state !== 'running') bad.push('status not running');
+    release(); s.hold = null;
+    const st1 = await settle();
+    const status = (await call('GET', '/amazon/sync/status', ADMIN)).body;
+    if (st1?.state !== 'completed' || status.state !== 'completed' || status.created !== 2 || status.fetched !== 2 || !status.connected || status.needsInitialSince || !status.checkpoint) bad.push(`status ${JSON.stringify(status).slice(0, 200)}`);
+    const w1 = (await db.query(`SELECT details FROM order_imports WHERE kind = 'amazon_sync' ORDER BY id DESC LIMIT 1`)).rows[0].details.window;
+    if (w1.since !== new Date(initial).toISOString() || (await ck()) !== w1.until) bad.push('first window/checkpoint');
+    const o40 = await azRow(40); const o41 = await azRow(41);
+    if (o40.source !== 'amazon_spapi' || o40.channel !== 'amazon' || o40.source_order_id !== AZS(40) || o41.fulfillment_type !== 'marketplace' || o41.dispatch_type !== null) bad.push('imported order fields');
+    // After a checkpoint exists, initial_since is ignored: the window starts 5 minutes before the checkpoint.
+    s.pages[''] = { orders: [azOrder(40, [azItem('I1', { item: '450.00', tax: '81.00' })], { updated: '2026-10-08T12:00:00Z' })] };
+    const later = await call('POST', '/amazon/sync', ADMIN, { initial_since: new Date(Date.now() - 80 * 86400000).toISOString() });
+    await settle();
+    const w2 = (await db.query(`SELECT details FROM order_imports WHERE kind = 'amazon_sync' ORDER BY id DESC LIMIT 1`)).rows[0].details.window;
+    if (later.status !== 202 || w2.since !== new Date(new Date(w1.until).getTime() - 5 * 60000).toISOString()) bad.push(`initial_since not ignored: ${w2.since}`);
+    if (Number((await azRow(40)).order_value) !== 531 || (await amazonSyncStatus()).updated !== 1) bad.push('update not applied');
+    // Repeat: nothing changes.
+    await call('POST', '/amazon/sync', ADMIN, {});
+    const rep = await settle();
+    if (rep.created || rep.updated || rep.unchanged !== 1) bad.push(`repeat ${JSON.stringify(rep).slice(0, 160)}`);
+    // CSV first, then the button: one order, still the file's.
+    await commitAmazonImport(amzCsv([amzRow({ 'order-id': AZS(42), 'order-item-id': 'I1' })]), 'azapi.csv', { actor: IMPORTER });
+    s.pages[''] = { orders: [azOrder(42, [azItem('I1')], { updated: '2026-10-08T13:00:00Z' })] };
+    await call('POST', '/amazon/sync', ADMIN, {});
+    await settle();
+    const n42 = (await db.query(`SELECT count(*)::int n, min(source) src FROM orders WHERE channel = 'amazon' AND source_order_id = $1`, [AZS(42)])).rows[0];
+    if (n42.n !== 1 || n42.src !== 'amazon_import' || !(await azRow(42)).source_payload.amazon_spapi) bad.push(`csv→api ${JSON.stringify(n42)}`);
+    // FBA and everything else: no shipment, reservation, movement, attribution or financial snapshot.
+    const fx1 = await fxq();
+    if (JSON.stringify(fx1) !== JSON.stringify(fx0)) bad.push(`side effects ${JSON.stringify([fx0, fx1])}`);
+    if (/dbcheck-buyer|DBCHECK STREET|9000000077/.test(JSON.stringify((await azRow(40)).source_payload))) bad.push('buyer data stored');
+  } finally {
+    server.close();
+    _setSharedAmazonClientForTest(null);
+    if (saved === null) await db.query('DELETE FROM system_state WHERE key = $1', [CK]);
+    else await db.query('UPDATE system_state SET value = $2 WHERE key = $1', [CK, saved]);
+    await db.query(`DELETE FROM order_imports WHERE kind = 'amazon_sync' AND id > $1`, [firstRun]);
+  }
+  if (bad.length) throw new Error(bad.join(' | '));
+  return 'operator/viewer 403; since/until/mode/from or any other field 400; no checkpoint → 409 needsInitialSince; initial_since >90 days, future, date-only, junk → 400, nothing recorded; valid → 202 running, second start 409, status running → completed (2 new, FBA marketplace, no dispatch type); checkpoint = window end; later initial_since ignored (checkpoint − 5 min); price update applied; repeat unchanged; CSV order converged (still amazon_import); no shipment, reservation, movement, attribution or snapshot; no secret in any response';
+});
+
+await step('orders page: Amazon button — admin only, one POST per click (disabled while busy), polls status, running/continuing/up-to-date/paused/stopped/throttled states, first-sync date only, no window from the page, mobile wrap', async () => {
+  const bad = [];
+  const js = await fsp.readFile(new URL('../public/orders.js', import.meta.url), 'utf8');
+  const html = await fsp.readFile(new URL('../public/orders.html', import.meta.url), 'utf8');
+  const css = await fsp.readFile(new URL('../public/orders.css', import.meta.url), 'utf8');
+  const order = ['id="refresh"', 'id="shopifyOrders"', 'id="amazonOrders"', 'id="importOrders"', 'id="newShipment"'].map((k) => html.indexOf(k));
+  if (order.some((i) => i < 0) || order.some((v, i) => i && v < order[i - 1])) bad.push(`button order ${order}`);
+  if (!/id="amazonOrders" type="button" hidden/.test(html) || !/\$\('#amazonOrders'\)\.hidden = !me\.isAdmin/.test(js)) bad.push('not admin-only in the page');
+  if (!/\$\('#amazonOrders'\)\.addEventListener\('click', \(\) => startAmazonSync\(\)\)/.test(js)) bad.push('click not wired');
+  const start = js.slice(js.indexOf('async function startAmazonSync'), js.indexOf('function askAmazonStart'));
+  if ((start.match(/api\('\/api\/orders\/amazon\/sync'/g) || []).length !== 1 || !/if \(\$\('#amazonOrders'\)\.disabled\) return;\s*amazonBusy\(true\)/.test(start)) bad.push('not exactly one POST per click / not guarded');
+  if (/since|until/.test(start.replace(/initialSince|initial_since/g, ''))) bad.push('the page sends a window');
+  const follow = js.slice(js.indexOf('async function followAmazonSync'), js.indexOf('function bind()'));
+  if (!/api\('\/api\/orders\/amazon\/sync\/status'\)/.test(follow) || !/setTimeout\(followAmazonSync, 2500\)/.test(follow)) bad.push('no polling');
+  for (const t of ['Amazon Syncing…', 'Amazon sync continuing…', 'Amazon orders up to date', 'Amazon sync paused part-way', 'Amazon sync stopped', 'Amazon kept limiting requests', 'fetched', 'new', 'updated', 'conflict', 'unmapped line', 'runs']) if (!js.includes(t)) bad.push(`missing state text: ${t}`);
+  if (!/\.page-actions \{ flex-wrap: wrap; \}/.test(css) || !/\.amazon-start \{[^}]*flex-wrap: wrap/.test(css)) bad.push('mobile wrap');
+  if (/sync-all|amazon\/.*history/i.test(follow + start)) bad.push('full history reachable from the page');
+  if (bad.length) throw new Error(bad.join(' | '));
+  return 'Refresh · Shopify · Amazon · Import · New shipment; hidden unless admin; one POST per click, button disabled while busy; polls /amazon/sync/status every 2.5 s; running / continuing (multi-run) / up to date (fetched, new, updated, conflicts, unmapped, runs, duration) / paused / stopped / throttled texts; only initial_since ever sent; actions and the start-date row wrap on mobile';
 });
 
 await step('amazon sp-api cleanup', async () => {
