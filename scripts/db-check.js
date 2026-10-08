@@ -57,7 +57,7 @@ import { metricsFrom, rawFromRow, rangeParams, classifyMetaError, createMetaClie
 import { overviewFor } from '../lib/overview.js';
 import { ensureAffiliateSchema, newAffiliatePublicId, rateAt, getAffiliateSetting, setAffiliateSetting, purgeTestAffiliates, _resetAffiliateSchemaForTest, createAffiliate } from '../lib/affiliates.js';
 import { receiveOrdersCreate, processWebhookDelivery, processPendingWebhooks, verifyWebhookHmac, ensureShopifyWebhookSchema } from '../lib/shopify-webhooks.js';
-import { startIncrementalSync, shopifySyncStatus, startFullHistorySync, fullHistoryStatus, grantedAccessScopes, hasReadAllOrders, _resetScopeCache, assertNoSyncRunning } from '../lib/shopify-orders.js';
+import { startIncrementalSync, shopifySyncStatus, cancelShopifySync, syncBusy, startFullHistorySync, fullHistoryStatus, grantedAccessScopes, hasReadAllOrders, _resetScopeCache, assertNoSyncRunning } from '../lib/shopify-orders.js';
 import { createAmazonClient, amazonConfig, amazonConfigured, redact, ENDPOINTS, ORDERS_API_VERSION, LWA_TOKEN_URL, SEARCH_ORDERS_RATE } from '../lib/amazon-spapi.js';
 import { mapAmazonOrder, runAmazonSync, startAmazonIncrementalSync, amazonSyncStatus, amazonSyncBusy, assertNoAmazonSyncRunning, sharedAmazonClient, _setSharedAmazonClientForTest } from '../lib/amazon-orders.js';
 import { runShopifySync, mapShopifyOrder, shopifyPaymentMethod, shopifyPaymentStatus, shopifyOrdersStatus, pollShopifyOrdersOnce, ordersPollMinutes } from '../lib/shopify-orders.js';
@@ -4658,7 +4658,7 @@ await step('orders page: Refresh only reloads, Shopify starts the full sync (no 
   const css = await fsp.readFile(new URL('../public/orders.css', import.meta.url), 'utf8');
   const refresh = js.match(/\$\('#refresh'\)\.addEventListener\('click', ([^\n]+)\);/)?.[1] || '';
   if (!refresh || /shopify|sync/i.test(refresh)) bad.push(`refresh handler: ${refresh}`);
-  if (!/\$\('#shopifyOrders'\)\.addEventListener\('click', startShopifySync\)/.test(js) || /\$\('#shopifyOrders'\)\.addEventListener\('click', openShopify\)/.test(js)) bad.push('Shopify button not wired to the direct sync');
+  if (!/\$\('#shopifyOrders'\)\.addEventListener\('click', onShopifyClick\)/.test(js) || !/: startShopifySync\(\)\)/.test(js) || /\$\('#shopifyOrders'\)\.addEventListener\('click', openShopify\)/.test(js)) bad.push('Shopify button not wired to the direct sync');
   if (!/api\('\/api\/orders\/shopify\/sync-updates', \{ method: 'POST' \}\)/.test(js)) bad.push('incremental sync not called');
   // k. The normal button never runs full history: the page never calls the recovery route.
   if (/shopify\/sync-all/.test(js)) bad.push('the page calls the full-history route');
@@ -5265,6 +5265,129 @@ await step('orders page: Amazon button — admin only, one POST per click (disab
   if (/sync-all|amazon\/.*history/i.test(follow + start)) bad.push('full history reachable from the page');
   if (bad.length) throw new Error(bad.join(' | '));
   return 'Refresh · Shopify · Amazon · Import · New shipment; hidden unless admin; one POST per click, button disabled while busy; polls /amazon/sync/status every 2.5 s; running / continuing (multi-run) / up to date (fetched, new, updated, conflicts, unmapped, runs, duration) / paused / stopped / throttled texts; only initial_since ever sent; actions and the start-date row wrap on mobile';
+});
+
+await step('shopify orders: Stop Shopify Sync — admin only, 409 when idle, stops after the page in progress, interrupts a backoff, checkpoint kept, resumes with no gap or duplicate, BWA once, no stock, Amazon untouched', async () => {
+  const bad = [];
+  const db = getPool();
+  const CK = 'shopify_orders_checkpoint';
+  const ckNow = async () => (await db.query('SELECT value FROM system_state WHERE key = $1', [CK])).rows[0]?.value ?? null;
+  const setCk = (v) => db.query(`INSERT INTO system_state (key, value, updated_at) VALUES ($1, $2, now()) ON CONFLICT (key) DO UPDATE SET value = $2, updated_at = now()`, [CK, v]);
+  const savedCk = await ckNow();
+  const AZCK = 'amazon_orders_checkpoint';
+  const savedAz = (await db.query('SELECT value FROM system_state WHERE key = $1', [AZCK])).rows[0]?.value ?? null;
+  const iso = (msAgo) => new Date(Date.now() - msAgo).toISOString();
+  const gidOf = (n) => `${SH_PREFIX}${String(n).padStart(4, '0')}`;
+  // 25 orders changed since the checkpoint: 3 pages of 10. One is a BWA order with an Amazon fulfilment.
+  const store = Array.from({ length: 25 }, (_, i) => ({ ...shOrder(4001 + i, { created: iso(3000000 - i * 1000) }), updatedAt: iso(3000000 - i * 1000) }));
+  const bwa = store[3];
+  bwa.tags = ['Buy with Amazon'];
+  bwa.fulfillments = [{ id: `gid://shopify/Fulfillment/${SH_NUM}9401`, name: '#4004-F1', status: 'SUCCESS', displayStatus: 'IN_TRANSIT', createdAt: iso(2900000), updatedAt: iso(2900000),
+    inTransitAt: iso(2900000), deliveredAt: null, estimatedDeliveryAt: null, trackingInfo: [{ company: 'Amazon Transportation Services', number: '374199999941', url: null }] }];
+  const base = shFake(() => store);
+  const pages = [];
+  const app = express();
+  app.use((req, _res, next) => { req.session = JSON.parse(req.get('x-test-session') || '{}'); next(); });
+  app.use('/api/orders', ordersRouterForTest);
+  const server = app.listen(0);
+  const url = `http://127.0.0.1:${server.address().port}/api/orders/shopify/sync/cancel`;
+  const ADMIN = { isAdmin: true, caps: ['logistics.view', 'logistics.edit'] };
+  const cancel = async (who = ADMIN) => { const r = await fetch(url, { method: 'POST', headers: { 'x-test-session': JSON.stringify(who) } }); return { status: r.status, body: await r.json() }; };
+  const has = async (n) => (await db.query('SELECT count(*)::int n FROM orders WHERE source_order_id = $1', [gidOf(n)])).rows[0].n;
+  const fx = async () => (await db.query(`SELECT (SELECT count(*) FROM inventory_movements)::int mv, (SELECT count(*) FROM inventory_reservations)::int rs,
+    (SELECT count(*) FROM affiliate_order_attributions a JOIN orders o ON o.id = a.order_id WHERE o.source_order_id LIKE $1)::int at`, [`${SH_PREFIX}%`])).rows[0];
+  const ships = async () => (await db.query(`SELECT count(*)::int n FROM order_shipments WHERE external_fulfillment_id = $1`, [bwa.fulfillments[0].id])).rows[0].n;
+  const lastRun = async () => (await db.query(`SELECT id, status, rows_processed, details FROM order_imports WHERE kind = 'shopify_sync' ORDER BY id DESC LIMIT 1`)).rows[0];
+  try {
+    const fx0 = await fx();
+    await setCk(iso(3600000));
+    const ck0 = await ckNow();
+    // Admin only; nothing running → 409.
+    if ((await cancel({ isAdmin: false, caps: ['logistics.view', 'logistics.edit'] })).status !== 403) bad.push('non-admin not 403');
+    const idle = await cancel();
+    if (idle.status !== 409 || idle.body.syncRunning !== false) bad.push(`idle → ${idle.status}`);
+    // Stop requested while page 2 is being fetched: page 2 finishes and is applied; page 3 is never requested.
+    const stopping = async (q, v) => {
+      if (/^query BriyoOrdersPage/.test(q)) {
+        pages.push(v.after || '-');
+        if (pages.length === 2) {
+          const c = await cancel();
+          if (c.status !== 202 || !c.body.stopping || c.body.status?.state !== 'running' || !c.body.status?.stopping) bad.push(`cancel → ${c.status} ${JSON.stringify(c.body).slice(0, 160)}`);
+          if ((await cancel()).status !== 202) bad.push('second stop request not accepted (idempotent)');
+        }
+      }
+      return base(q, v);
+    };
+    const r1 = await startIncrementalSync({ actor: SH_ACTOR, gql: stopping, backoffMs: 1 });
+    const res1 = await r1.done;
+    const run1 = await lastRun();
+    let first20 = 0; for (let n = 4001; n <= 4020; n += 1) first20 += await has(n);
+    let last5 = 0; for (let n = 4021; n <= 4025; n += 1) last5 += await has(n);
+    if (pages.length !== 2 || first20 !== 20 || last5 !== 0) bad.push(`pages ${pages.length}, applied ${first20}/20, beyond ${last5}`);
+    if (run1.status !== 'partial' || run1.rows_processed !== 20 || !run1.details.stopped_at || !res1.summary.stopped || !res1.summary.partial) bad.push(`run ${run1.status} ${run1.rows_processed} ${JSON.stringify(run1.details.stopped_at)}`);
+    if ((await ckNow()) !== ck0) bad.push('checkpoint moved by a stopped run');
+    const st = await shopifySyncStatus();
+    if (st.state !== 'partial' || !st.stopped || st.stopping || st.fetched !== 20 || st.created !== 20) bad.push(`status ${JSON.stringify(st).slice(0, 200)}`);
+    if (syncBusy()) bad.push('still busy after stopping');
+    if ((await ships()) !== 1) bad.push('BWA shipment not mirrored once');
+    // A stop during a backoff wait ends at once (does not sit out the wait); that page is not applied or counted.
+    let n429 = 0;
+    const throttled = async (q, v) => {
+      if (/^query BriyoOrdersPage/.test(q)) { n429 += 1; if (n429 === 1) setTimeout(() => { cancelShopifySync({ actor: SH_ACTOR }); }, 300); throw Object.assign(new Error('Shopify rate limit hit (HTTP 429).'), { throttled: true }); }
+      return base(q, v);
+    };
+    const t0 = Date.now();
+    const r2 = await startIncrementalSync({ actor: SH_ACTOR, gql: throttled, backoffMs: 20000 });
+    const res2 = await r2.done;
+    const run2 = await lastRun();
+    if (Date.now() - t0 > 5000 || !res2.summary.stopped || run2.status !== 'partial' || run2.rows_processed !== 0 || (await ckNow()) !== ck0) bad.push(`backoff stop: ${Date.now() - t0} ms, ${run2.status}, ${run2.rows_processed}`);
+    // Click Shopify again: from the unchanged checkpoint, every order once, the checkpoint moves only now.
+    const r3 = await startIncrementalSync({ actor: SH_ACTOR, gql: base, backoffMs: 1 });
+    await r3.done;
+    const run3 = await lastRun();
+    let all = 0; let dup = 0; for (let n = 4001; n <= 4025; n += 1) { const c = await has(n); all += c > 0 ? 1 : 0; dup += c > 1 ? 1 : 0; }
+    if (all !== 25 || dup || run3.status !== 'completed' || (await ckNow()) !== run3.details.window.until || run3.details.window.since !== new Date(new Date(ck0).getTime() - 5 * 60000).toISOString()) bad.push(`resume: ${all}/25, dup ${dup}, ${run3.status}`);
+    if ((await ships()) !== 1) bad.push('BWA shipment duplicated on resume');
+    const fx1 = await fx();
+    if (JSON.stringify(fx1) !== JSON.stringify(fx0)) bad.push(`stock/attribution changed ${JSON.stringify([fx0, fx1])}`);
+    // Amazon is separate: stopping Shopify never reaches a running Amazon sync.
+    await db.query('DELETE FROM system_state WHERE key = $1', [AZCK]);
+    const s = fakeAmazon(); s.pages[''] = { orders: [] };
+    let release; s.hold = new Promise((ok) => { release = ok; });
+    const az = await startAmazonIncrementalSync({ client: azClient(s), actor: AZ_ACTOR, startFrom: iso(86400000) });
+    const c = await cancel();
+    if (c.status !== 409 || !amazonSyncBusy()) bad.push('Shopify stop touched Amazon');
+    release(); s.hold = null;
+    const azr = await az.done;
+    if (azr.summary.partial || azr.summary.stopped) bad.push('Amazon run did not finish normally');
+  } finally {
+    server.close();
+    if (savedCk === null) await db.query('DELETE FROM system_state WHERE key = $1', [CK]); else await setCk(savedCk);
+    if (savedAz === null) await db.query('DELETE FROM system_state WHERE key = $1', [AZCK]); else await db.query('UPDATE system_state SET value = $2 WHERE key = $1', [AZCK, savedAz]);
+    await db.query(`DELETE FROM order_imports WHERE kind = 'amazon_sync' AND imported_by = $1`, [AZ_ACTOR]);
+  }
+  if (bad.length) throw new Error(bad.join(' | '));
+  return 'operator 403; nothing running → 409; stop while page 2 is fetched → page 2 applied, page 3 never requested, run partial + stopped_at, checkpoint unchanged, status "stopped" (20 fetched, 20 new), not busy; stop during a 20 s backoff → ends within ~0.3 s, that page not applied, checkpoint unchanged; next click → all 25 once from checkpoint − 5 min, checkpoint = new watermark; BWA shipment once; no movements, reservations or attributions; a Shopify stop never touches a running Amazon sync';
+});
+
+await step('orders page: Shopify button turns into a red "Stop Shopify Sync" while syncing — one cancel request, Stopping…, stopped summary, resumes on the next click, mobile wrap', async () => {
+  const bad = [];
+  const js = await fsp.readFile(new URL('../public/orders.js', import.meta.url), 'utf8');
+  const css = await fsp.readFile(new URL('../public/orders.css', import.meta.url), 'utf8');
+  const ui = await fsp.readFile(new URL('../public/ui.css', import.meta.url), 'utf8');
+  const busy = js.slice(js.indexOf('const shopifyBusy'), js.indexOf('const duration'));
+  if (!/classList\.toggle\('danger', stop\)/.test(busy) || !/'Stop Shopify Sync'/.test(busy) || !/'Stopping…'/.test(busy) || !/: 'Shopify'/.test(busy)) bad.push('button states');
+  if (!/\.btn\.danger \{[^}]*var\(--error\)/.test(ui)) bad.push('no red danger style');
+  const stop = js.slice(js.indexOf('async function stopShopifySync'), js.indexOf('const onShopifyClick'));
+  if ((stop.match(/api\('\/api\/orders\/shopify\/sync\/cancel'/g) || []).length !== 1 || !/if \(b\.dataset\.mode !== 'running' \|\| b\.disabled\) return;\s*shopifyBusy\(true, 'stopping'\)/.test(stop)) bad.push('not exactly one guarded cancel request');
+  if (!/const onShopifyClick = \(\) => \(\$\('#shopifyOrders'\)\.dataset\.mode === 'running' \? stopShopifySync\(\) : startShopifySync\(\)\)/.test(js) || !/\$\('#shopifyOrders'\)\.addEventListener\('click', onShopifyClick\)/.test(js)) bad.push('click not routed');
+  const follow = js.slice(js.indexOf('async function followShopifySync'), js.indexOf('/* ------------------------------------------------------------------ Amazon button'));
+  if (!/s\.stopping/.test(follow) || !/Shopify sync stopped/.test(follow) || !/Click Shopify to continue\./.test(follow) || !/fetched<\/span><span>\$\{count\(s\.created\)\} new<\/span><span>\$\{count\(s\.updated\)\} updated/.test(follow)) bad.push('stopped/stopping banner');
+  if (!/setTimeout\(followShopifySync, 2500\)/.test(follow)) bad.push('polling');
+  if (!/\.stop-facts \{[^}]*flex-wrap: wrap/.test(css) || !/\.page-actions \{ flex-wrap: wrap; \}/.test(css)) bad.push('mobile wrap');
+  if (/amazon/i.test(stop + busy)) bad.push('touches Amazon');
+  if (bad.length) throw new Error(bad.join(' | '));
+  return 'idle "Shopify"; running → red .btn.danger "Stop Shopify Sync" (logo hidden); one click → exactly one POST /shopify/sync/cancel, then disabled "Stopping…"; polling shows "Stopping…" then "Shopify sync stopped · N fetched · N new · N updated · Click Shopify to continue."; next click starts normally; wraps on mobile; Amazon button untouched';
 });
 
 await step('amazon sp-api cleanup', async () => {
