@@ -6542,6 +6542,44 @@ await step('referral: attribution through the existing Shopify sync — last eli
   return '9 orders: last click (incl. across affiliates) wins, bref/click mismatch and unknown click ignored, affiliate coupon beats the click, a non-affiliate coupon does not, ordered-before-click ignored, legacy keys read; preview = commit (5); re-sync idempotent; suspended affiliate loses new orders to the previous eligible click; 30 → 60-day window read from settings; rule v1 stored; totals, snapshots and stock untouched; DB refuses a second or orphan attribution and edits';
 });
 
+await step('affiliate commissions through the real Shopify sync: snapshot → attribution → one commission (rate, base, amount), a re-run sync adds nothing', async () => {
+  const bad = [];
+  const pool = getPool();
+  // An eligible affiliate WITH a rate (12.5%, effective before the click), a real click on its link, and a new order carrying it.
+  const D = await eligibleAffiliate('Ref commission');
+  const { rows: [d] } = await pool.query('SELECT id FROM affiliates WHERE public_id = $1', [D]);
+  await pool.query(`INSERT INTO affiliate_rates (affiliate_id, rate_bps, effective_from, created_by, reason) VALUES ($1, 1250, now() - interval '1 day', 'db-check', 'commission sync test')`, [d.id]);
+  const click = await goReq(`/r/${D}`, { ip: '203.0.113.77' });
+  const att = [{ key: '__briyo_ref', value: D }, { key: '__briyo_click', value: clickOf(click) }];
+  const store = [shOrder(950, { created: new Date().toISOString(), attributes: att, total: 1299, subtotal: 1250 })];
+  const gql = shFake(() => store);
+  const source = `${SH_PREFIX}0950`;
+  const state = async () => (await pool.query(`
+    SELECT o.id AS order_id,
+           (SELECT count(*)::int FROM order_financial_snapshots s WHERE s.order_id = o.id) AS snapshots,
+           (SELECT count(*)::int FROM affiliate_order_attributions t WHERE t.order_id = o.id) AS attributions,
+           (SELECT count(*)::int FROM affiliate_commissions c WHERE c.order_id = o.id) AS commissions
+    FROM orders o WHERE o.source_order_id = $1`, [source])).rows[0];
+  const r1 = await runShopifySync({ window: { days: 3 }, dryRun: false, gql, actor: SH_ACTOR });
+  const s1 = await state();
+  if (!s1 || s1.snapshots !== 1 || s1.attributions !== 1 || s1.commissions !== 1 || r1.summary.affiliateAttributionsRecorded !== 1) bad.push(`first sync ${JSON.stringify([s1, r1.summary.affiliateAttributionsRecorded])}`);
+  const { rows: [c] } = await pool.query(`SELECT c.*, a.public_id, s.current_subtotal::text AS sub, s.current_total_tax::text AS tax, (s.current_subtotal - s.current_total_tax)::text AS want_base,
+      round((s.current_subtotal - s.current_total_tax) * 1250 / 10000, 2)::text AS want_amount, t.id AS attribution
+    FROM affiliate_commissions c JOIN affiliates a ON a.id = c.affiliate_id JOIN order_financial_snapshots s ON s.id = c.snapshot_id
+    JOIN affiliate_order_attributions t ON t.id = c.attribution_id WHERE c.order_id = $1`, [s1?.order_id]);
+  // Shopify reports subtotal 1250.00 and tax 198.15 for this order → base 1051.85, 12.5% → 131.48 (from the stored fields).
+  if (!c || c.public_id !== D || c.rate_bps !== 1250 || c.status !== 'pending' || c.currency !== 'INR'
+    || c.base_amount !== c.want_base || c.commission_amount !== c.want_amount || c.want_base !== '1051.85' || c.want_amount !== '131.48') bad.push(`commission ${JSON.stringify(c)}`);
+  // The same sync again: no second attribution or commission; the commission is untouched.
+  const r2 = await runShopifySync({ window: { days: 3 }, dryRun: false, gql, actor: SH_ACTOR });
+  const s2 = await state();
+  const { rows: [c2] } = await pool.query('SELECT * FROM affiliate_commissions WHERE order_id = $1', [s1?.order_id]);
+  if (s2.attributions !== 1 || s2.commissions !== 1 || r2.summary.affiliateAttributionsRecorded !== 0) bad.push(`re-sync ${JSON.stringify([s2, r2.summary.affiliateAttributionsRecorded])}`);
+  if (JSON.stringify(c2) !== JSON.stringify((({ public_id, sub, tax, want_base, want_amount, attribution, ...rest }) => rest)(c))) bad.push('re-sync changed the commission');
+  if (bad.length) throw new Error(bad.join(' | '));
+  return `runShopifySync: snapshot 1, attribution 1, commission 1 at 12.5% on ${c.sub} − ${c.tax} = ${c.base_amount} → ${c.commission_amount} INR (pending); re-run: attributions 1, commissions 1, commission unchanged`;
+});
+
 await step('referral: GoKwik fallback (rule v2) — /r/{id} in full_url + a recorded click; UTMs alone never; v1 unchanged', async () => {
   const bad = [];
   const keepShop = process.env.SHOPIFY_STORE_DOMAIN;
@@ -6946,6 +6984,15 @@ await step('affiliate commissions: one per attribution, rate and base fixed at c
   // INR earned: 21.67 (12.5%) + 8.00 (10% on ₹80); the cancelled order's 40.00 apart; order value 273 + 80 + 273 (pre-ledger, no commission).
   if (inr.commission_earned !== 29.67 || inr.on_cancelled_orders !== 40 || inr.order_value !== 626 || !perf.orders.find((o) => o.order === '#CMCANCEL').cancelled) bad.push(`INR totals ${JSON.stringify(inr)}`);
   if (perf.totals.by_currency.find((x) => x.currency === 'USD').commission_earned !== 2) bad.push('USD totals');
+  // The earned breakdown reconciles: pending + approved + paid = commission earned, per currency; the cancelled
+  // order's 40.00 is only in on_cancelled_orders (not in pending).
+  for (const x of perf.totals.by_currency) {
+    const sum = Math.round((x.by_status.pending + x.by_status.approved + x.by_status.paid) * 100) / 100;
+    if (sum !== x.commission_earned) bad.push(`${x.currency} breakdown ${sum} ≠ earned ${x.commission_earned}`);
+  }
+  if (inr.by_status.pending !== 29.67 || inr.on_cancelled_orders !== 40) bad.push(`cancelled commission in the pending breakdown ${JSON.stringify(inr.by_status)}`);
+  const afSrc = await fsp.readFile(new URL('../public/affiliates.js', import.meta.url), 'utf8');
+  if (!/on_cancelled_orders \? `\$\{esc\(cash\(c\.currency, c\.on_cancelled_orders\)\)\} on cancelled orders, not counted`/.test(afSrc)) bad.push('cancelled commission no longer shown apart on the page');
   const cc = (await commissionsOf(oCan))[0];
   await expectErr('reverse without reason', () => setCommissionStatus('CMAXQT', Number(cc.id), { status: 'reversed', actor: ACT }), (e) => e.status === 400);
   await setCommissionStatus('CMAXQT', Number(cc.id), { status: 'reversed', reason: 'Order cancelled', actor: ACT });
@@ -6990,6 +7037,15 @@ await step('affiliate commissions: one per attribution, rate and base fixed at c
   const mMove = await af('manager', 'POST', `/api/affiliates/CMAXQT/commissions/${late.id}/status`, { status: 'approved' });
   const fMove = await af('finance', 'POST', `/api/affiliates/CMAXQT/commissions/${late.id}/status`, { status: 'approved' });
   if (vMove.status !== 403 || mMove.status !== 403 || fMove.status !== 200) bad.push(`status moves ${vMove.status}/${mMove.status}/${fMove.status}`);
+  // Only mapped statuses can be requested — pending or an unknown status is refused before the commission is read,
+  // for every role (the database lifecycle is not the authorization boundary), and the answer reveals nothing.
+  for (const who of ['manager', 'finance', 'adm']) {
+    for (const status of ['pending', 'bogus', '', 'constructor', '__proto__']) {
+      const r = await af(who, 'POST', `/api/affiliates/CMAXQT/commissions/${late.id}/status`, { status });
+      if (r.status !== 403 || r.body.error !== 'That status cannot be set.') bad.push(`${who} ${JSON.stringify(status)} → ${r.status} ${r.body.error}`);
+    }
+  }
+  if ((await commissionsOf(oNone))[0].status !== 'approved') bad.push('a refused request changed the commission');
   // The activity log never shows amounts.
   const ev = await af('viewer', 'GET', '/api/affiliates/CMAXQT');
   if (/21\.67|173\.36|₹|commission_amount/.test(JSON.stringify(ev.body.events || ev.body))) bad.push('amounts in the activity log');
