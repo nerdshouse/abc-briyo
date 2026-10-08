@@ -139,9 +139,18 @@ fetch('/api/config').then((r) => r.json()).then((cfg) => {
       + 'and <code>SHOPIFY_CLIENT_SECRET</code> to the environment to turn this on. '
       + 'Until then, use the CSV export above.</div>';
   }
+  // Abandoned-checkout polling is switched off on purpose (GoKwik is the feed): no manual pull either.
+  if (cfg.shopifyConnected && !cfg.shopifyPollEnabled) {
+    el.textContent = cfg.shopifyAuthorized ? 'connected · polling off' : el.textContent;
+    $('#pullBtn').hidden = true;
+    $('#pollHint').textContent = 'Abandoned checkouts come in through GoKwik. Pulling them from Shopify is turned off, '
+      + 'so there is nothing to run here. Shopify order sync is separate: Orders → Shopify.';
+  }
   if (new URLSearchParams(location.search).get('shopify') === 'connected') {
-    $('#pullResult').innerHTML =
-      '<div class="banner">Shopify connected. The first pull is running now — reload in a moment.</div>';
+    $('#pullResult').innerHTML = cfg.shopifyPollEnabled
+      ? '<div class="banner">Shopify connected. Abandoned checkouts are pulled on the next scheduled run.</div>'
+      : '<div class="banner">Shopify connected. Nothing is pulled from here: abandoned checkouts come in through GoKwik, '
+        + 'and Shopify order sync is separate (Orders → Shopify).</div>';
   }
 }).catch(() => {});
 
