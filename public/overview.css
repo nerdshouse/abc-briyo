@@ -81,6 +81,48 @@
 .ox-mod.m-marketing { border-color: var(--border); }
 .ox-mod.m-marketing > .ox-mod-head { background-color: var(--frame); background-image: var(--pattern); border-radius: var(--ox-r) var(--ox-r) 0 0; }
 
+/* Module accents: a pale tint on the header and a coloured top edge identify the
+   module; figures stay ink, so colour still means status everywhere else.
+   Scoped to these Overview modules only. */
+.ox-mod.m-shopify   { --mod-accent: #7FC8A9; --mod-tint: #F1FAF5; }
+.ox-mod.m-affiliate { --mod-accent: #B7A6E8; --mod-tint: #F6F3FD; }
+.ox-mod.m-shipments { --mod-accent: #8DB8EC; --mod-tint: #F1F6FD; }
+.ox-mod.m-inventory { --mod-accent: #E9C08A; --mod-tint: #FDF7EE; }
+.ox-mod.m-shopify, .ox-mod.m-affiliate, .ox-mod.m-shipments, .ox-mod.m-inventory { border-top: 3px solid var(--mod-accent); }
+.ox-mod.m-shopify > .ox-mod-head, .ox-mod.m-affiliate > .ox-mod-head, .ox-mod.m-shipments > .ox-mod-head, .ox-mod.m-inventory > .ox-mod-head {
+  background: var(--mod-tint); border-radius: calc(var(--ox-r) - 2px) calc(var(--ox-r) - 2px) 0 0;
+}
+
+/* group headings: Commerce, Operations */
+.ox-group-head { margin: 10px 0 -4px; font-size: var(--fs-label); font-weight: 500; letter-spacing: .06em; text-transform: uppercase; color: var(--text-3); }
+.ox-body > .ox-group-head:first-child { margin-top: 0; }
+
+/* source badge: where an order came from (source === 'shopify_sync') */
+.src-badge { display: inline-flex; align-items: center; height: 18px; padding: 0 6px; margin-right: 4px; border-radius: 4px; font-size: 11px; font-weight: 500; letter-spacing: .01em; vertical-align: 1px; white-space: nowrap; }
+.src-shopify { background: #E3F4EA; color: #0B6B3A; border: 1px solid #C4E8D3; }
+
+/* Shopify sync (admins) */
+.ox-scope { margin: 0; padding: 8px var(--ox-pad); border-bottom: 1px solid var(--ox-line); font-size: var(--fs-meta); color: var(--text-2); }
+.ox-sync { border-top: 1px solid var(--ox-line); padding: 10px var(--ox-pad) 12px; }
+.ox-sync-head { display: flex; align-items: center; flex-wrap: wrap; gap: 6px 10px; margin-bottom: 8px; }
+.ox-sync-head h3 { margin: 0; font-size: var(--fs-label); font-weight: 500; letter-spacing: .05em; text-transform: uppercase; color: var(--text-3); }
+.ox-sync-msg { font-size: var(--fs-meta); color: var(--text-2); }
+.ox-dl { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 6px 16px; margin: 0; }
+.ox-dl > div { min-width: 0; }
+.ox-dl dt { font-size: var(--fs-label); color: var(--text-3); }
+.ox-dl dd { margin: 1px 0 0; font-size: 13px; color: var(--text); overflow-wrap: anywhere; }
+
+/* Shipments: the live total beside the status grid */
+.ox-ship { display: grid; grid-template-columns: minmax(150px, auto) minmax(0, 1fr); border-bottom: 1px solid var(--ox-line); }
+.ox-ship > .ox-stat { box-shadow: inset -1px 0 var(--ox-line); justify-content: center; }
+.ox-ship .ox-kv > * + * { box-shadow: inset 1px 0 var(--ox-line); }
+.ox-ship .ox-kv > :nth-child(4) { box-shadow: none; }
+.ox-ship .ox-kv > :nth-child(n+4) { border-top: 1px solid var(--ox-line); }
+.ox-ship > .ox-stat .ox-s-label { align-self: auto; }
+.ox-ship-foot { padding-top: 0; }
+.ox-setup { border-top: 1px solid var(--ox-line); }
+.ox-v-text { font-size: 13.5px; font-weight: 500; letter-spacing: 0; }
+
 /* ---------------------------------------------------------------- figures */
 .ox-stat { display: flex; flex-direction: column; gap: 3px; min-width: 0; padding: 12px var(--ox-pad); color: var(--text); transition: background var(--ox-ease); }
 a.ox-stat:hover { background: var(--surface-2); }
@@ -102,6 +144,9 @@ a.ox-stat:hover { background: var(--surface-2); }
 /* a row of figures with hairline dividers */
 .ox-stats { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); border-bottom: 1px solid var(--ox-line); }
 .ox-stats.c4 { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+.ox-stats.c1 { grid-template-columns: minmax(0, 1fr); }
+.ox-stats.c2 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.ox-stats.c3 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
 .ox-stats > * + *, .ox-hero > * + *, .ox-eff > * + * { box-shadow: inset 1px 0 var(--ox-line); }
 
 /* flow: stages in order, read left to right */
@@ -308,6 +353,15 @@ a.ox-exc-row:hover .ox-exc-go { color: var(--text); transform: translateX(2px); 
   .ox-split { grid-template-columns: minmax(0, 1fr); }
   .ox-split > .ox-group + .ox-group { box-shadow: none; border-top: 1px solid var(--ox-line); }
   .ox-s-value { font-size: 20px; }
+  .ox-stats.c3 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .ox-stats.c3 > :nth-child(3) { box-shadow: none; border-top: 1px solid var(--ox-line); }
+  .ox-ship { grid-template-columns: minmax(0, 1fr); }
+  .ox-ship > .ox-stat { box-shadow: none; border-bottom: 1px solid var(--ox-line); }
+  .ox-kv.c3 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .ox-kv.c3 > :nth-child(n+3) { border-top: 1px solid var(--ox-line); }
+  .ox-ship .ox-kv.c3 > :nth-child(odd) { box-shadow: none; }
+  .ox-ship .ox-kv.c3 > :nth-child(even) { box-shadow: inset 1px 0 var(--ox-line); }
+  .ox-dl { grid-template-columns: minmax(0, 1fr); }
   .ox-skel-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
 @media (max-width: 400px) {
