@@ -30,7 +30,7 @@ import {
   uploadBatchDocument, getBatchDocument, shipmentStock, reserveShipmentStock, releaseShipmentStock, dispatchShipmentStock,
   inventoryOverview, resolveSkuIds, purgeTestInventory, saveWarehouse, unmappedSkus, fefoSuggest,
   addPlatformMappings, removePlatformMapping, savePlatform, listPlatforms, splitPlatformCell, migrateLegacyAmazonSkus, mappingUsage,
-  updateMappingUnits, unitsPerListingOf,
+  updateMappingUnits, unitsPerListingOf, getInventoryCutover, setInventoryCutover, isInventoryEligible,
 } from '../lib/inventory.js';
 import { planSkuSheet, previewSkuImport, commitSkuImport } from '../lib/sku-master-import.js';
 import { DOCUMENT_FORMATS } from '../lib/orders.js';
@@ -2184,6 +2184,7 @@ await step('inventory: stock can never be overwritten or the ledger rewritten', 
 const invOrders = async (rows) => commitAmazonImport(amzCsv(rows), 'inventory.csv', { actor: IMPORTER });
 await step('inventory: Amazon seller SKU resolves to the canonical SKU; unknown ones stay Unmapped and create nothing', async () => {
   const skusBefore = (await getPool().query('SELECT count(*)::int n FROM skus')).rows[0].n;
+  const mapsBefore = (await getPool().query('SELECT count(*)::int n FROM sku_platform_mappings')).rows[0].n;
   const file = amzCsv([
     amzRow({ 'order-id': AZ(40), 'order-item-id': 'I40', sku: `${TS}-D3-60`, 'quantity-purchased': '20' }),
     amzRow({ 'order-id': AZ(41), 'order-item-id': 'I41', sku: `${TS}-AMZ-ONLY-CODE`, 'quantity-purchased': '1' }),
@@ -2200,6 +2201,8 @@ await step('inventory: Amazon seller SKU resolves to the canonical SKU; unknown 
   if (i40.sku_id !== INV.a || i40.canonical_sku !== `${TS}-D3-60`) throw new Error(JSON.stringify(i40));
   if (i41.sku_id !== null || i41.sku !== `${TS}-AMZ-ONLY-CODE`) throw new Error(JSON.stringify(i41));
   if ((await getPool().query('SELECT count(*)::int n FROM skus')).rows[0].n !== skusBefore) throw new Error('a SKU was created');
+  // Manual-only mapping: an import never writes a mapping, whatever the title looks like.
+  if ((await getPool().query('SELECT count(*)::int n FROM sku_platform_mappings')).rows[0].n !== mapsBefore) throw new Error('an import created a mapping');
   if (!(await unmappedSkus()).some((u) => u.code === `${TS}-AMZ-ONLY-CODE`)) throw new Error('not listed as unmapped');
   // Imported orders never touch stock.
   if ((await stockOf(INV.a)).on !== 100 || (await stockOf(INV.a)).res !== 0) throw new Error('import changed stock');
@@ -2611,6 +2614,10 @@ await step('platform SKUs: unmapped lines stay unmapped (code kept, nothing crea
   let l = await lineOf(INV.blOrder);
   if (l.sku_id !== null || l.sku !== `${TS}20000001`) throw new Error(JSON.stringify(l));
   if (!(await unmappedSkus()).some((u) => u.code === `${TS}20000001` && u.channel === 'blinkit' && u.platform_label === 'Blinkit' && u.mappable)) throw new Error('not listed as unmapped Blinkit SKU');
+  // Staff see when the code was first and last ordered; listing it maps nothing.
+  const listed = (await unmappedSkus()).find((u) => u.code === `${TS}20000001`);
+  if (!listed.first_seen || !listed.last_seen || new Date(listed.first_seen) > new Date(listed.last_seen) || listed.orders !== 1 || listed.units !== 2) throw new Error(JSON.stringify(listed));
+  if ((await lineOf(INV.blOrder)).sku_id !== null) throw new Error('listing as unmapped changed the line');
   const r = await addPlatformMappings(INV.m, PF.blinkit, [`${TS}20000001`], { actor: ACTOR });
   l = await lineOf(INV.blOrder);
   if (r.orderItemsMapped !== 1 || l.sku_id !== INV.m || l.sku !== `${TS}20000001`) throw new Error(JSON.stringify({ r, l }));
@@ -2812,6 +2819,166 @@ await step('units per listing: changing it is refused while stock is reserved fo
   const a = (await getPool().query(`SELECT metadata FROM inventory_audit WHERE action = 'platform_sku_units_changed' AND sku_id = $1`, [INV.up])).rows;
   if (a.length !== 1 || a[0].metadata.from !== 3 || a[0].metadata.to !== 6) throw new Error(JSON.stringify(a));
   return 'refused after dispatch and while reserved; released → 3 → 6, the shipment now needs 6, audited once; same value is a no-op';
+});
+// ---- stock cutover: orders before it are historical and never touch stock ----------
+const CUT_AT = '2026-01-15T00:00:00+05:30';
+const setCut = async (v) => setInventoryCutover(v, { actor: ACTOR, confirm: true, version: (await getInventoryCutover()).version });
+const orderAt = async (number, code, qty, offset) => {
+  const id = await lineOn('amazon', number, code, qty);
+  // The stored timestamptz itself, relative to the cutover instant.
+  await getPool().query('UPDATE orders SET order_date = $2::timestamptz + $3::interval WHERE id = $1', [id, CUT_AT, offset]);
+  return id;
+};
+const movementsFor = async (sid) => (await getPool().query('SELECT count(*)::int n FROM inventory_movements WHERE shipment_id = $1', [sid])).rows[0].n;
+
+await step('stock cutover: unset by default; saving needs confirmation and the current version, and is audited', async () => {
+  const cur = await getInventoryCutover();
+  if (cur.cutover_at !== null) throw new Error('cutover should start unset');
+  INV.cutSku = (await createSku({ sku: `${TS}-CUT`, product_name: 'Cutover test' }, { actor: ACTOR })).id;
+  await addPlatformMappings(INV.cutSku, PF.amazon, [`${TS}-CUT-AMZ`], { actor: ACTOR });
+  INV.cutB = (await receiveInventory({ sku_id: INV.cutSku, batch_number: 'CUT-1', expiry_date: dayOffset(300), quantity: 50, unit_cost: 10, request_id: rid() }, { actor: ACTOR })).batchId;
+  INV.cutOld = await orderAt('CUT-OLD', `${TS}-CUT-AMZ`, 1, '-365 days');
+  const c = await getPool().connect();
+  try { if (!(await isInventoryEligible(c, INV.cutOld))) throw new Error('unset cutover must keep every order eligible'); } finally { c.release(); }
+  await expectErr('no confirm', () => setInventoryCutover(CUT_AT, { actor: ACTOR, version: cur.version }), (e) => e.status === 400 && e.confirmRequired);
+  for (const v of ['2026-01-15', '2026-01-15T00:00', 'yesterday', '', 12345]) {
+    await expectErr(`format ${v}`, () => setInventoryCutover(v, { actor: ACTOR, confirm: true, version: cur.version }), (e) => e.status === 400);
+  }
+  await expectErr('stale version', () => setInventoryCutover(CUT_AT, { actor: ACTOR, confirm: true, version: cur.version - 1 }), (e) => e.status === 409);
+  if ((await getInventoryCutover()).cutover_at !== null) throw new Error('a refused save changed the cutover');
+  const r = await setCut(CUT_AT);
+  const saved = await getInventoryCutover();
+  if (!r.changed || saved.cutover_at.toISOString() !== '2026-01-14T18:30:00.000Z' || saved.updated_by !== ACTOR) throw new Error(JSON.stringify(saved));
+  // A stale screen cannot overwrite the cutover now that it exists.
+  await expectErr('stale overwrite', () => setInventoryCutover('2026-02-01T00:00:00+05:30', { actor: ACTOR, confirm: true, version: cur.version }), (e) => e.status === 409);
+  if ((await setCut(CUT_AT)).changed) throw new Error('same value counted as a change');
+  const a = (await getPool().query(`SELECT actor, metadata FROM inventory_audit WHERE action = 'inventory_cutover_set' ORDER BY id DESC LIMIT 1`)).rows[0];
+  if (a.metadata.from !== null || a.metadata.to !== '2026-01-14T18:30:00.000Z' || a.actor !== ACTOR) throw new Error(JSON.stringify(a));
+  return 'unset → every order eligible; no confirm, bad formats, stale version refused; set 15 Jan 00:00 IST (18:30Z), audited from null; stale overwrite refused; same value no-op';
+});
+await step('stock cutover: boundary on the stored timestamp — 1 µs before excluded, exactly at and after included', async () => {
+  INV.cutBefore = await orderAt('CUT-B', `${TS}-CUT-AMZ`, 1, '-1 microsecond');
+  INV.cutAt = await orderAt('CUT-AT', `${TS}-CUT-AMZ`, 2, '0 seconds');
+  INV.cutAfter = await orderAt('CUT-AF', `${TS}-CUT-AMZ`, 3, '1 hour');
+  const c = await getPool().connect();
+  try {
+    const got = [await isInventoryEligible(c, INV.cutBefore), await isInventoryEligible(c, INV.cutAt), await isInventoryEligible(c, INV.cutAfter), await isInventoryEligible(c, INV.cutOld)];
+    if (got.join() !== 'false,true,true,false') throw new Error(got.join());
+  } finally { c.release(); }
+  return 'cutover − 1 µs → historical; = cutover → eligible; + 1 h → eligible; a year before → historical';
+});
+await step('stock cutover: a historical order can be mapped, but never reserves, consumes or releases stock', async () => {
+  // Mapping is not blocked by the cutover: a new code on a historical order resolves.
+  const hist = await orderAt('CUT-H', `${TS}-CUT-LATER`, 2, '-2 days');
+  if ((await lineOf(hist)).sku_id !== null) throw new Error('should start unmapped');
+  const m = await addPlatformMappings(INV.cutSku, PF.amazon, [`${TS}-CUT-LATER`], { actor: ACTOR });
+  if (m.orderItemsMapped !== 1 || (await lineOf(hist)).sku_id !== INV.cutSku) throw new Error('historical line not mapped');
+  const before = { ledger: await ledgerSum(INV.cutSku), stock: await stockOf(INV.cutSku) };
+  const sid = await upShip('amazon', 'CUT-H', 'AWB-CUT-H');
+  const st = await shipmentStock(sid);
+  if (st.lines.length) throw new Error(`historical order needs stock: ${JSON.stringify(st.lines)}`);
+  await expectErr('reserve', () => reserveShipmentStock(sid, [{ batch_id: INV.cutB, quantity: 2 }], { actor: ACTOR }), (e) => e.status === 400);
+  // An unmapped historical line does not block either: the order takes no part in stock.
+  const histUnmapped = await orderAt('CUT-HU', `${TS}-CUT-NEVER-MAPPED`, 1, '-3 days');
+  const sidU = await upShip('amazon', 'CUT-HU', 'AWB-CUT-HU');
+  for (const [order, s2] of [[hist, sid], [histUnmapped, sidU]]) {
+    const sh = (await orderShipments(order))[0];
+    await updateShipment(order, sh.id, { shipment_status: 'dispatched' }, { actor: ACTOR, version: sh.version });
+    if (await movementsFor(s2)) throw new Error('historical dispatch consumed stock');
+  }
+  // Cancelling a historical shipment releases nothing and writes nothing.
+  const histC = await orderAt('CUT-HC', `${TS}-CUT-AMZ`, 4, '-1 day');
+  const sidC = await upShip('amazon', 'CUT-HC', 'AWB-CUT-HC');
+  const shC = (await orderShipments(histC))[0];
+  await updateShipment(histC, shC.id, { shipment_status: 'cancelled' }, { actor: ACTOR, version: shC.version });
+  const resRows = (await getPool().query('SELECT count(*)::int n FROM inventory_reservations WHERE shipment_id = ANY($1)', [[sid, sidU, sidC]])).rows[0].n;
+  if (resRows || await movementsFor(sidC)) throw new Error('reservation or movement written for a historical order');
+  const after = { ledger: await ledgerSum(INV.cutSku), stock: await stockOf(INV.cutSku) };
+  if (JSON.stringify(before) !== JSON.stringify(after)) throw new Error(`${JSON.stringify(before)} → ${JSON.stringify(after)}`);
+  return 'historical line mapped (sku_id set); needs no stock; reserve refused; mapped and unmapped historical orders dispatch with 0 movements; cancel writes nothing; stock 50/0/50 unchanged';
+});
+await step('stock cutover: orders at and after the cutover reserve and dispatch normally', async () => {
+  for (const [order, number, qty] of [[INV.cutAt, 'CUT-AT', 2], [INV.cutAfter, 'CUT-AF', 3]]) {
+    const sid = await upShip('amazon', number, `AWB-${number}`);
+    const st = await shipmentStock(sid);
+    if (st.lines[0]?.required !== qty) throw new Error(`${number}: ${JSON.stringify(st.lines)}`);
+    await reserveShipmentStock(sid, [{ batch_id: INV.cutB, quantity: qty }], { actor: ACTOR });
+    const sh = (await orderShipments(order))[0];
+    await updateShipment(order, sh.id, { shipment_status: 'dispatched' }, { actor: ACTOR, version: sh.version });
+    const out = (await getPool().query('SELECT sum(quantity)::int q FROM inventory_movements WHERE shipment_id = $1', [sid])).rows[0].q;
+    if (out !== -qty) throw new Error(`${number} deducted ${out}`);
+  }
+  if ((await stockOf(INV.cutSku)).on !== 45) throw new Error(JSON.stringify(await stockOf(INV.cutSku)));
+  return 'exactly-at order: needs 2, reserved, dispatched −2; after order: needs 3, reserved, dispatched −3; on hand 50 → 45';
+});
+await step('stock cutover: a change that would move orders holding stock is refused; clearing restores the old behaviour', async () => {
+  // A later cutover would make the dispatched at/after orders historical: refused.
+  await expectErr('move dispatched', () => setCut('2026-01-15T02:00:00+05:30'), (e) => e.status === 409);
+  // An earlier cutover would bring a historical order with a reservation… none has one; but a live reservation also blocks.
+  const late = await orderAt('CUT-RES', `${TS}-CUT-AMZ`, 1, '30 days');
+  const sid = await upShip('amazon', 'CUT-RES', 'AWB-CUT-RES');
+  await reserveShipmentStock(sid, [{ batch_id: INV.cutB, quantity: 1 }], { actor: ACTOR });
+  await expectErr('move reserved', () => setCut('2026-03-01T00:00:00+05:30'), (e) => e.status === 409);
+  await releaseShipmentStock(sid, { actor: ACTOR });
+  if ((await getInventoryCutover()).cutover_at.toISOString() !== '2026-01-14T18:30:00.000Z') throw new Error('refused change saved');
+  // Clearing only re-admits orders with no stock against them, so it is allowed.
+  const r = await setCut(null);
+  const c = await getPool().connect();
+  try { if (!r.changed || !(await isInventoryEligible(c, INV.cutOld)) || !(await isInventoryEligible(c, late))) throw new Error('clear'); } finally { c.release(); }
+  const a = (await getPool().query(`SELECT metadata FROM inventory_audit WHERE action = 'inventory_cutover_set' ORDER BY id DESC LIMIT 1`)).rows[0];
+  if (a.metadata.to !== null) throw new Error(JSON.stringify(a));
+  return 'later cutover over dispatched orders refused; cutover over a reserved order refused; after release, clearing allowed and audited; all orders eligible again';
+});
+await step('stock cutover: editing an order date across the cutover is refused only when the order holds stock', async () => {
+  const edit = async (id, offset) => {
+    const at = (await getPool().query(`SELECT ($1::timestamptz + $2::interval) AS t`, [CUT_AT, offset])).rows[0].t.toISOString();
+    return updateOrder(id, { order_date: at }, { actor: ACTOR, version: (await getOrder(id)).version });
+  };
+  const sideOf = async (id) => { const c = await getPool().connect(); try { return await isInventoryEligible(c, id); } finally { c.release(); } };
+  const dateOf2 = async (id) => (await getPool().query('SELECT order_date FROM orders WHERE id = $1', [id])).rows[0].order_date.toISOString();
+  // Cutover unset: dates move freely (existing behaviour), whatever stock exists.
+  if ((await getInventoryCutover()).cutover_at !== null) throw new Error('expected unset');
+  await edit(INV.cutAt, '-10 days'); await edit(INV.cutAt, '0 seconds');   // CUT-AT has dispatched stock
+  await setCut(CUT_AT);
+  // No inventory state: both directions allowed, and the boundary is exact.
+  const free = await orderAt('CUT-FREE', `${TS}-CUT-AMZ`, 1, '-1 day');
+  await edit(free, '0 seconds');
+  if (!(await sideOf(free))) throw new Error('moved to exactly the cutover → should be eligible');
+  await edit(free, '-1 microsecond');
+  if (await sideOf(free)) throw new Error('1 µs before → should be historical');
+  await edit(free, '2 days');
+  await edit(free, '-2 days');
+  // Current → historical after dispatch: refused, date unchanged.
+  const atBefore = await dateOf2(INV.cutAt);
+  await expectErr('dispatched → historical', () => edit(INV.cutAt, '-1 microsecond'), (e) => e.status === 409 && e.inventoryCutover);
+  if (await dateOf2(INV.cutAt) !== atBefore) throw new Error('date changed');
+  // Moving within the same side is still fine even with stock.
+  await edit(INV.cutAfter, '2 hours');
+  // Current → historical with a live reservation: refused; after release, allowed.
+  const cur = await orderAt('CUT-CUR', `${TS}-CUT-AMZ`, 1, '5 days');
+  const sid = await upShip('amazon', 'CUT-CUR', 'AWB-CUT-CUR');
+  await reserveShipmentStock(sid, [{ batch_id: INV.cutB, quantity: 1 }], { actor: ACTOR });
+  await expectErr('reserved → historical', () => edit(cur, '-5 days'), (e) => e.status === 409 && e.inventoryCutover);
+  await releaseShipmentStock(sid, { actor: ACTOR });
+  await edit(cur, '-5 days');
+  // Historical → current with a reservation (one left from before the cutover existed): refused.
+  const hist = await orderAt('CUT-HRES', `${TS}-CUT-AMZ`, 1, '-5 days');
+  const sidH = await upShip('amazon', 'CUT-HRES', 'AWB-CUT-HRES');
+  const rid2 = (await getPool().query(`INSERT INTO inventory_reservations (shipment_id, sku_id, batch_id, quantity, created_by) VALUES ($1, $2, $3, 1, $4) RETURNING id`,
+    [sidH, INV.cutSku, INV.cutB, ACTOR])).rows[0].id;
+  await expectErr('reserved historical → current', () => edit(hist, '1 day'), (e) => e.status === 409 && e.inventoryCutover);
+  await getPool().query(`UPDATE inventory_reservations SET status = 'released', closed_at = now(), close_reason = 'test' WHERE id = $1`, [rid2]);
+  await edit(hist, '1 day');
+  // Any other writer (e.g. a re-import) is held to the same rule by the database.
+  await expectErr('direct update', () => getPool().query(`UPDATE orders SET order_date = $2::timestamptz - interval '1 day' WHERE id = $1`, [INV.cutAfter, CUT_AT]), (e) => e.hint === 'inventory_cutover');
+  await getPool().query('UPDATE inventory_settings SET cutover_at = NULL WHERE id');
+  await getPool().query(`UPDATE orders SET order_date = $2::timestamptz - interval '1 day' WHERE id = $1`, [INV.cutAfter, CUT_AT]);   // unset → allowed
+  await getPool().query(`UPDATE orders SET order_date = $2::timestamptz + interval '1 hour' WHERE id = $1`, [INV.cutAfter, CUT_AT]);
+  return 'unset → free; no stock → both directions allowed, exact boundary kept; dispatched → historical, reserved → historical, reserved historical → current refused (409, date kept); same-side move allowed; release → allowed; direct DB update held too';
+});
+await step('stock cutover: test cutover cleared', async () => {
+  await getPool().query('UPDATE inventory_settings SET cutover_at = NULL WHERE id');
+  return 'cutover NULL for the rest of the suite';
 });
 await step('master SKU import: parser — Briyo SKU + Product Name only; platform columns ignored with a warning', async () => {
   const two = planSkuSheet([['Briyo SKU', 'Product Name'], ['A1', 'Alpha'], ['', ''], ['A2', '  Beta   capsules ']]);
@@ -4167,6 +4334,8 @@ await step('rbac: route matrix on the real server — granted only by capability
     ['/api/couriers', 'POST', {}, { log: 403, multi: 403, lview: 403, adm: 'ok' }],
     ['/api/destinations', 'POST', {}, { log: 403, adm: 'ok' }],
     ['/api/inventory', 'GET', null, { log: 'ok', invOnly: 'ok', multi: 'ok', adm: 'ok', lview: 403, call: 403, none: 403 }],
+    ['/api/inventory/cutover', 'GET', null, { log: 'ok', invOnly: 'ok', lview: 403, call: 403 }],
+    ['/api/inventory/cutover', 'PUT', {}, { log: 403, lview: 403, call: 403, none: 403, invOnly: 'ok', multi: 'ok', adm: 'ok' }],
     ['/api/inventory/receive', 'POST', {}, { log: 403, lview: 403, call: 403, multi: 'ok', invOnly: 'ok', adm: 'ok' }],
     ['/api/inventory/skus', 'POST', {}, { log: 403, multi: 'ok', invOnly: 'ok', adm: 'ok' }],
     ['/api/inventory/platforms', 'POST', {}, { log: 403, multi: 'ok' }],
