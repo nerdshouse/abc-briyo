@@ -6542,6 +6542,44 @@ await step('referral: attribution through the existing Shopify sync — last eli
   return '9 orders: last click (incl. across affiliates) wins, bref/click mismatch and unknown click ignored, affiliate coupon beats the click, a non-affiliate coupon does not, ordered-before-click ignored, legacy keys read; preview = commit (5); re-sync idempotent; suspended affiliate loses new orders to the previous eligible click; 30 → 60-day window read from settings; rule v1 stored; totals, snapshots and stock untouched; DB refuses a second or orphan attribution and edits';
 });
 
+await step('affiliate commissions through the real Shopify sync: snapshot → attribution → one commission (rate, base, amount), a re-run sync adds nothing', async () => {
+  const bad = [];
+  const pool = getPool();
+  // An eligible affiliate WITH a rate (12.5%, effective before the click), a real click on its link, and a new order carrying it.
+  const D = await eligibleAffiliate('Ref commission');
+  const { rows: [d] } = await pool.query('SELECT id FROM affiliates WHERE public_id = $1', [D]);
+  await pool.query(`INSERT INTO affiliate_rates (affiliate_id, rate_bps, effective_from, created_by, reason) VALUES ($1, 1250, now() - interval '1 day', 'db-check', 'commission sync test')`, [d.id]);
+  const click = await goReq(`/r/${D}`, { ip: '203.0.113.77' });
+  const att = [{ key: '__briyo_ref', value: D }, { key: '__briyo_click', value: clickOf(click) }];
+  const store = [shOrder(950, { created: new Date().toISOString(), attributes: att, total: 1299, subtotal: 1250 })];
+  const gql = shFake(() => store);
+  const source = `${SH_PREFIX}0950`;
+  const state = async () => (await pool.query(`
+    SELECT o.id AS order_id,
+           (SELECT count(*)::int FROM order_financial_snapshots s WHERE s.order_id = o.id) AS snapshots,
+           (SELECT count(*)::int FROM affiliate_order_attributions t WHERE t.order_id = o.id) AS attributions,
+           (SELECT count(*)::int FROM affiliate_commissions c WHERE c.order_id = o.id) AS commissions
+    FROM orders o WHERE o.source_order_id = $1`, [source])).rows[0];
+  const r1 = await runShopifySync({ window: { days: 3 }, dryRun: false, gql, actor: SH_ACTOR });
+  const s1 = await state();
+  if (!s1 || s1.snapshots !== 1 || s1.attributions !== 1 || s1.commissions !== 1 || r1.summary.affiliateAttributionsRecorded !== 1) bad.push(`first sync ${JSON.stringify([s1, r1.summary.affiliateAttributionsRecorded])}`);
+  const { rows: [c] } = await pool.query(`SELECT c.*, a.public_id, s.current_subtotal::text AS sub, s.current_total_tax::text AS tax, (s.current_subtotal - s.current_total_tax)::text AS want_base,
+      round((s.current_subtotal - s.current_total_tax) * 1250 / 10000, 2)::text AS want_amount, t.id AS attribution
+    FROM affiliate_commissions c JOIN affiliates a ON a.id = c.affiliate_id JOIN order_financial_snapshots s ON s.id = c.snapshot_id
+    JOIN affiliate_order_attributions t ON t.id = c.attribution_id WHERE c.order_id = $1`, [s1?.order_id]);
+  // Shopify reports subtotal 1250.00 and tax 198.15 for this order → base 1051.85, 12.5% → 131.48 (from the stored fields).
+  if (!c || c.public_id !== D || c.rate_bps !== 1250 || c.status !== 'pending' || c.currency !== 'INR'
+    || c.base_amount !== c.want_base || c.commission_amount !== c.want_amount || c.want_base !== '1051.85' || c.want_amount !== '131.48') bad.push(`commission ${JSON.stringify(c)}`);
+  // The same sync again: no second attribution or commission; the commission is untouched.
+  const r2 = await runShopifySync({ window: { days: 3 }, dryRun: false, gql, actor: SH_ACTOR });
+  const s2 = await state();
+  const { rows: [c2] } = await pool.query('SELECT * FROM affiliate_commissions WHERE order_id = $1', [s1?.order_id]);
+  if (s2.attributions !== 1 || s2.commissions !== 1 || r2.summary.affiliateAttributionsRecorded !== 0) bad.push(`re-sync ${JSON.stringify([s2, r2.summary.affiliateAttributionsRecorded])}`);
+  if (JSON.stringify(c2) !== JSON.stringify((({ public_id, sub, tax, want_base, want_amount, attribution, ...rest }) => rest)(c))) bad.push('re-sync changed the commission');
+  if (bad.length) throw new Error(bad.join(' | '));
+  return `runShopifySync: snapshot 1, attribution 1, commission 1 at 12.5% on ${c.sub} − ${c.tax} = ${c.base_amount} → ${c.commission_amount} INR (pending); re-run: attributions 1, commissions 1, commission unchanged`;
+});
+
 await step('referral: GoKwik fallback (rule v2) — /r/{id} in full_url + a recorded click; UTMs alone never; v1 unchanged', async () => {
   const bad = [];
   const keepShop = process.env.SHOPIFY_STORE_DOMAIN;
@@ -6847,9 +6885,200 @@ await step('units per listing through the Inventory API and page: create (defaul
   return 'API: omitted → 1, 2, 10 stored; 0 / −1 / 1.5 / empty refused (400); shown on the master; edited 2 → 3; 0 refused; locked (409) while reserved; 3 ordered × 3 = 9 inventory units, order line still 3; audited; non-Inventory member 403; only the 3 asked-for mappings exist; page has the field, helper, "Units/listing" label and an edit form';
 });
 
+await step('affiliate commissions: one per attribution, rate and base fixed at creation (net subtotal excl. recorded tax: ₹215 − ₹41.64 = ₹173.36 × 12.5% = ₹21.67), idempotent, currency kept, cancelled / missing record / no rate handled, status changes audited, money gated', async () => {
+  const bad = [];
+  const pool = getPool();
+  const { attributeOrder } = await import('../lib/affiliate-referrals.js');
+  const { getAffiliatePerformance, setCommissionStatus, backfillAffiliateCommissions } = await import('../lib/affiliate-commissions.js');
+  const { tx: aTx } = await import('../lib/affiliates.js');
+  const ACT = 'db-check-commissions';
+  const P = `${TEST_ORDER}-CM`;
+  await purgeTestOrders(P); await purgeTestAffiliates(ACT);
+  const { rows: [cat] } = await pool.query(`SELECT key FROM affiliate_categories WHERE NOT requires_verification ORDER BY sort LIMIT 1`);
+  const mkAff = async (pid, rateBps) => {
+    const { rows: [a] } = await pool.query(`INSERT INTO affiliates (public_id, category, display_name, status, activated_at, created_by) VALUES ($1, $2, $3, 'active', now(), $4) RETURNING id`, [pid, cat.key, `DBCHECK-AF ${pid}`, ACT]);
+    if (rateBps !== null) await pool.query(`INSERT INTO affiliate_rates (affiliate_id, rate_bps, effective_from, created_by) VALUES ($1, $2, now() - interval '2 days', $3)`, [a.id, rateBps, ACT]);
+    await pool.query(`INSERT INTO affiliate_referral_assets (public_id, affiliate_id, type, code, created_by, created_at) VALUES ($1, $2, 'coupon', $3, $4, now() - interval '1 day')`, [`${pid}CPN2`.slice(0, 10).padEnd(10, '2'), a.id, `CM-${pid}`, ACT]);
+    return Number(a.id);
+  };
+  const A = await mkAff('CMAXQT', 1250);
+  const N = await mkAff('CMNRQT', null);   // no rate
+  let gid = 991000200;
+  // value = current_total_price; sub / tax / ship = current_subtotal / current_total_tax / current_shipping.
+  const order = async (tag, { value = null, sub = value, tax = '0', ship = '0', cur = 'INR', cancelled = false } = {}) => {
+    const { rows: [o] } = await pool.query(`INSERT INTO orders (channel, source_order_id, source, order_status, order_date, created_by, source_payload)
+      VALUES ('website', $1, 'shopify_sync', $2, now() - interval '1 hour', $3, $4) RETURNING id`,
+    [`${P}-${tag}`, cancelled ? 'cancelled' : 'new', ACT, JSON.stringify({ shopify: { name: `#CM${tag}` } })]);
+    if (value !== null) {
+      gid += 1;
+      await pool.query(`INSERT INTO order_financial_snapshots (order_id, shopify_order_gid, sequence, content_hash, shop_currency, presentment_currency, taxes_included,
+          financial_status, cancelled_at, current_subtotal, current_total_tax, current_shipping, current_total_discounts, current_total_price, total_price, total_refunded, total_refunded_shipping, money)
+        VALUES ($1, $2, 1, $3, $4, $4, true, 'PENDING', $5, $7, $8, $9, 0, $6, $6, 0, 0, '{}')`,
+      [o.id, `gid://shopify/Order/${gid}`, crypto.createHash('sha256').update(`cm-${tag}`).digest('hex'), cur, cancelled ? new Date() : null, value, sub, tax, ship]);
+    }
+    return Number(o.id);
+  };
+  const attribute = (orderId, code) => aTx((client) => attributeOrder(client, orderId, { orderedAt: new Date(Date.now() - 3600000).toISOString(), discountCodes: [code], customAttributes: [] }, { actor: ACT }));
+  const commissionsOf = async (orderId) => (await pool.query('SELECT * FROM affiliate_commissions WHERE order_id = $1', [orderId])).rows;
+  // 1. A #2806-style order: subtotal ₹215.00, recorded tax ₹41.64, shipping ₹58.00, total ₹273.00.
+  //    Base = Shopify net subtotal excluding recorded tax, computed from the stored fields → one commission at 12.5%.
+  const o1 = await order('2809', { value: '273.00', sub: '215.00', tax: '41.64', ship: '58.00' });
+  const r1 = await attribute(o1, 'CM-CMAXQT');
+  let c1 = await commissionsOf(o1);
+  if (!c1.length) throw new Error(`no commission for the ₹273 order: ${JSON.stringify(r1)} ${JSON.stringify((await pool.query(`SELECT action, metadata FROM affiliate_events WHERE affiliate_id = $1`, [A])).rows)}`);
+  const { rows: [want1] } = await pool.query(`SELECT (current_subtotal - current_total_tax)::text AS base, round((current_subtotal - current_total_tax) * 1250 / 10000, 2)::text AS amount FROM order_financial_snapshots WHERE order_id = $1`, [o1]);
+  if (want1.base !== '173.36' || want1.amount !== '21.67') bad.push(`fixture arithmetic ${JSON.stringify(want1)}`);
+  if (!r1?.recorded || r1.commission !== true || c1.length !== 1 || c1[0].rate_bps !== 1250 || c1[0].base_amount !== want1.base || c1[0].commission_amount !== want1.amount || c1[0].currency !== 'INR' || c1[0].status !== 'pending') bad.push(`base commission ${JSON.stringify([r1, c1[0]])}`);
+  if (c1[0].base_amount === '273.00' || c1[0].base_amount === '215.00') bad.push('base still includes tax or shipping');
+  // 2. Re-attribution / re-sync and a direct retry: still one.
+  const r1b = await attribute(o1, 'CM-CMAXQT');
+  const { createCommissionForAttribution } = await import('../lib/affiliate-commissions.js');
+  const retry = await aTx((client) => createCommissionForAttribution(client, c1[0].attribution_id, { actor: ACT }));
+  if (r1b?.recorded !== false || retry.created || (await commissionsOf(o1)).length !== 1) bad.push('duplicate commission');
+  // 3. A new rate does not change the recorded commission; the row's rate and amounts cannot be edited.
+  await pool.query(`INSERT INTO affiliate_rates (affiliate_id, rate_bps, effective_from, created_by) VALUES ($1, 1000, now(), $2)`, [A, ACT]);
+  c1 = await commissionsOf(o1);
+  if (c1[0].rate_bps !== 1250 || c1[0].commission_amount !== '21.67' || c1[0].base_amount !== '173.36') bad.push('rate change touched the commission');
+  await expectErr('edit amount', () => pool.query('UPDATE affiliate_commissions SET commission_amount = 1 WHERE id = $1', [c1[0].id]), (e) => /fixed when it is created/.test(e.message));
+  await expectErr('delete', () => pool.query('DELETE FROM affiliate_commissions WHERE id = $1', [c1[0].id]), (e) => /never deleted/.test(e.message));
+  // 4. Currency kept: a USD order → its own commission in USD, at the rate in effect when ITS attribution was
+  //    created — after the new 10% rate — while the earlier commission keeps 12.5%.
+  const oUsd = await order('USD', { value: '20.00', cur: 'USD' });
+  await attribute(oUsd, 'CM-CMAXQT');
+  const cu = (await commissionsOf(oUsd))[0];
+  if (!cu || cu.currency !== 'USD' || cu.commission_amount !== '2.00' || cu.rate_bps !== 1000) bad.push(`USD ${JSON.stringify(cu)}`);
+  if ((await commissionsOf(o1))[0].rate_bps !== 1250) bad.push('earlier commission lost its rate');
+  // 4b. An order already cancelled / voided when attributed → no commission, logged.
+  const oVoid = await order('VOIDED', { value: '300.00', sub: '300.00', cancelled: true });
+  await attribute(oVoid, 'CM-CMAXQT');
+  if ((await commissionsOf(oVoid)).length) bad.push('commission on a cancelled order');
+  // 5. No financial record → no commission (never ₹0), logged; created later by the backfill once the record exists.
+  const oNone = await order('NOREC');
+  await attribute(oNone, 'CM-CMAXQT');
+  if ((await commissionsOf(oNone)).length) bad.push('commission without a financial record');
+  // 6. No rate in effect → no commission, logged.
+  const oNoRate = await order('NORATE', { value: '100.00' });
+  await attribute(oNoRate, 'CM-CMNRQT');
+  if ((await commissionsOf(oNoRate)).length) bad.push('commission without a rate');
+  const skipped = (await pool.query(`SELECT metadata->>'skipped' AS s FROM affiliate_events WHERE action = 'commission_not_created' AND affiliate_id = ANY($1) ORDER BY id`, [[A, N]])).rows.map((r) => r.s);
+  if (skipped.join() !== 'order_cancelled,no_financial_snapshot,no_rate') bad.push(`skip log ${skipped.join()}`);
+  gid += 1;
+  await pool.query(`INSERT INTO order_financial_snapshots (order_id, shopify_order_gid, sequence, content_hash, shop_currency, presentment_currency, taxes_included,
+      financial_status, current_subtotal, current_total_tax, current_shipping, current_total_discounts, current_total_price, total_price, total_refunded, total_refunded_shipping, money)
+    VALUES ($1, $2, 1, $3, 'INR', 'INR', true, 'PAID', 80, 0, 0, 0, 80, 80, 0, 0, '{}')`, [oNone, `gid://shopify/Order/${gid}`, crypto.createHash('sha256').update('cm-late').digest('hex')]);
+  // A #2809-like attribution made before the ledger existed (no commission_not_created log) is never backfilled,
+  // even with a financial record; nor is the voided one (still cancelled).
+  const oPre = await order('PRELEDGER', { value: '273.00', sub: '215.00', tax: '41.64', ship: '58.00' });
+  await pool.query(`INSERT INTO affiliate_order_attributions (order_id, affiliate_id, attribution_method, order_placed_at, rule_version, attributed_at) VALUES ($1, $2, 'gokwik_full_url', now() - interval '1 hour', 'v2', now() - interval '1 hour')`, [oPre, A]);
+  const bf = await backfillAffiliateCommissions({ actor: ACT });
+  const bf2 = await backfillAffiliateCommissions({ actor: ACT });
+  const late = (await commissionsOf(oNone))[0];
+  if (!late || late.commission_amount !== '8.00' || bf.created !== 1 || bf2.created !== 0) bad.push(`backfill ${JSON.stringify([bf, bf2, late?.commission_amount])}`);
+  if ((await commissionsOf(oPre)).length || (await commissionsOf(oVoid)).length) bad.push('pre-ledger or voided attribution backfilled');
+  // 7. Cancelled after the commission: kept, flagged, not counted as earned; finance staff reverse it (reason required), amounts kept.
+  const oCan = await order('CANCEL', { value: '400.00' });
+  await attribute(oCan, 'CM-CMAXQT');
+  await pool.query(`UPDATE orders SET order_status = 'cancelled' WHERE id = $1`, [oCan]);
+  let perf = await getAffiliatePerformance('CMAXQT', { money: true });
+  const inr = perf.totals.by_currency.find((x) => x.currency === 'INR');
+  // INR earned: 21.67 (12.5%) + 8.00 (10% on ₹80); the cancelled order's 40.00 apart; order value 273 + 80 + 273 (pre-ledger, no commission).
+  if (inr.commission_earned !== 29.67 || inr.on_cancelled_orders !== 40 || inr.order_value !== 626 || !perf.orders.find((o) => o.order === '#CMCANCEL').cancelled) bad.push(`INR totals ${JSON.stringify(inr)}`);
+  if (perf.totals.by_currency.find((x) => x.currency === 'USD').commission_earned !== 2) bad.push('USD totals');
+  // The earned breakdown reconciles: pending + approved + paid = commission earned, per currency; the cancelled
+  // order's 40.00 is only in on_cancelled_orders (not in pending).
+  for (const x of perf.totals.by_currency) {
+    const sum = Math.round((x.by_status.pending + x.by_status.approved + x.by_status.paid) * 100) / 100;
+    if (sum !== x.commission_earned) bad.push(`${x.currency} breakdown ${sum} ≠ earned ${x.commission_earned}`);
+  }
+  if (inr.by_status.pending !== 29.67 || inr.on_cancelled_orders !== 40) bad.push(`cancelled commission in the pending breakdown ${JSON.stringify(inr.by_status)}`);
+  const afSrc = await fsp.readFile(new URL('../public/affiliates.js', import.meta.url), 'utf8');
+  if (!/on_cancelled_orders \? `\$\{esc\(cash\(c\.currency, c\.on_cancelled_orders\)\)\} on cancelled orders, not counted`/.test(afSrc)) bad.push('cancelled commission no longer shown apart on the page');
+  const cc = (await commissionsOf(oCan))[0];
+  await expectErr('reverse without reason', () => setCommissionStatus('CMAXQT', Number(cc.id), { status: 'reversed', actor: ACT }), (e) => e.status === 400);
+  await setCommissionStatus('CMAXQT', Number(cc.id), { status: 'reversed', reason: 'Order cancelled', actor: ACT });
+  const ccAfter = (await commissionsOf(oCan))[0];
+  if (ccAfter.status !== 'reversed' || ccAfter.commission_amount !== '40.00' || ccAfter.rate_bps !== 1000 || ccAfter.base_amount !== '400.00' || ccAfter.status_reason !== 'Order cancelled') bad.push('reversal');
+  // 8. Status path pending → approved → paid; illegal moves refused; every move in the history and the activity log.
+  await expectErr('pending → paid', () => setCommissionStatus('CMAXQT', Number(c1[0].id), { status: 'paid', actor: ACT }), (e) => e.status === 409);
+  await setCommissionStatus('CMAXQT', Number(c1[0].id), { status: 'approved', actor: ACT });
+  await setCommissionStatus('CMAXQT', Number(c1[0].id), { status: 'paid', actor: ACT });
+  await expectErr('reversed → approved', () => setCommissionStatus('CMAXQT', Number(cc.id), { status: 'approved', actor: ACT }), (e) => e.status === 409);
+  const hist = (await pool.query('SELECT from_status, to_status FROM affiliate_commission_events WHERE commission_id = $1 ORDER BY id', [c1[0].id])).rows.map((r) => `${r.from_status}>${r.to_status}`).join(',');
+  if (hist !== 'null>pending,pending>approved,approved>paid') bad.push(`history ${hist}`);
+  await expectErr('history edit', () => pool.query('UPDATE affiliate_commission_events SET reason = $2 WHERE commission_id = $1', [c1[0].id, 'x']), (e) => /append-only/.test(e.message));
+  // The same rules hold in the database itself, not just in the application (raw SQL around setCommissionStatus).
+  await expectErr('db: delete history', () => pool.query('DELETE FROM affiliate_commission_events WHERE commission_id = $1', [c1[0].id]), (e) => /never deleted/.test(e.message));
+  await expectErr('db: reversed → approved', () => pool.query(`UPDATE affiliate_commissions SET status = 'approved' WHERE id = $1`, [cc.id]), (e) => /reversed commission cannot become approved/.test(e.message));
+  await expectErr('db: paid → pending', () => pool.query(`UPDATE affiliate_commissions SET status = 'pending' WHERE id = $1`, [c1[0].id]), (e) => /paid commission cannot become pending/.test(e.message));
+  const { rows: [pend] } = await pool.query(`SELECT id FROM affiliate_commissions WHERE order_id = $1`, [oUsd]);
+  await expectErr('db: pending → paid', () => pool.query(`UPDATE affiliate_commissions SET status = 'paid' WHERE id = $1`, [pend.id]), (e) => /pending commission cannot become paid/.test(e.message));
+  await expectErr('db: reverse without reason', () => pool.query(`UPDATE affiliate_commissions SET status = 'reversed', status_reason = NULL WHERE id = $1`, [pend.id]), (e) => /affiliate_commissions_reversal_reason/.test(e.message));
+  await expectErr('db: reverse with blank reason', () => pool.query(`UPDATE affiliate_commissions SET status = 'reversed', status_reason = '  ' WHERE id = $1`, [pend.id]), (e) => /affiliate_commissions_reversal_reason/.test(e.message));
+  await expectErr('db: second commission for one attribution', () => pool.query(
+    `INSERT INTO affiliate_commissions (affiliate_id, attribution_id, order_id, currency, rate_bps, base_amount, commission_amount) SELECT affiliate_id, attribution_id, order_id, currency, rate_bps, base_amount, commission_amount FROM affiliate_commissions WHERE id = $1`, [pend.id]),
+  (e) => /affiliate_commissions_attribution_key/.test(e.message));
+  await expectErr('db: created as paid', () => pool.query(
+    `INSERT INTO affiliate_commissions (affiliate_id, attribution_id, order_id, currency, rate_bps, base_amount, commission_amount, status) SELECT affiliate_id, attribution_id, order_id, currency, rate_bps, base_amount, commission_amount, 'paid' FROM affiliate_commissions WHERE id = $1`, [pend.id]),
+  (e) => /created as pending/.test(e.message));
+  if ((await pool.query('SELECT status FROM affiliate_commissions WHERE id = $1', [pend.id])).rows[0].status !== 'pending') bad.push('a refused raw update changed the status');
+  const logged = (await pool.query(`SELECT action FROM affiliate_events WHERE affiliate_id = $1 AND action LIKE 'commission_%' ORDER BY id`, [A])).rows.map((r) => r.action);
+  for (const want of ['commission_created', 'commission_not_created', 'commission_reversed', 'commission_approved', 'commission_paid']) if (!logged.includes(want)) bad.push(`audit ${want}`);
+  // 9. API: admins and finance staff see money; a viewer sees orders without money fields (absent, not zero); viewers cannot move statuses.
+  const adm = await af('adm', 'GET', '/api/affiliates/CMAXQT/performance');
+  const fin = await af('finance', 'GET', '/api/affiliates/CMAXQT/performance');
+  const vw = await af('viewer', 'GET', '/api/affiliates/CMAXQT/performance');
+  const o2809 = (r) => r.body.performance?.orders.find((o) => o.order === '#CM2809');
+  if (adm.status !== 200 || !adm.body.money || o2809(adm)?.order_value !== 273 || o2809(adm)?.commission?.amount !== 21.67 || o2809(adm)?.commission?.base_amount !== 173.36 || o2809(adm)?.commission?.rate_bps !== 1250 || o2809(adm)?.commission?.status !== 'paid') bad.push(`admin view ${JSON.stringify(o2809(adm))}`);
+  if (fin.status !== 200 || !fin.body.money || !fin.body.canApprove || !fin.body.canPay) bad.push('finance view');
+  const v = o2809(vw);
+  if (vw.status !== 200 || vw.body.money || !v || 'order_value' in v || 'commission' in v || 'currency' in v || 'totals' in vw.body.performance) bad.push(`viewer saw money ${JSON.stringify(vw.body.performance)}`);
+  if (vw.body.performance?.clicks?.total === undefined || vw.body.performance.attributions.total !== 6) bad.push('viewer counts');
+  const vMove = await af('viewer', 'POST', `/api/affiliates/CMAXQT/commissions/${late.id}/status`, { status: 'approved' });
+  const mMove = await af('manager', 'POST', `/api/affiliates/CMAXQT/commissions/${late.id}/status`, { status: 'approved' });
+  const fMove = await af('finance', 'POST', `/api/affiliates/CMAXQT/commissions/${late.id}/status`, { status: 'approved' });
+  if (vMove.status !== 403 || mMove.status !== 403 || fMove.status !== 200) bad.push(`status moves ${vMove.status}/${mMove.status}/${fMove.status}`);
+  // Only mapped statuses can be requested — pending or an unknown status is refused before the commission is read,
+  // for every role (the database lifecycle is not the authorization boundary), and the answer reveals nothing.
+  for (const who of ['manager', 'finance', 'adm']) {
+    for (const status of ['pending', 'bogus', '', 'constructor', '__proto__']) {
+      const r = await af(who, 'POST', `/api/affiliates/CMAXQT/commissions/${late.id}/status`, { status });
+      if (r.status !== 403 || r.body.error !== 'That status cannot be set.') bad.push(`${who} ${JSON.stringify(status)} → ${r.status} ${r.body.error}`);
+    }
+  }
+  if ((await commissionsOf(oNone))[0].status !== 'approved') bad.push('a refused request changed the commission');
+  // The activity log never shows amounts.
+  const ev = await af('viewer', 'GET', '/api/affiliates/CMAXQT');
+  if (/21\.67|173\.36|₹|commission_amount/.test(JSON.stringify(ev.body.events || ev.body))) bad.push('amounts in the activity log');
+  // "Clicks in the last 30 days" = the last 30 IST calendar days, today included: a click at 00:00 IST 29 days
+  // ago counts; one a second earlier does not (a rolling 30×24h window would count both or neither).
+  const { rows: [b30] } = await pool.query(`SELECT ((((now() AT TIME ZONE 'Asia/Kolkata')::date - 29)::timestamp) AT TIME ZONE 'Asia/Kolkata') AS since`);
+  const { rows: [asset] } = await pool.query(`SELECT id FROM affiliate_referral_assets WHERE affiliate_id = $1 LIMIT 1`, [A]);
+  const c30 = async () => (await getAffiliatePerformance('CMAXQT')).clicks;
+  const before30 = await c30();
+  await pool.query(`INSERT INTO affiliate_referral_clicks (public_id, affiliate_id, referral_asset_id, visitor_id, clicked_at) VALUES
+    ('cmIstBoundaryClick0001', $1, $2, 'cmIstBoundaryVisitor01', $3), ('cmIstBoundaryClick0002', $1, $2, 'cmIstBoundaryVisitor02', $3::timestamptz - interval '1 second')`, [A, asset.id, b30.since]);
+  const after30 = await c30();
+  if (after30.total - before30.total !== 2 || after30.last_30_days - before30.last_30_days !== 1) bad.push(`IST 30-day window ${JSON.stringify([before30, after30])}`);
+  if (new Date(b30.since).getUTCHours() !== 18 || new Date(b30.since).getUTCMinutes() !== 30) bad.push(`window does not start at 00:00 IST: ${new Date(b30.since).toISOString()}`);
+  // The New affiliate drawer keeps its fixes: padded form, scrolling body, in-drawer discard (no native confirm).
+  const afPage = await fsp.readFile(new URL('../public/affiliates.js', import.meta.url), 'utf8');
+  const afHtml = await fsp.readFile(new URL('../public/affiliates.html', import.meta.url), 'utf8');
+  const uiCss = await fsp.readFile(new URL('../public/ui.css', import.meta.url), 'utf8');
+  if (/window\.confirm\('Discard your unsaved changes\?'\)/.test(afPage) || !/state\.discardAsked/.test(afPage) || !afHtml.includes('id="dDiscard"') || !afHtml.includes('Keep editing')
+    || !afHtml.includes('class="drawer af-drawer"') || !/\.af-drawer \.drawer-body > form \{ padding/.test(uiCss) || !/\.drawer-body \{ overflow-y: auto; flex: 1; min-height: 0; \}/.test(uiCss)
+    || !/\$\('#dClose'\)\.addEventListener\('click'/.test(afPage) || !/drawerScrim'\)\.addEventListener\('click'/.test(afPage) || !/e\.key === 'Escape'\) closeDrawer\(\)/.test(afPage)) bad.push('drawer fixes');
+  // Recorded tax larger than the subtotal → no commission (negative base), logged; never a guessed amount.
+  const oNeg = await order('NEG', { value: '10.00', sub: '10.00', tax: '12.00' });
+  await attribute(oNeg, 'CM-CMAXQT');
+  if ((await commissionsOf(oNeg)).length) bad.push('commission on a negative base');
+  await purgeTestOrders(P); await purgeTestAffiliates(ACT);
+  if (bad.length) throw new Error(bad.join(' | '));
+  return 'base = subtotal ₹215.00 − recorded tax ₹41.64 = ₹173.36 (shipping ₹58 and tax excluded) × 12.5% → one ₹21.67 commission (rate 1250 kept after a new 10% rate; amounts and history immutable); negative base → none; USD kept as USD ₹→$2.50; no record / no rate / voided → none, logged; retried by the backfill only when skipped-and-logged (pre-ledger #2809-like never); cancelled order flagged, not earned, reversed with a reason; pending→approved→paid audited, illegal moves 409; admin/finance see money, viewer gets no money fields and cannot move statuses; activity shows no amounts';
+});
+
 await step('affiliates admin cleanup', async () => {
   let n = 0;
-  for (const actor of [...Object.values(AFN), 'HR admin', 'db-check-overview-commerce']) {
+  for (const actor of [...Object.values(AFN), 'HR admin', 'db-check-overview-commerce', 'db-check-commissions']) {
     const r = await purgeTestAffiliates(actor);
     n += r.affiliates;
     // Verification documents written by these tests (the throwaway local store).

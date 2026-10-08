@@ -41,18 +41,22 @@
 
       <div id="alerts"></div>
       <div id="view"><section class="card"><div class="empty-note" aria-busy="true">Loading affiliates…</div></section></div>
-      <p class="footnote" id="footnote">Partner records only. Referral links, attribution, commissions and payouts are not part of Briyo OS yet.</p>
+      <p class="footnote" id="footnote">Partners, referral links, attributed orders and commissions. Payouts are not part of Briyo OS yet.</p>
     </main>
   </div>
 </div>
 
 <div class="drawer-scrim" id="drawerScrim" hidden></div>
-<aside class="drawer" id="drawer" hidden aria-label="Affiliate form">
+<aside class="drawer af-drawer" id="drawer" hidden aria-label="Affiliate form">
   <div class="drawer-head">
     <div style="min-width:0"><h2 class="drawer-title" id="dTitle"></h2><div class="drawer-sub" id="dSub"></div></div>
     <div class="drawer-nav"><button class="icon-btn" id="dClose" type="button" title="Close" aria-label="Close"><i data-lucide="x"></i></button></div>
   </div>
   <div class="drawer-body" id="dBody"></div>
+  <div class="af-discard" id="dDiscard" role="alertdialog" aria-label="Discard unsaved changes" hidden>
+    <span>Discard your unsaved changes?</span>
+    <span class="af-discard-actions"><button class="btn" type="button" id="dDiscardNo">Keep editing</button><button class="btn danger" type="button" id="dDiscardYes">Discard</button></span>
+  </div>
   <div class="drawer-foot" id="dFoot">
     <span class="saved" id="dSaved" aria-live="polite"></span>
     <div style="display:flex;gap:8px" id="dButtons"></div>
