@@ -6959,6 +6959,21 @@ await step('affiliate commissions: one per attribution, rate and base fixed at c
   const hist = (await pool.query('SELECT from_status, to_status FROM affiliate_commission_events WHERE commission_id = $1 ORDER BY id', [c1[0].id])).rows.map((r) => `${r.from_status}>${r.to_status}`).join(',');
   if (hist !== 'null>pending,pending>approved,approved>paid') bad.push(`history ${hist}`);
   await expectErr('history edit', () => pool.query('UPDATE affiliate_commission_events SET reason = $2 WHERE commission_id = $1', [c1[0].id, 'x']), (e) => /append-only/.test(e.message));
+  // The same rules hold in the database itself, not just in the application (raw SQL around setCommissionStatus).
+  await expectErr('db: delete history', () => pool.query('DELETE FROM affiliate_commission_events WHERE commission_id = $1', [c1[0].id]), (e) => /never deleted/.test(e.message));
+  await expectErr('db: reversed → approved', () => pool.query(`UPDATE affiliate_commissions SET status = 'approved' WHERE id = $1`, [cc.id]), (e) => /reversed commission cannot become approved/.test(e.message));
+  await expectErr('db: paid → pending', () => pool.query(`UPDATE affiliate_commissions SET status = 'pending' WHERE id = $1`, [c1[0].id]), (e) => /paid commission cannot become pending/.test(e.message));
+  const { rows: [pend] } = await pool.query(`SELECT id FROM affiliate_commissions WHERE order_id = $1`, [oUsd]);
+  await expectErr('db: pending → paid', () => pool.query(`UPDATE affiliate_commissions SET status = 'paid' WHERE id = $1`, [pend.id]), (e) => /pending commission cannot become paid/.test(e.message));
+  await expectErr('db: reverse without reason', () => pool.query(`UPDATE affiliate_commissions SET status = 'reversed', status_reason = NULL WHERE id = $1`, [pend.id]), (e) => /affiliate_commissions_reversal_reason/.test(e.message));
+  await expectErr('db: reverse with blank reason', () => pool.query(`UPDATE affiliate_commissions SET status = 'reversed', status_reason = '  ' WHERE id = $1`, [pend.id]), (e) => /affiliate_commissions_reversal_reason/.test(e.message));
+  await expectErr('db: second commission for one attribution', () => pool.query(
+    `INSERT INTO affiliate_commissions (affiliate_id, attribution_id, order_id, currency, rate_bps, base_amount, commission_amount) SELECT affiliate_id, attribution_id, order_id, currency, rate_bps, base_amount, commission_amount FROM affiliate_commissions WHERE id = $1`, [pend.id]),
+  (e) => /affiliate_commissions_attribution_key/.test(e.message));
+  await expectErr('db: created as paid', () => pool.query(
+    `INSERT INTO affiliate_commissions (affiliate_id, attribution_id, order_id, currency, rate_bps, base_amount, commission_amount, status) SELECT affiliate_id, attribution_id, order_id, currency, rate_bps, base_amount, commission_amount, 'paid' FROM affiliate_commissions WHERE id = $1`, [pend.id]),
+  (e) => /created as pending/.test(e.message));
+  if ((await pool.query('SELECT status FROM affiliate_commissions WHERE id = $1', [pend.id])).rows[0].status !== 'pending') bad.push('a refused raw update changed the status');
   const logged = (await pool.query(`SELECT action FROM affiliate_events WHERE affiliate_id = $1 AND action LIKE 'commission_%' ORDER BY id`, [A])).rows.map((r) => r.action);
   for (const want of ['commission_created', 'commission_not_created', 'commission_reversed', 'commission_approved', 'commission_paid']) if (!logged.includes(want)) bad.push(`audit ${want}`);
   // 9. API: admins and finance staff see money; a viewer sees orders without money fields (absent, not zero); viewers cannot move statuses.
