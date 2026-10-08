@@ -56,7 +56,7 @@ import nodeCrypto from 'node:crypto';
 import { metricsFrom, rawFromRow, rangeParams, classifyMetaError, createMetaClient, createCache, MetaError, createMetaService, metaConfig, todayIn, resolvePurchaseType, _resetMetaService, billingFrom } from '../lib/meta-ads.js';
 import { overviewFor } from '../lib/overview.js';
 import { ensureAffiliateSchema, newAffiliatePublicId, rateAt, getAffiliateSetting, setAffiliateSetting, purgeTestAffiliates, _resetAffiliateSchemaForTest, createAffiliate } from '../lib/affiliates.js';
-import { runShopifySync, mapShopifyOrder, shopifyPaymentMethod, shopifyPaymentStatus, shopifyOrdersStatus } from '../lib/shopify-orders.js';
+import { runShopifySync, mapShopifyOrder, shopifyPaymentMethod, shopifyPaymentStatus, shopifyOrdersStatus, pollShopifyOrdersOnce, ordersPollMinutes } from '../lib/shopify-orders.js';
 import { ensureOrderFinancialSnapshotSchema, financialSnapshotFrom, addAmounts, FINANCIAL_TABLES } from '../lib/order-financial-snapshots.js';
 import { SHOPIFY_MAX_QUERY_COST, SHOPIFY_ORDER_QUERIES, LIMITS as SHOPIFY_LIMITS, shopifyOrderQuery, estimateShopifyOrderQueryCost } from '../lib/shopify-order-queries.js';
 import { istDateTime, istDate, istTime, istDayKey as uiIstDayKey } from '../public/ui/ist.js';
@@ -4174,6 +4174,87 @@ await step('shopify orders: transient Shopify failures (503, connection reset) a
   return '503 → retry → ok; reset → retry → ok; 503 ×3 → fails after 3 attempts; 400 and GraphQL errors not retried; 429 still on its own policy; a failing page leaves earlier pages applied whole and itself unapplied; a retried page completes the import with no duplicate orders or snapshots; a further run is idempotent; retries logged without the token';
 });
 
+await step('shopify orders: automatic poll — the existing incremental sync on a timer; no overlap, checkpoint only on success, duplicates held, SKUs unchanged, no stock side effects', async () => {
+  const bad = [];
+  const CK = 'shopify_orders_checkpoint';
+  const ckNow = async () => (await getPool().query('SELECT value FROM system_state WHERE key = $1', [CK])).rows[0]?.value || null;
+  const setCk = async (v) => (v === null ? getPool().query('DELETE FROM system_state WHERE key = $1', [CK])
+    : getPool().query(`INSERT INTO system_state (key, value, updated_at) VALUES ($1, $2, now()) ON CONFLICT (key) DO UPDATE SET value = $2, updated_at = now()`, [CK, v]));
+  const savedCk = await ckNow();
+  // A master, a website listing of it (×2), and five Shopify orders updated in the last minutes.
+  const mPoll = (await createSku({ sku: `${TS}-POLL-M`, product_name: 'Poll test master' }, { actor: ACTOR })).id;
+  await addPlatformMappings(mPoll, 'website', [`${TS}-POLL-WEB`], { actor: ACTOR, unitsPerListing: 2 });
+  const recent = (s) => new Date(Date.now() - s * 1000).toISOString();
+  const store = [
+    { ...shOrder(951, { created: recent(300), lines: [{ sku: `${TS}-POLL-M`, qty: 1 }] }), updatedAt: recent(300) },
+    { ...shOrder(952, { created: recent(250), lines: [{ sku: `${TS}-POLL-WEB`, qty: 1 }] }), updatedAt: recent(250) },
+    { ...shOrder(953, { created: recent(200), lines: [{ sku: `${TS}-POLL-UNKNOWN`, qty: 1 }] }), updatedAt: recent(200) },
+    { ...shOrder(954, { created: recent(150), lines: [{ sku: null, title: 'Sample sachet', qty: 1 }] }), updatedAt: recent(150) },
+    { ...shOrder(955, { created: recent(100), name: `${TEST_ORDER}-POLLDUP` }), updatedAt: recent(100) },
+  ];
+  // A website order typed in by hand under 955's Shopify number: the poll must hold 955 back.
+  const manualDup = await createOrder({ ...R('website'), channel: 'website', source_order_id: `${TEST_ORDER}-POLLDUP` }, { actor: ACTOR });
+  const gql = shFake(() => store);
+  const ids = store.map((o) => o.id);
+  const ours = async () => (await getPool().query(`SELECT count(*)::int n FROM orders WHERE source_order_id = ANY($1)`, [ids])).rows[0].n;
+  const sideFx = async () => (await getPool().query(`SELECT (SELECT count(*) FROM inventory_movements)::int mv, (SELECT count(*) FROM inventory_reservations)::int rs,
+    (SELECT count(*) FROM order_shipments s JOIN orders o ON o.id = s.order_id WHERE o.source_order_id = ANY($1))::int sh, (SELECT count(*) FROM abandoned_carts)::int carts,
+    (SELECT value FROM system_state WHERE key = 'last_shopify_poll') cartpoll`, [ids])).rows[0];
+  const fx0 = await sideFx();
+  try {
+    // No checkpoint (no initial import): skipped, nothing recorded.
+    await setCk(null);
+    const runs0 = (await getPool().query(`SELECT count(*)::int n FROM order_imports WHERE kind = 'shopify_sync'`)).rows[0].n;
+    const s0 = await pollShopifyOrdersOnce({ gql });
+    if (s0.skipped !== 'no checkpoint' || (await getPool().query(`SELECT count(*)::int n FROM order_imports WHERE kind = 'shopify_sync'`)).rows[0].n !== runs0) bad.push('ran without a checkpoint');
+    // 1. Runs the existing sync from the checkpoint; recorded in the normal history as shopify-poll.
+    const ck1 = new Date(Date.now() - 3600000).toISOString();
+    await setCk(ck1);
+    // 2. Overlap: a second poll while one is running is skipped.
+    const [r1, r2] = await Promise.all([pollShopifyOrdersOnce({ gql }), pollShopifyOrdersOnce({ gql })]);
+    const ran = [r1, r2].find((r) => r.runId); const skipped = [r1, r2].find((r) => r.skipped);
+    if (!ran || skipped?.skipped !== 'already running') bad.push(`overlap ${JSON.stringify([r1.skipped || r1.runId, r2.skipped || r2.runId])}`);
+    const run = (await getPool().query('SELECT imported_by, status, orders_created, unmapped_lines, details FROM order_imports WHERE id = $1', [ran.runId])).rows[0];
+    if (run.imported_by !== 'shopify-poll' || run.status !== 'completed' || run.orders_created !== 4) bad.push(`run ${JSON.stringify({ by: run.imported_by, st: run.status, n: run.orders_created })}`);
+    if (ran.summary.mode !== 'incremental' || ran.summary.possibleDuplicates !== 1 || (run.details.duplicates || [])[0]?.existingId !== Number(manualDup)) bad.push(`dup ${JSON.stringify(ran.summary)}`);
+    // 3. Success advances the checkpoint (to the run's start).
+    const ck2 = await ckNow();
+    if (!(new Date(ck2) > new Date(ck1))) bad.push(`checkpoint ${ck1} → ${ck2}`);
+    // 6. The manual website order is untouched and the Shopify copy not created.
+    if ((await ours()) !== 4 || (await getOrder(manualDup)).source !== 'manual') bad.push('manual duplicate not held back');
+    // 8–10. SKUs resolve exactly as a manual sync: master code; website mapping (×2); unknown and code-less stay unmapped.
+    const line = async (n) => (await getPool().query(`SELECT oi.sku, oi.sku_id FROM order_items oi JOIN orders o ON o.id = oi.order_id WHERE o.source_order_id = $1`, [store.find((x) => x.id.endsWith(String(n).padStart(4, '0'))).id])).rows[0];
+    const [l1, l2, l3, l4] = [await line(951), await line(952), await line(953), await line(954)];
+    if (Number(l1.sku_id) !== mPoll || Number(l2.sku_id) !== mPoll || l3.sku_id !== null || l3.sku !== `${TS}-POLL-UNKNOWN` || l4.sku_id !== null || l4.sku) bad.push(`skus ${JSON.stringify([l1, l2, l3, l4])}`);
+    if ((await getSku(mPoll)).platform_skus.length !== 1) bad.push('a mapping was created');
+    // 7. Polling again changes nothing.
+    const r3 = await pollShopifyOrdersOnce({ gql });
+    if (r3.summary.ordersCreated !== 0 || r3.summary.changedLineItems !== 0 || (await ours()) !== 4) bad.push(`repeat ${JSON.stringify(r3.summary)}`);
+    // 4. A failed run records the failure and leaves the checkpoint where it was; the next poll still runs.
+    const ckBefore = await ckNow();
+    const broken = async (q, v) => { if (/^query BriyoOrdersPage/.test(q)) throw Object.assign(new Error('Shopify HTTP 400: Bad request'), { status: 400 }); return gql(q, v); };
+    let failed = false;
+    try { await pollShopifyOrdersOnce({ gql: broken, backoffMs: 1 }); } catch { failed = true; }
+    const lastRun = (await getPool().query(`SELECT imported_by, status FROM order_imports WHERE kind = 'shopify_sync' ORDER BY id DESC LIMIT 1`)).rows[0];
+    if (!failed || lastRun.status !== 'failed' || lastRun.imported_by !== 'shopify-poll' || (await ckNow()) !== ckBefore) bad.push(`failure ${JSON.stringify(lastRun)} ck ${await ckNow()}`);
+    if ((await pollShopifyOrdersOnce({ gql })).skipped) bad.push('guard not released after a failure');
+    // 11–12. No shipments, reservations or movements; the cart poll and carts untouched.
+    const fx1 = await sideFx();
+    if (JSON.stringify(fx1) !== JSON.stringify(fx0)) bad.push(`side effects ${JSON.stringify([fx0, fx1])}`);
+    // Status reports the schedule.
+    const keep = process.env.SHOPIFY_ORDERS_POLL_ENABLED;
+    process.env.SHOPIFY_ORDERS_POLL_ENABLED = 'true';
+    const st = await shopifyOrdersStatus();
+    if (!st.pollEnabled || st.pollMinutes !== ordersPollMinutes() || ordersPollMinutes() < 5) bad.push(`status ${st.pollEnabled}/${st.pollMinutes}`);
+    if (keep === undefined) delete process.env.SHOPIFY_ORDERS_POLL_ENABLED; else process.env.SHOPIFY_ORDERS_POLL_ENABLED = keep;
+  } finally {
+    await setCk(savedCk);
+    // The poll records its runs as 'shopify-poll' (the production name); this test's runs are removed here.
+    await getPool().query(`DELETE FROM order_imports WHERE kind = 'shopify_sync' AND imported_by = 'shopify-poll' AND started_at > now() - interval '1 hour'`);
+  }
+  if (bad.length) throw new Error(bad.join(' | '));
+  return 'no checkpoint → skipped; poll = incremental sync recorded as shopify-poll; concurrent poll skipped; 4 created, manual #POLLDUP held back; checkpoint advanced; master, ×2 website mapping, unknown and code-less lines resolved as usual (nothing auto-mapped); repeat poll idempotent; failed poll recorded, checkpoint kept, guard released; 0 shipments/reservations/movements, carts and cart poll untouched; status shows the interval';
+});
 await step('shopify orders cleanup', async () => {
   await purgeTestOrders(SH_PREFIX);
   await getPool().query(`DELETE FROM order_imports WHERE kind = 'shopify_sync' AND imported_by = $1`, [SH_ACTOR]);

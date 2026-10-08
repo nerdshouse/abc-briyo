@@ -1755,7 +1755,7 @@ async function openShopify() {
         <dt>Store</dt><dd class="mono">${esc(st.store || '—')}</dd>
         <dt>Last sync</dt><dd>${last ? `${esc(dateTime(last.completed_at || last.started_at))} · ${esc(label(last.status || 'completed'))}${last.imported_by ? ` · ${esc(last.imported_by)}` : ''}` : 'Never'}</dd>
         <dt>Orders synced</dt><dd class="num">${count(st.ordersSynced)}</dd>
-        <dt>Automatic sync</dt><dd>${st.pollEnabled ? 'On (changes every few minutes)' : 'Off — sync manually here'}</dd>
+        <dt>Automatic sync</dt><dd>${st.pollEnabled ? `On — every ${count(st.pollMinutes || 15)} min (Sync now still runs one at any time)` : 'Off — sync manually here'}</dd>
       </dl>` : `<p class="imp-note" style="margin:0 0 10px">Connect the store once; Briyo OS then reads orders with read-only access. Nothing is changed in Shopify.</p>
         <a class="btn primary" href="/auth/shopify/install" data-full-nav>${icon('plug-zap')}Connect Shopify</a>`}`;
     $('#sfForm').hidden = !st.configured;
