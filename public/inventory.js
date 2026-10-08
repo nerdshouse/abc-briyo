@@ -107,15 +107,16 @@ function renderUnmapped() {
   $('#unmapped').innerHTML = `<section class="card unmapped-card${state.view === 'unmapped' ? ' focus' : ''}" id="unmappedCard">
     <header class="card-head"><h2 class="card-title">${icon('triangle-alert')}SKU mapping <span class="card-meta">${count(lines)} unmapped order line${lines === 1 ? '' : 's'} · ${count(all.length)} platform code${all.length === 1 ? '' : 's'}${noCode.length ? ` · ${count(noCode.length)} without a code` : ''} · those orders cannot be dispatched until mapped</span></h2></header>
     <div class="pane">
-      <div class="form-actions" style="margin:0 0 10px">
-        <select id="umPlatform" aria-label="Platform"><option value="">All platforms</option>${platforms.map(([k, l]) => `<option value="${esc(k)}"${state.um.platform === k ? ' selected' : ''}>${esc(l)}</option>`).join('')}</select>
-        <input id="umQ" type="search" placeholder="Search code, product or order" aria-label="Search unmapped lines" value="${esc(state.um.q)}">
+      <div class="board-filters um-filters">
+        <label class="search">${icon('search')}<input class="input" id="umQ" type="search" autocomplete="off" spellcheck="false" placeholder="Code, product, order, ASIN or listing" aria-label="Search unmapped lines" value="${esc(state.um.q)}"></label>
+        <select class="select${state.um.platform ? ' on' : ''}" id="umPlatform" aria-label="Platform"><option value="">All platforms</option>${platforms.map(([k, l]) => `<option value="${esc(k)}"${state.um.platform === k ? ' selected' : ''}>${esc(l)}</option>`).join('')}</select>
       </div>
-      <p class="soft" style="margin:0 0 10px">Mapping a code points every order line with it at the master SKU you choose. Nothing is mapped until you save, and stock is not touched.</p>
-      <div class="table-wrap"><table class="table"><thead><tr><th>Platform SKU</th><th>Platform</th><th>Item</th><th>Orders</th><th class="r">Lines</th><th class="r">Units</th><th>First seen</th><th>Last seen</th><th class="r"></th></tr></thead><tbody id="umRows"></tbody></table></div>
-      ${noCode.length ? `<h3 class="dsec-title" style="margin-top:16px">Lines without a SKU code <span class="dsec-meta">${count(noCode.length)} · nothing to map them by; fix the product's SKU at the source and re-sync</span></h3>
-      <div class="table-wrap"><table class="table"><thead><tr><th>Order</th><th>Platform</th><th>Item</th><th class="r">Qty</th><th>Line ID</th><th>Ordered</th></tr></thead><tbody>
-      ${noCode.map((l) => `<tr><td class="mono">${esc(l.order_ref)}</td><td>${esc(l.platform_label)}</td><td><span class="cell-text">${esc(l.title || '—')}</span>${l.asin ? `<span class="cell-sub muted">ASIN ${esc(l.asin)}</span>` : ''}</td>
+      <p class="soft um-note">Mapping a code points every order line with it at the master SKU you choose. Nothing is mapped until you save, and stock is not touched.</p>
+      <div class="table-wrap"><table class="table um-table"><thead><tr><th>Platform SKU</th><th>Platform</th><th>Item</th><th>Orders</th><th class="r">Lines</th><th class="r">Units</th><th>Seen</th><th class="r"></th></tr></thead><tbody id="umRows"></tbody></table></div>
+      ${noCode.length ? `<h3 class="um-sub">Lines without a SKU code · ${count(noCode.length)}</h3>
+      <p class="soft um-note">Nothing to map these by. Fix the product's SKU at the source and re-sync.</p>
+      <div class="table-wrap"><table class="table um-table"><thead><tr><th>Order</th><th>Platform</th><th>Item</th><th class="r">Qty</th><th>Line ID</th><th>Ordered</th></tr></thead><tbody>
+      ${noCode.map((l) => `<tr><td class="mono">${esc(l.order_ref)}</td><td>${esc(l.platform_label)}</td><td class="um-wrap"><span class="cell-text">${esc(l.title || '—')}</span>${l.asin ? `<span class="cell-sub muted">ASIN ${esc(l.asin)}</span>` : ''}</td>
         <td class="r num">${count(l.quantity)}</td><td class="mono soft">${esc(l.source_line_item_id || '—')}</td><td class="num">${seenDate(l.order_date)}</td></tr>`).join('')}
       </tbody></table></div>` : ''}
     </div></section>`;
@@ -127,16 +128,16 @@ function renderUnmappedRows() {
   const rows = (state.data.unmapped || []).filter((u) => (!state.um.platform || u.channel === state.um.platform)
     && (!q || [u.code, u.title, ...(u.titles || []), ...(u.order_refs || []), u.asin, ...(u.listing_ids || [])].some((v) => String(v || '').toLowerCase().includes(q))));
   const refs = (u) => { const r = u.order_refs || []; return r.length ? `${r.slice(0, 3).map(esc).join(', ')}${u.orders > 3 ? ` <span class="soft">+${count(u.orders - 3)}</span>` : ''}` : '—'; };
-  $('#umRows').innerHTML = rows.length ? rows.map((u) => `<tr><td class="mono">${esc(u.code)}${u.asin ? `<span class="cell-sub muted">ASIN ${esc(u.asin)}</span>` : ''}${(u.listing_ids || []).length ? `<span class="cell-sub muted">Listing ${u.listing_ids.map(esc).join(', ')}</span>` : ''}</td>
-      <td>${esc(u.platform_label)}</td>
-      <td><span class="cell-text">${esc(u.title || '—')}</span>${(u.titles || []).length > 1 ? `<span class="cell-sub muted" title="${esc(u.titles.join(' · '))}">${count(u.titles.length)} titles on these lines</span>` : ''}</td>
-      <td class="mono" title="${esc((u.order_refs || []).join(', '))}">${refs(u)}</td>
+  $('#umRows').innerHTML = rows.length ? rows.map((u) => `<tr><td class="mono um-wrap">${esc(u.code)}${u.asin ? `<span class="cell-sub muted">ASIN ${esc(u.asin)}</span>` : ''}${(u.listing_ids || []).length ? `<span class="cell-sub muted">Listing ${u.listing_ids.map(esc).join(', ')}</span>` : ''}</td>
+      <td class="um-plat">${esc(u.platform_label)}</td>
+      <td class="um-wrap"><span class="cell-text">${esc(u.title || '—')}</span>${(u.titles || []).length > 1 ? `<span class="cell-sub muted" title="${esc(u.titles.join(' · '))}">${count(u.titles.length)} titles on these lines</span>` : ''}</td>
+      <td class="mono um-wrap" title="${esc((u.order_refs || []).join(', '))}">${refs(u)}</td>
       <td class="r num">${count(u.lines)}</td><td class="r num">${count(u.units)}</td>
-      <td class="num">${seenDate(u.first_seen)}</td><td class="num">${seenDate(u.last_seen)}</td>
+      <td class="num"><span class="cell-sub" title="First seen">${seenDate(u.first_seen)}</span><span class="cell-sub muted" title="Last seen">to ${seenDate(u.last_seen)}</span></td>
       <td class="r">${!canCatalog() ? '<span class="soft">Ask an Inventory manager</span>'
         : u.mappable ? `<button class="btn" type="button" data-map="${esc(u.code)}" data-platform="${esc(u.channel)}" data-platform-label="${esc(u.platform_label)}" data-title="${esc(u.title || '')}" data-asin="${esc(u.asin || '')}">Map to master SKU</button>`
           : `<span class="soft" title="${esc(u.platform_label)} orders use master SKU codes directly. Create a master SKU with this code, or add ${esc(u.platform_label)} as a platform.">Not a mapped platform</span>`}</td></tr>`).join('')
-    : '<tr><td colspan="9"><span class="soft">No unmapped codes match this filter.</span></td></tr>';
+    : '<tr><td colspan="8"><span class="soft">No unmapped codes match this filter.</span></td></tr>';
 }
 
 function render() {
@@ -822,7 +823,7 @@ function bind() {
     if (e.target.id === 'umQ') { state.um.q = e.target.value; renderUnmappedRows(); }
   });
   $('#unmapped').addEventListener('change', (e) => {
-    if (e.target.id === 'umPlatform') { state.um.platform = e.target.value; renderUnmappedRows(); }
+    if (e.target.id === 'umPlatform') { state.um.platform = e.target.value; e.target.classList.toggle('on', Boolean(e.target.value)); renderUnmappedRows(); }
   });
   $('#unmapped').addEventListener('click', (e) => {
     const b = e.target.closest('[data-map]');
