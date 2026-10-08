@@ -4486,13 +4486,15 @@ await step('orders page: Refresh only reloads, Shopify starts the full sync (no 
   if (!refresh || /shopify|sync/i.test(refresh)) bad.push(`refresh handler: ${refresh}`);
   if (!/\$\('#shopifyOrders'\)\.addEventListener\('click', startShopifySync\)/.test(js) || /\$\('#shopifyOrders'\)\.addEventListener\('click', openShopify\)/.test(js)) bad.push('Shopify button not wired to the direct sync');
   if (!/api\('\/api\/orders\/shopify\/sync-all', \{ method: 'POST' \}\)/.test(js)) bad.push('sync-all not called');
-  if (/class="brand-mark" src="\/brand\/shopify-bag\.svg"/.test(html) || (html.match(/class="shopify-mark"/g) || []).length !== 2) bad.push('logo still uses the dark brand-mark tile class');
+  if (/class="brand-mark" src="\/brand\/shopify-bag\.svg"/.test(html) || (html.match(/class="shopify-mark"/g) || []).length !== 1) bad.push('logo still uses the dark brand-mark tile class');
+  // The old sync drawer is gone, with its code: nothing left that could open it.
+  if (/id="shopifyDrawer"/.test(html) || /openShopify|closeShopify|sfRun|#shopifyDrawer|#sf[A-Z]/.test(js)) bad.push('old Shopify drawer or its code still present');
   if (!/\.shopify-mark \{[^}]*background: none/.test(css)) bad.push('logo background not cleared');
   if (/\.shopify-mark \{[^}]*var\(--ink\)/.test(css)) bad.push('logo has an ink background');
   const svg = await fsp.readFile(new URL('../public/brand/shopify-bag.svg', import.meta.url), 'utf8');
   if (/<rect/.test(svg)) bad.push('the logo file has a background rectangle');
   if (bad.length) throw new Error(bad.join(' | '));
-  return 'Refresh handler only reloads (no Shopify call); Shopify button → POST /api/orders/shopify/sync-all, the drawer no longer opened by it; logo uses .shopify-mark with no background (not the sidebar dark .brand-mark tile); the official SVG has no background shape';
+  return 'Refresh handler only reloads (no Shopify call); Shopify button → POST /api/orders/shopify/sync-all, the old drawer and its code removed; logo uses .shopify-mark with no background (not the sidebar dark .brand-mark tile); the official SVG has no background shape';
 });
 await step('shopify orders cleanup', async () => {
   await purgeTestOrders(SH_PREFIX);

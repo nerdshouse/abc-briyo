@@ -1740,22 +1740,6 @@ async function commitImport() {
   }
 }
 
-/* ---------------------------------------------------------- Shopify orders (admin) */
-
-const sf = { busy: false, status: null, preview: null, done: false };
-const sfError = (msg) => { $('#sfError').textContent = msg || ''; $('#sfError').hidden = !msg; };
-
-/** The window as the API takes it. Dates are whole IST days, inclusive. */
-function sfWindow() {
-  const m = $('#sfMode').value;
-  if (m === 'incremental') return { mode: 'incremental' };
-  if (m === 'custom') {
-    const from = $('#sfFrom').value; const to = $('#sfTo').value;
-    return { mode: 'window', from: from ? `${from}T00:00:00+05:30` : undefined, to: to ? `${to}T23:59:59+05:30` : undefined };
-  }
-  return { mode: 'window', days: Number(m) };
-}
-
 /* ------------------------------------------------------------------ Shopify button: full-history sync */
 
 const syncNote = (html, tone = '') => {
@@ -1806,105 +1790,6 @@ async function followShopifySync() {
     syncNote(`<b>Shopify sync stopped</b> after ${count(s.fetched)} orders${s.failure ? ` — ${esc(s.failure)}` : ''}. Click Shopify again to continue from where it stopped.`, 'error');
     load();
   }
-}
-
-async function openShopify() {
-  Object.assign(sf, { preview: null, done: false });
-  sfError(''); $('#sfResult').innerHTML = ''; $('#sfSaved').textContent = '';
-  $('#sfSubmit').disabled = true; $('#sfSubmit').textContent = 'Import'; $('#sfPreview').disabled = true;
-  $('#shopifyDrawer').hidden = false; $('#drawerScrim').hidden = false;
-  try {
-    const st = await api('/api/orders/shopify/status');
-    sf.status = st;
-    const last = st.lastRun;
-    $('#sfConn').innerHTML = `<h3 class="dsec-title">Shopify <span class="dsec-meta">${st.configured ? '<span class="health healthy">Connected</span>' : '<span class="health">Not connected</span>'}</span></h3>
-      ${st.configured ? `<dl class="kv">
-        <dt>Store</dt><dd class="mono">${esc(st.store || '—')}</dd>
-        <dt>Last sync</dt><dd>${last ? `${esc(dateTime(last.completed_at || last.started_at))} · ${esc(label(last.status || 'completed'))}${last.imported_by ? ` · ${esc(last.imported_by)}` : ''}` : 'Never'}</dd>
-        <dt>Orders synced</dt><dd class="num">${count(st.ordersSynced)}</dd>
-        <dt>Automatic sync</dt><dd>${st.pollEnabled ? `On — every ${count(st.pollMinutes || 15)} min (Sync now still runs one at any time)` : 'Off — sync manually here'}</dd>
-      </dl>` : `<p class="imp-note" style="margin:0 0 10px">Connect the store once; Briyo OS then reads orders with read-only access. Nothing is changed in Shopify.</p>
-        <a class="btn primary" href="/auth/shopify/install" data-full-nav>${icon('plug-zap')}Connect Shopify</a>`}`;
-    $('#sfForm').hidden = !st.configured;
-    $('#sfNote').textContent = `Shopify returns orders from the last ${st.maxWindowDays} days with the current access. Importing creates orders and line items only — no shipments, no stock reserved or deducted.`;
-    const incr = $('#sfMode').querySelector('option[value="incremental"]');
-    incr.disabled = !st.checkpoint; incr.textContent = st.checkpoint ? `Changes since the last sync (${dateTime(st.checkpoint)})` : 'Changes since the last sync (after a first import)';
-    $('#sfPreview').disabled = !st.configured;
-    renderShopifyHistory(st.history || []);
-  } catch (err) {
-    $('#sfConn').innerHTML = ''; sfError(err.message);
-  }
-  renderIcons();
-}
-
-function renderShopifyHistory(runs) {
-  $('#sfHistory').innerHTML = runs.length ? `<section class="dsec">
-    <h3 class="dsec-title">Recent syncs</h3>
-    <div class="imp-scroll"><table class="imp-errors"><thead><tr><th>When</th><th>By</th><th>Status</th><th>Fetched</th><th>New</th><th>Updated</th><th>Conflicts</th><th>Unmapped lines</th><th>Errors</th></tr></thead><tbody>
-    ${runs.map((x) => `<tr><td>${esc(dateTime(x.completed_at || x.started_at))}</td><td>${esc(x.imported_by || '—')}</td>
-      <td>${esc(label(x.status || '—'))}${x.resumable ? ` <button type="button" class="linkish" data-sf-resume="${x.id}">Continue</button>` : ''}</td>
-      <td class="num">${count(x.orders_in_file)}</td><td class="num">${count(x.orders_created)}</td><td class="num">${count(x.orders_updated)}</td>
-      <td class="num">${count(x.conflicts)}</td><td class="num">${count(x.unmapped_lines)}</td><td class="num">${count(x.error_rows)}</td></tr>`).join('')}
-    </tbody></table></div></section>` : '';
-}
-
-function sfReport(r, applied) {
-  const s = r.summary;
-  const list = (title, rows, fmt) => (rows.length ? `<section class="dsec"><h3 class="dsec-title">${esc(title)} <span class="dsec-meta">${count(rows.length)}</span></h3>
-    <ul class="imp-list">${rows.slice(0, 50).map(fmt).join('')}</ul></section>` : '');
-  return `<section class="dsec">
-      <h3 class="dsec-title">${applied ? 'Imported' : 'Preview'} <span class="dsec-meta">${applied ? indicator('completed') : 'nothing saved yet'}</span></h3>
-      <div class="imp-stats">
-        ${stat(s.found, 'Found in Shopify')}
-        ${stat(applied ? s.ordersCreated : s.newOrders, applied ? 'Orders added' : 'New')}
-        ${stat(s.unchanged, 'Already imported')}
-        ${stat(s.changed, applied ? 'Updated' : 'Changed')}
-        ${stat(s.unmappedSkus, 'Unmapped SKUs', s.unmappedSkus ? 'warn' : '')}
-        ${stat(s.conflicts, 'Conflicts', s.conflicts ? 'warn' : '')}
-        ${s.possibleDuplicates ? stat(s.possibleDuplicates, 'Possible duplicates held back', 'warn') : ''}
-        ${s.errors ? stat(s.errors, 'Not imported', 'bad') : ''}
-        ${s.skippedTest ? stat(s.skippedTest, 'Test orders skipped') : ''}
-      </div>
-      ${s.partial ? '<p class="imp-note">This window has more orders than one run takes. Import, then choose Continue on the run below.</p>' : ''}
-      ${s.customerDataAvailable === false ? '<p class="imp-note">Shopify did not share customer name, email, phone or address (protected customer data is not approved for this app). Orders import without them.</p>' : ''}
-      <p class="imp-note">Orders and line items only. No shipments are created and no stock is reserved or deducted; Logistics ships them as usual.</p>
-    </section>
-    ${list('Unmapped SKUs', r.unmapped || [], (u) => `<li><span class="mono">${esc(u.code || '(no SKU in Shopify)')}</span> · ${esc(u.title || '')} · ${count(u.lines)} line${u.lines === 1 ? '' : 's'}</li>`)}
-    ${list('Conflicts — not applied', (r.conflicts || []).flatMap((c) => c.conflicts.map((x) => ({ ...c, ...x }))), (c) => `<li><b>${esc(c.name || '')}</b> · ${esc(c.detail)}</li>`)}
-    ${list('Possible duplicates — held back', r.duplicates || [], (d) => `<li><b>${esc(d.name)}</b> already exists as website order <span class="mono">${esc(d.existingNumber)}</span> (entered by hand). Not imported.</li>`)}
-    ${list('Not imported', r.errors || [], (e) => `<li><b>${esc(e.name || e.shopifyId || '')}</b> · ${esc(e.reason)}</li>`)}`;
-}
-
-async function sfRun(step, extra = {}) {
-  if (sf.busy) return;
-  sf.busy = true; sfError('');
-  $('#sfPreview').disabled = true; $('#sfSubmit').disabled = true;
-  $('#sfSaved').textContent = step === 'preview' ? 'Reading Shopify…' : 'Importing…';
-  try {
-    const r = await api(`/api/orders/shopify/${step}`, { method: 'POST', body: JSON.stringify({ ...sfWindow(), ...extra }) });
-    $('#sfResult').innerHTML = sfReport(r, step === 'sync');
-    if (step === 'preview') {
-      const work = (r.summary.newOrders || 0) + (r.summary.changed || 0);
-      $('#sfSubmit').textContent = work ? `Import ${count(work)} order${work > 1 ? 's' : ''}` : 'Nothing to import';
-      $('#sfSubmit').disabled = !work;
-    } else {
-      sf.done = true; $('#sfSubmit').textContent = 'Done'; $('#sfSubmit').disabled = false;
-      load();
-      const st = await api('/api/orders/shopify/status').catch(() => null);
-      if (st) renderShopifyHistory(st.history || []);
-    }
-  } catch (err) {
-    sfError(`${err.message} Nothing was saved.`);
-  } finally {
-    sf.busy = false; $('#sfSaved').textContent = ''; $('#sfPreview').disabled = !sf.status?.configured;
-    renderIcons();
-  }
-}
-
-function closeShopify() {
-  if (sf.busy) return;
-  $('#shopifyDrawer').hidden = true;
-  if ($('#drawer').hidden && $('#formDrawer').hidden && $('#createDrawer').hidden && $('#importDrawer').hidden) $('#drawerScrim').hidden = true;
 }
 
 function bind() {
@@ -1973,18 +1858,6 @@ function bind() {
   $('#iClose').addEventListener('click', closeImport);
   // One click: sync the whole Shopify order history (no panel). Refresh above only reloads the list.
   $('#shopifyOrders').addEventListener('click', startShopifySync);
-  $('#sfClose').addEventListener('click', closeShopify);
-  $('#sfPreview').addEventListener('click', () => sfRun('preview'));
-  $('#sfSubmit').addEventListener('click', () => (sf.done ? closeShopify() : sfRun('sync')));
-  $('#sfMode').addEventListener('change', () => {
-    const custom = $('#sfMode').value === 'custom';
-    $('#sfFromF').hidden = !custom; $('#sfToF').hidden = !custom;
-    $('#sfSubmit').disabled = true; $('#sfSubmit').textContent = 'Import'; $('#sfResult').innerHTML = ''; sf.done = false;
-  });
-  $('#sfHistory').addEventListener('click', (e) => {
-    const b = e.target.closest('[data-sf-resume]');
-    if (b) sfRun('sync', { resumeRunId: Number(b.dataset.sfResume) });
-  });
   $('#iCancel').addEventListener('click', closeImport);
   $('#iFile').addEventListener('change', (e) => { imp.file = e.target.files[0] || null; imp.done = false; previewImport(); });
   $('#iSubmit').addEventListener('click', () => (imp.done ? closeImport() : commitImport()));
@@ -1996,7 +1869,6 @@ function bind() {
   const closeTop = () => {
     if (!$('#shipDrawer').hidden) closeShipNew();
     else if (!$('#importDrawer').hidden) closeImport();
-    else if (!$('#shopifyDrawer').hidden) closeShopify();
     else if (!$('#createDrawer').hidden) closeCreate();
     else if (!$('#formDrawer').hidden) closeForm();
     else if (!$('#drawer').hidden) closeDrawer();

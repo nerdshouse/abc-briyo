@@ -217,7 +217,6 @@
 .item-row .t div:first-child { font-weight: 500; overflow-wrap: anywhere; }
 .item-row .n { text-align: right; white-space: nowrap; font-variant-numeric: tabular-nums; }
 .imp-note { margin: 10px 0 0; font-size: 12px; color: var(--text-3); line-height: 1.5; }
-.imp-list { margin: 0; padding: 0 0 0 18px; display: grid; gap: 4px; font-size: 12.5px; color: var(--text-2); }
 
 /* Picking orders for one shipment. */
 .pick { display: inline-flex; align-items: center; margin-right: 8px; vertical-align: middle; }
@@ -476,6 +475,5 @@ html.scroll-locked .drawer-scrim { touch-action: none; }
 /* Shopify mark beside Shopify order controls: decorative, text-sized, no badge. */
 /* The Shopify logo: its own class — "brand-mark" is the sidebar's dark logo tile (ui.css), which gave it a black square. */
 .shopify-mark { display: inline-block; width: 16px; height: 18px; flex: 0 0 auto; background: none; border-radius: 0; }
-.drawer-title:has(> .shopify-mark) { display: flex; align-items: center; gap: 8px; }
 #shopifyOrders[aria-busy="true"] { cursor: progress; }
 #shopifySync .sync-facts { display: flex; flex-wrap: wrap; gap: 4px 14px; margin-top: 4px; font-size: 12.5px; }

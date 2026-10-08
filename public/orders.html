@@ -317,36 +317,6 @@
   </div>
 </aside>
 
-<aside class="drawer drawer-wide" id="shopifyDrawer" hidden aria-label="Shopify orders">
-  <div class="drawer-head">
-    <div><h2 class="drawer-title"><img class="shopify-mark" src="/brand/shopify-bag.svg" alt="" aria-hidden="true" width="16" height="18" />Shopify orders</h2><div class="drawer-sub">Website orders from Shopify. Preview first — nothing is saved until you import.</div></div>
-    <div class="drawer-nav"><button class="icon-btn" id="sfClose" type="button" title="Close" aria-label="Close"><i data-lucide="x"></i></button></div>
-  </div>
-  <div class="drawer-body">
-    <div class="form-error" id="sfError" role="alert" hidden></div>
-    <section class="dsec" id="sfConn"><div class="state loading" aria-busy="true"><b>Checking Shopify…</b></div></section>
-    <section class="dsec" id="sfForm" hidden>
-      <h3 class="dsec-title">What to bring in</h3>
-      <div class="form-grid">
-        <label class="fld"><span>Window</span><select class="select" id="sfMode">
-          <option value="7">Last 7 days</option><option value="30" selected>Last 30 days</option><option value="60">Last 60 days</option>
-          <option value="custom">Custom dates</option><option value="incremental">Changes since the last sync</option></select></label>
-        <label class="fld" id="sfFromF" hidden><span>From</span><input class="input" type="date" id="sfFrom" /></label>
-        <label class="fld" id="sfToF" hidden><span>To</span><input class="input" type="date" id="sfTo" /></label>
-      </div>
-      <p class="imp-note" id="sfNote"></p>
-    </section>
-    <div id="sfResult"></div>
-    <div id="sfHistory"></div>
-  </div>
-  <div class="drawer-foot">
-    <span class="saved" id="sfSaved"></span>
-    <div style="display:flex;gap:8px">
-      <button class="btn" type="button" id="sfPreview" disabled>Preview</button>
-      <button class="btn primary" type="button" id="sfSubmit" disabled>Import</button>
-    </div>
-  </div>
-</aside>
 
 <script type="module" src="/orders.js"></script>
 </body>
