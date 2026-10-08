@@ -504,6 +504,7 @@ function renderDrawer() {
       ${shipments.length > 1 ? `<div class="ship-tabs" role="tablist" aria-label="Shipments">${shipments.map((x, i) => `
         <button type="button" role="tab" class="pill${x.id === ship.id ? ' on' : ''}" data-ship="${x.id}" aria-selected="${x.id === ship.id}">
           ${i + 1} · ${esc(x.tracking_id || 'no AWB')}</button>`).join('')}</div>` : ''}
+      ${ship.external_fulfillment_id ? `<div class="banner mock" style="margin:8px 0">Fulfilled externally by <b>Buy with Amazon</b> — mirrored from Shopify${ship.external_carrier ? ` (${esc(ship.external_carrier)}${ship.external_display_status ? ` · ${esc(label(String(ship.external_display_status).toLowerCase()))}` : ''})` : ''}. It updates on each Shopify sync. No Briyo stock is reserved or deducted for it.</div>` : ''}
       ${!canEdit() ? `<dl class="kv">
         <dt>Courier</dt><dd>${esc(courier?.name || '—')}</dd>
         <dt>AWB / Tracking ID</dt><dd class="mono">${esc(ship.tracking_id || '—')}</dd>

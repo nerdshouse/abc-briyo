@@ -4255,6 +4255,122 @@ await step('shopify orders: automatic poll — the existing incremental sync on 
   if (bad.length) throw new Error(bad.join(' | '));
   return 'no checkpoint → skipped; poll = incremental sync recorded as shopify-poll; concurrent poll skipped; 4 created, manual #POLLDUP held back; checkpoint advanced; master, ×2 website mapping, unknown and code-less lines resolved as usual (nothing auto-mapped); repeat poll idempotent; failed poll recorded, checkpoint kept, guard released; 0 shipments/reservations/movements, carts and cart poll untouched; status shows the interval';
 });
+await step('shopify orders: Buy with Amazon fulfilments mirrored as external shipments — tag + Amazon carrier only, one per fulfilment GID, forward-only status, never stock', async () => {
+  const bad = [];
+  const ATS = 'Amazon Transportation Services';
+  const FGID = (n, k = 1) => `gid://shopify/Fulfillment/${SH_NUM}${n}${k}`;
+  const ful = (n, k, o = {}) => ({ id: FGID(n, k), name: `#${n}-F${k}`, status: o.status || 'SUCCESS', displayStatus: o.display ?? 'IN_TRANSIT',
+    createdAt: o.at || new Date(Date.now() - 3600000).toISOString(), updatedAt: new Date().toISOString(), inTransitAt: o.inTransit || new Date(Date.now() - 1800000).toISOString(),
+    deliveredAt: o.deliveredAt || null, estimatedDeliveryAt: null,
+    trackingInfo: o.noTracking ? [] : [{ company: o.carrier || ATS, number: 'number' in o ? o.number : `37414676${n}${k}`, url: 'url' in o ? o.url : `https://www.swiship.co.uk/track?id=37414676${n}${k}` }] });
+  const recent = () => new Date(Date.now() - 7200000).toISOString();
+  const order = (n, tags, fulfillments, extra = {}) => ({ ...shOrder(n, { created: recent(), ...extra }), tags, fulfillments, updatedAt: new Date().toISOString() });
+  const BWA = ['Buy with Amazon', 'COD', 'GoKwik'];
+  const store = [
+    order(981, BWA, [ful(981, 1)]),                                                                // one fulfilment
+    order(982, ['Non Buy with Amazon', 'GoKwik'], [ful(982, 1)]),                                  // not BWA, even with the Amazon carrier
+    order(983, BWA, [ful(983, 1), ful(983, 2, { display: 'DELIVERED', deliveredAt: new Date().toISOString() })]), // two fulfilments
+    order(985, BWA, [ful(985, 1, { number: null, url: null })]),                                   // no tracking number
+    order(986, BWA, [ful(986, 1)], { lines: [{ sku: `${TS}-BWA-UNMAPPED`, qty: 1 }] }),            // unmapped SKU
+    order(987, BWA, [ful(987, 1, { carrier: 'Delhivery' })]),                                      // BWA tag, other carrier
+    order(988, BWA, [ful(988, 1)]),                                                                // cancelled later
+    order(989, BWA, []),                                                                           // manual shipment first
+  ];
+  const gql = shFake(() => store);
+  const sync = (actor = SH_ACTOR) => runShopifySync({ window: { days: 1 }, dryRun: false, gql, actor });
+  const gid = (n) => `${SH_PREFIX}${String(n).padStart(4, '0')}`;
+  const ships = async (n) => (await getPool().query(`SELECT s.* FROM order_shipments s JOIN orders o ON o.id = s.order_id WHERE o.source_order_id = $1 ORDER BY s.id`, [gid(n)])).rows;
+  const fx = async () => (await getPool().query(`SELECT (SELECT count(*) FROM inventory_movements)::int mv, (SELECT count(*) FROM inventory_reservations)::int rs,
+    (SELECT count(*) FROM courier_partners)::int couriers, (SELECT coalesce(sum(on_hand), 0) FROM inventory_batches)::int on_hand`)).rows[0];
+  const keep = { tag: process.env.BWA_ORDER_TAG, carriers: process.env.BWA_CARRIERS };
+  delete process.env.BWA_ORDER_TAG; delete process.env.BWA_CARRIERS;
+  try {
+    if ((await listCouriers()).some((c) => c.name.toLowerCase() === ATS.toLowerCase())) bad.push('test assumes no ATS courier row');
+    const fx0 = await fx();
+    // Preview counts what a sync would mirror, and writes nothing.
+    const pre = await runShopifySync({ window: { days: 1 }, dryRun: true, gql });
+    if (pre.summary.newExternalShipments !== 6) bad.push(`preview ${pre.summary.newExternalShipments}`);
+    // 989: a person ships it from Briyo first; then Amazon's fulfilment appears.
+    const r1 = await sync();
+    const dl = (await listCouriers()).find((c) => c.name === 'Delhivery');
+    const manual = await createShipment({ ...R('website'), channel: 'website', source_order_id: gid(989), courier_partner_id: dl.id, tracking_id: 'BRIYO-AWB-989', shipment_status: 'packed' }, { actor: ACTOR, addToExisting: true });
+    store.find((o) => o.id === gid(989)).fulfillments = [ful(989, 1)];
+    // 1, 4. One BWA fulfilment → exactly one shipment, in_transit, Shopify's tracking and URL, provider bwa, no courier row made.
+    const s981 = await ships(981);
+    if (r1.summary.externalShipmentsCreated !== 6 || s981.length !== 1) bad.push(`created ${r1.summary.externalShipmentsCreated}, 981 has ${s981.length}`);
+    const a = s981[0];
+    if (a?.shipment_status !== 'in_transit' || a.tracking_id !== '374146769811' || a.tracking_url !== 'https://www.swiship.co.uk/track?id=374146769811'
+      || a.external_source !== 'shopify' || a.external_provider !== 'bwa' || a.external_fulfillment_id !== FGID(981, 1) || a.external_carrier !== ATS
+      || a.courier_partner_id !== null || a.external_display_status !== 'IN_TRANSIT' || !a.dispatch_date) bad.push(`981 ${JSON.stringify(a)}`);
+    // 8. Not BWA (tag), and BWA with another carrier: no shipment.
+    if ((await ships(982)).length || (await ships(987)).length) bad.push('non-eligible fulfilment mirrored');
+    // 13. Two fulfilments → two shipments, each its own status.
+    const s983 = await ships(983);
+    if (s983.length !== 2 || s983.map((x) => x.shipment_status).sort().join() !== 'delivered,in_transit' || new Set(s983.map((x) => x.external_fulfillment_id)).size !== 2
+      || !s983.find((x) => x.shipment_status === 'delivered').delivered_at) bad.push(`983 ${JSON.stringify(s983.map((x) => [x.external_fulfillment_id, x.shipment_status]))}`);
+    // 15. No tracking number: none invented.
+    const s985 = await ships(985);
+    if (s985.length !== 1 || s985[0].tracking_id !== null || s985[0].tracking_url !== null) bad.push(`985 ${JSON.stringify(s985)}`);
+    // An unmapped SKU does not stop the mirror.
+    if ((await ships(986)).length !== 1) bad.push('unmapped SKU blocked the mirror');
+    // 2. Sync again: nothing new, nothing changed.
+    const r2 = await sync();
+    const total = async () => (await getPool().query(`SELECT count(*)::int n FROM order_shipments WHERE external_fulfillment_id LIKE $1`, [`gid://shopify/Fulfillment/${SH_NUM}%`])).rows[0].n;
+    if (r2.summary.externalShipmentsCreated !== 0 || r2.summary.externalShipmentsUpdated !== 0 || await total() !== 6) bad.push(`resync ${JSON.stringify([r2.summary.externalShipmentsCreated, r2.summary.externalShipmentsUpdated, await total()])}`);
+    // 9. The manual Briyo shipment is kept; Amazon's fulfilment is not added beside it.
+    const s989 = await ships(989);
+    if (s989.length !== 1 || s989[0].id !== String(manual.shipmentId) || s989[0].tracking_id !== 'BRIYO-AWB-989' || s989[0].external_fulfillment_id !== null
+      || r2.summary.externalShipmentsSkipped < 1) bad.push(`manual ${JSON.stringify(s989.map((x) => [x.tracking_id, x.external_fulfillment_id]))} skipped ${r2.summary.externalShipmentsSkipped}`);
+    // 3, 7, 5, 6. Same fulfilment, updated: tracking follows; DELAYED keeps the status; OUT_FOR_DELIVERY, DELIVERED move forward; an older state never moves it back.
+    const f981 = store.find((o) => o.id === gid(981)).fulfillments[0];
+    const step = async (patch) => { Object.assign(f981, patch, { updatedAt: new Date(Date.now() + 1000).toISOString() }); store.find((o) => o.id === gid(981)).updatedAt = new Date().toISOString(); await sync(); return (await ships(981))[0]; };
+    let x = await step({ trackingInfo: [{ company: ATS, number: '374146769999', url: 'https://www.swiship.co.uk/track?id=374146769999' }] });
+    if (x.tracking_id !== '374146769999' || x.tracking_url !== 'https://www.swiship.co.uk/track?id=374146769999' || (await ships(981)).length !== 1) bad.push(`tracking update ${x.tracking_id}`);
+    x = await step({ displayStatus: 'DELAYED' });
+    if (x.shipment_status !== 'in_transit' || x.external_display_status !== 'DELAYED') bad.push(`DELAYED → ${x.shipment_status}`);
+    x = await step({ displayStatus: 'OUT_FOR_DELIVERY' });
+    if (x.shipment_status !== 'out_for_delivery') bad.push(`OUT_FOR_DELIVERY → ${x.shipment_status}`);
+    x = await step({ displayStatus: 'DELIVERED', deliveredAt: new Date().toISOString() });
+    if (x.shipment_status !== 'delivered' || !x.delivered_at) bad.push(`DELIVERED → ${x.shipment_status}`);
+    x = await step({ displayStatus: 'IN_TRANSIT' });
+    if (x.shipment_status !== 'delivered') bad.push(`moved back to ${x.shipment_status}`);
+    if ((await orderEvents(Number((await getPool().query('SELECT id FROM orders WHERE source_order_id = $1', [gid(981)])).rows[0].id))).filter((e) => e.event_type === 'external_shipment_mirrored').length !== 1) bad.push('mirror event count');
+    // 17. Cancelled in Shopify: the shipment is cancelled, its history kept; a replacement fulfilment is a new shipment; a later SUCCESS restores it.
+    const o988 = store.find((o) => o.id === gid(988));
+    o988.fulfillments[0] = { ...o988.fulfillments[0], status: 'CANCELLED', updatedAt: new Date(Date.now() + 2000).toISOString() };
+    o988.updatedAt = new Date().toISOString();
+    const rc = await sync();
+    let s988 = await ships(988);
+    if (rc.summary.externalShipmentsCancelled !== 1 || s988.length !== 1 || s988[0].shipment_status !== 'cancelled' || s988[0].tracking_id !== '374146769881') bad.push(`cancel ${JSON.stringify(s988.map((y) => y.shipment_status))}`);
+    o988.fulfillments.push(ful(988, 2));
+    o988.updatedAt = new Date(Date.now() + 1000).toISOString();
+    await sync();
+    s988 = await ships(988);
+    if (s988.length !== 2 || s988.map((y) => `${y.external_fulfillment_id === FGID(988, 1) ? 'F1' : 'F2'}:${y.shipment_status}`).sort().join() !== 'F1:cancelled,F2:in_transit') bad.push(`replacement ${JSON.stringify(s988.map((y) => [y.external_fulfillment_id, y.shipment_status]))}`);
+    // 14. Two syncs at once (poll + Sync now share this path, as the webhook does): no duplicates.
+    store.push(order(984, BWA, [ful(984, 1)]));
+    await Promise.all([sync(), sync('shopify-poll')]);
+    if ((await ships(984)).length !== 1) bad.push(`concurrent ${(await ships(984)).length}`);
+    // 10–12, 16. No reservation possible, no movement, no stock change, no courier row created.
+    await expectErr('reserve external', () => reserveShipmentStock(Number(a.id), [{ batch_id: 1, quantity: 1 }], { actor: ACTOR }), (e) => e.status === 409 && e.externalShipment);
+    const c = await getPool().connect();
+    try { const d = await dispatchShipmentStock(c, Number(a.id), { actor: ACTOR }); if (d.deducted !== 0 || !d.external) bad.push(`dispatch ${JSON.stringify(d)}`); } finally { c.release(); }
+    const o982 = Number((await getPool().query('SELECT id FROM orders WHERE source_order_id = $1', [gid(982)])).rows[0].id);
+    await expectErr('attach to external', () => attachToShipment(Number(a.id), { orderIds: [o982] }, { actor: ACTOR }), (e) => e.status === 409);
+    const fx1 = await fx();
+    if (JSON.stringify(fx1) !== JSON.stringify(fx0)) bad.push(`stock or couriers changed ${JSON.stringify([fx0, fx1])}`);
+    // The tag and carriers are configurable; a different tag mirrors nothing new.
+    process.env.BWA_ORDER_TAG = 'Some Other Tag';
+    store.push(order(990, BWA, [ful(990, 1)]));
+    await sync();
+    if ((await ships(990)).length) bad.push('mirrored without the configured tag');
+  } finally {
+    for (const [k, v] of [['BWA_ORDER_TAG', keep.tag], ['BWA_CARRIERS', keep.carriers]]) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }
+    await getPool().query(`DELETE FROM order_imports WHERE kind = 'shopify_sync' AND imported_by = 'shopify-poll' AND started_at > now() - interval '1 hour'`);
+  }
+  if (bad.length) throw new Error(bad.join(' | '));
+  return 'BWA tag + Amazon carrier → 1 shipment per fulfilment GID (in_transit, Shopify tracking + URL, provider bwa, no courier row made); non-BWA tag and other carrier → none; 2 fulfilments → 2 shipments; no tracking → none invented; unmapped SKU no obstacle; re-sync and concurrent syncs → no duplicates; manual Briyo shipment kept, mirror skipped; tracking update applied; DELAYED keeps in_transit; OUT_FOR_DELIVERY, DELIVERED forward, never back; cancelled in Shopify → cancelled (kept), replacement → new shipment; reserve refused, dispatch deducts nothing, no other order can join; no movements, reservations, stock or courier changes; tag configurable';
+});
 await step('shopify orders cleanup', async () => {
   await purgeTestOrders(SH_PREFIX);
   await getPool().query(`DELETE FROM order_imports WHERE kind = 'shopify_sync' AND imported_by = $1`, [SH_ACTOR]);
