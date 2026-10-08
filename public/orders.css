@@ -240,6 +240,19 @@
 .exp-bad { color: var(--error-text); }
 .unmapped-card { margin-bottom: 16px; border-color: var(--warn-border, var(--border)); }
 .unmapped-card .card-title svg { color: var(--warning-text); }
+.unmapped-card .um-filters { padding: 0 0 10px; border-bottom: 0; }
+.unmapped-card .um-note { margin: 0 0 10px; }
+.unmapped-card .um-sub { margin: 18px 0 4px; font-size: 13px; font-weight: 600; }
+/* Long product titles and order lists wrap, so the Map action stays in view. */
+.um-table td.um-wrap { white-space: normal; min-width: 160px; max-width: 320px; padding-top: 8px; padding-bottom: 8px; }
+.um-table td.mono.um-wrap { min-width: 130px; max-width: 190px; overflow-wrap: anywhere; }
+.um-table td.um-plat { white-space: normal; min-width: 80px; }
+@media (max-width: 640px) {
+  .unmapped-card .um-filters .search, .unmapped-card .um-filters .search .input, .unmapped-card .um-filters .select { width: 100%; }
+  /* The totals are the point of this card: keep them where card meta is normally hidden. */
+  .unmapped-card .card-head .card-meta { display: block; white-space: normal; margin-top: 4px; line-height: 1.4; }
+  .unmapped-card .card-head { height: auto; padding-top: 10px; padding-bottom: 10px; }
+}
 .unmapped-card.focus { box-shadow: 0 0 0 2px var(--warn-border, var(--border-strong)); }
 .batch-table .sub-row td { padding-top: 0; border-top: 0; }
 .batch-docs { display: flex; flex-wrap: wrap; gap: 6px 12px; align-items: center; font-size: 12.5px; }
