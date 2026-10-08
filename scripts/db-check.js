@@ -6399,6 +6399,89 @@ await step('referral: storefront redirect action — finds or creates the Shopif
   return '/r/{id} → https://{click host}/r/{id} created once; an identical existing redirect is reused; a conflicting one is refused (409); a missing navigation scope is reported with the exact scopes; no click host → 409';
 });
 
+await step('referral: creating a link sets up the Shopify storefront redirect automatically — success, adopt (case-insensitive), conflict kept, missing permission never undoes the link, retry, fixed target', async () => {
+  const bad = [];
+  const { createReferralLink, syncStorefrontRedirect } = await import('../lib/affiliate-referrals.js');
+  const keep = process.env.AFFILIATE_CLICK_HOST;
+  process.env.AFFILIATE_CLICK_HOST = 'go.test';
+  const newAff = async (name) => {
+    const pid = (await af('manager', 'POST', '/api/affiliates', { display_name: `DBCHECK-AF ${name}`, category: 'influencer' })).body.affiliate.public_id;
+    await af('manager', 'POST', `/api/affiliates/${pid}/status`, { action: 'activate' });
+    return pid;
+  };
+  const calls = [];
+  const fake = (existing, opts = {}) => async (query, vars) => {
+    calls.push({ query: query.split('(')[0], vars });
+    if (opts.deny) throw new Error('Shopify GraphQL error: Access denied for urlRedirects field. Required access: `read_online_store_navigation` access scope.');
+    if (/urlRedirects/.test(query)) return { urlRedirects: { nodes: existing } };
+    return { urlRedirectCreate: { urlRedirect: { id: 'gid://shopify/UrlRedirect/77' }, userErrors: [] } };
+  };
+  const mutations = () => calls.filter((c) => /mutation/.test(c.query));
+  const asset = async (pid) => (await getPool().query(`SELECT r.status, r.storefront_redirect_gid, r.storefront_redirect_at FROM affiliate_referral_assets r JOIN affiliates a ON a.id = r.affiliate_id WHERE a.public_id = $1 AND r.type = 'link'`, [pid])).rows[0];
+  try {
+    // 1–3, 9. Success: the link and the redirect, /r/{id} → https://{click host}/r/{same id}, state stored.
+    const A = await newAff('Auto redirect ok');
+    calls.length = 0;
+    const r1 = await createReferralLink(A, { actor: 'db-check', gql: fake([]) });
+    const m1 = mutations();
+    if (!r1.link || r1.storefront_setup?.ok !== true || !r1.link.storefront_redirect_set || m1.length !== 1
+      || m1[0].vars.r.path !== `/r/${A}` || m1[0].vars.r.target !== `https://go.test/r/${A}`) bad.push(`success ${JSON.stringify([r1.storefront_setup, m1.map((c) => c.vars)])}`);
+    if ((await asset(A))?.storefront_redirect_gid !== 'gid://shopify/UrlRedirect/77') bad.push('redirect state not stored');
+    // 7. Re-running setup is idempotent: the existing redirect is found, nothing is created.
+    calls.length = 0;
+    await syncStorefrontRedirect(A, { actor: 'db-check', gql: fake([{ id: 'gid://shopify/UrlRedirect/77', path: `/r/${A}`, target: `https://go.test/r/${A}` }]) });
+    if (mutations().length) bad.push('re-run created a duplicate');
+    // 4, 8. Missing Shopify permission: the link is still created and usable; the setup status says why; logged; the retry action then works.
+    const B = await newAff('Auto redirect no scope');
+    calls.length = 0;
+    const r2 = await createReferralLink(B, { actor: 'db-check', gql: fake([], { deny: true }) });
+    if (!r2.link || r2.link.status !== 'active' || r2.link.storefront_redirect_set || r2.storefront_setup?.ok !== false || r2.storefront_setup.reason !== 'missing_scope') bad.push(`missing scope ${JSON.stringify([r2.link, r2.storefront_setup])}`);
+    if ((await asset(B))?.status !== 'active') bad.push('link rolled back');
+    const logged = (await getPool().query(`SELECT e.metadata FROM affiliate_events e JOIN affiliates a ON a.id = e.affiliate_id WHERE a.public_id = $1 AND e.action = 'storefront_redirect_failed'`, [B])).rows;
+    if (logged.length !== 1 || !/navigation permission/.test(logged[0].metadata.reason)) bad.push(`failure not logged ${JSON.stringify(logged)}`);
+    const retried = await syncStorefrontRedirect(B, { actor: 'db-check', gql: fake([]) });
+    if (!retried.link.storefront_redirect_set) bad.push('retry action');
+    // 5. An existing correct redirect — stored by Shopify in lowercase — is adopted, never duplicated.
+    const C = await newAff('Auto redirect adopt');
+    calls.length = 0;
+    const r3 = await createReferralLink(C, { actor: 'db-check', gql: fake([{ id: 'gid://shopify/UrlRedirect/88', path: `/r/${C.toLowerCase()}`, target: `https://go.test/r/${C.toLowerCase()}` }]) });
+    if (mutations().length || r3.storefront_setup?.ok !== true || (await asset(C))?.storefront_redirect_gid !== 'gid://shopify/UrlRedirect/88') bad.push(`adopt ${JSON.stringify([r3.storefront_setup, mutations().length])}`);
+    // 6. A redirect to somewhere else is a conflict: not overwritten, link still created.
+    const D = await newAff('Auto redirect conflict');
+    calls.length = 0;
+    const r4 = await createReferralLink(D, { actor: 'db-check', gql: fake([{ id: 'x', path: `/r/${D}`, target: 'https://elsewhere.example/' }]) });
+    if (mutations().length || r4.storefront_setup?.reason !== 'conflict' || !r4.link || r4.link.storefront_redirect_set) bad.push(`conflict ${JSON.stringify(r4.storefront_setup)}`);
+    // An existing redirect to /R/{id} (capital R) is broken — the click host serves only lowercase /r/ — so it is a
+    // conflict: never adopted as configured, never overwritten.
+    const F = await newAff('Auto redirect capital R');
+    calls.length = 0;
+    const r6 = await createReferralLink(F, { actor: 'db-check', gql: fake([{ id: 'gid://shopify/UrlRedirect/99', path: `/r/${F}`, target: `https://go.test/R/${F}` }]) });
+    if (mutations().length || r6.storefront_setup?.reason !== 'conflict' || r6.link?.storefront_redirect_set || (await asset(F))?.storefront_redirect_gid) bad.push(`/R/ adopted ${JSON.stringify([r6.storefront_setup, (await asset(F))?.storefront_redirect_gid])}`);
+    // Only the id ignores case: the matching rule itself, for the forms that must and must not be adopted.
+    const { isClickTarget } = await import('../lib/affiliate-referrals.js');
+    const adopt = ['https://go.briyo.xyz/r/GPJ92U', 'https://go.briyo.xyz/r/gpj92u', 'https://go.briyo.xyz/r/GpJ92u', 'https://GO.briyo.xyz/r/GPJ92U', 'https://go.briyo.xyz/r/GPJ92U/'];
+    const refuse = ['https://go.briyo.xyz/R/GPJ92U', 'https://go.briyo.xyz/ref/GPJ92U', 'https://other.example/r/GPJ92U', 'http://go.briyo.xyz/r/GPJ92U',
+      'https://go.briyo.xyz/r/OTHER1', 'https://go.briyo.xyz:8443/r/GPJ92U', 'https://go.briyo.xyz/r/GPJ92U?next=https://evil.example', 'https://go.briyo.xyz.evil.example/r/GPJ92U',
+      'https://user@go.briyo.xyz/r/GPJ92U', '/r/GPJ92U', ''];
+    for (const u of adopt) if (!isClickTarget(u, 'go.briyo.xyz', 'GPJ92U')) bad.push(`should adopt ${u}`);
+    for (const u of refuse) if (isClickTarget(u, 'go.briyo.xyz', 'GPJ92U')) bad.push(`should refuse ${u}`);
+    // 10. No caller can choose the destination: extra options are ignored; the target is always the click host + the same id.
+    calls.length = 0;
+    await syncStorefrontRedirect(D, { actor: 'db-check', target: 'https://evil.example/', path: '/x', gql: fake([]) });
+    const m5 = mutations();
+    if (m5.length !== 1 || m5[0].vars.r.target !== `https://go.test/r/${D}` || m5[0].vars.r.path !== `/r/${D}`) bad.push(`fixed target ${JSON.stringify(m5.map((c) => c.vars))}`);
+    // Through the API (the running server talks to no Shopify): link creation still succeeds (201) and reports the setup state.
+    const E = await newAff('Auto redirect api');
+    const api = await af('manager', 'POST', `/api/affiliates/${E}/referral`, { target: 'https://evil.example/' });
+    if (api.status !== 201 || !api.body.referral?.link || api.body.referral.link.storefront_redirect_set || api.body.referral.storefront_setup?.ok !== false) bad.push(`api create ${api.status} ${JSON.stringify(api.body.referral?.storefront_setup)}`);
+    // No click recorded by any of this.
+    const clicks = (await getPool().query(`SELECT count(*)::int n FROM affiliate_referral_clicks c JOIN affiliates a ON a.id = c.affiliate_id WHERE a.public_id = ANY($1)`, [[A, B, C, D, E, F]])).rows[0].n;
+    if (clicks) bad.push(`${clicks} clicks recorded`);
+  } finally { if (keep === undefined) delete process.env.AFFILIATE_CLICK_HOST; else process.env.AFFILIATE_CLICK_HOST = keep; }
+  if (bad.length) throw new Error(bad.join(' | '));
+  return 'create link → redirect /r/{id} → https://go.test/r/{id} created and stored; re-run creates nothing; missing permission → link kept (active), status missing_scope, logged, retry works; lowercase existing redirect adopted; /R/ (broken) and other targets are conflicts, never adopted or overwritten; caller cannot pick the target; API create 201 with setup status; no clicks';
+});
+
 await step('referral: public redirect — 302 to the fixed storefront, opaque click and visitor ids, UTM allow-list, no open redirect, safe failures, isolated host', async () => {
   const bad = [];
   const P = RF.inf;

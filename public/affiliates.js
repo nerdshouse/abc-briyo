@@ -667,6 +667,15 @@ function referralCard() {
     ? (R.usable ? '<span class="status recovered"><span class="dot"></span>Live</span>' : '<span class="status noresp"><span class="dot"></span>Not usable now</span>')
     : '<span class="status none"><span class="dot"></span>No link</span>';
   const kv = (label, value) => `<div class="hr-kv"><span>${esc(label)}</span><span>${value}</span></div>`;
+  // Right after "Create referral link": the automatic Shopify redirect attempt's outcome (never blocks the link).
+  const SETUP_TEXT = {
+    missing_scope: 'The storefront redirect could not be set up automatically: the Shopify app does not have the online store navigation permission yet. The link is created; set up the redirect once Shopify is reconnected with that permission.',
+    conflict: 'The storefront redirect could not be set up automatically: Shopify already redirects this path somewhere else. Review it in Shopify → Navigation → URL redirects; it was not overwritten.',
+    shopify_error: 'The storefront redirect could not be set up automatically because Shopify could not be reached. Try "Set up storefront redirect" again.',
+    no_click_host: 'The storefront redirect was not set up: the click host is not configured.',
+  };
+  const setup = R.storefront_setup && !R.storefront_setup.ok && link && !link.storefront_redirect_set
+    ? `<div class="alert warn">${icon('info')}<span>${esc(SETUP_TEXT[R.storefront_setup.reason] || R.storefront_setup.message || 'The storefront redirect is not set up yet.')}</span></div>` : '';
   const notice = !R.eligibility.eligible
     ? `<div class="alert warn">${icon('info')}<span>${link ? 'The link exists but is not usable: ' : 'A referral link cannot be created yet: '}${esc(R.eligibility.text)}${link ? ' Visitors land on the storefront home page and no click is recorded.' : ''}</span></div>` : '';
   const actions = [];
@@ -678,7 +687,7 @@ function referralCard() {
   return `<section class="card af-referral">
     <header class="card-head"><h2 class="card-title">${icon('link')}Referral link ${badge}</h2></header>
     <div class="pane pad">
-      ${notice}
+      ${notice}${setup}
       ${link ? `<div class="hr-link af-link"><input class="input mono" id="refUrl" readonly value="${esc(R.public_url)}" aria-label="Referral link" />
           <button class="btn" type="button" data-copy-link>${icon('copy')}Copy</button></div>
         <div class="af-ref-grid">
