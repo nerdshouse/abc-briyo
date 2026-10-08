@@ -1,3 +1,4 @@
+import { formatDayKey } from './ui/ist.js';
 /**
  * Admin dashboard: operations first, recovery below.
  *
@@ -630,11 +631,8 @@ const PERIOD_HEAD = { day: 'Date', week: 'Week starting', month: 'Month' };
 function periodLabel(bucket) {
   // A YYYY-MM-DD string, deliberately not parsed as a UTC instant — that would
   // reintroduce the timezone shift the server query exists to avoid.
-  const [y, m, dd] = bucket.split('-').map(Number);
-  const date = new Date(y, m - 1, dd);
-  return state.period === 'month'
-    ? date.toLocaleDateString('en-IN', { month: 'long', year: 'numeric' })
-    : date.toLocaleDateString('en-IN', { day: 'numeric', month: 'short' });
+  const [y, m] = bucket.split('-');
+  return state.period === 'month' ? `${m}-${y}` : formatDayKey(bucket);
 }
 
 async function loadReport() {

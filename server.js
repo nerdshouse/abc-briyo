@@ -1,3 +1,4 @@
+import { APP_TIMEZONE, legacyTimezoneWarning, istDayKey as istDayKeyOf, formatDayKey } from './lib/timezone.js';
 import 'dotenv/config';
 import express from 'express';
 import cookieParser from 'cookie-parser';
@@ -539,7 +540,7 @@ app.get('/api/config', async (req, res) => {
     // The board formats callback times in the team's timezone, not the
     // browser's, so a caller travelling or a laptop set to UTC still reads the
     // same "today 6:30 pm" the SLA and the reports mean.
-    boardTimezone: process.env.BOARD_TIMEZONE || process.env.BOARD_TZ || 'Asia/Kolkata',
+    boardTimezone: APP_TIMEZONE,
     // Two distinct states: credentials present, and the store actually authorised.
     shopifyConnected: shopifyConfigured(),
     shopifyAuthorized: shopifyConfigured()
@@ -730,7 +731,7 @@ app.get('/api/carts.csv', requirePermission('support.work'), async (req, res) =>
 
     const body = toCsv(COLUMNS, result.carts);
 
-    const stamp = new Date().toISOString().slice(0, 10);
+    const stamp = formatDayKey(istDayKeyOf(new Date()));   // today in IST, DD-MM-YYYY
     res.setHeader('Content-Type', 'text/csv; charset=utf-8');
     res.setHeader('Content-Disposition', `attachment; filename="abandoned-carts-${stamp}.csv"`);
     // BOM so Excel opens UTF-8 correctly — customer names contain non-ASCII.
@@ -926,7 +927,11 @@ app.get('/api/admin/report.csv', requireAdmin, async (req, res) => {
     const rows = await periodReport(period, 60);
 
     const cols = [
-      [period === 'day' ? 'Date' : period === 'week' ? 'Week starting' : 'Month', (r) => r.bucket],
+      [period === 'day' ? 'Date' : period === 'week' ? 'Week starting' : 'Month', (r) => {
+        const b = String(r.bucket ?? '');
+        if (period === 'month') { const m = /^(\d{4})-(\d{2})/.exec(b); return m ? `${m[2]}-${m[1]}` : b; }
+        return /^\d{4}-\d{2}-\d{2}/.test(b) ? formatDayKey(b.slice(0, 10)) : b;
+      }],
       ['Carts', (r) => r.carts],
       ['Cart value', (r) => r.cart_value],
       ['Called', (r) => r.worked],
@@ -941,7 +946,7 @@ app.get('/api/admin/report.csv', requireAdmin, async (req, res) => {
 
     console.log(`Report CSV (${period}) exported by ${await currentUserName(req)}`);
     res.setHeader('Content-Type', 'text/csv; charset=utf-8');
-    res.setHeader('Content-Disposition', `attachment; filename="recovery-${period}-${new Date().toISOString().slice(0, 10)}.csv"`);
+    res.setHeader('Content-Disposition', `attachment; filename="recovery-${period}-${formatDayKey(istDayKeyOf(new Date()))}.csv"`);
     return res.send('\uFEFF' + body);
   } catch (err) { return fail(res, err); }
 });
@@ -1186,10 +1191,8 @@ if (!MOCK) {
 
 app.listen(port, async () => {
   console.log(`Briyo OS on http://localhost:${port}`);
-  if (process.env.BOARD_TZ && !process.env.BOARD_TIMEZONE) {
-    console.warn('BOARD_TZ is deprecated — rename it to BOARD_TIMEZONE. '
-      + 'It is still honoured, but only BOARD_TIMEZONE is documented.');
-  }
+  const tzWarning = legacyTimezoneWarning();
+  if (tzWarning) console.warn(tzWarning);
   console.log(`Storage: ${MOCK ? 'MOCK (in-memory, resets on restart)' : 'Postgres'}`);
   console.log(`OTP delivery: ${driver() === 'console' ? 'CONSOLE (codes printed here)' : '11za WhatsApp'}`);
 

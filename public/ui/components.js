@@ -1,3 +1,4 @@
+import { APP_TIMEZONE, istDate, istTime, istDateTime, formatDayKey } from './ist.js';
 /**
  * Briyo OS — UI components (shared design system)
  *
@@ -34,8 +35,10 @@ export function renderIcons() {
    Every calendar-day decision is made in the board's timezone, never the
    browser's, so a laptop set to UTC reads the same "today" as the reports. */
 
-let TZ = 'Asia/Kolkata';
-export const setTimezone = (tz) => { if (tz) TZ = tz; };
+// Always IST (public/ui/ist.js, lib/timezone.js). setTimezone is kept for its callers; the server only
+// ever sends Asia/Kolkata, and nothing else is accepted.
+const TZ = APP_TIMEZONE;
+export const setTimezone = () => {};
 
 /** YYYY-MM-DD in the board's timezone — the same string the report buckets use. */
 export const dayKey = (d) => new Intl.DateTimeFormat('en-CA', {
@@ -48,23 +51,18 @@ export function lastDays(n, offset = 0) {
   return Array.from({ length: n }, (_, i) => dayKey(new Date(now - (offset + n - 1 - i) * 86400000)));
 }
 
-export const clock = (iso) => new Intl.DateTimeFormat('en-IN', {
-  timeZone: TZ, hour: 'numeric', minute: '2-digit', hour12: true,
-}).format(new Date(iso)).toUpperCase();
+/** "10:35 AM" (IST). */
+export const clock = (iso) => istTime(iso);
+/** "08-10-2026" — the IST date of an instant. */
+export const dateShort = (iso) => istDate(iso);
+/** "08-10-2026, 10:35 AM IST" */
+export const dateTime = (iso) => istDateTime(iso);
 
-export const dateShort = (iso) => new Intl.DateTimeFormat('en-IN', {
-  timeZone: TZ, day: 'numeric', month: 'short',
-}).format(new Date(iso));
-
-export const dateTime = (iso) => `${dateShort(iso)}, ${clock(iso).toLowerCase()}`;
-
-/** "Tue" / "24 Sep" for a YYYY-MM-DD key, without parsing it as a UTC instant. */
+/** "Tue" / "24-09-2026" for a YYYY-MM-DD key, without parsing it as a UTC instant. */
 export function keyLabel(key, style = 'short') {
+  if (style !== 'weekday') return formatDayKey(key);
   const [y, m, d] = key.split('-').map(Number);
-  const date = new Date(Date.UTC(y, m - 1, d, 12));
-  return style === 'weekday'
-    ? date.toLocaleDateString('en-IN', { weekday: 'short', timeZone: 'UTC' })
-    : date.toLocaleDateString('en-IN', { day: 'numeric', month: 'short', timeZone: 'UTC' });
+  return new Date(Date.UTC(y, m - 1, d, 12)).toLocaleDateString('en-IN', { weekday: 'short', timeZone: 'UTC' });
 }
 
 export function relative(iso) {
