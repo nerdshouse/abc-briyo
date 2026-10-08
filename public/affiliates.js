@@ -588,9 +588,12 @@ function performanceCard() {
   if (money) {
     figs.push(fig('Attributed order value', perCur((c) => esc(cash(c.currency, c.order_value))),
       ['Current Shopify value, cancelled orders excluded', T.orders_without_financial_record ? `${count(T.orders_without_financial_record)} without a financial record` : ''].filter(Boolean).join(' · ')));
+    // With no commission recorded in any currency, the caption says so instead of repeating the "—" of the value.
+    const anyCommission = T.by_currency.some((c) => c.on_cancelled_orders || Object.values(c.by_status).some(Boolean));
     figs.push(fig('Commission earned', perCur((c) => esc(cash(c.currency, c.commission_earned))),
-      perCur((c) => [...['pending', 'approved', 'paid'].filter((k) => c.by_status[k]).map((k) => `${COMMISSION_TAG[k][1]} ${esc(cash(c.currency, c.by_status[k]))}`),
-        c.on_cancelled_orders ? `${esc(cash(c.currency, c.on_cancelled_orders))} on cancelled orders, not counted` : ''].filter(Boolean).join(' · ')) || 'Excludes reversed and cancelled'));
+      !anyCommission ? 'No commission yet'
+        : perCur((c) => [...['pending', 'approved', 'paid'].filter((k) => c.by_status[k]).map((k) => `${COMMISSION_TAG[k][1]} ${esc(cash(c.currency, c.by_status[k]))}`),
+          c.on_cancelled_orders ? `${esc(cash(c.currency, c.on_cancelled_orders))} on cancelled orders, not counted` : ''].filter(Boolean).join(' · ')) || 'Excludes reversed and cancelled'));
   }
   const acts = (o) => {
     const c = o.commission;

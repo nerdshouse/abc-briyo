@@ -6993,6 +6993,8 @@ await step('affiliate commissions: one per attribution, rate and base fixed at c
   if (inr.by_status.pending !== 29.67 || inr.on_cancelled_orders !== 40) bad.push(`cancelled commission in the pending breakdown ${JSON.stringify(inr.by_status)}`);
   const afSrc = await fsp.readFile(new URL('../public/affiliates.js', import.meta.url), 'utf8');
   if (!/on_cancelled_orders \? `\$\{esc\(cash\(c\.currency, c\.on_cancelled_orders\)\)\} on cancelled orders, not counted`/.test(afSrc)) bad.push('cancelled commission no longer shown apart on the page');
+  // With no commission at all, the earned caption reads "No commission yet" (not a second "—").
+  if (!afSrc.includes("!anyCommission ? 'No commission yet'")) bad.push('empty commission caption');
   const cc = (await commissionsOf(oCan))[0];
   await expectErr('reverse without reason', () => setCommissionStatus('CMAXQT', Number(cc.id), { status: 'reversed', actor: ACT }), (e) => e.status === 400);
   await setCommissionStatus('CMAXQT', Number(cc.id), { status: 'reversed', reason: 'Order cancelled', actor: ACT });
