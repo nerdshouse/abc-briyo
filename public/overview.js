@@ -29,10 +29,10 @@ const DEPTS = {
   inventory: { label: 'Inventory', icon: 'boxes', href: '/inventory' },
   support: { label: 'Support', icon: 'headset', href: '/?mode=tocall' },
   hr: { label: 'HR', icon: 'briefcase', href: '/hr/jobs' },
-  people: { label: 'People', icon: 'users', href: '/admin' },
+  team: { label: 'Team', icon: 'users', href: '/admin' },
 };
 // Reading order. Pairs share a row on wide screens; a lone module takes the row.
-const ROWS = [['marketing'], ['logistics', 'inventory'], ['support', 'hr'], ['people']];
+const ROWS = [['marketing'], ['logistics', 'inventory'], ['support', 'hr'], ['team']];
 const SEV_LABEL = { critical: 'Critical', warning: 'Warning', attention: 'Review' };
 
 function greeting(tz) {
@@ -216,12 +216,12 @@ const BODIES = {
   logistics: (s) => `
     <ol class="ox-flow" aria-label="Order flow">
       <li>${stat('Orders today', n(s.today), { href: '/orders' })}</li>
-      <li>${stat('Pending dispatch', n(s.pending_dispatch), { href: '/orders?view=pending_dispatch' })}</li>
+      <li>${stat('Awaiting dispatch', n(s.awaiting_dispatch), { href: '/orders?view=awaiting_dispatch', note: 'Shipments created in the app' })}</li>
       <li>${stat('In transit', n(s.in_transit), { href: '/orders?view=in_transit' })}</li>
       <li>${stat('Delivered', n(s.delivered), { href: '/orders?view=delivered' })}</li>
     </ol>
     ${group('Exceptions', `${signal('Failed / RTO', s.failed, { href: '/orders?view=failed', tone: 'critical' })}
-      ${signal('Open orders without a shipment', s.without_shipment, { href: '/orders?view=pending_dispatch', tone: 'warning' })}`)}`,
+`)}`,
 
   // Catalogue and units on top; the stock and batch signals below, each calm at zero.
   inventory: (s) => {
@@ -236,8 +236,8 @@ const BODIES = {
       <div class="ox-split">
         ${group('Stock', tracked ? `${signal('Out of stock', s.out_of_stock, { href: '/inventory?stock=out', tone: 'warning' })}
           ${signal('Low stock', s.low_stock, { href: '/inventory?stock=low', tone: 'attention' })}
-          ${signal('Unmapped platform SKUs', s.unmapped_skus, { href: '/inventory?view=unmapped', tone: 'warning' })}`
-          : `<p class="ox-quiet">${waiting}.</p>${signal('Unmapped platform SKUs', s.unmapped_skus, { href: '/inventory?view=unmapped', tone: 'warning' })}`)}
+          ${row('Platform SKUs to map', s.platform_skus_to_map, { href: '/inventory?view=unmapped', note: 'Setup' })}`
+          : `<p class="ox-quiet">${waiting}.</p>${row('Platform SKUs to map', s.platform_skus_to_map, { href: '/inventory?view=unmapped', note: 'Setup' })}`)}
         ${group('Batches', `${signal('Expired, still holding stock', s.expired_batches, { href: '/inventory?expiring=expired', tone: 'critical' })}
           ${signal('Expiring within 30 days', s.expiring_30, { href: '/inventory?expiring=30', tone: 'attention' })}`)}
       </div>`;
@@ -274,7 +274,7 @@ const BODIES = {
       <a href="/hr/candidates"><span class="ox-k">New this week</span><span class="ox-v num">${n(s.new_7d)}</span></a></div>`)}`,
 
   // A supporting strip: the team at a glance, with the two things an admin can fix.
-  people: (s) => {
+  team: (s) => {
     const cat = state.me?.moduleCatalog || {};
     const depts = Object.entries(s.by_department || {}).map(([k, v]) => `<span class="ox-chipn">${esc(cat[k]?.label || k)} <b class="num">${n(v)}</b></span>`).join('');
     return `<div class="ox-people">
@@ -336,6 +336,17 @@ function renderAttention(d) {
         <div class="ox-exc-list">${by(sv).map(line).join('')}</div>
       </div>`).join('')
     : `<p class="ox-clear">${icon('circle-check')}<span><b>All clear.</b> Nothing needs intervention right now — every department ${state.me?.isAdmin ? '' : 'you can see '}is up to date.</span></p>`;
+  // Setup: onboarding work that blocks nothing — listed quietly, never counted as an alarm.
+  const setup = d.setup || [];
+  if (setup.length) {
+    $('#ovAttention').insertAdjacentHTML('beforeend', `<div class="ox-exc-group g-setup" role="group" aria-label="Setup: ${setup.length}">
+        <h3 class="ox-exc-gh"><span class="health neutral">Setup</span><span class="num">${setup.length}</span></h3>
+        <div class="ox-exc-list">${setup.map((a) => `<a class="ox-exc-row" href="${a.href}">
+          <span class="ox-exc-dept">${icon(DEPTS[a.dept]?.icon || 'circle')}${esc(DEPTS[a.dept]?.label || a.dept)}</span>
+          <span class="ox-exc-text">${a.count !== null ? `<b class="num">${n(a.count)}</b> ` : ''}${esc(a.text)}</span>
+          <span class="ox-exc-go" aria-hidden="true">${icon('arrow-right')}</span></a>`).join('')}</div>
+      </div>`);
+  }
 }
 
 function render() {
@@ -357,7 +368,7 @@ function render() {
   const body = $('#ovDepts');
   body.innerHTML = ROWS.map((row) => row.filter((k) => keys.includes(k)))
     .filter((row) => row.length)
-    .map((row) => (row.length === 1 && (row[0] === 'marketing' || row[0] === 'people')
+    .map((row) => (row.length === 1 && (row[0] === 'marketing' || row[0] === 'team')
       ? moduleHtml(row[0], d.sections[row[0]])
       : `<div class="ox-row${row.length === 1 ? ' solo' : ''}">${row.map((k) => moduleHtml(k, d.sections[k])).join('')}</div>`))
     .join('');
