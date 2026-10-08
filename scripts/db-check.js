@@ -5109,21 +5109,34 @@ await step('amazon sync catch-up: 2,050 orders across chained runs on one window
     const b1 = await runAmazonSync({ client: c2, actor: AZ_ACTOR, startFrom: from });
     const runMs = vc.t - t0;
     if (!b1.summary.partial || b1.summary.endedBy !== 'allowance' || b1.summary.fetched !== 25 || runMs > 15 * 60000 || (await ck()) !== null) bad.push(`budget ${JSON.stringify(b1.summary)} ${runMs}`);
-    // Throttled before a page, run after run: each run ends partial (cursor and window kept), the third fails; checkpoint never moves.
+    // A run that processes a page and is then throttled ends partial with the no-progress count at 0.
     const thr = { status: 429, headers: {}, text: '{}' };
     const idT = await lastId();
-    let prevRun = b1.runId;
+    s2.script.push(null, thr, thr, thr);                        // null: the page is served normally, then 429s
+    const pr = await runAmazonSync({ client: c2, actor: AZ_ACTOR, resumeRunId: b1.runId });
+    const [prRow] = (await runRows(idT)).slice(-1);
+    if (prRow.status !== 'partial' || pr.summary.endedBy !== 'throttled' || pr.summary.fetched !== 1 || prRow.details.throttle_streak !== 0 || prRow.details.cursor?.token !== 'H26') bad.push(`progress then throttled: ${prRow.status} ${JSON.stringify(prRow.details.cursor)} streak ${prRow.details.throttle_streak}`);
+    // Then throttled before a page, run after run: 1, 2 → partial; the third no-progress run in a row fails. Cursor and window kept.
+    let prevRun = pr.runId;
     for (let i = 1; i <= 3; i += 1) {
       for (let k = 0; k < 3; k += 1) s2.script.push(thr);
       const res = await runAmazonSync({ client: c2, actor: AZ_ACTOR, resumeRunId: prevRun }).then((x) => x, (e) => e);
       const [row] = (await runRows(idT)).slice(-1);
       prevRun = Number(row.id);
       const want = i < 3 ? 'partial' : 'failed';
-      if (row.status !== want || row.details.cursor?.token !== 'H25' || row.details.window.until !== b1.window.until || (i < 3 && res.summary?.endedBy !== 'throttled')) bad.push(`throttled run ${i}: ${row.status} ${JSON.stringify(row.details.cursor)}`);
+      if (row.status !== want || row.details.throttle_streak !== i || row.details.cursor?.token !== 'H26' || row.details.window.until !== b1.window.until
+        || (i < 3 && res.summary?.endedBy !== 'throttled') || (i === 3 && !/3 runs in a row without a page/.test(res.message || ''))) bad.push(`throttled run ${i}: ${row.status} streak ${row.details.throttle_streak} ${JSON.stringify(row.details.cursor)}`);
     }
     if ((await ck()) !== null) bad.push('checkpoint moved by throttled runs');
-    // Recovery: the failed run is continued from its saved token, the window finishes, then the checkpoint moves.
-    const done = await (await startAmazonIncrementalSync({ client: c2, actor: AZ_ACTOR })).done;
+    // A person starts it again: the count starts at 0, so one more throttled run is partial (not an instant failure) and the
+    // chain carries on from the saved cursor and window, finishes it, and only then moves the checkpoint.
+    for (let k = 0; k < 3; k += 1) s2.script.push(thr);
+    const idM = await lastId();
+    const manual = await startAmazonIncrementalSync({ client: c2, actor: AZ_ACTOR });
+    const done = await manual.done;
+    const mRows = await runRows(idM);
+    if (manual.resumedFrom !== prevRun || mRows[0].status !== 'partial' || mRows[0].details.throttle_streak !== 1 || mRows[0].details.cursor?.token !== 'H26'
+      || mRows[0].details.window.since !== b1.window.since || mRows[mRows.length - 1].status !== 'completed') bad.push(`manual retry: ${mRows.map((r) => `${r.status}/${r.details.throttle_streak}`)}`);
     if (done.window.until !== b1.window.until || (await ck()) !== b1.window.until) bad.push('throttled window not completed');
     const total = (await db.query(`SELECT count(*)::int n FROM orders WHERE channel = 'amazon' AND source_order_id = ANY($1)`, [Array.from({ length: 30 }, (_, i) => AZS(5000 + i))])).rows[0].n;
     if (total !== 30) bad.push(`${total} of 30 budget-test orders`);
@@ -5132,7 +5145,7 @@ await step('amazon sync catch-up: 2,050 orders across chained runs on one window
     else await db.query('UPDATE system_state SET value = $2 WHERE key = $1', [CK, saved]);
   }
   if (bad.length) throw new Error(bad.join(' | '));
-  return '2,050 orders: run 1 = 20 pages in the burst → partial with the page-21 token, no checkpoint; the chain reuses the client, waits one refill (178.6 s) before page 21 and completes the same window; checkpoint = window end only then; a run stops taking paced pages before 15 min of waiting (partial); 429s before a page end runs partial with cursor and window kept, the third in a row fails, checkpoint untouched; resumed → done, then the checkpoint moves';
+  return '2,050 orders: run 1 = 20 pages in the burst → partial with the page-21 token, no checkpoint; the chain reuses the client, waits one refill (178.6 s) before page 21 and completes the same window; checkpoint = window end only then; a run stops taking paced pages before 15 min of waiting (partial); a run that processed a page then hit 429s → partial, no-progress count 0; then 429s before a page: runs 1, 2 partial, the 3rd in a row fails (cursor and window kept, checkpoint untouched); a person\'s retry starts the count at 0 (partial, not an instant failure), the chain resumes the same cursor/window and completes, then the checkpoint moves';
 });
 
 await step('amazon sp-api cleanup', async () => {
