@@ -4100,6 +4100,93 @@ await step('shopify orders: contact and addresses come from the order itself (re
   return 'query asks for email, phone, shipping and billing address, not customer; complete / customer-null / partial address / billing fallback / no phone / no email / nothing all map without error and nulls stay null; GoKwik attributes and referral untouched; an order imported without contact data is filled by a later sync (same order, no new snapshot) and never wiped by one without it';
 });
 
+await step('shared order-sync runner and HTTP retry (lib/order-sync-runner.js, lib/http-retry.js): windows, checkpoint rule, lifecycle, chains, one at a time, retry policy', async () => {
+  const bad = [];
+  const R = await import('../lib/order-sync-runner.js');
+  const H = await import('../lib/http-retry.js');
+  // Windows: overlap below the checkpoint, fixed watermark at `now`.
+  const now = new Date('2026-10-09T10:00:00.000Z');
+  const w = R.incrementalWindow('2026-10-09T09:00:00.000Z', now, 5 * 60000);
+  if (w.mode !== 'incremental' || w.since !== '2026-10-09T08:55:00.000Z' || w.until !== '2026-10-09T10:00:00.000Z') bad.push(`window ${JSON.stringify(w)}`);
+  // Checkpoint rule: never on partial or single-order; watermark, chain start or run start otherwise.
+  const st = new Date('2026-10-09T10:00:05.000Z');
+  const cases = [[w, false, '2026-10-09T10:00:00.000Z'], [w, true, null], [{ mode: 'order' }, false, null],
+    [{ mode: 'all', chain_started_at: '2026-10-01T00:00:00.000Z' }, false, '2026-10-01T00:00:00.000Z'], [{ mode: 'window' }, false, st.toISOString()]];
+  for (const [win, partial, want] of cases) if (R.checkpointAfter(win, { partial, startedAt: st }) !== want) bad.push(`checkpoint ${JSON.stringify(win)} ${partial}`);
+  // Lifecycle on a test kind: open (resumed run keeps its cursor), progress, fail, complete; resume rules.
+  const db = getPool();
+  const KIND = 'dbcheck_runner_sync';
+  try {
+    const id1 = await R.openRun(db, { channel: 'website', kind: KIND, actor: 'dbcheck-runner', filename: 'runner test', window: w });
+    await R.recordPageProgress(db, id1, { cursor: 'C2', fetched: 10 });
+    await R.completeRun(db, id1, { partial: true, fetched: 10, created: 4, updated: 1, unchanged: 5, itemsCreated: 4, itemsUpdated: 0, errors: 0, reportedErrors: [], conflicts: 0, unmappedLines: 2, details: { note: 'p1' } });
+    const prev = await R.resumableRun(db, KIND, id1);
+    if (prev.cursor !== 'C2' || prev.window.until !== w.until) bad.push('resumableRun');
+    const id2 = await R.openRun(db, { channel: 'website', kind: KIND, actor: 'dbcheck-runner', filename: 'runner test', window: prev.window, resumedFrom: id1, cursor: prev.cursor });
+    await R.failRun(db, id2, { fetched: 0, created: 0, updated: 0, unchanged: 0, itemsCreated: 0, itemsUpdated: 0, errorRows: 1, reportedErrors: [{ reason: 'boom' }], details: { failure: 'boom' } });
+    const r2 = (await db.query('SELECT status, error_rows, details FROM order_imports WHERE id = $1', [id2])).rows[0];
+    if (r2.status !== 'failed' || r2.error_rows !== 1 || r2.details.cursor !== 'C2' || r2.details.resumed_from !== id1 || r2.details.failure !== 'boom') bad.push(`failed run ${JSON.stringify(r2)}`);
+    await expectErr('wrong kind', () => R.resumableRun(db, 'shopify_sync', id2), (e) => /cannot be continued/.test(e.message));
+    // Runner: chain of resumed runs, resumable tail, status totals, one at a time, background busy.
+    let bg = false;
+    const runner = R.createSyncRunner({ kind: KIND, label: 'Runner test', isBusy: () => bg, runningIgnoredActors: ['dbcheck-ignored'], chainIgnoredActors: ['dbcheck-ignored'], busyMessage: 'busy test' });
+    const chain = await runner.chain(db, ['incremental']);
+    if (chain.map((r) => Number(r.id)).join() !== `${id1},${id2}` || runner.resumableTail(chain) !== id2) bad.push('chain/resumable');
+    const s1 = await runner.status(['incremental']);
+    if (s1.state !== 'failed' || s1.runs !== 2 || s1.created !== 4 || s1.unmappedLines !== 2 || s1.failure !== 'boom') bad.push(`status ${JSON.stringify(s1)}`);
+    bg = true;
+    await expectErr('background busy', () => runner.assertNoRunning(db), (e) => e.status === 409 && e.syncRunning && e.message === 'busy test');
+    bg = false;
+    const idR = await R.openRun(db, { channel: 'website', kind: KIND, actor: 'someone', filename: 'running elsewhere', window: w });
+    await expectErr('running row elsewhere', () => runner.assertNoRunning(db), (e) => e.status === 409);
+    await db.query(`UPDATE order_imports SET started_at = now() - interval '31 minutes' WHERE id = $1`, [idR]);
+    await runner.assertNoRunning(db);                         // a stale 'running' row no longer blocks
+    await db.query(`UPDATE order_imports SET imported_by = 'dbcheck-ignored', started_at = now() WHERE id = $1`, [idR]);
+    await runner.assertNoRunning(db);                         // an ignored actor's running row never blocks
+    await db.query(`UPDATE order_imports SET status = 'completed' WHERE id = $1`, [idR]);
+    // launch: partial runs chain on until one is not partial; busy while it runs; failure logged and cleared.
+    const seen = [];
+    let n = 0;
+    const done = runner.launch({ failLabel: 'test', runOnce: async ({ resumeRunId }) => { seen.push(resumeRunId); n += 1; await new Promise((r) => setTimeout(r, 10)); return { runId: 100 + n, summary: { partial: n < 3 } }; } });
+    if (!runner.busy()) bad.push('not busy while launched');
+    await expectErr('second start while running', () => runner.assertNoRunning(db), (e) => e.status === 409);
+    await done;
+    await new Promise((r) => setTimeout(r, 5));               // busy clears in the chain's finally, a tick later
+    if (seen.join() !== ',101,102' || runner.busy()) bad.push(`chain loop ${seen} busy=${runner.busy()}`);
+    const err = console.error; console.error = () => {};
+    const failing = runner.launch({ failLabel: 'test', runOnce: async () => { throw new Error('nope'); } });
+    await failing.then(() => bad.push('failure swallowed'), () => {});
+    await new Promise((r) => setTimeout(r, 5));
+    console.error = err;
+    if (runner.busy()) bad.push('busy after a failed chain');
+  } finally {
+    await db.query(`DELETE FROM order_imports WHERE kind = $1`, [KIND]);
+  }
+  // Retry: classification, flags, connection failure text, policy and timings.
+  if (H.classifyStatus(429) !== 'throttled' || H.classifyStatus(503) !== 'transient' || H.classifyStatus(504) !== 'transient' || H.classifyStatus(400) !== 'permanent' || H.classifyStatus(401) !== 'permanent') bad.push('classifyStatus');
+  const cf = H.connectionFailure(Object.assign(new Error('x'), { cause: { code: 'ECONNRESET' } }), 'Shopify');
+  if (cf.message !== 'Shopify could not be reached: ECONNRESET' || cf.transient !== true || 'status' in cf) bad.push(`connectionFailure ${cf.message}`);
+  const run = async (plan, opts = {}) => { const waits = []; let calls = 0; const retries = [];
+    try { const v = await H.withRetry(async () => { const e = plan[calls++]; if (e) throw e; return 'ok'; }, { backoffMs: 10, wait: async (ms) => { waits.push(ms); }, onTransientRetry: (k, max) => retries.push(`${k}/${max}`), ...opts }); return { v, calls, waits, retries }; }
+    catch (e) { return { err: e, calls, waits, retries }; } };
+  const T = () => H.markThrottled(new Error('429'));
+  const X = () => H.markTransient(new Error('503'));
+  const P = () => new Error('400');
+  let r = await run([T(), T(), T(), T()]);                    // throttled: attempts 0..3 retried, the 5th try succeeds
+  if (r.v !== 'ok' || r.calls !== 5 || r.waits.join() !== '10,20,40,80') bad.push(`throttle ${JSON.stringify(r)}`);
+  r = await run([T(), T(), T(), T(), T()]);                   // the 5th throttle is thrown
+  if (!r.err?.throttled || r.calls !== 5) bad.push('throttle bound');
+  r = await run([X(), X()]);                                  // transient: 3 tries in all, waits ×1, ×2
+  if (r.v !== 'ok' || r.calls !== 3 || r.waits.join() !== '10,20' || r.retries.join() !== '1/2,2/2') bad.push(`transient ${JSON.stringify(r)}`);
+  r = await run([X(), X(), X()]);
+  if (!r.err?.transient || r.calls !== 3) bad.push('transient bound');
+  r = await run([P()]);                                       // permanent: never retried
+  if (!r.err || r.calls !== 1 || r.waits.length) bad.push('permanent retried');
+  r = await run([X(), T()]);                                  // attempt counts every try: a throttle after a transient waits ×2
+  if (r.v !== 'ok' || r.waits.join() !== '10,20') bad.push(`mixed ${JSON.stringify(r.waits)}`);
+  if (bad.length) throw new Error(bad.join(' | '));
+  return 'incremental window (overlap + fixed watermark); checkpoint only on full success (watermark / chain start / run start; never partial or single-order); open/progress/fail/complete lifecycle, a resumed run keeps its cursor, resume refused across kinds; chain walk, resumable tail, status totals; 409 when busy here, in the background or by a fresh running row elsewhere (stale and ignored actors don\'t block); partial runs chain until done, busy cleared after success and failure; retry: 429 ×4 then thrown, 5xx/connection 3 tries, 4xx never, backoff ×2 per attempt, same as Shopify';
+});
 await step('shopify orders: transient Shopify failures (503, connection reset) are retried, bounded; permanent errors are not; 429 unchanged; idempotent', async () => {
   const bad = [];
   const store = Array.from({ length: 12 }, (_, i) => ({ ...shOrder(701 + i, { created: shDays(0.1) }), updatedAt: new Date(Date.now() - (12 - i) * 1000).toISOString() }));
