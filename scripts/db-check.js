@@ -4610,7 +4610,7 @@ await step('shopify oauth: APP_BASE_URL pins the callback; connecting stores the
     const state = (install.headers['set-cookie'] || []).join(';').match(/shopify_oauth_state=([0-9a-f]+)/)?.[1];
     if (install.statusCode !== 302 || loc.host !== SHOP || loc.pathname !== '/admin/oauth/authorize') bad.push(`install ${install.statusCode} ${loc}`);
     if (loc.searchParams.get('redirect_uri') !== 'https://abc.briyo.xyz/auth/shopify/callback') bad.push(`redirect_uri ${loc.searchParams.get('redirect_uri')}`);
-    if (loc.searchParams.get('scope') !== 'read_orders' || !state) bad.push('scope/state');
+    if (loc.searchParams.get('scope') !== 'read_online_store_navigation,write_online_store_navigation,read_orders' || !state) bad.push(`scope/state ${loc.searchParams.get('scope')}`);
     // Non-admins cannot start it.
     const nonAdmin = await fetch(`${base}/auth/shopify/install`, { headers: { cookie: `${SESSION_COOKIE}=${issueSession(HRM.nonHr)}` }, redirect: 'manual' });
     if (nonAdmin.status === 302 && /myshopify/.test(nonAdmin.headers.get('location') || '')) bad.push('non-admin reached Shopify');
