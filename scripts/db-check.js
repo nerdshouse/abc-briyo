@@ -3160,6 +3160,43 @@ await step('post-cutover dispatch guard: no lines (or only code-less ones) → r
   if (!plain) throw new Error('a non-website manual order could not be created');
   return `after cutover: no-lines dispatch refused ("${MSG.slice(0, 40)}…"), direct-dispatched create refused and rolled back, code-less-only refused, line-less order cannot join a dispatched parcel; historical order and no-cutover dispatch unchanged (0 movements); non-website manual orders unaffected`;
 });
+await step('manual order lines: channel and order number are fixed while the order has manual products (no route onto an Amazon order)', async () => {
+  const MSG = 'Cannot change channel or order number while this order has manual products. Remove the products first.';
+  const o = await mlOrder('MOVE');
+  const add = await addManualOrderLine(o, { sku_id: ML.a, quantity: 2 }, { actor: ACTOR });
+  const before = JSON.stringify(await orderItems(o));
+  const v = async () => (await getOrder(o)).version;
+  await expectErr('channel', async () => updateOrder(o, { channel: 'zepto', ...R('zepto') }, { actor: ACTOR, version: await v() }), (e) => e.status === 409 && e.message === MSG);
+  await expectErr('number', async () => updateOrder(o, { source_order_id: `${TEST_ORDER}-ML-MOVED` }, { actor: ACTOR, version: await v() }), (e) => e.status === 409 && e.message === MSG);
+  // D. Not onto Amazon either, under a real-looking Amazon order ID.
+  await expectErr('to amazon', async () => updateOrder(o, { channel: 'amazon', ...R('amazon'), source_order_id: AZ('ML-MOVE') }, { actor: ACTOR, version: await v() }), (e) => e.status === 409 && e.message === MSG);
+  const cur = await getOrder(o);
+  if (cur.channel !== 'blinkit' || cur.source_order_id !== `${TEST_ORDER}-ML-MOVE` || JSON.stringify(await orderItems(o)) !== before) throw new Error('order or lines changed');
+  // Other edits still work; once the products are removed, the order can move again.
+  await updateOrder(o, { order_value: 250 }, { actor: ACTOR, version: await v() });
+  await removeManualOrderLine(o, add.itemId, { actor: ACTOR });
+  await updateOrder(o, { source_order_id: `${TEST_ORDER}-ML-MOVED` }, { actor: ACTOR, version: await v() });
+  // B. No manual products: channel and number change as before.
+  const free = await mlOrder('FREE');
+  await updateOrder(free, { channel: 'zepto', ...R('zepto') }, { actor: ACTOR, version: (await getOrder(free)).version });
+  await updateOrder(free, { source_order_id: `${TEST_ORDER}-ML-FREE2` }, { actor: ACTOR, version: (await getOrder(free)).version });
+  const f = await getOrder(free);
+  if (f.channel !== 'zepto' || f.source_order_id !== `${TEST_ORDER}-ML-FREE2`) throw new Error(JSON.stringify(f));
+  return 'with a manual product: channel, number and a move onto an Amazon order ID refused (409, order and line unchanged); value edit fine; products removed → number changes; no products → channel and number change as before';
+});
+await step('manual order lines: a hand-entered Amazon order (no manual products possible) gets its Amazon lines from the import exactly once', async () => {
+  const id = await createOrder({ ...R('amazon'), channel: 'amazon', source_order_id: AZ('ML-HAND'), order_value: 1 }, { actor: ACTOR });
+  await expectErr('manual line', () => addManualOrderLine(id, { sku_id: ML.a, quantity: 1 }, { actor: ACTOR }), (e) => e.status === 409);
+  const file = amzCsv([amzRow({ 'order-id': AZ('ML-HAND'), 'order-item-id': 'MLH-1', sku: 'SKU-MLH', 'quantity-purchased': '2' })]);
+  const r = await commitAmazonImport(file, 'ml-hand.csv', { actor: IMPORTER });
+  let items = await orderItems(id);
+  if (r.summary.ordersUpdated !== 1 || items.length !== 1 || items[0].source_line_item_id !== 'MLH-1' || items[0].quantity !== 2 || items[0].sku !== 'SKU-MLH') throw new Error(JSON.stringify({ s: r.summary, items }));
+  const again = await commitAmazonImport(file, 'ml-hand.csv', { actor: IMPORTER });
+  items = await orderItems(id);
+  if (items.length !== 1 || again.summary.lineItemsAdded) throw new Error(`rerun: ${items.length} lines, added ${again.summary.lineItemsAdded}`);
+  if ((await getOrder(id)).source !== 'manual') throw new Error('source changed');
+  return 'manual line refused on the Amazon order; import matched it and added its 1 Amazon line (qty 2, Amazon code); rerun added nothing; order stays hand-entered';
+});
 await step('manual order lines: test cutover cleared', async () => {
   await getPool().query('UPDATE inventory_settings SET cutover_at = NULL WHERE id');
   return 'cutover NULL for the rest of the suite';
