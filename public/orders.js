@@ -1740,7 +1740,7 @@ async function commitImport() {
   }
 }
 
-/* ------------------------------------------------------------------ Shopify button: full-history sync */
+/* ------------------------------------------------------------------ Shopify button: sync new and changed orders */
 
 const syncNote = (html, tone = '') => {
   const el = $('#shopifySync');
@@ -1756,13 +1756,13 @@ const shopifyBusy = (on) => {
 };
 const duration = (ms) => (ms === null || ms === undefined ? '' : ms < 60000 ? `${Math.max(1, Math.round(ms / 1000))} s` : `${Math.round(ms / 60000)} min`);
 
-/** Starts the full-history sync (the server refuses a second one with 409) and follows it to the end. */
+/** Syncs orders changed since the last sync (the server refuses a second sync with 409) and follows it to the end. */
 async function startShopifySync() {
   if ($('#shopifyOrders').disabled) return;
   shopifyBusy(true);
-  syncNote('Syncing Shopify orders…');
+  syncNote('Syncing new and changed Shopify orders…');
   try {
-    await api('/api/orders/shopify/sync-all', { method: 'POST' });
+    await api('/api/orders/shopify/sync-updates', { method: 'POST' });
   } catch (err) {
     // Already running (another click, another admin, or the poll): follow that run instead.
     if (!(err.status === 409 && err.data?.syncRunning)) { shopifyBusy(false); syncNote(esc(err.message), 'error'); return; }
@@ -1772,16 +1772,16 @@ async function startShopifySync() {
 
 async function followShopifySync() {
   let s;
-  try { s = await api('/api/orders/shopify/sync-all'); } catch (err) { shopifyBusy(false); syncNote(esc(err.message), 'error'); return; }
+  try { s = await api('/api/orders/shopify/sync-updates'); } catch (err) { shopifyBusy(false); syncNote(esc(err.message), 'error'); return; }
   if (s.state === 'running') {
     shopifyBusy(true);
-    syncNote(`Syncing Shopify orders… <span class="soft">${count(s.fetched || 0)} fetched so far</span>`);
+    syncNote(`Syncing new and changed Shopify orders… <span class="soft">${count(s.fetched || 0)} fetched so far</span>`);
     setTimeout(followShopifySync, 2500);
     return;
   }
   shopifyBusy(false);
   if (s.state === 'completed') {
-    syncNote(`<b>Shopify sync complete</b>${s.durationMs ? ` · ${esc(duration(s.durationMs))}` : ''}<div class="sync-facts">
+    syncNote(`<b>Shopify ${s.mode === 'all' ? 'full-history sync' : 'orders up to date'}</b>${s.durationMs ? ` · ${esc(duration(s.durationMs))}` : ''}<div class="sync-facts">
       <span>${count(s.fetched)} fetched</span><span>${count(s.created)} new</span><span>${count(s.updated)} updated</span>
       <span>${count(s.conflicts)} conflict${s.conflicts === 1 ? '' : 's'}</span><span>${count(s.unmappedLines)} unmapped line${s.unmappedLines === 1 ? '' : 's'}</span>
       <span>BWA shipments: ${count(s.externalCreated)} created, ${count(s.externalUpdated)} updated</span></div>`, 'success');
@@ -1856,7 +1856,7 @@ function bind() {
   $('#newShipment').addEventListener('click', openCreate);
   $('#importOrders').addEventListener('click', openImport);
   $('#iClose').addEventListener('click', closeImport);
-  // One click: sync the whole Shopify order history (no panel). Refresh above only reloads the list.
+  // One click: sync orders changed in Shopify since the last sync (no panel). Refresh above only reloads the list.
   $('#shopifyOrders').addEventListener('click', startShopifySync);
   $('#iCancel').addEventListener('click', closeImport);
   $('#iFile').addEventListener('change', (e) => { imp.file = e.target.files[0] || null; imp.done = false; previewImport(); });
@@ -1905,7 +1905,7 @@ function bind() {
     // Shopify connection and sync are admin-only (the API enforces it too).
     $('#shopifyOrders').hidden = !me.isAdmin;
     // A sync already under way (started elsewhere, or before a reload): show it and follow it.
-    if (me.isAdmin) api('/api/orders/shopify/sync-all').then((st) => { if (st.state === 'running') followShopifySync(); }).catch(() => {});
+    if (me.isAdmin) api('/api/orders/shopify/sync-updates').then((st) => { if (st.state === 'running') followShopifySync(); }).catch(() => {});
     fillFilters();
     bind();
     await load({ pending: firstOrders });
