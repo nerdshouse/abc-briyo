@@ -1,3 +1,4 @@
+import { istDate, istDateTime, formatDayKey } from './ui/ist.js';
 /**
  * Inventory — stock by SKU and batch, the SKU drawer (batches, COAs, ledger),
  * and the admin forms: new SKU, add inventory, adjust, transfer, batch status,
@@ -32,14 +33,9 @@ const canCatalog = () => Boolean(state.me?.caps?.includes('inventory.catalog'));
 const opt = (value, text, selected) => `<option value="${esc(value)}"${selected ? ' selected' : ''}>${esc(text)}</option>`;
 // A batch date is a calendar day ('YYYY-MM-DD'): formatted in UTC from its own
 // parts, so the viewer's timezone can never move it to the day before.
-const DAY_FMT = new Intl.DateTimeFormat('en-IN', { day: 'numeric', month: 'short', year: 'numeric', timeZone: 'UTC' });
-const day = (d) => {
-  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(d || ''));
-  return m ? DAY_FMT.format(Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3]))) : '—';
-};
+const day = (d) => formatDayKey(d);   // DD-MM-YYYY from the key's own parts
 // An order's date (a timestamp), shown as the day it was in India.
-const SEEN_FMT = new Intl.DateTimeFormat('en-IN', { day: 'numeric', month: 'short', year: 'numeric', timeZone: 'Asia/Kolkata' });
-const seenDate = (t) => (t && !Number.isNaN(new Date(t).getTime()) ? SEEN_FMT.format(new Date(t)) : '—');
+const seenDate = (t) => istDate(t);
 const amount = (v) => (v === null || v === undefined ? '—' : money(v));
 const requestId = () => (crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random().toString(16).slice(2)}`);
 
@@ -454,8 +450,8 @@ function openForm(kind, ctx = {}) {
       <label class="fld wide"><span>SKU</span><select class="select" name="sku_id" required>${skuOptions(ctx.skuId || '')}</select></label>
       <label class="fld"><span>Batch number</span><input class="input mono" name="batch_number" required maxlength="80" autocomplete="off" /></label>
       <label class="fld"><span>Quantity</span><input class="input" name="quantity" inputmode="numeric" required /></label>
-      <label class="fld"><span>Manufacturing date</span><input class="input" name="mfg_date" placeholder="08/2026 or 01/08/2026" autocomplete="off" /></label>
-      <label class="fld"><span>Expiry</span><input class="input" name="expiry_date" placeholder="08/2028 or 31/08/2028" autocomplete="off" />
+      <label class="fld"><span>Manufacturing date</span><input class="input" name="mfg_date" placeholder="08-2026 or 01-08-2026" autocomplete="off" /></label>
+      <label class="fld"><span>Expiry</span><input class="input" name="expiry_date" placeholder="08-2028 or 31-08-2028" autocomplete="off" />
         <span class="help">A month alone means its last day: 08/2028 = 31 Aug 2028.</span></label>
       <label class="fld"><span>Unit cost (₹)</span><input class="input" name="unit_cost" inputmode="decimal" placeholder="180" /></label>
       <label class="fld"><span>Received date</span><input class="input" name="received_date" placeholder="Today if empty" autocomplete="off" /></label>
@@ -505,8 +501,8 @@ function openForm(kind, ctx = {}) {
       <label class="fld"><span>Reason for a status change</span><input class="input" name="reason" maxlength="300" /></label>
       <label class="fld"><span>Location / rack</span><input class="input" name="location" value="${esc(batch.location || '')}" maxlength="80" /></label>
       <label class="fld"><span>Unit cost (₹)</span><input class="input" name="unit_cost" inputmode="decimal" value="${esc(batch.unit_cost ?? '')}" /></label>
-      <label class="fld"><span>Manufacturing date</span><input class="input" name="mfg_date" value="${esc(batch.mfg_date || '')}" placeholder="08/2026" autocomplete="off" /></label>
-      <label class="fld"><span>Expiry</span><input class="input" name="expiry_date" value="${esc(batch.expiry_date || '')}" placeholder="08/2028 or 31/08/2028" autocomplete="off" />
+      <label class="fld"><span>Manufacturing date</span><input class="input" name="mfg_date" value="${esc(batch.mfg_date ? formatDayKey(batch.mfg_date) : '')}" placeholder="08-2026" autocomplete="off" /></label>
+      <label class="fld"><span>Expiry</span><input class="input" name="expiry_date" value="${esc(batch.expiry_date ? formatDayKey(batch.expiry_date) : '')}" placeholder="08-2028 or 31-08-2028" autocomplete="off" />
         <span class="help">A month alone means its last day.</span></label>
       <label class="fld"><span>PO number</span><input class="input mono" name="po_number" value="${esc(batch.po_number || '')}" /></label>
       <label class="fld"><span>GRN number</span><input class="input mono" name="grn_number" value="${esc(batch.grn_number || '')}" /></label>
@@ -593,7 +589,7 @@ function renderImportPreview(p) {
 }
 
 // Stock cutover: orders placed before it are historical and never reserve or consume stock.
-const CUT_FMT = new Intl.DateTimeFormat('en-IN', { day: 'numeric', month: 'short', year: 'numeric', hour: 'numeric', minute: '2-digit', timeZone: 'Asia/Kolkata' });
+const CUT_FMT = { format: (d) => istDateTime(d).replace(/ IST$/, '') };   // " IST" is appended where shown
 async function renderCutover() {
   const el = $('#cutover');
   try {
@@ -728,8 +724,9 @@ async function submitForm(e) {
     } else if (kind === 'batch') {
       const batch = state.detail.batches.find((b) => b.id === ctx.batchId);
       if (v.status === batch.status) delete v.status;
-      if (v.mfg_date === (batch.mfg_date || '')) delete v.mfg_date;
-      if (v.expiry_date === (batch.expiry_date || '')) delete v.expiry_date;
+      // Shown as DD-MM-YYYY; unchanged when it still reads the same date.
+      if (v.mfg_date === (batch.mfg_date ? formatDayKey(batch.mfg_date) : '')) delete v.mfg_date;
+      if (v.expiry_date === (batch.expiry_date ? formatDayKey(batch.expiry_date) : '')) delete v.expiry_date;
       await api(`/api/inventory/batches/${ctx.batchId}`, { method: 'PATCH', body: JSON.stringify({ ...v, version: batch.version }) });
       openAfter = state.detail.sku.id;
     }

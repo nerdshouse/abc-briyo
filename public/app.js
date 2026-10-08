@@ -1,3 +1,4 @@
+import { istInputValue, fromIstInput } from './ui/ist.js';
 /**
  * Call board (v2 shell).
  *
@@ -150,14 +151,8 @@ function attentionOf(c) {
   return null;
 }
 
-/** <input type="datetime-local"> wants local wall-clock, not an ISO UTC string. */
-function toLocalInput(iso) {
-  if (!iso) return '';
-  const d = new Date(iso);
-  if (Number.isNaN(d.getTime())) return '';
-  const pad = (n) => String(n).padStart(2, '0');
-  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
-}
+/** <input type="datetime-local"> holds IST wall-clock time — never the browser's zone (ui/ist.js). */
+const toLocalInput = (iso) => istInputValue(iso);
 
 /** Who, and exactly when — attribution without asking anyone to type it. */
 function savedLabel(cart) {
@@ -667,7 +662,7 @@ function changeStatus(id, status) {
     showCallback(true);
     const input = $('#dBody .js-callback');
     if (!input.value) { flagCallbackNeeded(); return; }
-    saveRow(id, { status, callbackAt: new Date(input.value).toISOString() });
+    saveRow(id, { status, callbackAt: fromIstInput(input.value) });
     return;
   }
   const notes = state.openId === String(id) ? ($('#dBody .js-notes')?.value ?? cart.notes ?? '') : (cart.notes ?? '');
@@ -946,7 +941,7 @@ dBody.addEventListener('click', (e) => {
       showCallback(true);
       const input = $('#dBody .js-callback');
       if (!input.value) { flagCallbackNeeded(); return; }
-      saveRow(state.openId, { status, callbackAt: new Date(input.value).toISOString() });
+      saveRow(state.openId, { status, callbackAt: fromIstInput(input.value) });
       return;
     }
     showCallback(false);
@@ -964,7 +959,7 @@ dBody.addEventListener('change', (e) => {
     if (!e.target.value) { flagCallbackNeeded(); return; }
     e.target.classList.remove('needed');
     $('#dBody .cb-hint').hidden = true;
-    saveRow(id, { status: 'Callback scheduled', callbackAt: new Date(e.target.value).toISOString() });
+    saveRow(id, { status: 'Callback scheduled', callbackAt: fromIstInput(e.target.value) });
     return;
   }
   if (e.target.classList.contains('js-assign')) {

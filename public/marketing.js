@@ -11,7 +11,7 @@
  *                                 /marketing?adset=ID       ad set → ads
  */
 import { $, $$, esc, count, icon, renderIcons, initShell, pageFetch, pageSignal, onLeave, onQueryChange, navigate } from './ui/components.js';
-import { istDateTime } from './ui/ist.js';
+import { istDateTime, formatDayKey } from './ui/ist.js';
 
 const fetch = pageFetch();
 const RANGES = [['today', 'Today'], ['yesterday', 'Yesterday'], ['last_7d', 'Last 7 days'], ['last_30d', 'Last 30 days'], ['this_month', 'This month'], ['custom', 'Custom']];
@@ -144,7 +144,7 @@ function trendChart(trend, title = 'Spend vs Meta-attributed revenue') {
   const path = (k) => trend.map((d, i) => `${i ? 'L' : 'M'}${x(i).toFixed(1)},${y(d[k] || 0).toFixed(1)}`).join('');
   const ticks = [0, 0.5, 1].map((f) => top * f);
   const short = (v) => new Intl.NumberFormat('en-IN', { notation: 'compact', maximumFractionDigits: 1, style: 'currency', currency: cur() }).format(v);
-  const dayLabel = (d) => new Date(`${d}T00:00:00Z`).toLocaleDateString('en-IN', { day: 'numeric', month: 'short', timeZone: 'UTC' });
+  const dayLabel = (d) => formatDayKey(d);   // a reporting-day key: DD-MM-YYYY, never shifted
   const every = Math.ceil(trend.length / Math.max(3, Math.floor(W / 95)));
   const last = trend[trend.length - 1];
   return `<section class="card mk-trend" aria-labelledby="trendTitle">
@@ -183,7 +183,7 @@ function bindChart(trend) {
     cross.setAttribute('x1', xi); cross.setAttribute('x2', xi); cross.hidden = false;
     for (const dot of dots) { dot.setAttribute('cx', xi); dot.setAttribute('cy', P.t + (vb.height - P.t - P.b) * (1 - (d[dot.dataset.k] || 0) / top)); dot.hidden = false; }
     tip.replaceChildren();
-    const h = document.createElement('b'); h.textContent = new Date(`${d.date}T00:00:00Z`).toLocaleDateString('en-IN', { weekday: 'short', day: 'numeric', month: 'short', timeZone: 'UTC' }); tip.appendChild(h);
+    const h = document.createElement('b'); h.textContent = `${new Date(`${d.date}T12:00:00Z`).toLocaleDateString('en-IN', { weekday: 'short', timeZone: 'UTC' })} ${formatDayKey(d.date)}`; tip.appendChild(h);
     for (const [k, s] of Object.entries(SERIES)) {
       const row = document.createElement('div'); const key = document.createElement('i'); key.style.background = s.color;
       const v = document.createElement('strong'); v.textContent = money(d[k]); const l = document.createElement('span'); l.textContent = s.label;

@@ -4839,14 +4839,83 @@ await step('hr: status changes with history, notes, search and filters', async (
   return 'applied→screening (note)→interview with history + actor; stale 409; unknown 400; non-HR 403; notes; search by name/email/phone; status + job filters; events';
 });
 
+await step('timezone: Asia/Kolkata is the one business timezone and DD-MM-YYYY the one display format, whatever the machine timezone', async () => {
+  const bad = [];
+  const tz = await import('../lib/timezone.js');
+  const ui = await import('../public/ui/ist.js');
+  const { teamTimezone: tt, zonedToUtc: z } = await import('../lib/orders.js');
+  const { resolveWindow } = await import('../lib/shopify-orders.js');
+  const { dateOf } = await import('../lib/inventory.js');
+  const { csvCell } = await import('../lib/csv.js');
+  // 1. One source; the legacy variables never override it.
+  const keep = { a: process.env.BOARD_TIMEZONE, b: process.env.BOARD_TZ };
+  try {
+    process.env.BOARD_TIMEZONE = 'UTC'; process.env.BOARD_TZ = 'America/New_York';
+    if (tz.APP_TIMEZONE !== 'Asia/Kolkata' || ui.APP_TIMEZONE !== 'Asia/Kolkata' || tt() !== 'Asia/Kolkata') bad.push('APP_TIMEZONE');
+    const w = tz.legacyTimezoneWarning();
+    if (!w || !/BOARD_TIMEZONE=UTC/.test(w) || !/BOARD_TZ=America\/New_York/.test(w) || !/always uses Asia\/Kolkata/.test(w)) bad.push(`warning ${w}`);
+    if (tz.legacyTimezoneWarning({ BOARD_TIMEZONE: 'Asia/Kolkata' }) !== null || tz.legacyTimezoneWarning({}) !== null) bad.push('IST or unset should be silent');
+  } finally {
+    if (keep.a === undefined) delete process.env.BOARD_TIMEZONE; else process.env.BOARD_TIMEZONE = keep.a;
+    if (keep.b === undefined) delete process.env.BOARD_TZ; else process.env.BOARD_TZ = keep.b;
+  }
+  // 2. A UTC instant shows in IST, DD-MM-YYYY, h:mm AM/PM IST — server and page agree.
+  const t = '2026-10-08T05:05:00Z';   // 10:35 IST
+  if (tz.formatDateTime(t) !== '08-10-2026, 10:35 AM IST' || ui.istDateTime(t) !== '08-10-2026, 10:35 AM IST') bad.push(`timestamp ${tz.formatDateTime(t)} / ${ui.istDateTime(t)}`);
+  if (tz.formatDate(t) !== '08-10-2026' || ui.istDate(t) !== '08-10-2026') bad.push('date');
+  if (ui.istDateTime('2026-10-08T18:29:00Z') !== '08-10-2026, 11:59 PM IST' || ui.istDateTime('2026-10-08T18:30:00Z') !== '09-10-2026, 12:00 AM IST') bad.push('midnight display');
+  // 3. Midnight business boundary: 08-10-2026 is 07-10 18:30Z → 08-10 18:30Z.
+  if (tz.istDayStart('2026-10-08').toISOString() !== '2026-10-07T18:30:00.000Z' || tz.istDayEnd('2026-10-08').toISOString() !== '2026-10-08T18:30:00.000Z') bad.push('day bounds');
+  // 4. "Today" is the IST day, not the UTC/server one: 19:00Z on 07-10 is already 08-10 in IST.
+  if (tz.istDayKey('2026-10-07T19:00:00Z') !== '2026-10-08' || ui.istDayKey('2026-10-07T19:00:00Z') !== '2026-10-08') bad.push('today');
+  // 5. "Last 30 days" = 30 IST calendar days, today included, from 00:00 IST.
+  const { rows: [w30] } = await getPool().query(`SELECT ${tz.lastIstDaysSql(30)} AS since, (now() AT TIME ZONE 'Asia/Kolkata')::date AS today`);
+  const expect = tz.istDayStart(new Date(Date.UTC(...w30.today.split('-').map((v, i) => (i === 1 ? v - 1 : Number(v)))) - 29 * 86400000).toISOString().slice(0, 10));
+  if (new Date(w30.since).toISOString() !== expect.toISOString()) bad.push(`last 30 days ${new Date(w30.since).toISOString()} vs ${expect.toISOString()}`);
+  // 6. Order date filters are IST days: 18:45Z on 07-10 is 08-10 IST; 18:15Z is still 07-10.
+  const mk = async (tag, at) => createOrder({ ...R('website'), channel: 'website', source_order_id: `${TEST_ORDER}-TZ-${tag}`, order_date: at, order_value: 1 }, { actor: ACTOR });
+  const inDay = await mk('IN', '2026-10-07T18:45:00Z'); const before = await mk('BEFORE', '2026-10-07T18:15:00Z');
+  const got = (await listOrders({ from: '2026-10-08', to: '2026-10-08', q: `${TEST_ORDER}-TZ-` })).orders.map((o) => o.id);
+  if (!got.includes(inDay) || got.includes(before)) bad.push(`order filter ${JSON.stringify(got)}`);
+  if (z('2026-10-08T10:35', 'Asia/Kolkata') !== '2026-10-08T05:05:00.000Z') bad.push('zonedToUtc');
+  // 7. Affiliate clicks "last 30 days" uses the same IST window (lastIstDaysSql) — checked by source and by the SQL above.
+  const refSrc = await fsp.readFile(new URL('../lib/affiliate-referrals.js', import.meta.url), 'utf8');
+  const ovSrc = await fsp.readFile(new URL('../lib/overview.js', import.meta.url), 'utf8');
+  if (!/clicked_at >= \$\{lastIstDaysSql\(30\)\}/.test(refSrc) || !/clicked_at >= \$\{lastIstDaysSql\(30\)\}/.test(ovSrc) || /clicked_at > now\(\) - interval '30 days'/.test(refSrc + ovSrc)) bad.push('affiliate 30-day window');
+  // 8. Shopify: the checkpoint shows in IST; a picked day is the whole IST day (never past now).
+  if (ui.istDateTime('2026-10-07T19:03:57.433Z') !== '08-10-2026, 12:33 AM IST') bad.push('checkpoint display');
+  const win = resolveWindow({ from: '2026-10-07', to: '2026-10-07' }, new Date('2026-10-09T00:00:00Z'));
+  if (win.from !== '2026-10-06T18:30:00.000Z' || win.to !== '2026-10-07T18:30:00.000Z') bad.push(`shopify window ${JSON.stringify(win)}`);
+  const winToday = resolveWindow({ from: '2026-10-08', to: '2026-10-08' }, new Date('2026-10-08T06:00:00Z'));
+  if (winToday.to !== '2026-10-08T06:00:00.000Z') bad.push('window capped at now');
+  // 9–10. Date-only values never shift: inventory expiry typed DD-MM-YYYY or MM-YYYY → the same calendar day.
+  if (dateOf('31-08-2028') !== '2028-08-31' || dateOf('08-2028') !== '2028-08-31' || dateOf('2028-08-31') !== '2028-08-31') bad.push('inventory dateOf');
+  if (tz.formatDayKey('2028-08-31') !== '31-08-2028' || ui.formatDayKey('2028-02-29') !== '29-02-2028') bad.push('date-only display');
+  // 11. The exact strings, and the parser.
+  if (ui.formatDayKey('2026-10-08') !== '08-10-2026' || tz.formatDayKey('2026-10-08') !== '08-10-2026') bad.push('08-10-2026');
+  if (ui.parseDisplayDate('08-10-2026') !== '2026-10-08' || tz.parseDisplayDate('8-10-2026') !== '2026-10-08' || ui.parseDisplayDate('31-02-2026') !== null || ui.parseDisplayDate('2026-10-08') !== null) bad.push('parseDisplayDate');
+  // Inputs: IST wall clock ↔ instant, regardless of the browser zone.
+  if (ui.istInputValue('2026-10-08T05:05:00Z') !== '2026-10-08T10:35' || ui.fromIstInput('2026-10-08T10:35') !== '2026-10-08T05:05:00.000Z') bad.push('datetime input');
+  // CSV: timestamps for people, in IST.
+  if (csvCell(new Date(t)) !== '"08-10-2026, 10:35 AM IST"') bad.push(`csv ${csvCell(new Date(t))}`);
+  // No page formats dates on its own any more (one formatter: public/ui/ist.js).
+  for (const f of ['orders', 'inventory', 'overview', 'marketing', 'dashboard', 'affiliates', 'hr', 'members', 'app']) {
+    const src = await fsp.readFile(new URL(`../public/${f}.js`, import.meta.url), 'utf8');
+    if (/toLocaleDateString\('en-IN', \{ (day|month)|DAY_FMT|SEEN_FMT|month: 'short', year|month: 'long', year/.test(src)) bad.push(`${f}.js has its own date format`);
+  }
+  await purgeTestOrders(`${TEST_ORDER}-TZ-`);
+  if (bad.length) throw new Error(bad.join(' | '));
+  return `process TZ=${process.env.TZ || '(unset)'} · Intl ${Intl.DateTimeFormat().resolvedOptions().timeZone}: APP_TIMEZONE Asia/Kolkata (BOARD_* ignored with a warning); 05:05Z → "08-10-2026, 10:35 AM IST"; 08-10-2026 = 07-10 18:30Z…08-10 18:30Z; today/last-30-days/order filter/Shopify window in IST; expiry 31-08-2028 unshifted; "08-10-2026" exact; parser, inputs and CSV in IST`;
+});
+
 await step('hr: IST — UTC instants shown and bucketed as Asia/Kolkata days and times', async () => {
   const bad = [];
   // 20:00 UTC on 6 Oct is 01:30 IST on 7 Oct.
   const t = '2026-10-06T20:00:00.000Z';
-  if (istDateTime(t) !== '7 Oct 2026, 1:30 am IST') bad.push(`istDateTime ${JSON.stringify(istDateTime(t))}`);
-  if (istDate(t) !== '7 Oct 2026' || istTime(t) !== '1:30 am' || uiIstDayKey(t) !== '2026-10-07' || istDayKey(t) !== '2026-10-07') bad.push('date/time/day key');
-  if (istDateTime('2026-10-06T06:29:00Z') !== '6 Oct 2026, 11:59 am IST') bad.push('morning UTC');
-  if (istDateTime('2026-12-31T18:30:00Z') !== '1 Jan 2027, 12:00 am IST') bad.push('year boundary');
+  if (istDateTime(t) !== '07-10-2026, 1:30 AM IST') bad.push(`istDateTime ${JSON.stringify(istDateTime(t))}`);
+  if (istDate(t) !== '07-10-2026' || istTime(t) !== '1:30 AM' || uiIstDayKey(t) !== '2026-10-07' || istDayKey(t) !== '2026-10-07') bad.push('date/time/day key');
+  if (istDateTime('2026-10-06T06:29:00Z') !== '06-10-2026, 11:59 AM IST') bad.push('morning UTC');
+  if (istDateTime('2026-12-31T18:30:00Z') !== '01-01-2027, 12:00 AM IST') bad.push('year boundary');
   if (istDateTime(null) !== '—' || istDateTime('nonsense') !== '—') bad.push('empty values');
   if (HR_TIMEZONE !== 'Asia/Kolkata' || (await internal('mgr', 'GET', '/api/hr/meta')).body.timezone !== 'Asia/Kolkata') bad.push('meta timezone');
   // JobPosting datePosted is the IST day.

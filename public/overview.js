@@ -11,7 +11,7 @@
  * existing Marketing APIs and loads after the page; it never delays it.
  */
 import { $, esc, count, money, icon, renderIcons, initShell, pageFetch, pageSignal, onLeave, relative } from './ui/components.js';
-import { istDateTime } from './ui/ist.js';
+import { istDateTime, istDate, formatDayKey } from './ui/ist.js';
 
 const fetch = pageFetch();
 const state = { me: null, data: null, timer: null, tick: null, mk: { trend: null, campaigns: null, loading: false, done: false } };
@@ -60,7 +60,7 @@ function greeting(tz) {
   const h = Number(new Intl.DateTimeFormat('en-GB', { timeZone: tz, hour: 'numeric', hour12: false }).format(new Date()));
   return h < 5 ? 'Good evening' : h < 12 ? 'Good morning' : h < 17 ? 'Good afternoon' : 'Good evening';
 }
-const today = (tz) => new Intl.DateTimeFormat('en-IN', { timeZone: tz, weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' }).format(new Date());
+const today = (tz) => `${new Intl.DateTimeFormat('en-IN', { timeZone: tz, weekday: 'long' }).format(new Date())}, ${istDate(new Date())}`;
 
 const n = (v) => count(v ?? 0);
 const plural = (v, one, many) => (v === 1 ? one : many);
@@ -131,7 +131,7 @@ function sparkline(s, trend) {
   const x = (i) => (trend.length === 1 ? W / 2 : P + i * step);
   const y = (v) => H - P - ((v || 0) / max) * (H - 2 * P);
   const line = (k) => trend.map((d, i) => `${x(i).toFixed(1)},${y(d[k]).toFixed(1)}`).join(' ');
-  const day = (d) => new Date(`${d}T00:00:00Z`).toLocaleDateString('en-IN', { day: 'numeric', month: 'short', timeZone: 'UTC' });
+  const day = (d) => formatDayKey(d);
   const cols = trend.map((d, i) => {
     const w = trend.length === 1 ? W : step; const x0 = Math.max(0, x(i) - w / 2);
     return `<rect class="ox-spark-col" x="${x0.toFixed(1)}" y="0" width="${Math.min(w, W - x0).toFixed(1)}" height="${H}"><title>${esc(day(d.date))} · Spend ${esc(mkMoney(s, d.spend))} · Meta-attributed revenue ${esc(mkMoney(s, d.revenue))}</title></rect>`;

@@ -1,3 +1,4 @@
+import { formatDayKey } from './ui/ist.js';
 /**
  * Orders & Logistics — All orders, channel tabs, the logistics queues, the
  * order drawer and manual create/edit. Everything reads /api/orders; channels,
@@ -1326,11 +1327,7 @@ function fillFilters() {
  * exactly what is reserved; the server refuses it otherwise.
  */
 // Batch dates are calendar days ('YYYY-MM-DD'): formatted in UTC from their own parts so no timezone shifts them.
-const DAY_FMT = new Intl.DateTimeFormat('en-IN', { day: 'numeric', month: 'short', year: 'numeric', timeZone: 'UTC' });
-const calendarDay = (d) => {
-  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(d || ''));
-  return m ? DAY_FMT.format(Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3]))) : '—';
-};
+const calendarDay = (d) => formatDayKey(d);   // DD-MM-YYYY from the key's own parts
 
 async function loadStock(shipmentId) {
   const host = $('#dStock');
