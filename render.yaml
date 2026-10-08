@@ -49,6 +49,13 @@ services:
       # installed on the store (it currently fails with app_not_installed).
       - key: SHOPIFY_POLL_ENABLED
         value: "false"
+      # Shopify ORDERS: the existing incremental sync on a timer (lib/shopify-orders.js
+      # startShopifyOrdersPoll). Separate from the abandoned-checkout poll above, which stays off.
+      # Imports orders and lines only: no shipments, reservations or stock movements.
+      - key: SHOPIFY_ORDERS_POLL_ENABLED
+        value: "true"
+      - key: SHOPIFY_ORDERS_POLL_MINUTES
+        value: "15"
       - key: SHOPIFY_API_VERSION
         value: "2026-07"
       # Every operational date/time is shown, entered and filtered in IST.
