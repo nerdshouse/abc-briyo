@@ -5669,6 +5669,100 @@ await step('stock outward: reports (by purpose, product, people, recipient; outs
   return 'report: 15 issued / 3 back / 1 non-saleable / 1 consumed / 1 kept / 9 outstanding over 3 movements (drafts, cancelled excluded); by purpose, recipient, requester, issuer, outstanding list; cost = Σ qty × batch CP at issue (₹1,740) less restocked (₹320), SP/MRP unused; search by product/organisation/reference, filters by purpose/status/outstanding/employee/date; API: viewer reads, every change 403 for a viewer and changes nothing, logistics-only cannot read, operator issues';
 });
 
+await step('stock outward: "Other" requester — typed name required, trimmed, never the word "Other", kept apart from team members; team members unchanged; switching clears the typed name; issue/ledger/report/search work', async () => {
+  const bad = [];
+  const db = getPool();
+  const fixA = (await db.query('SELECT name FROM allowed_users WHERE phone = $1', [FIX_A])).rows[0].name;
+  const before = JSON.stringify((await db.query('SELECT id, requested_by_phone, requested_by_name FROM stock_outwards WHERE sku_id = $1 ORDER BY id', [SO.sku])).rows);
+  // A team member: exactly as before (phone + name from the record).
+  const m = await createOutward({ ...soBase(), quantity: 1 }, { actor: ACTOR });
+  let o = await getOutward(m.id);
+  if (o.requested_by_phone !== FIX_A || o.requested_by_name !== fixA || o.requested_by_external) bad.push('team member requester changed');
+  // "Other" with no name, whitespace, too long, control characters, or the word itself: refused (field named), nothing saved.
+  const count0 = (await db.query('SELECT count(*)::int n FROM stock_outwards')).rows[0].n;
+  for (const name of [undefined, '', '   ', '\t \n', 'x'.repeat(61), 'Ravi\u0007', 'Other', ' other ']) {
+    await expectErr(`other name ${JSON.stringify(name)}`, () => createOutward({ ...soBase(), requested_by: 'other', requested_by_name: name }, { actor: ACTOR }),
+      (e) => e.status === 400 && e.field === 'requested_by_name');
+  }
+  // A typed name with a team member is an invalid combination (refused, not silently dropped); a blank one is fine.
+  await expectErr('member + typed name', () => createOutward({ ...soBase(), requested_by: FIX_A, requested_by_name: 'Somebody Else' }, { actor: ACTOR }), (e) => e.status === 400 && e.field === 'requested_by_name');
+  await createOutward({ ...soBase(), quantity: 1, requested_by: FIX_A, requested_by_name: '  ' }, { actor: ACTOR });
+  if ((await db.query('SELECT count(*)::int n FROM stock_outwards')).rows[0].n !== count0 + 1) bad.push('a refused requester was saved');
+  // A valid typed name: trimmed, inner spaces collapsed; no phone; flagged as not a team member.
+  const x = await createOutward({ ...soBase(), quantity: 2, requested_by: 'other', requested_by_name: '  Ravi   Kumar  ' }, { actor: ACTOR });
+  o = await getOutward(x.id);
+  if (o.requested_by_name !== 'Ravi Kumar' || o.requested_by_phone !== null || !o.requested_by_external || /other/i.test(o.requested_by_name)) bad.push(`typed requester ${JSON.stringify([o.requested_by_name, o.requested_by_phone])}`);
+  // Editing the draft: other fields keep the typed name; Other → team member replaces it (no stale name); back to Other needs a name.
+  await updateOutward(x.id, { notes: 'shoot kit', version: o.version }, { actor: ACTOR });
+  o = await getOutward(x.id);
+  if (o.requested_by_name !== 'Ravi Kumar' || o.requested_by_phone !== null) bad.push('a draft edit lost the typed name');
+  await updateOutward(x.id, { requested_by: FIX_A, version: o.version }, { actor: ACTOR });
+  o = await getOutward(x.id);
+  if (o.requested_by_phone !== FIX_A || o.requested_by_name !== fixA || o.requested_by_external) bad.push(`switch to member ${JSON.stringify([o.requested_by_phone, o.requested_by_name])}`);
+  await expectErr('back to Other without a name', () => updateOutward(x.id, { requested_by: 'other', version: o.version }, { actor: ACTOR }), (e) => e.status === 400);
+  await updateOutward(x.id, { requested_by: 'other', requested_by_name: fixA, version: o.version }, { actor: ACTOR });   // same name as a team member, typed
+  o = await getOutward(x.id);
+  if (o.requested_by_phone !== null || o.requested_by_name !== fixA) bad.push('typed requester with a member\'s name');
+  // Issue and return as usual: ledger, cost, audit unchanged by who requested it.
+  const b1 = await soOnHand(SO.b1);
+  const free = (await outwardStockOptions(SO.sku, 2)).suggestion;
+  await issueOutward(x.id, { allocations: free }, { actor: ACTOR });
+  if ((await soLedger(x.id)).reduce((n, mv) => n + mv.quantity, 0) !== -2 || (await getOutward(x.id)).status !== 'issued') bad.push('issue with a typed requester');
+  if (!free.some((f) => f.batch_id === SO.b1) || (await soOnHand(SO.b1)) > b1) bad.push('stock not taken');
+  await expectErr('requester fixed after issue', () => updateOutward(x.id, { requested_by_name: 'Changed' }, { actor: ACTOR }), (e) => e.status === 409);
+  await recordOutwardReturn(x.id, { consumed: 2 }, { actor: ACTOR });
+  o = await getOutward(x.id);
+  if (o.status !== 'closed' || !o.events.some((e) => e.event_type === 'edited' && e.metadata.changes?.requested_by_phone)) bad.push('history');
+  // Reports keep the typed requester apart from the team member of the same name; search finds typed names.
+  const rep = await outwardReport({ from: dayOffset(-1), to: dayOffset(1) });
+  const rows = rep.byRequester.filter((r) => r.name === fixA);
+  if (rows.length !== 2 || !rows.some((r) => r.external === true && r.issued >= 2) || !rows.some((r) => r.external === false)) bad.push(`report ${JSON.stringify(rows)}`);
+  const y = await createOutward({ ...soBase(), quantity: 1, requested_by: 'other', requested_by_name: 'Meera Studio Lead' }, { actor: ACTOR });
+  if (!(await listOutwards({ q: 'Meera Studio' })).some((r) => r.id === y.id && r.requested_by_external)) bad.push('search by typed requester');
+  // Through the API: the same rules (no frontend needed to enforce them).
+  const app = express();
+  app.use((req, _res, next) => { req.session = JSON.parse(req.get('x-test-session') || '{}'); next(); });
+  app.use(express.json());
+  app.use('/api/inventory', inventoryRouterForTest);
+  const server = app.listen(0);
+  try {
+    const post = (body, caps = ['inventory.view', 'inventory.move']) => fetch(`http://127.0.0.1:${server.address().port}/api/inventory/outward`, { method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-test-session': JSON.stringify({ caps }) }, body: JSON.stringify(body) }).then(async (r) => ({ status: r.status, body: await r.json() }));
+    const r1 = await post({ ...soBase(), requested_by: 'other', requested_by_name: '   ' });
+    const r2 = await post({ ...soBase(), requested_by: 'other' });
+    const r3 = await post({ ...soBase(), requested_by: FIX_A, requested_by_name: 'Sneaky' });
+    const r4 = await post({ ...soBase(), requested_by: 'other', requested_by_name: 'Api Person' }, ['inventory.view']);
+    const r5 = await post({ ...soBase(), requested_by: 'other', requested_by_name: ' Api  Person ' });
+    if (r1.status !== 400 || r1.body.field !== 'requested_by_name' || r2.status !== 400 || r3.status !== 400 || r4.status !== 403 || r5.status !== 201) bad.push(`api ${[r1.status, r2.status, r3.status, r4.status, r5.status]}`);
+    if ((await getOutward(r5.body.id)).requested_by_name !== 'Api Person') bad.push('api trim');
+  } finally { server.close(); }
+  // The 2 units consumed above are received back into SO-1, so the next steps see the stock they expect.
+  await receiveInventory({ sku_id: SO.sku, batch_number: 'SO-1', quantity: 2, request_id: rid() }, { actor: ACTOR });
+  // Existing records: untouched.
+  const after = JSON.stringify((await db.query('SELECT id, requested_by_phone, requested_by_name FROM stock_outwards WHERE id = ANY($1) ORDER BY id', [JSON.parse(before).map((r) => r.id)])).rows);
+  if (after !== before) bad.push('existing records changed');
+  if (bad.length) throw new Error(bad.join(' | '));
+  return 'team member as before; Other + none/blank/whitespace/61 chars/control char/"Other" → 400 on requested_by_name, nothing saved; member + typed name refused, member + blank fine; "  Ravi   Kumar  " → "Ravi Kumar", no phone, flagged; draft edits keep it, Other→member replaces it, back to Other needs a name; issue/ledger/return/history as usual, requester fixed after issue; report keeps a typed requester apart from a same-named member; search finds typed names; API enforces the same (400/403/201, trimmed); existing records unchanged';
+});
+
+await step('stock outward page: "Other" in Requested by reveals "Enter Requester\'s Name" right under it; switching back hides and clears it; required only with Other; inline message; shown as not a team member', async () => {
+  const bad = [];
+  const js = await fsp.readFile(new URL('../public/stock-outward.js', import.meta.url), 'utf8');
+  const form = js.slice(js.indexOf('function formHtml'), js.indexOf('const formValues'));
+  const reqAt = form.indexOf('name="requested_by"'); const otherAt = form.indexOf('name="requested_by_name"'); const issuedAt = form.indexOf('name="issued_by"');
+  if (!(reqAt > 0 && otherAt > reqAt && otherAt < issuedAt)) bad.push('the name box is not right under Requested by');
+  if (!form.includes("opt('other', 'Other'") || !form.includes("Enter Requester's Name") || !form.includes('placeholder="Enter full name"') || !form.includes('maxlength="60"') || !/id="soOtherWrap"\$\{[^}]*' hidden'\}/.test(form)) bad.push('option/label/placeholder/hidden');
+  const fv = js.slice(js.indexOf('const formValues'), js.indexOf('function wireRequester'));
+  if (!/if \(v\.requested_by !== 'other'\) \{ delete v\.requested_by_name; return v; \}/.test(fv) || !/Enter the requester\\'s name\./.test(fv) || !/replace\(\/\\s\+\/g, ' '\)\.trim\(\)/.test(fv)) bad.push('form values / validation');
+  const wire = js.slice(js.indexOf('function wireRequester'), js.indexOf('function showAvailable'));
+  if (!/\$\('#soOtherWrap'\)\.hidden = !other;/.test(wire) || !/input\.required = other;/.test(wire) || !/if \(!other\) input\.value = '';/.test(wire)) bad.push('reveal/clear on switch');
+  if ((js.match(/wireRequester\(\);/g) || []).length !== 2) bad.push('not wired on both the new and the draft form');
+  if (!/requested_by_external \? ' <span class="muted">\(not a team member\)<\/span>'/.test(js) || !/x\.external \? ' \(not a team member\)'/.test(js)) bad.push('detail/report labels');
+  if (!/err\.data\?\.field === 'requested_by_name'/.test(js)) bad.push('server message not shown inline');
+  if (bad.length) throw new Error(bad.join(' | '));
+  return 'Other option after the team; name box between Requested by and Issued by, hidden until Other, required only then, cleared when switching back; trimmed, empty refused with an inline message (server message shown too); detail and report say "not a team member"';
+});
+
 await step('retailer orders without Briyo SKUs (e.g. Medkart): retailer name/code kept beside the Briyo product, code optional; an unmatched line is flagged and blocks stock until a person matches it; then deducted exactly once', async () => {
   const bad = [];
   const db = getPool();

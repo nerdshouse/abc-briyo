@@ -522,3 +522,7 @@ dl.facts dd { margin: 0; min-width: 0; overflow-wrap: anywhere; }
 .ml-remember { display: inline-flex; gap: 6px; align-items: center; font-size: 12px; }
 .dest-pf { width: auto; max-width: 220px; flex: none; }
 @media (max-width: 640px) { .dest { flex-wrap: wrap; } .dest-pf { max-width: 100%; flex: 1 1 100%; } }
+/* Stock outward: "Other" requester — the name box under Requested by */
+.so-other { display: flex; flex-direction: column; gap: 6px; margin-top: 8px; }
+.so-other > span { font-size: 12px; color: var(--text-2); }
+.fld .fld-lbl { font-size: 12px; color: var(--text-2); }
