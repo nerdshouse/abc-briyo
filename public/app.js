@@ -31,6 +31,7 @@ let REASON_TAGS = [];
 let SLA_HOURS = 6;
 let TEAM = [];
 let ME = null;
+let IS_ADMIN = false;   // only for showing the Recovery verification link; the server checks again
 
 const st = (c) => c.status || 'Not called';
 
@@ -354,10 +355,15 @@ function renderTabs() {
   $('#viewTabs').innerHTML = Object.entries(VIEWS).map(([key, v]) => {
     const n = state.carts.filter(v.match).length;
     const tone = key === 'attention' && n ? ' is-alert' : '';
-    return `<button type="button" role="tab" class="tab${key === state.view ? ' active' : ''}" data-view="${key}" aria-selected="${key === state.view}">`
+    // Recovered and Lost carry their outcome's colour (green / red); every other tab keeps the neutral style.
+    const outcome = key === 'recovered' ? ' tab-recovered' : key === 'lost' ? ' tab-lost' : '';
+    return `<button type="button" role="tab" class="tab${outcome}${key === state.view ? ' active' : ''}" data-view="${key}" aria-selected="${key === state.view}">`
       + `${esc(v.label)}<span class="tab-count${tone}">${count(n)}</span></button>`;
   }).join('');
   $('#viewTabs').classList.toggle('searching', Boolean(state.query));
+  // Admins: from the Recovered tab, check those carts against the Shopify orders (Recovery verification).
+  const verify = $('#verifyLink');
+  if (verify) verify.hidden = !(IS_ADMIN && state.view === 'recovered' && !state.query);
   $('#crumbView').textContent = state.query ? 'Search' : VIEWS[state.view].label;
 }
 
@@ -1152,7 +1158,8 @@ onLeave(() => { clearInterval(poll); clearTimeout(searchTimer); clearTimeout(ins
   skeleton();
   try {
     const me = await (await fetch('/auth/me')).json();
-    byCallerForbidden = !me.isAdmin;  // per-caller stats are an admin report; don't ask for it otherwise
+    byCallerForbidden = !me.isAdmin;
+    IS_ADMIN = Boolean(me.isAdmin);  // per-caller stats are an admin report; don't ask for it otherwise
     if (!me.authenticated) { window.location.href = '/login'; return; }
     initShell(me, {
       // The sidebar search is the board's own search here, not a page change.

@@ -722,6 +722,18 @@ button { font: inherit; color: inherit; }
 .tab.active .tab-count { color: var(--text-2); }
 .tab-count.is-alert { color: var(--warning-text); }
 .tabs.searching .tab { opacity: .55; }
+/* Call Board outcomes: Recovered green, Lost red — text, count and the selected tab; other tabs unchanged */
+.tab.tab-recovered { color: var(--success-text); }
+.tab.tab-recovered .tab-count, .tab.tab-recovered.active .tab-count { color: var(--success-text); background: var(--success-soft); border-radius: 999px; padding: 0 6px; }
+.tab.tab-recovered.active { background: var(--success-soft); border-color: #ABEFC6; color: var(--success-text); }
+.tab.tab-lost { color: var(--error-text); }
+.tab.tab-lost .tab-count, .tab.tab-lost.active .tab-count { color: var(--error-text); background: var(--error-soft); border-radius: 999px; padding: 0 6px; }
+.tab.tab-lost.active { background: var(--error-soft); border-color: #FECDCA; color: var(--error-text); }
+/* The link never squeezes the tabs: it moves to its own line when the row is full. */
+.board-head:has(.verify-link:not([hidden])) { flex-wrap: wrap; row-gap: 2px; }
+.board-head:has(.verify-link:not([hidden])) .tabs { flex-shrink: 0; max-width: 100%; }
+.verify-link { display: inline-flex; gap: 6px; align-items: center; font-size: 12.5px; color: var(--success-text); text-decoration: none; margin-left: auto; padding: 4px 6px; white-space: nowrap; }
+.verify-link svg { width: 14px; height: 14px; }
 
 /* filters row, inside the pane */
 .board-filters { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; padding: 12px 14px; border-bottom: 1px solid var(--border-soft); }

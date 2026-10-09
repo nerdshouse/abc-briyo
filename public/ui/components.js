@@ -389,7 +389,8 @@ function sidebarHtml(me) {
         navLink('/?mode=tocall', 'To call', '', { id: 'countToCall', view: 'tocall' })
         + navLink('/?mode=callbacks', 'Callbacks', '', { id: 'countCallbacks', view: 'callbacks' })
         + navLink('/?mode=mine', 'My queue', '', { view: 'mine' })
-        + navLink('/?mode=all', 'All carts', '', { view: 'all' })) : '')}
+        + navLink('/?mode=all', 'All carts', '', { view: 'all' })
+        + (admin ? navLink('/recovery-verification', 'Recovery verification') : '')) : '')}
       ${navSection('Growth', (has('marketing.view') ? navDept('Marketing', 'megaphone', '/marketing',
         navLink('/marketing', 'Overview') + navLink('/marketing?view=campaigns', 'Campaigns')) : '')
         + (has('affiliate.view') ? navLink('/affiliates', 'Affiliates', 'handshake') : ''))}

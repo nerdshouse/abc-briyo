@@ -57,13 +57,14 @@ import { jobPostingLd } from '../lib/careers-pages.js';
 import nodeCrypto from 'node:crypto';
 import { metricsFrom, rawFromRow, rangeParams, classifyMetaError, createMetaClient, createCache, MetaError, createMetaService, metaConfig, todayIn, resolvePurchaseType, _resetMetaService, billingFrom } from '../lib/meta-ads.js';
 import { overviewFor, profileCompleteSql as profileCompleteSqlForTest } from '../lib/overview.js';
+import { phone10, paymentOf, matchRecoveries, summarise } from '../lib/recovery-verification.js';
 import { ensureAffiliateSchema, newAffiliatePublicId, rateAt, getAffiliateSetting, setAffiliateSetting, purgeTestAffiliates, _resetAffiliateSchemaForTest, createAffiliate } from '../lib/affiliates.js';
 import { receiveOrdersCreate, processWebhookDelivery, processPendingWebhooks, verifyWebhookHmac, ensureShopifyWebhookSchema } from '../lib/shopify-webhooks.js';
 import { startIncrementalSync, shopifySyncStatus, cancelShopifySync, syncBusy, startFullHistorySync, fullHistoryStatus, grantedAccessScopes, hasReadAllOrders, _resetScopeCache, assertNoSyncRunning } from '../lib/shopify-orders.js';
 import { createAmazonClient, amazonConfig, amazonConfigured, redact, ENDPOINTS, ORDERS_API_VERSION, LWA_TOKEN_URL, SEARCH_ORDERS_RATE } from '../lib/amazon-spapi.js';
 import { mapAmazonOrder, runAmazonSync, startAmazonIncrementalSync, amazonSyncStatus, amazonSyncBusy, assertNoAmazonSyncRunning, sharedAmazonClient, _setSharedAmazonClientForTest } from '../lib/amazon-orders.js';
 import { runShopifySync, mapShopifyOrder, shopifyPaymentMethod, shopifyPaymentStatus, shopifyOrdersStatus, pollShopifyOrdersOnce, ordersPollMinutes } from '../lib/shopify-orders.js';
-import { ensureOrderFinancialSnapshotSchema, financialSnapshotFrom, addAmounts, FINANCIAL_TABLES } from '../lib/order-financial-snapshots.js';
+import { ensureOrderFinancialSnapshotSchema, financialSnapshotFrom, recordFinancialSnapshot, addAmounts, FINANCIAL_TABLES } from '../lib/order-financial-snapshots.js';
 import { SHOPIFY_MAX_QUERY_COST, SHOPIFY_ORDER_QUERIES, LIMITS as SHOPIFY_LIMITS, shopifyOrderQuery, estimateShopifyOrderQueryCost } from '../lib/shopify-order-queries.js';
 import { istDateTime, istDate, istTime, istDayKey as uiIstDayKey } from '../public/ui/ist.js';
 import { issueFormToken, verifyTurnstile, normalizeHost, isCareersRequest } from '../lib/careers.js';
@@ -7491,6 +7492,203 @@ await step('profiles: every member is held until complete — existing members t
   await pool.query(`DELETE FROM allowed_users WHERE phone = '919000000308'`);
   if (bad.length) throw new Error(bad.join(' | '));
   return `existing (not-required) incomplete member → /profile?next= + 403, row untouched; whitespace/placeholder name, blank/invalid email, non-image type or non-stored photo key → incomplete; completing opens access, RBAC unchanged; admin photo removal re-holds; disabled → signed out (401, /login) not the profile page; new member held; healthz, login, careers open; Overview incomplete = ${n} by the same rule`;
+});
+
+// ---- Recovery verification (Support) ---------------------------------------------------------------------
+await step('recovery verification: matching rules (pure) — phone normalisation, identifier, phone+SKU/product+time, phone+time, window, missing time, shared and multiple orders, name never enough, payment states, revenue per currency, each order once', async () => {
+  const bad = [];
+  for (const [v, want] of [['+91 98765 43210', '9876543210'], ['919876543210', '9876543210'], ['09876543210', '9876543210'], ['9876543210', '9876543210'],
+    ['+91-98765-43210', '9876543210'], ['12345', null], ['5876543210', null], ['', null], [null, null], ['+1 415 555 0100', null]]) if (phone10(v) !== want) bad.push(`phone10(${v}) = ${phone10(v)}`);
+  for (const [o, want] of [[{ financial_status: 'PAID' }, 'paid'], [{ financial_status: 'PARTIALLY_REFUNDED' }, 'paid'], [{ financial_status: 'PENDING' }, 'pending'],
+    [{ financial_status: 'PARTIALLY_PAID' }, 'pending'], [{ financial_status: 'AUTHORIZED' }, 'pending'], [{ financial_status: 'REFUNDED' }, 'refunded'],
+    [{ financial_status: 'VOIDED' }, 'cancelled'], [{ financial_status: 'PAID', cancelled_at: '2026-10-01' }, 'cancelled'], [{}, 'unknown'], [{ order_status: 'cancelled' }, 'cancelled']]) {
+    if (paymentOf(o) !== want) bad.push(`payment ${JSON.stringify(o)} → ${paymentOf(o)}`);
+  }
+  const T = Date.parse('2026-10-05T10:00:00Z');
+  const at = (h) => new Date(T + h * 3600000).toISOString();
+  const cart = (id, o = {}) => ({ id, cart_id: `C${id}`, customer_name: o.name || `Cust ${id}`, phone: o.phone ?? `98765000${String(id).padStart(2, '0')}`, abandoned_at: at(-5), received_at: at(-5),
+    marked_at: 'marked' in o ? o.marked : at(0), recovered_at: null, recovered_order_id: o.oid || null, recovered_order_name: o.oname || null, items: o.items || [] });
+  const order = (id, o = {}) => ({ id, shopify_name: o.name || `#${id}`, legacy_id: String(id), customer_phone: o.phone ?? null, customer_name: o.cname || null,
+    order_date: o.date || at(2), financial_status: 'fin' in o ? o.fin : 'PAID', cancelled_at: o.cancelled || null, current_total_price: 'value' in o ? o.value : 1000,
+    shop_currency: o.cur || 'INR', currency: o.cur || 'INR', lines: o.lines || [] });
+  const run = (carts, orders, dec = [], wh = 48) => Object.fromEntries(matchRecoveries(carts, orders, dec, { windowHours: wh }).map((r) => [r.cart.id, r]));
+  let r = run([cart(1, { oname: '#RV-1', phone: '' })], [order(101, { name: '#RV-1' })]);
+  if (r[1].status !== 'verified_paid' || r[1].tier !== 'identifier') bad.push(`identifier ${r[1].status}`);
+  r = run([cart(2, { items: [{ title: 'Whey 1kg (Pack of 2)', sku: 'SKU-W' }] })], [order(102, { phone: '+91 98765 00002', date: at(5), lines: [{ sku: 'sku-w', title: 'Other name' }] })]);
+  if (r[2].status !== 'verified_paid' || r[2].tier !== 'phone+product' || r[2].confidence !== 'high') bad.push(`phone+sku ${r[2].status} ${r[2].tier}`);
+  r = run([cart(3, { items: [{ title: 'Whey 1kg (Pack of 2)' }] })], [order(103, { phone: '919876500003', fin: 'PENDING', lines: [{ title: 'Whey 1kg' }] })]);
+  if (r[3].status !== 'verified_placed' || r[3].tier !== 'phone+product') bad.push(`phone+product name ${r[3].status} ${r[3].tier}`);
+  r = run([cart(4)], [order(104, { phone: '9876500004' })]);
+  if (r[4].status !== 'verified_paid' || r[4].tier !== 'phone+time' || r[4].confidence !== 'medium') bad.push(`phone+time ${r[4].status}`);
+  r = run([cart(5)], [order(105, { phone: '9876500005', date: at(49) })]);
+  if (r[5].status !== 'no_match') bad.push('outside 48 h matched');
+  if (run([cart(5)], [order(105, { phone: '9876500005', date: at(49) })], [], 72)[5].status !== 'verified_paid') bad.push('window not configurable');
+  if (run([cart(6)], [order(106, { phone: '9876500006', date: at(-6) })])[6].status !== 'no_match') bad.push('order before the cart matched');
+  r = run([cart(7, { marked: null })], [order(107, { phone: '9876500007', date: at(-3) })]);
+  if (r[7].status !== 'possible' || !r[7].lowConfidence || r[7].matchedOrder) bad.push(`missing time ${r[7].status}`);
+  r = run([cart(8, { phone: '9876500088' }), cart(9, { phone: '+919876500088' })], [order(108, { phone: '9876500088' })]);
+  if (r[8].status !== 'needs_review' || r[9].status !== 'needs_review') bad.push('one order for two carts not flagged');
+  r = run([cart(10, { items: [{ title: 'Zinc' }] })], [order(110, { phone: '9876500010', date: at(1), lines: [{ title: 'Omega' }] }), order(111, { phone: '9876500010', date: at(3), lines: [{ title: 'Iron' }] })]);
+  if (r[10].status !== 'needs_review' || r[10].candidates.length !== 2) bad.push('two orders not flagged');
+  r = run([cart(11, { items: [{ title: 'Zinc' }] })], [order(112, { phone: '9876500011', date: at(1), lines: [{ title: 'Omega' }] }), order(113, { phone: '9876500011', date: at(3), lines: [{ title: 'Zinc' }] })]);
+  if (r[11].status !== 'verified_paid' || Number(r[11].matchedOrder.id) !== 113) bad.push('the order with the product not chosen');
+  r = run([cart(12, { items: [{ title: 'Zinc' }] })], [order(114, { phone: '9876500012', lines: [{ title: 'Omega' }] })]);
+  if (r[12].status !== 'possible') bad.push('product conflict not "possible"');
+  r = run([cart(13, { name: 'Ravi Kumar' })], [order(115, { phone: '9000000099', cname: 'Ravi Kumar' })]);
+  if (r[13].status !== 'no_match') bad.push('matched on name alone');
+  for (const [fin, extra, want] of [['REFUNDED', {}, 'cancelled_refunded'], ['PAID', { cancelled: at(3) }, 'cancelled_refunded'], [null, { value: null }, 'verified_placed']]) {
+    r = run([cart(14)], [order(116, { phone: '9876500014', fin, ...extra })]);
+    if (r[14].status !== want) bad.push(`${fin} → ${r[14].status}`);
+  }
+  // Decisions: a confirmation stands and takes the order away from other carts; a rejection removes that candidate.
+  r = run([cart(8, { phone: '9876500088' }), cart(9, { phone: '9876500088' })], [order(108, { phone: '9876500088' })], [{ decision: 'confirmed', cart_id: 8, order_id: 108 }]);
+  if (r[8].status !== 'verified_paid' || r[8].tier !== 'manual' || r[9].status !== 'no_match') bad.push('confirmation not applied');
+  r = run([cart(10, { items: [{ title: 'Zinc' }] })], [order(110, { phone: '9876500010', lines: [{ title: 'Omega' }] }), order(111, { phone: '9876500010', date: at(3), lines: [{ title: 'Iron' }] })], [{ decision: 'rejected', cart_id: 10, order_id: 110 }]);
+  if (r[10].candidates.length !== 1 || Number(r[10].candidates[0].order.id) !== 111) bad.push('rejection not applied');
+  // Summary: each order once, paid only, per currency; missing values never ₹0.
+  const res = [{ matchedOrder: order(1, { value: 1000 }), status: 'verified_paid' }, { matchedOrder: order(1, { value: 1000 }), status: 'verified_paid' },
+    { matchedOrder: order(2, { value: 500, fin: 'PENDING' }), status: 'verified_placed' }, { matchedOrder: order(3, { value: 20, cur: 'USD' }), status: 'verified_paid' },
+    { matchedOrder: order(4, { value: null }), status: 'verified_paid' }, { matchedOrder: order(5, { value: 700, fin: 'REFUNDED' }), status: 'cancelled_refunded' },
+    { matchedOrder: null, status: 'no_match' }, { matchedOrder: null, status: 'needs_review' }, { matchedOrder: null, status: 'possible' }];
+  const s = summarise(res);
+  const inr = s.revenue.find((x) => x.currency === 'INR'); const usd = s.revenue.find((x) => x.currency === 'USD');
+  if (s.recovered !== 9 || s.verifiedOrders !== 5 || s.paidOrders !== 3 || s.pendingOrders !== 1 || s.unmatched !== 1 || s.ambiguous !== 2 || s.paidWithoutValue !== 1) bad.push(`summary ${JSON.stringify(s)}`);
+  if (inr?.amount !== 1000 || inr.paidOrders !== 1 || inr.averagePaidOrder !== 1000 || inr.perRecoveredCart !== 111.11 || usd?.amount !== 20) bad.push(`revenue ${JSON.stringify(s.revenue)}`);
+  if (bad.length) throw new Error(bad.join(' | '));
+  return '+91/0/spaces normalised, non-Indian or short refused; PAID/PARTIALLY_REFUNDED paid, PENDING/PARTIALLY_PAID/AUTHORIZED pending, REFUNDED, VOIDED/cancelled, no record → unknown (never paid); identifier → verified; phone+SKU and phone+product name → high; phone+time → medium; after 48 h / before the cart → none (72 h configurable); no recovery time → possible; one order for two carts and two orders for one cart → needs review (unless exactly one shares a product); product conflict → possible; same name, other phone → none; refunded/cancelled; confirm/reject applied; revenue: each order once, paid only, per currency, null value excluded (not ₹0)';
+});
+
+await step('recovery verification: end to end on the database and the real server — imported Shopify orders with financial records, statuses, refresh without double counting, decisions audited and exclusive, admin only; carts, orders and stock untouched', async () => {
+  const bad = [];
+  const db = getPool();
+  const RV_NUM = `66${String(Date.now()).slice(-8)}`;
+  const gidOf = (n) => `gid://shopify/Order/${RV_NUM}${String(n).padStart(3, '0')}`;
+  const P = (n) => `98761${RV_NUM.slice(-3)}${String(n).padStart(2, '0')}`;      // test-only mobiles, unique to this run
+  const now = Date.now(); const at = (h) => new Date(now + h * 3600000).toISOString();
+  const cartIds = {};
+  const mkCart = async (n, { phone = P(n), marked = at(-30), items = [], name = `RV Test ${n}`, oname = null } = {}) => {
+    const { rows: [c] } = await db.query(`INSERT INTO abandoned_carts (cart_id, customer_name, phone, total_price, currency, abandoned_at, raw_payload, status, assigned_to, recovered_order_name, updated_by)
+      VALUES ($1, $2, $3, 1299, 'INR', $4, $5, 'Called – Recovered', $6, $7, $6) RETURNING id`,
+      [`DBCHECK-RV-${RV_NUM}-${n}`, name, phone, at(-40), JSON.stringify({ line_items: items }), 'RV Agent', oname]);
+    if (marked) await db.query(`INSERT INTO cart_events (cart_id, kind, from_status, to_status, actor, at) VALUES ($1, 'status', 'Not called', 'Called – Recovered', 'RV Agent', $2)`, [c.id, marked]);
+    cartIds[n] = Number(c.id);
+    return Number(c.id);
+  };
+  const mkOrder = async (n, { phone = P(n), date = at(-28), fin = 'PAID', cancelled = false, total = 1299, sku = `${TS}-RV`, title = 'Vitamin D3', snapshot = true, name = `#RV${RV_NUM.slice(-4)}${n}` } = {}) => {
+    const { rows: [o] } = await db.query(`INSERT INTO orders (channel, source, source_order_id, order_date, customer_name, customer_phone, order_value, currency, order_status, source_payload)
+      VALUES ('website', 'shopify_sync', $1, $2, 'Buyer', $3, $4, 'INR', $5, $6) RETURNING id`,
+      [gidOf(n), date, phone, total, cancelled ? 'cancelled' : 'new', JSON.stringify({ shopify: { name, legacy_id: `${RV_NUM}${String(n).padStart(3, '0')}` } })]);
+    await db.query(`INSERT INTO order_items (order_id, source_line_item_id, sku, title, quantity) VALUES ($1, $2, $3, $4, 1)`, [o.id, `L${n}`, sku, title]);
+    if (snapshot) {
+      const node = { ...shOrder(900 + n, { fin, cancelled, total }), id: gidOf(n), name };
+      await recordFinancialSnapshot(db, Number(o.id), financialSnapshotFrom(node));
+    }
+    return Number(o.id);
+  };
+  const fx = async () => (await db.query(`SELECT (SELECT count(*) FROM inventory_movements)::int mv, (SELECT count(*) FROM inventory_reservations)::int rs, (SELECT count(*) FROM order_shipments)::int sh,
+    (SELECT count(*) FROM affiliate_order_attributions)::int at, (SELECT count(*) FROM orders)::int orders`)).rows[0];
+  try {
+    // Carts and orders (orders imported as the Shopify sync stores them, each with Shopify's financial record).
+    await mkCart(1, { phone: '', oname: `#RV${RV_NUM.slice(-4)}1` }); const o1 = await mkOrder(1, { phone: '9000000001' });   // identifier
+    await mkCart(2, { phone: `+91 ${P(2).slice(0, 5)} ${P(2).slice(5)}`, items: [{ title: 'Vitamin D3', quantity: 1, sku: `${TS}-RV` }] }); const o2 = await mkOrder(2);   // phone (+91) + SKU
+    await mkCart(3); const o3 = await mkOrder(3, { fin: 'PENDING' });                        // phone + time, payment pending
+    await mkCart(4); await mkOrder(4, { date: at(30) });                                    // after the window (marked −30 h + 48 h = +18 h)
+    await mkCart(5, { marked: null }); await mkOrder(5, { date: at(-35) });                 // no recovery time
+    await mkCart(6, { phone: P(6) }); await mkCart(7, { phone: P(6) }); const o6 = await mkOrder(6);   // two carts, one order
+    await mkCart(8); await mkOrder(8, { date: at(-29) }); await mkOrder(81, { phone: P(8), date: at(-27), title: 'Omega' });   // two orders
+    await mkCart(10); await mkOrder(10, { cancelled: true });                               // cancelled
+    await mkCart(11); await mkOrder(11, { fin: 'REFUNDED' });                               // refunded
+    await mkCart(12); const o12 = await mkOrder(12, { snapshot: false });                   // no financial record
+    const fx0 = await fx();
+    const report = async (q = {}) => {
+      const r = await internal('adm', 'GET', `/api/recovery-verification?${new URLSearchParams(q)}`);
+      if (r.status !== 200) throw new Error(`report ${r.status} ${JSON.stringify(r.body)}`);
+      return { ...r.body, mine: Object.fromEntries(r.body.results.filter((x) => Object.values(cartIds).includes(x.cartId)).map((x) => [Object.keys(cartIds).find((k) => cartIds[k] === x.cartId), x])) };
+    };
+    let rep = await report();
+    const st = (n) => rep.mine[n]?.status;
+    const want = { 1: 'verified_paid', 2: 'verified_paid', 3: 'verified_placed', 4: 'no_match', 5: 'possible', 6: 'needs_review', 7: 'needs_review', 8: 'needs_review', 10: 'cancelled_refunded', 11: 'cancelled_refunded', 12: 'verified_placed' };
+    for (const [n, w] of Object.entries(want)) if (st(n) !== w) bad.push(`cart ${n}: ${st(n)} ≠ ${w} (${rep.mine[n]?.reason})`);
+    if (rep.mine[2]?.order?.id !== o2 || rep.mine[2].tier !== 'phone+product' || rep.mine[1]?.order?.id !== o1 || rep.mine[1].tier !== 'identifier') bad.push('matched orders');
+    if (rep.mine[12]?.order?.payment !== 'unknown' || rep.mine[3]?.order?.payment !== 'pending' || rep.mine[5]?.recoveryTimeRecorded !== false) bad.push('payment / time flags');
+    if (rep.mine[2].products?.[0]?.sku !== `${TS}-RV` || rep.mine[2].agent !== 'RV Agent' || rep.mine[2].cartValue !== 1299 || !rep.mine[2].recoveredAt) bad.push('cart fields');
+    // Refresh: the same answer, nothing stored, nothing doubled.
+    const again = await report();
+    if (JSON.stringify(again.summary) !== JSON.stringify(rep.summary) || again.results.length !== rep.results.length) bad.push('refresh changed the report');
+    // Summary over this run's carts (filter by this agent): orders 1 and 2 paid at Shopify's current total, each once.
+    const mineSum = summarise(Object.values(rep.mine).map((x) => ({ status: x.status, matchedOrder: x.order ? { id: x.order.id, current_total_price: x.order.value, shop_currency: x.order.currency } : null })));
+    if (mineSum.paidOrders !== 2 || mineSum.revenue[0]?.amount !== 2598 || mineSum.pendingOrders !== 2) bad.push(`summary ${JSON.stringify(mineSum)}`);
+    const agentRep = await report({ agent: 'RV Agent' });
+    if (agentRep.results.some((x) => x.agent !== 'RV Agent') || agentRep.summary.recovered < 11) bad.push('agent filter');
+    const day = new Date(now + 5.5 * 3600000).toISOString().slice(0, 10);
+    const ranged = await report({ from: day, to: day });
+    if (ranged.mine[5] || !ranged.summary.excludedNoRecoveryTime) bad.push('a cart without a recovery time was put in a date range');
+    // Decisions: confirm order 6 for cart 6 → cart 7 loses it; the same order for cart 7 refused; a non-candidate refused; revert restores.
+    const dec = (body, who = 'adm') => internal(who, 'POST', '/api/recovery-verification/decisions', body);
+    const c1 = await dec({ cart_id: cartIds[6], order_id: o6, decision: 'confirmed', note: 'customer confirmed on the phone' });
+    rep = await report();
+    if (c1.status !== 201 || rep.mine[6].status !== 'verified_paid' || rep.mine[6].tier !== 'manual' || rep.mine[7].status !== 'no_match') bad.push(`confirm ${c1.status} ${rep.mine[6]?.status} ${rep.mine[7]?.status}`);
+    if ((await dec({ cart_id: cartIds[7], order_id: o6, decision: 'confirmed' })).status !== 409) bad.push('the same order confirmed for a second cart');
+    if ((await dec({ cart_id: cartIds[3], order_id: o12, decision: 'confirmed' })).status !== 409) bad.push('a non-candidate confirmed');
+    const { rows: [d] } = await db.query('SELECT id, auto_result, decided_by FROM recovery_match_decisions WHERE cart_id = $1 AND reverted_at IS NULL', [cartIds[6]]);
+    if (d.auto_result.status !== 'needs_review' || !d.decided_by) bad.push('original automatic result not kept');
+    await expectErr('decision edit', () => db.query(`UPDATE recovery_match_decisions SET note = 'x' WHERE id = $1`, [d.id]), (e) => /reverted/.test(e.message));
+    await expectErr('decision delete', () => db.query('DELETE FROM recovery_match_decisions WHERE id = $1', [d.id]), (e) => /append-only/.test(e.message));
+    if ((await internal('adm', 'POST', `/api/recovery-verification/decisions/${d.id}/revert`, {})).status !== 200) bad.push('revert');
+    if ((await internal('adm', 'POST', `/api/recovery-verification/decisions/${d.id}/revert`, {})).status !== 404) bad.push('reverted twice');
+    rep = await report();
+    if (rep.mine[6].status !== 'needs_review') bad.push('revert did not restore the automatic result');
+    const hist = (await internal('adm', 'GET', `/api/recovery-verification/carts/${cartIds[6]}/decisions`)).body.decisions;
+    if (hist.length !== 1 || !hist[0].reverted_at || !hist[0].reverted_by) bad.push('history lost the reverted decision');
+    // Reject one of cart 8's two orders → one candidate left, with no shared product → a possible match only.
+    const r8 = (await report()).mine[8].candidates.find((x) => x.order.products[0]?.title === 'Omega');
+    await dec({ cart_id: cartIds[8], order_id: r8.order.id, decision: 'rejected', note: 'different product' });
+    if ((await report()).mine[8].status === 'needs_review') bad.push('rejection not applied');
+    // Admin only: page, report and decisions; agents and others refused.
+    for (const who of ['mgr', 'multi', 'nonHr']) {
+      if ((await internal(who, 'GET', '/api/recovery-verification')).status !== 403 || (await dec({ cart_id: cartIds[3], order_id: o3, decision: 'confirmed' }, who)).status !== 403) bad.push(`${who} reached the report or decisions`);
+      const pg = await internal(who, 'GET', '/recovery-verification');
+      if (pg.status === 200) bad.push(`${who} opened the page`);
+    }
+    // Nothing else changed: cart statuses, orders, stock, shipments, attribution.
+    const { rows: carts } = await db.query('SELECT status FROM abandoned_carts WHERE id = ANY($1)', [Object.values(cartIds)]);
+    if (carts.some((c) => c.status !== 'Called – Recovered')) bad.push('a cart status changed');
+    if (JSON.stringify(await fx()) !== JSON.stringify(fx0)) bad.push(`side effects ${JSON.stringify([fx0, await fx()])}`);
+  } finally {
+    const c = await db.connect();
+    try {
+      await c.query('BEGIN'); await c.query(`SET LOCAL app.purge_recovery = 'on'`);
+      await c.query('DELETE FROM recovery_match_decisions WHERE cart_id = ANY($1)', [Object.values(cartIds)]);
+      await c.query('COMMIT');
+    } catch (err) { await c.query('ROLLBACK'); throw err; } finally { c.release(); }
+    await db.query('DELETE FROM abandoned_carts WHERE id = ANY($1)', [Object.values(cartIds)]);
+    await purgeTestOrders(`gid://shopify/Order/${RV_NUM}`);
+  }
+  if (bad.length) throw new Error(bad.join(' | '));
+  return 'identifier → paid; +91 phone + SKU → paid; pending; after the window → none; no recovery time → possible (and left out of a date range); one order for two carts and two orders for one cart → needs review; cancelled and refunded; no financial record → order placed, payment unknown, no revenue; refresh identical; paid revenue each order once at Shopify\'s current total; agent filter; confirm takes the order from the other cart, a second confirmation and a non-candidate refused, original automatic result kept, decisions not editable/deletable, revert once restores it, history keeps it; rejection applied; non-admins refused (API, decisions, page); cart statuses, orders, stock, shipments, attribution unchanged';
+});
+
+await step('call board: Recovered tab green, Lost tab red (text, count, selected); other tabs unchanged; Recovery verification linked for admins only', async () => {
+  const bad = [];
+  const js = await fsp.readFile(new URL('../public/app.js', import.meta.url), 'utf8');
+  const css = await fsp.readFile(new URL('../public/ui.css', import.meta.url), 'utf8');
+  const html = await fsp.readFile(new URL('../public/index.html', import.meta.url), 'utf8');
+  const nav = await fsp.readFile(new URL('../public/ui/components.js', import.meta.url), 'utf8');
+  if (!/const outcome = key === 'recovered' \? ' tab-recovered' : key === 'lost' \? ' tab-lost' : '';/.test(js) || !/class="tab\$\{outcome\}/.test(js)) bad.push('outcome classes not limited to Recovered / Lost');
+  for (const [cls, tone] of [['tab-recovered', 'success'], ['tab-lost', 'error']]) {
+    if (!new RegExp(`\\.tab\\.${cls} \\{ color: var\\(--${tone}-text\\); \\}`).test(css)) bad.push(`${cls} text`);
+    if (!new RegExp(`\\.tab\\.${cls}\\.active \\{ background: var\\(--${tone}-soft\\);[^}]*color: var\\(--${tone}-text\\); \\}`).test(css)) bad.push(`${cls} selected`);
+    if (!new RegExp(`\\.tab\\.${cls} \\.tab-count[^{]*\\{[^}]*color: var\\(--${tone}-text\\); background: var\\(--${tone}-soft\\)`).test(css)) bad.push(`${cls} count`);
+  }
+  if (/\.tab\.active \{[^}]*success|\.tab \{[^}]*(success|error)/.test(css)) bad.push('the base tab style changed');
+  if (!/<a class="verify-link" id="verifyLink" href="\/recovery-verification" hidden>/.test(html) || !/verify\.hidden = !\(IS_ADMIN && state\.view === 'recovered' && !state\.query\)/.test(js)) bad.push('verification link');
+  if (!/admin \? navLink\('\/recovery-verification', 'Recovery verification'\) : ''/.test(nav)) bad.push('nav link not admin-only');
+  const page = await fsp.readFile(new URL('../public/recovery.js', import.meta.url), 'utf8');
+  for (const t of ['Carts marked Recovered', 'Verified Shopify orders', 'Verified paid orders', 'Pending-payment orders', 'Unmatched carts', 'Ambiguous matches', 'Paid order revenue', 'Average paid order', 'Revenue per recovered cart']) if (!page.includes(t)) bad.push(`summary label ${t}`);
+  const pageHtml = await fsp.readFile(new URL('../public/recovery.html', import.meta.url), 'utf8');
+  if (!/revenue <b>associated with<\/b> recovered carts — not proof that support caused it/.test(pageHtml)) bad.push('revenue caveat');
+  if (bad.length) throw new Error(bad.join(' | '));
+  return 'only Recovered (green: text, count pill, selected background) and Lost (red) get outcome classes; base tab style untouched; "Verify against Shopify orders" shown on the Recovered tab to admins; sidebar link admin-only; page summary labels and the "associated with, not caused by" caveat present';
 });
 
 await step('marketing: metrics, purchases (one action type), ranges and Meta error classification', async () => {

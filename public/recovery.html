@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <link rel="icon" type="image/png" href="/brand/briyo-logo-square.png" />
+  <link rel="apple-touch-icon" href="/brand/apple-touch-icon.png" />
+  <title>Recovery verification — Briyo OS</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/ui.css" />
+  <link rel="stylesheet" href="/orders.css" />
+  <script src="https://cdn.jsdelivr.net/npm/lucide@0.469.0/dist/umd/lucide.min.js" defer></script>
+</head>
+<body>
+<div class="app">
+  <aside class="sidebar" id="sidebar" aria-label="Main navigation"></aside>
+  <div class="scrim" id="scrim"></div>
+  <div class="main">
+    <header class="topbar">
+      <button class="icon-btn" id="navOpen" type="button" aria-label="Open navigation"><i data-lucide="menu"></i></button>
+      <span class="topbar-title">Recovery verification</span>
+    </header>
+    <main class="page" data-section="support">
+      <div class="crumbs"><i data-lucide="headset"></i><span>Support</span><span class="sep">/</span><span class="here">Recovery verification</span></div>
+      <div class="page-head">
+        <div>
+          <h1 class="page-title">Recovery verification</h1>
+          <p class="page-sub">Carts marked Recovered, checked against the Shopify orders Briyo OS has imported. Revenue here is revenue <b>associated with</b> recovered carts — not proof that support caused it.</p>
+        </div>
+      </div>
+      <div class="filters rv-filters">
+        <label class="fld"><span>Recovered from</span><input class="input" type="date" id="fFrom" /></label>
+        <label class="fld"><span>to</span><input class="input" type="date" id="fTo" /></label>
+        <label class="fld"><span>Agent</span><select class="select" id="fAgent"><option value="">Everyone</option></select></label>
+        <label class="fld"><span>Window after recovery</span><select class="select" id="fWindow"><option value="24">24 hours</option><option value="48" selected>48 hours</option><option value="72">72 hours</option><option value="168">7 days</option></select></label>
+      </div>
+      <div id="alerts"></div>
+      <div class="imp-stats rv-stats" id="stats"></div>
+      <p class="muted rv-note" id="note"></p>
+      <div class="seg rv-seg" role="tablist" aria-label="Verification status" id="statusSeg"></div>
+      <section class="card">
+        <div class="table-wrap">
+          <table class="table rv-table">
+            <thead><tr><th>Customer</th><th>Cart</th><th>Recovered</th><th>Agent</th><th class="r">Cart value</th><th>Shopify order</th><th class="r">Order value</th><th>Payment</th><th>Verification</th></tr></thead>
+            <tbody id="rows"></tbody>
+          </table>
+        </div>
+      </section>
+    </main>
+  </div>
+</div>
+<div class="drawer-scrim" id="drawerScrim" hidden></div>
+<aside class="drawer drawer-wide" id="drawer" hidden aria-label="Recovered cart">
+  <div class="drawer-head">
+    <div style="min-width:0"><h2 class="drawer-title" id="dTitle"></h2><div class="drawer-sub" id="dSub"></div></div>
+    <div class="drawer-nav"><button class="icon-btn" id="dClose" type="button" title="Close" aria-label="Close"><i data-lucide="x"></i></button></div>
+  </div>
+  <div class="drawer-body" id="dBody"></div>
+  <div class="drawer-foot"><span class="saved" id="dSaved"></span></div>
+</aside>
+<script type="module" src="/recovery.js"></script>
+</body>
+</html>

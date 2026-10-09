@@ -526,3 +526,17 @@ dl.facts dd { margin: 0; min-width: 0; overflow-wrap: anywhere; }
 .so-other { display: flex; flex-direction: column; gap: 6px; margin-top: 8px; }
 .so-other > span { font-size: 12px; color: var(--text-2); }
 .fld .fld-lbl { font-size: 12px; color: var(--text-2); }
+
+/* Recovery verification */
+.tag.bad { color: var(--error-text); border-color: #FECDCA; }
+.rv-filters { margin-bottom: 12px; align-items: flex-end; }
+.rv-filters .fld { flex: 1 1 160px; }
+.rv-stats { margin-bottom: 8px; }
+.rv-note { font-size: 12.5px; margin: 0 0 12px; }
+.rv-seg { margin-bottom: 12px; flex-wrap: wrap; height: auto; }
+.rv-table td { vertical-align: top; }
+.rv-table tbody tr { cursor: pointer; }
+.rv-table .cell-sub { display: block; }
+.rv-cand { border: 1px solid var(--border); border-radius: var(--r-sm, 8px); padding: 10px 12px; margin-bottom: 10px; display: flex; flex-direction: column; gap: 6px; font-size: 13px; }
+.rv-cand .tag { display: inline-block; margin: 2px 4px 0 0; }
+.rv-actions { display: flex; gap: 8px; flex-wrap: wrap; }
