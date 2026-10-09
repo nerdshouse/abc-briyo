@@ -75,7 +75,11 @@ function formHtml(o = {}) {
     <label class="fld wide"><span>Product</span><select class="select" name="sku_id" required><option value="">Choose a product</option>${m.skus.map((k) => opt(k.id, `${skuLabel(k)} · ${count(k.available)} available`, k.id === o.sku_id)).join('')}</select>
       <span class="help" id="soAvail"></span></label>
     <label class="fld"><span>Quantity</span><input class="input" name="quantity" inputmode="numeric" required value="${esc(o.quantity ?? '')}" /></label>
-    <label class="fld"><span>Requested by</span><select class="select" name="requested_by" required>${people(o.requested_by_phone)}</select></label>
+    <div class="fld"><label class="fld-lbl" for="soReqBy"><span>Requested by</span></label>
+      <select class="select" id="soReqBy" name="requested_by" required>${people(o.requested_by_phone)}${opt('other', 'Other', Boolean(o.id && !o.requested_by_phone))}</select>
+      <label class="so-other" id="soOtherWrap"${o.id && !o.requested_by_phone ? '' : ' hidden'}><span>Enter Requester's Name</span>
+        <input class="input" name="requested_by_name" placeholder="Enter full name" maxlength="60" autocomplete="off" value="${esc(o.id && !o.requested_by_phone ? o.requested_by_name : '')}" /></label>
+      <span class="err" id="soOtherErr" role="alert"></span></div>
     <label class="fld"><span>Issued by</span><select class="select" name="issued_by" required>${people(o.issued_by_phone)}</select>
       <span class="help">The person who physically hands the stock over.</span></label>
     <label class="fld"><span>Recipient / point of contact</span><input class="input" name="recipient_name" required maxlength="160" value="${esc(o.recipient_name || '')}" /></label>
@@ -87,7 +91,38 @@ function formHtml(o = {}) {
     <label class="fld wide"><span>Notes</span><textarea class="input" name="notes" maxlength="1000">${esc(o.notes || '')}</textarea></label>
   </div><p class="imp-note">Saving creates a draft. No stock moves until it is issued.</p></section></form>`;
 }
-const formValues = () => Object.fromEntries(new FormData($('#soForm')));
+/**
+ * The form as sent: the typed requester name only with "Other" (a team member never carries a stale typed name).
+ * Returns null, with the message beside the field, when "Other" has no name — the server checks the same.
+ */
+const formValues = () => {
+  const v = Object.fromEntries(new FormData($('#soForm')));
+  if (v.requested_by !== 'other') { delete v.requested_by_name; return v; }
+  v.requested_by_name = String(v.requested_by_name || '').replace(/\s+/g, ' ').trim();
+  if (!v.requested_by_name) {
+    $('#soOtherErr').textContent = 'Enter the requester\'s name.';
+    $('#soForm [name=requested_by_name]').focus();
+    return null;
+  }
+  return v;
+};
+/** "Other" shows the name box right under Requested by; choosing a team member hides and clears it. */
+function wireRequester() {
+  const sel = $('#soReqBy');
+  if (!sel) return;
+  const sync = () => {
+    const other = sel.value === 'other';
+    const input = $('#soForm [name=requested_by_name]');
+    $('#soOtherWrap').hidden = !other;
+    input.required = other;
+    if (!other) input.value = '';
+    $('#soOtherErr').textContent = '';
+  };
+  sel.addEventListener('change', sync);
+  $('#soForm [name=requested_by_name]').addEventListener('input', () => { $('#soOtherErr').textContent = ''; });
+  const input = $('#soForm [name=requested_by_name]');
+  input.required = sel.value === 'other';
+}
 
 function showAvailable() {
   const sel = $('#soForm [name=sku_id]');
@@ -100,6 +135,7 @@ function openNew() {
   $('#dBody').innerHTML = formHtml();
   $('#dActions').innerHTML = '<button class="btn" type="button" data-act="close">Cancel</button><button class="btn primary" type="button" data-act="create">Save draft</button>';
   $('#soForm [name=sku_id]').addEventListener('change', showAvailable);
+  wireRequester();
   renderIcons();
 }
 
@@ -109,7 +145,7 @@ async function openOutward(id) {
   openDrawer(`${o.reference} · ${o.purpose_label}`, `${o.sku} — ${o.product_name}`);
   const facts = [
     ['Status', statusTag(o.status)], ['Movement date', esc(day(o.movement_date))], ['Quantity', count(o.quantity)],
-    ['Requested by', esc(o.requested_by_name)], ['Issued by', esc(o.issued_by_name)],
+    ['Requested by', `${esc(o.requested_by_name)}${o.requested_by_external ? ' <span class="muted">(not a team member)</span>' : ''}`], ['Issued by', esc(o.issued_by_name)],
     ['Recipient / POC', esc(o.recipient_name)], ['Organisation', esc(o.recipient_org || '—')], ['Department', esc(o.department || '—')],
     ['Event / campaign', esc(o.campaign || '—')], ['Reference', esc(o.request_reference || '—')], ['Expected back', esc(day(o.expected_return_date))],
     ['Cost at CP', o.cost_value === null ? (o.status === 'draft' ? '—' : 'Unknown (a batch has no CP)') : esc(money(o.cost_value))],
@@ -167,6 +203,7 @@ async function openOutward(id) {
   if (['issued', 'partially_returned'].includes(o.status) && canMove()) acts.push('<button class="btn" type="button" data-act="close-out">Close</button>', '<button class="btn primary" type="button" data-act="record">Record</button>');
   $('#dActions').innerHTML = acts.join('');
   if ($('#soForm [name=sku_id]')) $('#soForm [name=sku_id]').addEventListener('change', showAvailable);
+  wireRequester();
   renderIcons();
 }
 
@@ -176,12 +213,16 @@ async function act(name, btn) {
   try {
     if (name === 'close') return closeDrawer();
     if (name === 'create') {
-      const r = await api('/api/inventory/outward', { method: 'POST', body: JSON.stringify(formValues()) });
+      const v = formValues();
+      if (!v) return;
+      const r = await api('/api/inventory/outward', { method: 'POST', body: JSON.stringify(v) });
       await load();
       await openOutward(r.id);
       saved(`Draft ${r.reference} saved. Issue it when the stock is handed over.`);
     } else if (name === 'save-draft') {
-      await api(`/api/inventory/outward/${o.id}`, { method: 'PATCH', body: JSON.stringify({ ...formValues(), version: o.version }) });
+      const v = formValues();
+      if (!v) return;
+      await api(`/api/inventory/outward/${o.id}`, { method: 'PATCH', body: JSON.stringify({ ...v, version: o.version }) });
       await load(); await openOutward(o.id); saved('Draft saved');
     } else if (name === 'cancel-draft') {
       if (!confirm('Cancel this draft? Nothing was issued, so no stock moves.')) return;
@@ -209,6 +250,7 @@ async function act(name, btn) {
     }
   } catch (err) {
     saved(err.message, true);
+    if (err.data?.field === 'requested_by_name' && $('#soOtherErr')) $('#soOtherErr').textContent = err.message;
   } finally { btn.disabled = false; }
 }
 
@@ -232,7 +274,7 @@ async function loadReport() {
     <p class="muted" style="font-size:12px">Cost uses each batch's Cost Price (CP) at the time of issue; Selling Price and MRP are never used.</p>
     ${table('By purpose', r.byPurpose, (x) => x.purpose_label, 'Purpose')}
     ${table('By product', r.byProduct, (x) => `${x.sku} — ${x.product_name}`, 'Product')}
-    ${table('By requester', r.byRequester, (x) => x.name, 'Requested by')}
+    ${table('By requester', r.byRequester, (x) => `${x.name}${x.external ? ' (not a team member)' : ''}`, 'Requested by')}
     ${table('By issuer', r.byIssuer, (x) => x.name, 'Issued by')}
     ${table('By recipient / organisation', r.byRecipient, (x) => x.recipient, 'Recipient')}
     <section class="card so-rep"><header class="card-head"><h2 class="card-title">Outstanding — expected back</h2></header><div class="table-wrap"><table class="table">
