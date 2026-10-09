@@ -693,7 +693,8 @@ async function renderOrdersNav(me) {
     navLink('/inventory', 'Stock')
     + navLink('/inventory?stock=low', 'Low stock')
     + navLink('/inventory?expiring=90', 'Expiring soon')
-    + navLink('/inventory?view=unmapped', 'Unmapped SKUs', '', { count: meta.inventory?.unmappedSkus })) : ''}`;
+    + navLink('/inventory?view=unmapped', 'Unmapped SKUs', '', { count: meta.inventory?.unmappedSkus })
+    + navLink('/stock-outward', 'Stock outward')) : ''}`;
   // Re-rendered on every page; replaced only if something (a count) changed.
   if (host.dataset.html === html) return;
   host.dataset.html = html;

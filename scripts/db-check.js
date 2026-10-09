@@ -21,9 +21,9 @@ import {
   orderShipments, addOrderNote, removeDocument, orderDocuments, getDocument, listCouriers, saveCourier,
   trackingUrlFor, purgeTestOrders, zonedToUtc, listDestinations, saveDestination, DISPATCH_TYPES,
   shipmentMembers, sharedShipmentOf, attachToShipment, detachFromShipment, attachableOrders, createShipmentForOrders,
-  addManualOrderLine, updateManualOrderLine, removeManualOrderLine, manualLineSkuOptions,
+  addManualOrderLine, updateManualOrderLine, removeManualOrderLine, manualLineSkuOptions, matchManualOrderLine,
 } from '../lib/orders.js';
-import { saveUploadedDocument, router as ordersRouterForTest } from '../lib/orders-routes.js';
+import { saveUploadedDocument, router as ordersRouterForTest, destinationRouter as destinationRouterForTest } from '../lib/orders-routes.js';
 import { planAmazon, readTable, previewAmazonImport, commitAmazonImport } from '../lib/amazon-import.js';
 import { orderItems } from '../lib/orders.js';
 import {
@@ -34,6 +34,8 @@ import {
   updateMappingUnits, unitsPerListingOf, getInventoryCutover, setInventoryCutover, isInventoryEligible,
 } from '../lib/inventory.js';
 import { planSkuSheet, previewSkuImport, commitSkuImport } from '../lib/sku-master-import.js';
+import { createOutward, updateOutward, cancelOutward, issueOutward, recordOutwardReturn, closeOutward, listOutwards, getOutward, outwardReport, outwardStockOptions } from '../lib/stock-outward.js';
+import { router as inventoryRouterForTest } from '../lib/inventory-routes.js';
 import { DOCUMENT_FORMATS } from '../lib/orders.js';
 import {
   validateDocument, storage, signV4, _resetStorage, StorageNotConfigured,
@@ -5493,6 +5495,359 @@ await step('inventory page: Add inventory and batch forms show CP, SP and MRP as
   if (!/\.price-row \{[^}]*grid-template-columns: repeat\(3, minmax\(0, 1fr\)\)/.test(css) || !/@media \(max-width: 760px\) \{ \.price-row \{ grid-template-columns: 1fr; \}/.test(css)) bad.push('layout');
   if (bad.length) throw new Error(bad.join(' | '));
   return 'both forms: three labelled inputs (unit_cost/selling_price/mrp, decimal keypad) with their helper texts, no dropdown, no "Unit cost"; receipt keeps SKU, batch, quantity, dates, received date, supplier, PO, GRN, warehouse, location, COA, notes; 3 columns on desktop, 1 below 760 px';
+});
+
+// ---- Stock Outward + retailer lines without Briyo SKUs ------------------------------------------------
+const SO = {};
+const soBase = () => ({ movement_date: dayOffset(0), purpose: 'free_sample', sku_id: SO.sku, quantity: 4, requested_by: FIX_A, issued_by: FIX_B, recipient_name: 'Dbcheck Recipient' });
+const soOnHand = async (batchId) => (await getPool().query('SELECT on_hand FROM inventory_batches WHERE id = $1', [batchId])).rows[0].on_hand;
+const soLedger = async (id) => (await getPool().query(`SELECT movement_type, quantity, batch_id FROM inventory_movements WHERE reference_type = 'stock_outward' AND reference_id = (SELECT reference FROM stock_outwards WHERE id = $1) ORDER BY id`, [id])).rows;
+
+await step('stock outward: drafts take no stock; issue deducts exactly once through the ledger (retries and double clicks too); insufficient or quarantined stock refused; nothing oversold under concurrency', async () => {
+  const bad = [];
+  const db = getPool();
+  SO.sku = (await createSku({ sku: `${TS}-SO`, product_name: 'Outward test', variant_name: '30 caps' }, { actor: ACTOR })).id;
+  SO.b1 = (await receiveInventory({ sku_id: SO.sku, batch_number: 'SO-1', expiry_date: dayOffset(300), quantity: 10, unit_cost: '120', selling_price: '299', mrp: '399', request_id: rid() }, { actor: ACTOR })).batchId;
+  SO.b2 = (await receiveInventory({ sku_id: SO.sku, batch_number: 'SO-2', expiry_date: dayOffset(500), quantity: 5, unit_cost: '100', request_id: rid() }, { actor: ACTOR })).batchId;
+  const prices0 = (await db.query('SELECT id, unit_cost, selling_price, mrp FROM inventory_batches WHERE sku_id = $1 ORDER BY id', [SO.sku])).rows;
+  // 1. A draft moves nothing.
+  const d1 = await createOutward(soBase(), { actor: ACTOR });
+  if ((await soOnHand(SO.b1)) !== 10 || (await soLedger(d1.id)).length || (await getOutward(d1.id)).status !== 'draft') bad.push('draft moved stock');
+  // Validation and people: names come from the team record, never from the request.
+  for (const [k, v] of [['quantity', 0], ['quantity', 'x'], ['purpose', 'party'], ['requested_by', '919999999999'], ['issued_by', ''], ['recipient_name', ' '], ['sku_id', 99999999], ['movement_date', 'tomorrow']]) {
+    await expectErr(`create ${k}=${v}`, () => createOutward({ ...soBase(), [k]: v }, { actor: ACTOR }), (e) => [400, 404].includes(e.status));
+  }
+  const o1 = await getOutward(d1.id);
+  const names = (await db.query('SELECT phone, name FROM allowed_users WHERE phone = ANY($1)', [[FIX_A, FIX_B]])).rows;
+  if (o1.requested_by_name !== names.find((n) => n.phone === FIX_A).name || o1.issued_by_name !== names.find((n) => n.phone === FIX_B).name || o1.created_by !== ACTOR) bad.push('people not from team records');
+  // 3. Insufficient: allocations must add up and the batch must have it free; nothing written on refusal.
+  await expectErr('wrong total', () => issueOutward(d1.id, { allocations: [{ batch_id: SO.b1, quantity: 3 }] }, { actor: ACTOR }), (e) => e.status === 400);
+  await expectErr('no batches', () => issueOutward(d1.id, {}, { actor: ACTOR }), (e) => e.status === 400);
+  const big = await createOutward({ ...soBase(), quantity: 11 }, { actor: ACTOR });
+  await expectErr('more than the batch', () => issueOutward(big.id, { allocations: [{ batch_id: SO.b1, quantity: 11 }] }, { actor: ACTOR }), (e) => e.status === 409 && e.insufficientStock);
+  if ((await soOnHand(SO.b1)) !== 10 || (await getOutward(big.id)).status !== 'draft' || (await soLedger(big.id)).length) bad.push('a refused issue changed something');
+  const other = (await createSku({ sku: `${TS}-SO-OTHER`, product_name: 'Other' }, { actor: ACTOR })).id;
+  const ob = (await receiveInventory({ sku_id: other, batch_number: 'SO-X', quantity: 9, request_id: rid() }, { actor: ACTOR })).batchId;
+  await expectErr('another product\'s batch', () => issueOutward(d1.id, { allocations: [{ batch_id: ob, quantity: 4 }] }, { actor: ACTOR }), (e) => e.status === 400);
+  const qb = (await receiveInventory({ sku_id: SO.sku, batch_number: 'SO-Q', expiry_date: dayOffset(300), quantity: 9, request_id: rid() }, { actor: ACTOR })).batchId;
+  await updateBatch(qb, { status: 'quarantined', reason: 'test' }, { actor: ACTOR, version: (await skuDetail(SO.sku)).batches.find((b) => b.id === qb).version });
+  await expectErr('quarantined', () => issueOutward(d1.id, { allocations: [{ batch_id: qb, quantity: 4 }] }, { actor: ACTOR }), (e) => e.status === 409 && e.unsellable);
+  // The issue panel's options: sellable batches only (not the quarantined one), earliest expiry suggested first.
+  const opts = await outwardStockOptions(SO.sku, 12);
+  if (opts.batches.map((b) => b.batch_number).join() !== 'SO-1,SO-2' || opts.available !== 15
+    || JSON.stringify(opts.suggestion) !== JSON.stringify([{ batch_id: SO.b1, quantity: 10 }, { batch_id: SO.b2, quantity: 2 }]) || opts.short !== 0) bad.push(`stock options ${JSON.stringify(opts)}`);
+  // 2, 5. Issue: 4 from SO-1, once; a retry and a second click change nothing.
+  const r1 = await issueOutward(d1.id, { allocations: [{ batch_id: SO.b1, quantity: 4 }] }, { actor: ACTOR });
+  const again = await issueOutward(d1.id, { allocations: [{ batch_id: SO.b1, quantity: 4 }] }, { actor: ACTOR });
+  const [c1, c2] = await Promise.all([issueOutward(d1.id, { allocations: [{ batch_id: SO.b1, quantity: 4 }] }, { actor: ACTOR }), issueOutward(d1.id, { allocations: [{ batch_id: SO.b1, quantity: 4 }] }, { actor: ACTOR })]);
+  const led = await soLedger(d1.id);
+  if (!r1.issued || !again.repeated || !c1.repeated || !c2.repeated || led.length !== 1 || led[0].quantity !== -4 || led[0].movement_type !== 'outward_issued' || (await soOnHand(SO.b1)) !== 6) bad.push(`issue once: ${JSON.stringify(led)} on hand ${await soOnHand(SO.b1)}`);
+  const i1 = await getOutward(d1.id);
+  if (i1.status !== 'issued' || i1.cost_value !== 480 || i1.batches[0].unit_cost !== 120 || !i1.issue_actor || i1.outstanding !== 4) bad.push(`issued row ${JSON.stringify([i1.status, i1.cost_value, i1.outstanding])}`);
+  // Stock fields are fixed once issued; a draft can be cancelled, an issued movement cannot.
+  await expectErr('edit qty after issue', () => updateOutward(d1.id, { quantity: 9 }, { actor: ACTOR }), (e) => e.status === 409);
+  await updateOutward(d1.id, { notes: 'handed over at the studio', campaign: 'Diwali shoot' }, { actor: ACTOR });
+  if ((await soOnHand(SO.b1)) !== 6 || (await soLedger(d1.id)).length !== 1) bad.push('an edit moved stock');
+  await expectErr('cancel issued', () => cancelOutward(d1.id, { actor: ACTOR }), (e) => e.status === 409);
+  await cancelOutward(big.id, { actor: ACTOR });
+  await expectErr('issue cancelled', () => issueOutward(big.id, { allocations: [{ batch_id: SO.b1, quantity: 6 }] }, { actor: ACTOR }), (e) => e.status === 409);
+  // 4. Concurrency: two drafts of 5 against 6 free in SO-1 — exactly one issues; never below zero.
+  const x = await createOutward({ ...soBase(), quantity: 5 }, { actor: ACTOR });
+  const y = await createOutward({ ...soBase(), quantity: 5 }, { actor: ACTOR });
+  const res = await Promise.allSettled([x, y].map((d) => issueOutward(d.id, { allocations: [{ batch_id: SO.b1, quantity: 5 }] }, { actor: ACTOR })));
+  const okN = res.filter((r) => r.status === 'fulfilled').length;
+  const failN = res.filter((r) => r.status === 'rejected' && r.reason.insufficientStock).length;
+  if (okN !== 1 || failN !== 1 || (await soOnHand(SO.b1)) !== 1) bad.push(`concurrent: ${okN} issued, ${failN} refused, on hand ${await soOnHand(SO.b1)}`);
+  SO.loser = res[0].status === 'rejected' ? x.id : y.id;
+  if ((await getOutward(SO.loser)).status !== 'draft') bad.push('the refused draft changed');
+  // Only 1 unit of SO-1 is left free now: 2 are refused.
+  const z = await createOutward({ ...soBase(), quantity: 2 }, { actor: ACTOR });
+  await expectErr('more than free', () => issueOutward(z.id, { allocations: [{ batch_id: SO.b1, quantity: 2 }] }, { actor: ACTOR }), (e) => e.insufficientStock);
+  // 11. Prices unchanged by any of it; CP is the cost.
+  const prices1 = (await db.query('SELECT id, unit_cost, selling_price, mrp FROM inventory_batches WHERE sku_id = $1 AND id = ANY($2) ORDER BY id', [SO.sku, prices0.map((p) => p.id)])).rows;
+  if (JSON.stringify(prices0) !== JSON.stringify(prices1)) bad.push('batch prices changed');
+  SO.d1 = d1.id;
+  if (bad.length) throw new Error(bad.join(' | '));
+  return 'draft: no movement; bad quantity/purpose/people/recipient/product/date refused; people named from team records, creator = signed-in actor; wrong total, no batches, 11 of 10, another product\'s batch, quarantined → refused with nothing written; issue 4 → one outward_issued −4 (on hand 10→6), cost 4 × CP ₹120 = ₹480; retry, repeat and two simultaneous clicks → no second deduction; stock fields fixed after issue (details editable, no stock moved); issued not cancellable, draft cancellable, cancelled not issuable; two drafts of 5 against 6 free → exactly one issued, other refused and still a draft, on hand 1; CP/SP/MRP unchanged';
+});
+
+await step('stock outward: returns — partial, only verified saleable units restocked to their batch, non-saleable never; quantities reconcile; cannot close with units outstanding; closes when all accounted for; history append-only', async () => {
+  const bad = [];
+  const db = getPool();
+  const id = SO.d1;   // 4 issued from SO-1
+  const before = await soOnHand(SO.b1);
+  await expectErr('nothing entered', () => recordOutwardReturn(id, {}, { actor: ACTOR }), (e) => e.status === 400);
+  await expectErr('not verified', () => recordOutwardReturn(id, { returned_saleable: 1 }, { actor: ACTOR }), (e) => e.status === 400 && e.confirmRequired);
+  await expectErr('more than issued', () => recordOutwardReturn(id, { consumed: 5 }, { actor: ACTOR }), (e) => e.status === 409);
+  await expectErr('negative', () => recordOutwardReturn(id, { consumed: -1 }, { actor: ACTOR }), (e) => e.status === 400);
+  // 9. Close with units outstanding: refused.
+  await expectErr('close early', () => closeOutward(id, { actor: ACTOR }), (e) => e.status === 409 && e.outstanding === 4);
+  // 6, 7. One saleable (verified) back, one damaged: only the saleable unit returns to stock; retry does nothing.
+  const key = rid();
+  const r = await recordOutwardReturn(id, { returned_saleable: 1, returned_non_saleable: 1, saleable_verified: true, request_id: key, notes: 'one seal broken' }, { actor: ACTOR });
+  const again = await recordOutwardReturn(id, { returned_saleable: 1, returned_non_saleable: 1, saleable_verified: true, request_id: key }, { actor: ACTOR });
+  let o = await getOutward(id);
+  if (r.status !== 'partially_returned' || r.outstanding !== 2 || !again.repeated || o.returned_saleable !== 1 || o.returned_non_saleable !== 1 || o.batches[0].restocked !== 1) bad.push(`partial ${JSON.stringify([r, o.returned_saleable, o.returned_non_saleable])}`);
+  if ((await soOnHand(SO.b1)) !== before + 1) bad.push(`restocked ${(await soOnHand(SO.b1)) - before}, want 1`);
+  const back = (await soLedger(id)).filter((m) => m.movement_type === 'outward_returned');
+  if (back.length !== 1 || back[0].quantity !== 1 || Number(back[0].batch_id) !== SO.b1) bad.push(`return ledger ${JSON.stringify(back)}`);
+  // 8. Reconciliation: 4 = 1 + 1 + consumed + retained + outstanding; over-recording refused.
+  await expectErr('over', () => recordOutwardReturn(id, { consumed: 2, retained: 1 }, { actor: ACTOR }), (e) => e.status === 409);
+  const r2 = await recordOutwardReturn(id, { consumed: 1, retained: 1 }, { actor: ACTOR });
+  o = await getOutward(id);
+  if (r2.status !== 'closed' || o.outstanding !== 0 || o.status !== 'closed' || !o.closed_at
+    || o.quantity !== o.returned_saleable + o.returned_non_saleable + o.consumed + o.retained) bad.push(`close ${JSON.stringify(r2)}`);
+  if ((await soOnHand(SO.b1)) !== before + 1) bad.push('consumed/retained/damaged were restocked');
+  await expectErr('after close', () => recordOutwardReturn(id, { consumed: 1 }, { actor: ACTOR }), (e) => e.status === 409);
+  if ((await closeOutward(id, { actor: ACTOR })).changed !== false) bad.push('close not idempotent');
+  // The database itself refuses an unreconciled total or a closed row with units outstanding.
+  await expectErr('db over', () => db.query('UPDATE stock_outwards SET consumed = consumed + 5 WHERE id = $1', [id]), (e) => e.code === '23514');
+  // 10. History: every step, append-only; ledger rows stay.
+  o = await getOutward(id);
+  if (o.events.map((e) => e.event_type).join() !== 'created,issued,edited,returned,returned,closed') bad.push(`history ${o.events.map((e) => e.event_type)}`);
+  await expectErr('event edit', () => db.query('UPDATE stock_outward_events SET notes = $2 WHERE outward_id = $1', [id, 'x']), (e) => /append-only/.test(e.message));
+  await expectErr('event delete', () => db.query('DELETE FROM stock_outward_events WHERE outward_id = $1', [id]), (e) => /append-only/.test(e.message));
+  await expectErr('ledger edit', () => db.query(`UPDATE inventory_movements SET quantity = -1 WHERE reference_type = 'stock_outward'`), (e) => /append-only/.test(e.message));
+  // Multi-batch issue: saleable returns name their batch; never more back to a batch than came from it.
+  await receiveInventory({ sku_id: SO.sku, batch_number: 'SO-1', quantity: 5, request_id: rid() }, { actor: ACTOR });
+  const m = await createOutward({ ...soBase(), quantity: 6, purpose: 'event', recipient_org: 'Dbcheck Expo' }, { actor: ACTOR });
+  await issueOutward(m.id, { allocations: [{ batch_id: SO.b1, quantity: 3 }, { batch_id: SO.b2, quantity: 3 }] }, { actor: ACTOR });
+  await expectErr('no batch named', () => recordOutwardReturn(m.id, { returned_saleable: 2, saleable_verified: true }, { actor: ACTOR }), (e) => e.status === 400);
+  await expectErr('too many to a batch', () => recordOutwardReturn(m.id, { returned_saleable: [{ batch_id: SO.b2, quantity: 4 }], saleable_verified: true }, { actor: ACTOR }), (e) => e.status === 409);
+  await expectErr('foreign batch', () => recordOutwardReturn(m.id, { returned_saleable: [{ batch_id: SO.loser, quantity: 1 }], saleable_verified: true }, { actor: ACTOR }), (e) => e.status === 400);
+  const b2before = await soOnHand(SO.b2);
+  await recordOutwardReturn(m.id, { returned_saleable: [{ batch_id: SO.b2, quantity: 2 }], saleable_verified: true }, { actor: ACTOR });
+  if ((await soOnHand(SO.b2)) !== b2before + 2 || (await getOutward(m.id)).cost_value !== 3 * 120 + 3 * 100) bad.push('multi-batch return/cost');
+  SO.m = m.id;
+  if (bad.length) throw new Error(bad.join(' | '));
+  return 'empty, unverified saleable, over-issue and negative refused; close with 4 outstanding refused; 1 saleable (verified) + 1 damaged → +1 to SO-1 only (one outward_returned), retry no-op, partially returned, 2 outstanding; over-record refused; 1 consumed + 1 kept → reconciled 4 = 1+1+1+1, closed; nothing else restocked; closed refuses more; DB check refuses an over-total; history created/issued/edited/returned/returned/closed append-only, ledger append-only; multi-batch: saleable must name its batch, ≤ what came from it, from this issue only; cost = Σ batch qty × its CP';
+});
+
+await step('stock outward: reports (by purpose, product, people, recipient; outstanding; dispositions; cost at CP never SP/MRP), list search and filters, API permissions', async () => {
+  const bad = [];
+  const rep = await outwardReport({ from: dayOffset(-1), to: dayOffset(1) });
+  const mine = (rows, key) => rows.find(key);
+  const prod = mine(rep.byProduct, (x) => x.sku === `${TS}-SO`);
+  // d1 4 (1 saleable, 1 non-saleable, 1 consumed, 1 kept), the concurrent winner 5, m 6 (2 saleable back) — drafts and cancelled excluded.
+  if (!prod || prod.issued !== 15 || prod.returned_saleable !== 3 || prod.returned_non_saleable !== 1 || prod.consumed !== 1 || prod.retained !== 1 || prod.outstanding !== 9 || prod.movements !== 3) bad.push(`by product ${JSON.stringify(prod)}`);
+  if (!mine(rep.byPurpose, (x) => x.purpose === 'event' && x.issued >= 6) || !mine(rep.byRecipient, (x) => x.recipient === 'Dbcheck Expo')) bad.push('by purpose/recipient');
+  if (!rep.byRequester.length || !rep.byIssuer.length || !rep.outstanding.some((x) => x.id === SO.m && x.outstanding === 4)) bad.push('people/outstanding');
+  // Cost: issued at each batch's CP when issued, less restocked at the same CP; SP 299 / MRP 399 never used.
+  const { rows: [c] } = await getPool().query(`SELECT sum(ob.quantity * ob.unit_cost)::numeric iv, sum(ob.restocked * ob.unit_cost)::numeric rv FROM stock_outward_batches ob JOIN stock_outwards o ON o.id = ob.outward_id WHERE o.sku_id = $1`, [SO.sku]);
+  if (Number(c.iv) !== 4 * 120 + 5 * 120 + 3 * 120 + 3 * 100 || Number(c.rv) !== 1 * 120 + 2 * 100) bad.push(`cost ${c.iv} ${c.rv}`);
+  if (rep.cost.issuedValue < Number(c.iv) || rep.cost.netValue !== Math.round((rep.cost.issuedValue - rep.cost.restockedValue) * 100) / 100) bad.push('report cost');
+  // List: search by product, recipient org, reference; filters by purpose, status, employee, product.
+  const ref = (await getOutward(SO.m)).reference;
+  for (const [f, want] of [[{ q: `${TS}-SO` }, (l) => l.length >= 4], [{ q: 'Dbcheck Expo' }, (l) => l.length === 1 && l[0].id === SO.m], [{ q: ref }, (l) => l.length === 1],
+    [{ purpose: 'event', sku_id: SO.sku }, (l) => l.every((x) => x.purpose === 'event')], [{ status: 'closed', sku_id: SO.sku }, (l) => l.length === 1 && l[0].id === SO.d1],
+    [{ status: 'outstanding', sku_id: SO.sku }, (l) => l.every((x) => ['issued', 'partially_returned'].includes(x.status))], [{ employee: FIX_B, sku_id: SO.sku }, (l) => l.length >= 4],
+    [{ from: dayOffset(2) }, (l) => !l.some((x) => x.sku_id === SO.sku)]]) {
+    if (!want(await listOutwards(f))) bad.push(`list ${JSON.stringify(f)}`);
+  }
+  // 17. API: viewers read; only inventory.move changes anything; logistics-only cannot read.
+  const app = express();
+  app.use((req, _res, next) => { req.session = JSON.parse(req.get('x-test-session') || '{}'); next(); });
+  app.use(express.json());
+  app.use('/api/inventory', inventoryRouterForTest);
+  const server = app.listen(0);
+  const base = `http://127.0.0.1:${server.address().port}/api/inventory/outward`;
+  const call = (method, path, caps, body) => fetch(`${base}${path}`, { method, headers: { 'x-test-session': JSON.stringify({ caps }), 'content-type': 'application/json' }, body: body ? JSON.stringify(body) : undefined }).then((r) => r.status);
+  try {
+    const draft = await createOutward({ ...soBase(), quantity: 1 }, { actor: ACTOR });
+    const before = await soOnHand(SO.b1);
+    if (await call('GET', '', ['inventory.view']) !== 200 || await call('GET', `/${SO.m}`, ['inventory.view']) !== 200 || await call('GET', '/report', ['inventory.view']) !== 200) bad.push('viewer cannot read');
+    if (await call('GET', '', ['logistics.view']) !== 403) bad.push('logistics-only can read outward');
+    for (const [m, p, b] of [['POST', '', soBase()], ['PATCH', `/${draft.id}`, { notes: 'x' }], ['POST', `/${draft.id}/issue`, { allocations: [{ batch_id: SO.b1, quantity: 1 }] }],
+      ['POST', `/${SO.m}/return`, { consumed: 1 }], ['POST', `/${SO.m}/close`, {}], ['POST', `/${draft.id}/cancel`, {}]]) {
+      const st = await call(m, p, ['inventory.view'], b);
+      if (st !== 403) bad.push(`viewer ${m} ${p} → ${st}`);
+    }
+    if ((await soOnHand(SO.b1)) !== before || (await getOutward(draft.id)).status !== 'draft' || (await getOutward(SO.m)).consumed !== 0) bad.push('a refused request changed something');
+    if (await call('POST', `/${draft.id}/issue`, ['inventory.view', 'inventory.move'], { allocations: [{ batch_id: SO.b1, quantity: 1 }] }) !== 200 || (await soOnHand(SO.b1)) !== before - 1) bad.push('operator could not issue');
+  } finally { server.close(); }
+  if (bad.length) throw new Error(bad.join(' | '));
+  return 'report: 15 issued / 3 back / 1 non-saleable / 1 consumed / 1 kept / 9 outstanding over 3 movements (drafts, cancelled excluded); by purpose, recipient, requester, issuer, outstanding list; cost = Σ qty × batch CP at issue (₹1,740) less restocked (₹320), SP/MRP unused; search by product/organisation/reference, filters by purpose/status/outstanding/employee/date; API: viewer reads, every change 403 for a viewer and changes nothing, logistics-only cannot read, operator issues';
+});
+
+await step('retailer orders without Briyo SKUs (e.g. Medkart): retailer name/code kept beside the Briyo product, code optional; an unmatched line is flagged and blocks stock until a person matches it; then deducted exactly once', async () => {
+  const bad = [];
+  const db = getPool();
+  const cut0 = (await getInventoryCutover()).cutover_at;
+  await setCut(CUT_AT);
+  try {
+    const ret = await createOrder({ ...R('retailers'), channel: 'retailers', source_order_id: `${TEST_ORDER}-MEDKART-1`, customer_name: 'Medkart', order_value: 1500 }, { actor: ACTOR });
+    // 12. A matched line with the retailer's name and no code; a price as the line amount.
+    const a = await addManualOrderLine(ret, { sku_id: SO.sku, quantity: 2, item_price: '598', retailer_product_name: 'BRIYO OUTWARD TST 30S', retailer_product_code: '' }, { actor: ACTOR });
+    // 13, 14. An unmatched line: kept by the retailer's name/code, no SKU, flagged.
+    const u = await addManualOrderLine(ret, { unmatched: true, quantity: 3, item_price: '900', retailer_product_name: 'Briyo Magnesium 60', retailer_product_code: 'MK-4471' }, { actor: ACTOR });
+    await expectErr('unmatched without a name', () => addManualOrderLine(ret, { unmatched: true, quantity: 1 }, { actor: ACTOR }), (e) => e.status === 400);
+    await expectErr('bad amount', () => addManualOrderLine(ret, { unmatched: true, quantity: 1, retailer_product_name: 'x', item_price: '-5' }, { actor: ACTOR }), (e) => e.status === 400);
+    let items = await orderItems(ret);
+    const la = items.find((i) => i.id === a.itemId); const lu = items.find((i) => i.id === u.itemId);
+    if (la.sku_id !== SO.sku || la.sku !== `${TS}-SO` || la.retailer_product_name !== 'BRIYO OUTWARD TST 30S' || la.retailer_product_code !== null || la.item_price !== 598 || la.needs_review) bad.push(`matched line ${JSON.stringify(la)}`);
+    if (lu.sku_id !== null || lu.sku !== null || !lu.needs_review || lu.retailer_product_code !== 'MK-4471' || !u.needsReview) bad.push(`unmatched line ${JSON.stringify(lu)}`);
+    if ((await db.query(`SELECT count(*)::int n FROM skus WHERE sku ILIKE '%MK-4471%' OR product_name = 'Briyo Magnesium 60'`)).rows[0].n) bad.push('a SKU was created for the retailer product');
+    // The shipment cannot reserve or dispatch while a line is unmatched.
+    const dl = (await listCouriers()).find((x) => x.name === 'Delhivery');
+    const { shipmentId } = await createShipment({ ...R('retailers'), channel: 'retailers', source_order_id: `${TEST_ORDER}-MEDKART-1`, courier_partner_id: dl.id, tracking_id: 'AWB-MEDKART-1', shipment_status: 'packed' }, { actor: ACTOR, addToExisting: true });
+    const st = await shipmentStock(shipmentId);
+    if (st.state !== 'unmapped' || !st.unmapped.some((x) => x.title === 'Briyo Magnesium 60')) bad.push(`stock state ${st.state}`);
+    const onHand0 = await soOnHand(SO.b1);
+    const sh = (await orderShipments(ret))[0];
+    await expectErr('dispatch unmatched', () => updateShipment(ret, sh.id, { shipment_status: 'dispatched' }, { actor: ACTOR, version: sh.version }), (e) => e.status === 409);
+    if ((await soOnHand(SO.b1)) !== onHand0) bad.push('stock taken with an unmatched line');
+    // A person matches it (another product), then reserves; dispatch deducts exactly once.
+    const prodB = (await createSku({ sku: `${TS}-SO-MG`, product_name: 'Magnesium', variant_name: '60' }, { actor: ACTOR })).id;
+    const bMg = (await receiveInventory({ sku_id: prodB, batch_number: 'MG-1', expiry_date: dayOffset(400), quantity: 10, unit_cost: '50', request_id: rid() }, { actor: ACTOR })).batchId;
+    await expectErr('match to a product already on the order', () => matchManualOrderLine(ret, u.itemId, { sku_id: SO.sku }, { actor: ACTOR }), (e) => e.status === 409);
+    await expectErr('match a matched line', () => matchManualOrderLine(ret, a.itemId, { sku_id: prodB }, { actor: ACTOR }), (e) => e.status === 409);
+    await matchManualOrderLine(ret, u.itemId, { sku_id: prodB }, { actor: ACTOR });
+    items = await orderItems(ret);
+    const m = items.find((i) => i.id === u.itemId);
+    if (m.sku_id !== prodB || m.needs_review || m.retailer_product_name !== 'Briyo Magnesium 60' || m.retailer_product_code !== 'MK-4471') bad.push('match did not keep the retailer fields');
+    if (!(await orderEvents(ret)).some((e) => e.event_type === 'item_matched' && e.metadata.retailer_code === 'MK-4471')) bad.push('match not audited');
+    await reserveShipmentStock(shipmentId, [{ batch_id: SO.b1, quantity: 2 }, { batch_id: bMg, quantity: 3 }], { actor: ACTOR });
+    const sh2 = (await orderShipments(ret))[0];
+    await updateShipment(ret, sh2.id, { shipment_status: 'dispatched' }, { actor: ACTOR, version: sh2.version });
+    const sh3 = (await orderShipments(ret))[0];
+    await updateShipment(ret, sh3.id, { shipment_status: 'in_transit' }, { actor: ACTOR, version: sh3.version });   // a later status change: no second deduction
+    const moved = (await db.query(`SELECT sku_id, sum(quantity)::int q, count(*)::int n FROM inventory_movements WHERE order_id = $1 GROUP BY sku_id ORDER BY sku_id`, [ret])).rows;
+    if (moved.length !== 2 || moved.find((x) => x.sku_id === SO.sku).q !== -2 || moved.find((x) => x.sku_id === prodB).q !== -3 || (await soOnHand(SO.b1)) !== onHand0 - 2 || (await soOnHand(bMg)) !== 7) bad.push(`deducted ${JSON.stringify(moved)}`);
+    await expectErr('line change after dispatch', () => updateManualOrderLine(ret, u.itemId, { quantity: 9 }, { actor: ACTOR }), (e) => e.status === 409);
+    // No attribution, snapshots or marketplace sync for a hand-entered retailer order.
+    const fx = (await db.query(`SELECT (SELECT count(*) FROM affiliate_order_attributions WHERE order_id = $1)::int a, (SELECT count(*) FROM order_financial_snapshots WHERE order_id = $1)::int f`, [ret])).rows[0];
+    if (fx.a || fx.f) bad.push('attribution/snapshot on a retailer order');
+    // Line edits: amount and retailer fields separately; an unmatched line keeps its name.
+    const ret2 = await createOrder({ ...R('retailers'), channel: 'retailers', source_order_id: `${TEST_ORDER}-MEDKART-2` }, { actor: ACTOR });
+    const u2 = await addManualOrderLine(ret2, { unmatched: true, quantity: 1, retailer_product_name: 'Medkart item' }, { actor: ACTOR });
+    await updateManualOrderLine(ret2, u2.itemId, { item_price: '120.50' }, { actor: ACTOR });
+    await expectErr('clear name of unmatched', () => updateManualOrderLine(ret2, u2.itemId, { retailer_product_name: '' }, { actor: ACTOR }), (e) => e.status === 400);
+    await expectErr('sku via update', () => updateManualOrderLine(ret2, u2.itemId, { sku_id: SO.sku }, { actor: ACTOR }), (e) => e.status === 400);
+    const l2 = (await orderItems(ret2))[0];
+    if (l2.item_price !== 120.5 || l2.quantity !== 1 || l2.retailer_product_name !== 'Medkart item' || !l2.needs_review) bad.push('line edit');
+  } finally { await setCut(cut0); }
+  if (bad.length) throw new Error(bad.join(' | '));
+  return 'matched line: Briyo SKU + retailer name, blank code, line amount ₹598; unmatched line: retailer name + code MK-4471, no SKU, flagged; name required, bad amount refused; no SKU created; shipment state "unmapped" and dispatch refused with no stock taken; matching refuses a product already on the order and an already-matched line, keeps the retailer fields, audited; after matching: reserve + dispatch → −2 and −3 exactly once (a later status change adds nothing); lines locked after dispatch; no attribution or snapshot; amount edit alone; unmatched keeps its name; SKU only via Match';
+});
+
+await step('retailer product matches (e.g. Medkart): saved only when a person confirms; reused by exact code, or by exact name only when there is no code; never by a similar name; ambiguous never used; retailer fields kept; unresolved lines take no stock', async () => {
+  const bad = [];
+  const db = getPool();
+  const pf = await savePlatform({ key: `${TS}_medkart`.toLowerCase().replace(/[^a-z0-9]+/g, '_'), label: `${TS} Medkart` }, { actor: ACTOR });
+  const dest = await saveDestination({ channel: 'retailers', dispatch_type: 'retailer', name: `${TS} Medkart` });
+  const plain = await saveDestination({ channel: 'retailers', dispatch_type: 'retailer', name: `${TS} Plain retailer` });
+  try {
+    // Destinations: only a retailer one takes a product-code list, and only a known one.
+    await expectErr('non-retailer destination', () => saveDestination({ id: R('blinkit').destination_id, sku_platform: pf.key }), (e) => e.status === 400);
+    await expectErr('unknown list', () => saveDestination({ id: dest.id, sku_platform: 'no_such_platform' }), (e) => e.status === 400);
+    const linked = await saveDestination({ id: dest.id, sku_platform: pf.key });
+    if (linked.sku_platform !== pf.key || (await listDestinations()).find((d) => d.id === dest.id)?.sku_platform !== pf.key) bad.push('destination not linked');
+    const zinc = (await createSku({ sku: `${TS}-MK-ZINC`, product_name: 'Zinc', variant_name: '30' }, { actor: ACTOR })).id;
+    let n = 0;
+    const order = async (d = dest.id) => createOrder({ channel: 'retailers', dispatch_type: 'retailer', destination_id: d, source_order_id: `${TEST_ORDER}-MKMAP-${++n}`, customer_name: 'Medkart' }, { actor: ACTOR });
+    const line = async (o, id) => (await orderItems(o)).find((i) => i.id === id);
+    const maps = async () => (await db.query('SELECT platform_sku, sku_id, source, created_by FROM sku_platform_mappings WHERE platform = $1 ORDER BY id', [pf.key])).rows;
+    // 1. Nothing saved: a new retailer line is not matched (no guess), and matching it without "remember" saves nothing.
+    const o1 = await order();
+    const a = await addManualOrderLine(o1, { unmatched: true, quantity: 2, retailer_product_name: 'BRIYO D3 60S', retailer_product_code: 'MK-1' }, { actor: ACTOR });
+    if (!a.needsReview || a.savedMatch) bad.push('matched without a saved match');
+    await matchManualOrderLine(o1, a.itemId, { sku_id: SO.sku }, { actor: ACTOR });
+    if ((await maps()).length) bad.push('a match without "remember" was saved');
+    // 2. Confirmed with "remember": saved under the retailer's code, for this retailer only.
+    const b = await addManualOrderLine(o1, { unmatched: true, quantity: 1, retailer_product_name: 'BRIYO ZINC 30', retailer_product_code: 'MK-2' }, { actor: ACTOR });
+    const rem = await matchManualOrderLine(o1, b.itemId, { sku_id: zinc, remember: true }, { actor: ACTOR });
+    let m = await maps();
+    if (!rem.remembered?.added || m.length !== 1 || m[0].platform_sku !== 'MK-2' || m[0].sku_id !== zinc || m[0].source !== 'retailer_order' || m[0].created_by !== ACTOR) bad.push(`saved ${JSON.stringify(m)}`);
+    // 3. Reused on the next Medkart order by the exact code (any letter case); the retailer's own name/code are kept.
+    const o2 = await order();
+    const c = await addManualOrderLine(o2, { unmatched: true, quantity: 4, item_price: '480', retailer_product_name: 'Zinc tabs (renamed by Medkart)', retailer_product_code: 'mk-2' }, { actor: ACTOR });
+    const lc = await line(o2, c.itemId);
+    if (c.needsReview || c.savedMatch !== `${TS}-MK-ZINC` || lc.sku_id !== zinc || lc.needs_review || lc.retailer_product_name !== 'Zinc tabs (renamed by Medkart)' || lc.retailer_product_code !== 'mk-2' || lc.item_price !== 480) bad.push(`reuse by code ${JSON.stringify(lc)}`);
+    if (!(await orderEvents(o2)).some((e) => e.event_type === 'item_added' && e.metadata.saved_match === 'MK-2')) bad.push('reuse not audited');
+    // A code is never matched through the name, and an unknown code stays unmatched.
+    const d2 = await addManualOrderLine(o2, { unmatched: true, quantity: 1, retailer_product_name: 'BRIYO ZINC 30', retailer_product_code: 'MK-999' }, { actor: ACTOR });
+    if (!d2.needsReview) bad.push('an unknown code matched');
+    // 4. No code: a name match is saved only when confirmed, then reused only for the exact name (spaces/case aside).
+    const o3 = await order();
+    const e1 = await addManualOrderLine(o3, { unmatched: true, quantity: 1, retailer_product_name: 'Briyo  Magnesium 60' }, { actor: ACTOR });
+    await matchManualOrderLine(o3, e1.itemId, { sku_id: SO.sku, remember: true }, { actor: ACTOR });
+    m = await maps();
+    if (!m.some((x) => x.platform_sku === 'name:briyo magnesium 60' && x.sku_id === SO.sku)) bad.push(`name key ${JSON.stringify(m)}`);
+    const o4 = await order();
+    const exact = await addManualOrderLine(o4, { unmatched: true, quantity: 1, retailer_product_name: ' BRIYO magnesium   60 ' }, { actor: ACTOR });
+    const similar = await addManualOrderLine(o4, { unmatched: true, quantity: 1, retailer_product_name: 'Briyo Magnesium 60s' }, { actor: ACTOR });
+    const withCode = await addManualOrderLine((await order()), { unmatched: true, quantity: 1, retailer_product_name: 'Briyo Magnesium 60', retailer_product_code: 'MK-NEW' }, { actor: ACTOR });
+    if (exact.needsReview || exact.savedMatch !== `${TS}-SO` || !similar.needsReview || !withCode.needsReview) bad.push(`name reuse exact=${exact.savedMatch} similar=${similar.needsReview} withCode=${withCode.needsReview}`);
+    // 5. Ambiguous (the same key deliberately mapped to two products): never used.
+    await addPlatformMappings(SO.sku, pf.key, ['MK-2'], { actor: ACTOR, confirmDuplicate: true, reason: 'dbcheck: ambiguity test' });
+    const amb = await addManualOrderLine((await order()), { unmatched: true, quantity: 1, retailer_product_name: 'x', retailer_product_code: 'MK-2' }, { actor: ACTOR });
+    if (!amb.needsReview || !amb.ambiguous) bad.push('an ambiguous match was used');
+    // 6. Remember refused when the key already means another product (never made ambiguous silently) — and the line stays unmatched.
+    const o7 = await order();
+    const f = await addManualOrderLine(o7, { unmatched: true, quantity: 1, retailer_product_name: 'Briyo Magnesium 60s', retailer_product_code: '' }, { actor: ACTOR });
+    await matchManualOrderLine(o7, f.itemId, { sku_id: zinc, remember: true }, { actor: ACTOR });
+    const g = await addManualOrderLine((await order()), { unmatched: true, quantity: 1, retailer_product_name: 'briyo magnesium 60s' }, { actor: ACTOR });
+    const og = (await db.query('SELECT order_id FROM order_items WHERE id = $1', [g.itemId])).rows[0].order_id;
+    // ('briyo magnesium 60s' is now saved to Zinc, so it matched; a fresh order line for the same name pointed at another product:)
+    const h = await addManualOrderLine((await order()), { unmatched: true, quantity: 1, retailer_product_name: 'Unsaved product' }, { actor: ACTOR });
+    const oh = (await db.query('SELECT order_id FROM order_items WHERE id = $1', [h.itemId])).rows[0].order_id;
+    await getPool().query(`UPDATE order_items SET retailer_product_name = 'briyo magnesium 60s' WHERE id = $1`, [h.itemId]);
+    await expectErr('remember onto a key of another product', () => matchManualOrderLine(oh, h.itemId, { sku_id: SO.sku, remember: true }, { actor: ACTOR }), (e) => e.status === 409);
+    if (!(await line(oh, h.itemId)).needs_review) bad.push('a refused remember still matched the line');
+    if (g.needsReview || Number(og) <= 0) bad.push('saved name not reused');
+    // 7. A destination without a list: matching works, remembering is refused with a clear message.
+    const o8 = await order(plain.id);
+    const k = await addManualOrderLine(o8, { unmatched: true, quantity: 1, retailer_product_name: 'Anything', retailer_product_code: 'MK-2' }, { actor: ACTOR });
+    if (!k.needsReview) bad.push('a destination without a list used Medkart\'s matches');
+    await expectErr('remember without a list', () => matchManualOrderLine(o8, k.itemId, { sku_id: zinc, remember: true }, { actor: ACTOR }), (e) => e.status === 400 && /Destinations/.test(e.message));
+    // 8. An unresolved line holds the shipment's stock; the matched-from-saved line counts like any matched line.
+    const dl = (await listCouriers()).find((x) => x.name === 'Delhivery');
+    const { shipmentId } = await createShipment({ channel: 'retailers', dispatch_type: 'retailer', destination_id: dest.id, source_order_id: `${TEST_ORDER}-MKMAP-2`, courier_partner_id: dl.id, tracking_id: 'AWB-MKMAP-2', shipment_status: 'packed' }, { actor: ACTOR, addToExisting: true });
+    const st = await shipmentStock(shipmentId);
+    if (st.state !== 'unmapped' || !st.lines.some((l) => l.sku_id === zinc && l.required === 4) || st.unmapped.length !== 1) bad.push(`stock panel ${st.state} ${JSON.stringify(st.unmapped)}`);
+    // 9. Matching a line needs logistics.edit (orders API).
+    const app = express();
+    app.use((req, _res, next) => { req.session = JSON.parse(req.get('x-test-session') || '{}'); next(); });
+    app.use('/api/orders', ordersRouterForTest);
+    const server = app.listen(0);
+    try {
+      const r = await fetch(`http://127.0.0.1:${server.address().port}/api/orders/${o2}/items/${d2.itemId}/match`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-test-session': JSON.stringify({ caps: ['logistics.view'] }) }, body: JSON.stringify({ sku_id: zinc, remember: true }) });
+      if (r.status !== 403 || !(await line(o2, d2.itemId)).needs_review) bad.push(`viewer match → ${r.status}`);
+    } finally { server.close(); }
+    // 10. Isolation. A retailer cannot use a sales channel's list, nor share another destination's — checked by the server.
+    for (const ch of ['amazon', 'website', 'blinkit']) await expectErr(`link to ${ch}`, () => saveDestination({ id: plain.id, sku_platform: ch }), (e) => e.status === 400);
+    await expectErr('share a list', () => saveDestination({ id: plain.id, sku_platform: pf.key }), (e) => e.status === 409);
+    const dApp = express();
+    dApp.use((req, _r, next) => { req.session = { caps: ['logistics.view'] }; next(); });
+    dApp.use('/d', destinationRouterForTest);
+    const dServer = dApp.listen(0);
+    let listed;
+    try { listed = await (await fetch(`http://127.0.0.1:${dServer.address().port}/d`)).json(); } finally { dServer.close(); }
+    if (listed.platforms.some((p) => ['amazon', 'website', 'blinkit', 'zepto', 'tata_1mg', 'netmeds'].includes(p.key)) || !listed.platforms.some((p) => p.key === pf.key)) bad.push('destination page offers channel lists');
+    // Medkart's matches live only on its own list: Amazon's (and every other) mappings are untouched and unaffected.
+    const others = (await db.query(`SELECT platform, count(*)::int n FROM sku_platform_mappings WHERE platform <> $1 AND (lower(platform_sku) IN ('mk-2','mk-1') OR platform_sku LIKE 'name:%') GROUP BY platform`, [pf.key])).rows;
+    if (others.length || (await resolveSkuIds(db, 'amazon', ['MK-2'])).size || (await resolveSkuIds(db, 'retailers', ['MK-2'])).size) bad.push(`leaked ${JSON.stringify(others)}`);
+    // Even if a channel's list were attached behind the server's back, it is never used for retailer matching.
+    await db.query('UPDATE dispatch_destinations SET sku_platform = $2 WHERE id = $1', [plain.id, 'amazon']);
+    const sneak = await addManualOrderLine((await order(plain.id)), { unmatched: true, quantity: 1, retailer_product_name: 'x', retailer_product_code: 'MK-2' }, { actor: ACTOR });
+    await db.query('UPDATE dispatch_destinations SET sku_platform = $2 WHERE id = $1', [plain.id, pf.key]);   // and a shared list: ignored for both
+    const shared = await addManualOrderLine((await order()), { unmatched: true, quantity: 1, retailer_product_name: 'x', retailer_product_code: 'MK-2' }, { actor: ACTOR });
+    await db.query('UPDATE dispatch_destinations SET sku_platform = NULL WHERE id = $1', [plain.id]);
+    if (!sneak.needsReview || !shared.needsReview) bad.push('a channel or shared list was used for matching');
+    // Changing the destination's list never remaps existing lines (matched stay as they are; unmatched stay unmatched).
+    const before = (await db.query('SELECT id, sku_id FROM order_items WHERE order_id = ANY($1) ORDER BY id', [[o1, o2, o3, o4]])).rows;
+    await saveDestination({ id: dest.id, sku_platform: '' });
+    await saveDestination({ id: dest.id, sku_platform: pf.key });
+    await addPlatformMappings(zinc, pf.key, ['MK-999'], { actor: ACTOR });   // a new mapping for d2's code, added on the SKU page
+    const after = (await db.query('SELECT id, sku_id FROM order_items WHERE order_id = ANY($1) ORDER BY id', [[o1, o2, o3, o4]])).rows;
+    if (JSON.stringify(before) !== JSON.stringify(after) || !(await line(o2, d2.itemId)).needs_review) bad.push('existing lines remapped');
+  } finally {
+    await saveDestination({ id: dest.id, sku_platform: '' });   // unlinked, so the test platform can be removed with the test SKUs
+    await saveDestination({ id: dest.id, active: false });
+    await saveDestination({ id: plain.id, active: false });
+  }
+  if (bad.length) throw new Error(bad.join(' | '));
+  return 'destination ↔ product-code list (retailer only, known list); no saved match → not matched; match without "remember" saves nothing; with it → mapping MK-2 → Zinc (source retailer_order, by the signed-in user); next order: code mk-2 → Zinc, retailer name/code/total kept, audited; unknown code never falls back to the name; no code: exact name (case/spaces aside) reused, "…60s" not; a key on two products → never used; remember onto a key of another product refused, line stays unmatched; no list → no reuse, remember refused; shipment: unresolved line keeps it "unmapped", the saved-match line needs its 4 units; match needs logistics.edit';
 });
 
 await step('inventory cleanup', async () => {

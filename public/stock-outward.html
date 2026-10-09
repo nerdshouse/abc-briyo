@@ -1,0 +1,93 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <link rel="icon" type="image/png" href="/brand/briyo-logo-square.png" />
+  <link rel="apple-touch-icon" href="/brand/apple-touch-icon.png" />
+  <title>Stock outward — Briyo OS</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/ui.css" />
+  <link rel="stylesheet" href="/orders.css" />
+  <script src="https://cdn.jsdelivr.net/npm/lucide@0.469.0/dist/umd/lucide.min.js" defer></script>
+</head>
+<body>
+<div class="app">
+
+  <aside class="sidebar" id="sidebar" aria-label="Main navigation"></aside>
+  <div class="scrim" id="scrim"></div>
+
+  <div class="main">
+    <header class="topbar">
+      <button class="icon-btn" id="navOpen" type="button" aria-label="Open navigation"><i data-lucide="menu"></i></button>
+      <span class="topbar-title">Stock outward</span>
+    </header>
+
+    <main class="page" data-section="inventory">
+      <div class="crumbs">
+        <i data-lucide="boxes"></i><span>Inventory</span><span class="sep">/</span><span class="here">Stock outward</span>
+      </div>
+      <div class="page-head">
+        <div>
+          <h1 class="page-title">Stock outward</h1>
+          <p class="page-sub">Stock that leaves for something other than a sale — samples, shoots, events, seeding, testing, internal use.</p>
+        </div>
+        <div class="page-actions">
+          <div class="seg" role="tablist" aria-label="View">
+            <button type="button" class="on" data-tab="list" role="tab">Movements</button>
+            <button type="button" data-tab="report" role="tab">Reports</button>
+          </div>
+          <button class="btn primary" id="newOut" type="button" hidden><i data-lucide="plus"></i>New stock outward</button>
+        </div>
+      </div>
+      <div id="alerts"></div>
+
+      <section id="listView">
+        <div class="filters so-filters">
+          <input class="input" id="fQ" type="search" placeholder="Search product, recipient, organisation, reference" aria-label="Search" />
+          <input class="input" id="fFrom" type="date" aria-label="From date" />
+          <input class="input" id="fTo" type="date" aria-label="To date" />
+          <select class="select" id="fPurpose" aria-label="Purpose"><option value="">All purposes</option></select>
+          <select class="select" id="fSku" aria-label="Product"><option value="">All products</option></select>
+          <select class="select" id="fEmployee" aria-label="Employee"><option value="">Anyone</option></select>
+          <select class="select" id="fStatus" aria-label="Status"><option value="">Any status</option></select>
+        </div>
+        <section class="card">
+          <div class="table-wrap">
+            <table class="table so-table">
+              <thead><tr>
+                <th>Reference</th><th>Date</th><th>Purpose</th><th>Product</th>
+                <th class="r">Issued</th><th class="r">Returned</th><th class="r">Consumed / damaged</th><th class="r">Outstanding</th>
+                <th>Requested by</th><th>Issued by</th><th>Recipient / POC</th><th>Status</th>
+              </tr></thead>
+              <tbody id="rows"></tbody>
+            </table>
+          </div>
+        </section>
+      </section>
+
+      <section id="reportView" hidden>
+        <div class="filters so-filters">
+          <label class="fld"><span>From</span><input class="input" id="rFrom" type="date" /></label>
+          <label class="fld"><span>To</span><input class="input" id="rTo" type="date" /></label>
+        </div>
+        <div id="report"></div>
+      </section>
+    </main>
+  </div>
+</div>
+
+<div class="drawer-scrim" id="drawerScrim" hidden></div>
+<aside class="drawer drawer-wide" id="drawer" hidden aria-label="Stock outward">
+  <div class="drawer-head">
+    <div style="min-width:0"><h2 class="drawer-title" id="dTitle"></h2><div class="drawer-sub" id="dSub"></div></div>
+    <div class="drawer-nav"><button class="icon-btn" id="dClose" type="button" title="Close" aria-label="Close"><i data-lucide="x"></i></button></div>
+  </div>
+  <div class="drawer-body" id="dBody"></div>
+  <div class="drawer-foot"><span class="saved" id="dSaved"></span><div class="drawer-foot-actions" id="dActions"></div></div>
+</aside>
+<script type="module" src="/stock-outward.js"></script>
+</body>
+</html>

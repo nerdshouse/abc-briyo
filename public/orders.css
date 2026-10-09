@@ -491,3 +491,34 @@ html.scroll-locked .drawer-scrim { touch-action: none; }
 .price-row .fld > span:first-child { min-height: 2.6em; display: flex; align-items: flex-end; line-height: 1.3; }
 @media (max-width: 760px) { .price-row { grid-template-columns: 1fr; } .price-row .fld > span:first-child { min-height: 0; } }
 .price-line { white-space: normal; max-width: none; }
+
+/* Retailer lines on hand-entered orders: line amount beside quantity; a line not matched yet stands out */
+.ml-amt { width: 110px; }
+.item-row.needs-review { border-left: 3px solid var(--warn, #F79009); padding-left: 8px; }
+.ml-match { margin-top: 6px; }
+@media (max-width: 760px) { .ml-row { flex-wrap: wrap; } .ml-row .select, .ml-row .input:not(.ml-qty):not(.ml-amt) { flex: 1 1 100%; } }
+.ml-row .input:not(.ml-qty):not(.ml-amt) { flex: 1 1 180px; min-width: 0; }
+
+/* Stock outward */
+.so-filters { margin-bottom: 12px; }
+.so-filters .input, .so-filters .select { width: auto; min-width: 0; flex: 1 1 150px; }
+.so-filters #fQ { flex: 2 1 260px; }
+.so-table td, .so-table th { white-space: nowrap; }
+.so-table tbody tr[data-id], .so-rep tr[data-id] { cursor: pointer; }
+.so-alloc { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 10px; }
+.so-history { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 8px; font-size: 12.5px; }
+.so-history li { border-left: 2px solid var(--border); padding-left: 10px; }
+.so-history b { margin-right: 6px; }
+.so-totals { margin-bottom: 8px; }
+.so-rep { margin-top: 12px; }
+dl.facts { display: grid; grid-template-columns: max-content 1fr; gap: 6px 14px; margin: 0; font-size: 13px; }
+dl.facts dt { color: var(--text-3); }
+dl.facts dd { margin: 0; min-width: 0; overflow-wrap: anywhere; }
+.tag.ok { color: var(--success-text); border-color: #ABEFC6; }
+.tag.warn { color: #B54708; border-color: #FEDF89; }
+.check { display: inline-flex; gap: 8px; align-items: center; color: var(--text); }
+@media (max-width: 760px) { .so-filters .input, .so-filters .select { flex: 1 1 100%; } dl.facts { grid-template-columns: 1fr; } dl.facts dt { margin-top: 4px; } }
+.so-table .cell-sub, .so-rep .cell-sub { display: block; }
+.ml-remember { display: inline-flex; gap: 6px; align-items: center; font-size: 12px; }
+.dest-pf { width: auto; max-width: 220px; flex: none; }
+@media (max-width: 640px) { .dest { flex-wrap: wrap; } .dest-pf { max-width: 100%; flex: 1 1 100%; } }
