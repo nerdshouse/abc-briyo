@@ -7374,6 +7374,12 @@ await step('profiles: every member is held until complete — existing members t
   const dApi = await internal('old', 'GET', '/api/carts?days=1'); const dPage = await internal('old', 'GET', '/profile');
   if (dApi.status !== 401 || dPage.status !== 302 || dPage.headers.get('location') !== '/login') bad.push(`disabled ${dApi.status} ${dPage.status} ${dPage.headers.get('location')}`);
   if ((await internal('adm', 'PATCH', `/api/members/${HRM.old}`, { active: true })).status !== 200) bad.push('could not reactivate');
+  // Routes registered before the global gate apply it themselves: an incomplete admin cannot start the Shopify install.
+  if ((await internal('adm', 'PATCH', `/api/members/${HRM.old}`, { isAdmin: true })).status !== 200) bad.push('could not make admin');
+  const inst = await internal('old', 'GET', '/auth/shopify/install');
+  if (inst.status !== 302 || inst.headers.get('location') !== '/profile') bad.push(`incomplete admin reached Shopify install: ${inst.status} ${inst.headers.get('location')}`);
+  if ((await internal('old', 'GET', '/api/members')).status !== 403) bad.push('incomplete admin reached the members API');
+  if ((await internal('adm', 'PATCH', `/api/members/${HRM.old}`, { isAdmin: false })).status !== 200) bad.push('could not remove admin');
   // New members (the default) are held the same way.
   await pool.query(`INSERT INTO allowed_users (phone, name, added_by) VALUES ('919000000308', 'Team', 'db-check')`);
   await setModuleRole('919000000308', 'support', 'agent', { actor: 'db-check' });
