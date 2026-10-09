@@ -613,9 +613,10 @@ function itemsSection(o, items) {
               it.shipping_price ? `Shipping ${esc(money(it.shipping_price))}` : ''].filter(Boolean).join(' · ')}</div>
             ${label ? `<div style="font-size:12px">${label}</div>` : ''}
             ${it.needs_review && open ? `<div class="ml-row ml-match"><select class="select" data-line-match-sku="${it.id}" aria-label="Briyo product for ${esc(it.retailer_product_name || 'this line')}"><option value="">Choose the Briyo product</option>${skuOptions}</select>
-              <button class="btn" type="button" data-line-match="${it.id}">Match product</button></div>` : ''}</div>
+              <button class="btn" type="button" data-line-match="${it.id}">Match product</button>
+              <label class="soft ml-remember"><input type="checkbox" data-line-remember="${it.id}" /> Remember for this retailer's next orders</label></div>` : ''}</div>
           ${own ? `<div class="n ml-edit"><input class="input ml-qty" type="number" min="1" step="1" inputmode="numeric" value="${esc(it.quantity)}" aria-label="Quantity of ${esc(it.sku || it.retailer_product_name || 'line')}" data-line-qty="${it.id}" />
-            <input class="input ml-amt" inputmode="decimal" value="${esc(it.item_price ?? '')}" placeholder="₹ amount" aria-label="Line amount (₹)" data-line-amt="${it.id}" />
+            <input class="input ml-amt" inputmode="decimal" value="${esc(it.item_price ?? '')}" placeholder="₹ line total" aria-label="Line total (₹)" title="Line total for all units on this line — not a unit price" data-line-amt="${it.id}" />
             <button class="btn" type="button" data-line-save="${it.id}">Save</button><button class="linkish" type="button" data-line-remove="${it.id}" data-line-sku="${esc(it.sku || it.retailer_product_name || 'this line')}">Remove</button></div>`
           : `<div class="n"><div>× ${esc(it.quantity)}</div><div class="muted" style="font-size:12px">${esc(amount(it.item_price))}</div></div>`}
         </div>`;
@@ -630,7 +631,7 @@ function itemsSection(o, items) {
         <div class="ml-row">
           <select class="select" id="mlSku" aria-label="Product (master SKU)"><option value="">Choose a product</option><option value="unmatched">Not matched yet (match later)</option>${skuOptions}</select>
           <input class="input ml-qty" id="mlQty" type="number" min="1" step="1" inputmode="numeric" value="1" aria-label="Quantity (units)" />
-          <input class="input ml-amt" id="mlAmt" inputmode="decimal" placeholder="₹ line amount" aria-label="Line amount (₹), optional" />
+          <input class="input ml-amt" id="mlAmt" inputmode="decimal" placeholder="₹ line total" aria-label="Line total (₹): price × quantity for the whole line, optional" title="Line total for all units on this line — not a unit price" />
         </div>
         <div class="ml-row">
           <input class="input" id="mlRName" maxlength="300" placeholder="Retailer's product name (optional)" aria-label="Retailer's product name" />
@@ -831,9 +832,10 @@ function describeEvent(e) {
     case 'shopify_sync_conflict': return ['triangle-alert', 'warn', `Shopify sync conflict: ${esc(md.detail || md.kind)}`];
     case 'note_added': return ['message-square-text', '', `Note: ${esc(md.note)}`];
     case 'item_added': return md.needs_review
-      ? ['package-plus', 'warn', `Retailer line added (not matched yet) · ${esc(md.retailer_product)}${md.retailer_code ? ` · code ${esc(md.retailer_code)}` : ''} × ${esc(md.quantity)}`]
+      ? ['package-plus', 'warn', `Retailer line added (not matched yet${md.ambiguous_match ? ' — saved match ambiguous' : ''}) · ${esc(md.retailer_product)}${md.retailer_code ? ` · code ${esc(md.retailer_code)}` : ''} × ${esc(md.quantity)}`]
+      : md.saved_match ? ['package-plus', 'info', `Retailer line added · ${esc(md.retailer_product)} → <b>${esc(md.sku)}</b> (saved match) × ${esc(md.quantity)}`]
       : ['package-plus', 'info', `Product added · ${esc(md.sku)} × ${esc(md.quantity)}${md.retailer_product ? ` · retailer: ${esc(md.retailer_product)}` : ''}`];
-    case 'item_matched': return ['link', 'info', `Retailer line matched · ${esc(md.retailer_product)}${md.retailer_code ? ` (${esc(md.retailer_code)})` : ''} → <b>${esc(md.sku)}</b>`];
+    case 'item_matched': return ['link', 'info', `Retailer line matched · ${esc(md.retailer_product)}${md.retailer_code ? ` (${esc(md.retailer_code)})` : ''} → <b>${esc(md.sku)}</b>${md.remembered ? ' · saved for next orders' : ''}`];
     case 'item_updated': return ['pencil', '', `Line changed · ${esc(md.sku || md.retailer_product || '')}: ${esc(Object.keys(md.changes || {}).join(', '))}`];
     case 'item_quantity_changed': return ['pencil', '', `Product quantity · ${esc(md.sku)}: ${esc(md.from)} → <b>${esc(md.to)}</b>`];
     case 'item_removed': return ['package-minus', 'warn', `Product removed · ${esc(md.sku || md.retailer_product || 'line')} × ${esc(md.quantity)}`];
@@ -1020,12 +1022,13 @@ dBody.addEventListener('click', async (e) => {
       const unmatched = $('#mlSku').value === 'unmatched';
       req = [`/api/orders/${oid}/items`, { method: 'POST', body: JSON.stringify({ ...(unmatched ? { unmatched: true } : { sku_id: $('#mlSku').value }), quantity: $('#mlQty').value,
         item_price: $('#mlAmt').value, retailer_product_name: $('#mlRName').value, retailer_product_code: $('#mlRCode').value }) }];
-      done = unmatched ? 'Line added — not matched yet' : 'Product added';
+      done = unmatched ? 'Line added' : 'Product added';
     } else if (lineAct.dataset.lineMatch) {
       const sku = $(`[data-line-match-sku="${lineAct.dataset.lineMatch}"]`).value;
       if (!sku) { $('#dSaved').className = 'saved failed'; $('#dSaved').textContent = 'Choose the Briyo product first.'; return; }
-      req = [`/api/orders/${oid}/items/${lineAct.dataset.lineMatch}/match`, { method: 'POST', body: JSON.stringify({ sku_id: sku }) }];
-      done = 'Line matched';
+      const remember = $(`[data-line-remember="${lineAct.dataset.lineMatch}"]`)?.checked === true;
+      req = [`/api/orders/${oid}/items/${lineAct.dataset.lineMatch}/match`, { method: 'POST', body: JSON.stringify({ sku_id: sku, remember }) }];
+      done = remember ? 'Line matched — saved for this retailer\'s next orders' : 'Line matched';
     } else if (lineAct.dataset.lineSave) {
       const id = lineAct.dataset.lineSave;
       req = [`/api/orders/${oid}/items/${id}`, { method: 'PATCH', body: JSON.stringify({ quantity: $(`[data-line-qty="${id}"]`).value, item_price: $(`[data-line-amt="${id}"]`).value }) }];
@@ -1037,10 +1040,12 @@ dBody.addEventListener('click', async (e) => {
     }
     lineAct.disabled = true;
     try {
-      await api(...req);
+      const res = await api(...req);
       await openOrder(oid);
       $('#dSaved').className = 'saved';
-      $('#dSaved').textContent = done;
+      $('#dSaved').textContent = res.savedMatch ? `Line added — matched to ${res.savedMatch} from this retailer's saved matches`
+        : res.ambiguous ? 'Line added — not matched: the saved match for this retailer product points to more than one product'
+        : res.needsReview ? 'Line added — not matched yet' : done;
     } catch (err) {
       lineAct.disabled = false;
       $('#dSaved').className = 'saved failed';

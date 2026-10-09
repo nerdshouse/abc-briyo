@@ -5,7 +5,7 @@ import { $, $$, esc, icon, renderIcons, initShell, pageFetch } from './ui/compon
 const fetch = pageFetch();
 
 let isAdmin = false;
-let data = { destinations: [], channels: [], dispatchTypes: [] };
+let data = { destinations: [], channels: [], dispatchTypes: [], platforms: [] };
 let tab = '';
 
 const api = async (url, opts = {}) => {
@@ -42,9 +42,11 @@ function render() {
       ${list.length ? `<ul class="dest-list">${list.map((d) => `
         <li class="dest${d.active ? '' : ' off'}" data-id="${d.id}">
           ${isAdmin ? `<input class="input plain" name="name" value="${esc(d.name)}" maxlength="160" aria-label="Destination name" />
+            ${d.dispatch_type === 'retailer' ? `<select class="select dest-pf" name="sku_platform" aria-label="Product-code list for ${esc(d.name)}" title="The retailer's own product codes and names: saved matches to Briyo SKUs are reused on its next orders">
+              <option value="">No product-code list</option>${data.platforms.map((p) => opt(p.key, `Codes: ${p.label}`, p.key === d.sku_platform)).join('')}</select>` : ''}
             <label class="soft dest-on"><input type="checkbox" name="active"${d.active ? ' checked' : ''} />Active</label>
             <button class="btn" type="button" data-save>Save</button>`
-            : `<span>${esc(d.name)}</span>${d.active ? '' : '<span class="muted">Off</span>'}`}
+            : `<span>${esc(d.name)}</span>${d.sku_platform ? `<span class="muted">Codes: ${esc(data.platforms.find((p) => p.key === d.sku_platform)?.label || d.sku_platform)}</span>` : ''}${d.active ? '' : '<span class="muted">Off</span>'}`}
         </li>`).join('')}</ul>` : '<p class="muted dest-none">None yet.</p>'}
     </div>`).join('') || '<div class="empty-note">No destinations for this type yet.</div>';
 
@@ -83,6 +85,8 @@ $('#destGroups').addEventListener('click', async (e) => {
   if (!btn) return;
   const li = btn.closest('[data-id]');
   const body = { name: li.querySelector('[name=name]').value, active: li.querySelector('[name=active]').checked };
+  const pf = li.querySelector('[name=sku_platform]');
+  if (pf) body.sku_platform = pf.value;
   btn.disabled = true;
   try {
     await api(`/api/destinations/${li.dataset.id}`, { method: 'PATCH', body: JSON.stringify(body) });

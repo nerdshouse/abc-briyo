@@ -5730,6 +5730,99 @@ await step('retailer orders without Briyo SKUs (e.g. Medkart): retailer name/cod
   return 'matched line: Briyo SKU + retailer name, blank code, line amount ₹598; unmatched line: retailer name + code MK-4471, no SKU, flagged; name required, bad amount refused; no SKU created; shipment state "unmapped" and dispatch refused with no stock taken; matching refuses a product already on the order and an already-matched line, keeps the retailer fields, audited; after matching: reserve + dispatch → −2 and −3 exactly once (a later status change adds nothing); lines locked after dispatch; no attribution or snapshot; amount edit alone; unmatched keeps its name; SKU only via Match';
 });
 
+await step('retailer product matches (e.g. Medkart): saved only when a person confirms; reused by exact code, or by exact name only when there is no code; never by a similar name; ambiguous never used; retailer fields kept; unresolved lines take no stock', async () => {
+  const bad = [];
+  const db = getPool();
+  const pf = await savePlatform({ key: `${TS}_medkart`.toLowerCase().replace(/[^a-z0-9]+/g, '_'), label: `${TS} Medkart` }, { actor: ACTOR });
+  const dest = await saveDestination({ channel: 'retailers', dispatch_type: 'retailer', name: `${TS} Medkart` });
+  const plain = await saveDestination({ channel: 'retailers', dispatch_type: 'retailer', name: `${TS} Plain retailer` });
+  try {
+    // Destinations: only a retailer one takes a product-code list, and only a known one.
+    await expectErr('non-retailer destination', () => saveDestination({ id: R('blinkit').destination_id, sku_platform: pf.key }), (e) => e.status === 400);
+    await expectErr('unknown list', () => saveDestination({ id: dest.id, sku_platform: 'no_such_platform' }), (e) => e.status === 400);
+    const linked = await saveDestination({ id: dest.id, sku_platform: pf.key });
+    if (linked.sku_platform !== pf.key || (await listDestinations()).find((d) => d.id === dest.id)?.sku_platform !== pf.key) bad.push('destination not linked');
+    const zinc = (await createSku({ sku: `${TS}-MK-ZINC`, product_name: 'Zinc', variant_name: '30' }, { actor: ACTOR })).id;
+    let n = 0;
+    const order = async (d = dest.id) => createOrder({ channel: 'retailers', dispatch_type: 'retailer', destination_id: d, source_order_id: `${TEST_ORDER}-MKMAP-${++n}`, customer_name: 'Medkart' }, { actor: ACTOR });
+    const line = async (o, id) => (await orderItems(o)).find((i) => i.id === id);
+    const maps = async () => (await db.query('SELECT platform_sku, sku_id, source, created_by FROM sku_platform_mappings WHERE platform = $1 ORDER BY id', [pf.key])).rows;
+    // 1. Nothing saved: a new retailer line is not matched (no guess), and matching it without "remember" saves nothing.
+    const o1 = await order();
+    const a = await addManualOrderLine(o1, { unmatched: true, quantity: 2, retailer_product_name: 'BRIYO D3 60S', retailer_product_code: 'MK-1' }, { actor: ACTOR });
+    if (!a.needsReview || a.savedMatch) bad.push('matched without a saved match');
+    await matchManualOrderLine(o1, a.itemId, { sku_id: SO.sku }, { actor: ACTOR });
+    if ((await maps()).length) bad.push('a match without "remember" was saved');
+    // 2. Confirmed with "remember": saved under the retailer's code, for this retailer only.
+    const b = await addManualOrderLine(o1, { unmatched: true, quantity: 1, retailer_product_name: 'BRIYO ZINC 30', retailer_product_code: 'MK-2' }, { actor: ACTOR });
+    const rem = await matchManualOrderLine(o1, b.itemId, { sku_id: zinc, remember: true }, { actor: ACTOR });
+    let m = await maps();
+    if (!rem.remembered?.added || m.length !== 1 || m[0].platform_sku !== 'MK-2' || m[0].sku_id !== zinc || m[0].source !== 'retailer_order' || m[0].created_by !== ACTOR) bad.push(`saved ${JSON.stringify(m)}`);
+    // 3. Reused on the next Medkart order by the exact code (any letter case); the retailer's own name/code are kept.
+    const o2 = await order();
+    const c = await addManualOrderLine(o2, { unmatched: true, quantity: 4, item_price: '480', retailer_product_name: 'Zinc tabs (renamed by Medkart)', retailer_product_code: 'mk-2' }, { actor: ACTOR });
+    const lc = await line(o2, c.itemId);
+    if (c.needsReview || c.savedMatch !== `${TS}-MK-ZINC` || lc.sku_id !== zinc || lc.needs_review || lc.retailer_product_name !== 'Zinc tabs (renamed by Medkart)' || lc.retailer_product_code !== 'mk-2' || lc.item_price !== 480) bad.push(`reuse by code ${JSON.stringify(lc)}`);
+    if (!(await orderEvents(o2)).some((e) => e.event_type === 'item_added' && e.metadata.saved_match === 'MK-2')) bad.push('reuse not audited');
+    // A code is never matched through the name, and an unknown code stays unmatched.
+    const d2 = await addManualOrderLine(o2, { unmatched: true, quantity: 1, retailer_product_name: 'BRIYO ZINC 30', retailer_product_code: 'MK-999' }, { actor: ACTOR });
+    if (!d2.needsReview) bad.push('an unknown code matched');
+    // 4. No code: a name match is saved only when confirmed, then reused only for the exact name (spaces/case aside).
+    const o3 = await order();
+    const e1 = await addManualOrderLine(o3, { unmatched: true, quantity: 1, retailer_product_name: 'Briyo  Magnesium 60' }, { actor: ACTOR });
+    await matchManualOrderLine(o3, e1.itemId, { sku_id: SO.sku, remember: true }, { actor: ACTOR });
+    m = await maps();
+    if (!m.some((x) => x.platform_sku === 'name:briyo magnesium 60' && x.sku_id === SO.sku)) bad.push(`name key ${JSON.stringify(m)}`);
+    const o4 = await order();
+    const exact = await addManualOrderLine(o4, { unmatched: true, quantity: 1, retailer_product_name: ' BRIYO magnesium   60 ' }, { actor: ACTOR });
+    const similar = await addManualOrderLine(o4, { unmatched: true, quantity: 1, retailer_product_name: 'Briyo Magnesium 60s' }, { actor: ACTOR });
+    const withCode = await addManualOrderLine((await order()), { unmatched: true, quantity: 1, retailer_product_name: 'Briyo Magnesium 60', retailer_product_code: 'MK-NEW' }, { actor: ACTOR });
+    if (exact.needsReview || exact.savedMatch !== `${TS}-SO` || !similar.needsReview || !withCode.needsReview) bad.push(`name reuse exact=${exact.savedMatch} similar=${similar.needsReview} withCode=${withCode.needsReview}`);
+    // 5. Ambiguous (the same key deliberately mapped to two products): never used.
+    await addPlatformMappings(SO.sku, pf.key, ['MK-2'], { actor: ACTOR, confirmDuplicate: true, reason: 'dbcheck: ambiguity test' });
+    const amb = await addManualOrderLine((await order()), { unmatched: true, quantity: 1, retailer_product_name: 'x', retailer_product_code: 'MK-2' }, { actor: ACTOR });
+    if (!amb.needsReview || !amb.ambiguous) bad.push('an ambiguous match was used');
+    // 6. Remember refused when the key already means another product (never made ambiguous silently) — and the line stays unmatched.
+    const o7 = await order();
+    const f = await addManualOrderLine(o7, { unmatched: true, quantity: 1, retailer_product_name: 'Briyo Magnesium 60s', retailer_product_code: '' }, { actor: ACTOR });
+    await matchManualOrderLine(o7, f.itemId, { sku_id: zinc, remember: true }, { actor: ACTOR });
+    const g = await addManualOrderLine((await order()), { unmatched: true, quantity: 1, retailer_product_name: 'briyo magnesium 60s' }, { actor: ACTOR });
+    const og = (await db.query('SELECT order_id FROM order_items WHERE id = $1', [g.itemId])).rows[0].order_id;
+    // ('briyo magnesium 60s' is now saved to Zinc, so it matched; a fresh order line for the same name pointed at another product:)
+    const h = await addManualOrderLine((await order()), { unmatched: true, quantity: 1, retailer_product_name: 'Unsaved product' }, { actor: ACTOR });
+    const oh = (await db.query('SELECT order_id FROM order_items WHERE id = $1', [h.itemId])).rows[0].order_id;
+    await getPool().query(`UPDATE order_items SET retailer_product_name = 'briyo magnesium 60s' WHERE id = $1`, [h.itemId]);
+    await expectErr('remember onto a key of another product', () => matchManualOrderLine(oh, h.itemId, { sku_id: SO.sku, remember: true }, { actor: ACTOR }), (e) => e.status === 409);
+    if (!(await line(oh, h.itemId)).needs_review) bad.push('a refused remember still matched the line');
+    if (g.needsReview || Number(og) <= 0) bad.push('saved name not reused');
+    // 7. A destination without a list: matching works, remembering is refused with a clear message.
+    const o8 = await order(plain.id);
+    const k = await addManualOrderLine(o8, { unmatched: true, quantity: 1, retailer_product_name: 'Anything', retailer_product_code: 'MK-2' }, { actor: ACTOR });
+    if (!k.needsReview) bad.push('a destination without a list used Medkart\'s matches');
+    await expectErr('remember without a list', () => matchManualOrderLine(o8, k.itemId, { sku_id: zinc, remember: true }, { actor: ACTOR }), (e) => e.status === 400 && /Destinations/.test(e.message));
+    // 8. An unresolved line holds the shipment's stock; the matched-from-saved line counts like any matched line.
+    const dl = (await listCouriers()).find((x) => x.name === 'Delhivery');
+    const { shipmentId } = await createShipment({ channel: 'retailers', dispatch_type: 'retailer', destination_id: dest.id, source_order_id: `${TEST_ORDER}-MKMAP-2`, courier_partner_id: dl.id, tracking_id: 'AWB-MKMAP-2', shipment_status: 'packed' }, { actor: ACTOR, addToExisting: true });
+    const st = await shipmentStock(shipmentId);
+    if (st.state !== 'unmapped' || !st.lines.some((l) => l.sku_id === zinc && l.required === 4) || st.unmapped.length !== 1) bad.push(`stock panel ${st.state} ${JSON.stringify(st.unmapped)}`);
+    // 9. Matching a line needs logistics.edit (orders API).
+    const app = express();
+    app.use((req, _res, next) => { req.session = JSON.parse(req.get('x-test-session') || '{}'); next(); });
+    app.use('/api/orders', ordersRouterForTest);
+    const server = app.listen(0);
+    try {
+      const r = await fetch(`http://127.0.0.1:${server.address().port}/api/orders/${o2}/items/${d2.itemId}/match`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-test-session': JSON.stringify({ caps: ['logistics.view'] }) }, body: JSON.stringify({ sku_id: zinc, remember: true }) });
+      if (r.status !== 403 || !(await line(o2, d2.itemId)).needs_review) bad.push(`viewer match → ${r.status}`);
+    } finally { server.close(); }
+  } finally {
+    await saveDestination({ id: dest.id, sku_platform: '' });   // unlinked, so the test platform can be removed with the test SKUs
+    await saveDestination({ id: dest.id, active: false });
+    await saveDestination({ id: plain.id, active: false });
+  }
+  if (bad.length) throw new Error(bad.join(' | '));
+  return 'destination ↔ product-code list (retailer only, known list); no saved match → not matched; match without "remember" saves nothing; with it → mapping MK-2 → Zinc (source retailer_order, by the signed-in user); next order: code mk-2 → Zinc, retailer name/code/total kept, audited; unknown code never falls back to the name; no code: exact name (case/spaces aside) reused, "…60s" not; a key on two products → never used; remember onto a key of another product refused, line stays unmatched; no list → no reuse, remember refused; shipment: unresolved line keeps it "unmapped", the saved-match line needs its 4 units; match needs logistics.edit';
+});
+
 await step('inventory cleanup', async () => {
   const { skus, paths } = await purgeTestInventory(TS);
   for (const p of paths) await storage().remove(p).catch(() => {});

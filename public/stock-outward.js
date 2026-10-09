@@ -157,7 +157,7 @@ async function openOutward(id) {
       <b>${esc({ created: 'Draft created', edited: 'Edited', issued: 'Issued', returned: 'Recorded', closed: 'Closed', cancelled: 'Cancelled' }[e.event_type] || e.event_type)}</b>
       <span class="muted">${esc(istDateTime(e.at))} · ${esc(e.actor || '—')}</span>
       ${e.event_type === 'issued' && e.batches ? `<div class="muted">${e.batches.map((b) => `${count(b.quantity)} from ${esc(b.batch_number)}`).join(', ')}</div>` : ''}
-      ${e.event_type === 'returned' ? `<div class="muted">${[e.returned_saleable && `${count(e.returned_saleable)} saleable back in stock`, e.returned_non_saleable && `${count(e.returned_non_saleable)} non-saleable`,
+      ${e.event_type === 'returned' ? `<div class="muted">${[e.returned_saleable && `${count(e.returned_saleable)} saleable back in stock`, e.returned_non_saleable && `${count(e.returned_non_saleable)} damaged / non-saleable (not restocked)`,
         e.consumed && `${count(e.consumed)} consumed`, e.retained && `${count(e.retained)} kept`].filter(Boolean).join(' · ')}</div>` : ''}
       ${e.event_type === 'edited' ? `<div class="muted">${Object.keys(e.metadata?.changes || {}).map(esc).join(', ')}</div>` : ''}
       ${e.notes ? `<div class="muted">${esc(e.notes)}</div>` : ''}</li>`).join('')}</ul></section>`;

@@ -519,3 +519,6 @@ dl.facts dd { margin: 0; min-width: 0; overflow-wrap: anywhere; }
 .check { display: inline-flex; gap: 8px; align-items: center; color: var(--text); }
 @media (max-width: 760px) { .so-filters .input, .so-filters .select { flex: 1 1 100%; } dl.facts { grid-template-columns: 1fr; } dl.facts dt { margin-top: 4px; } }
 .so-table .cell-sub, .so-rep .cell-sub { display: block; }
+.ml-remember { display: inline-flex; gap: 6px; align-items: center; font-size: 12px; }
+.dest-pf { width: auto; max-width: 220px; flex: none; }
+@media (max-width: 640px) { .dest { flex-wrap: wrap; } .dest-pf { max-width: 100%; flex: 1 1 100%; } }
