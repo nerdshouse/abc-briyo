@@ -43,6 +43,8 @@
           <button class="btn" id="places" type="button" data-cap="inventory.catalog" hidden><i data-lucide="warehouse"></i>Warehouses &amp; suppliers</button>
           <button class="btn" id="importSkus" type="button" data-cap="inventory.catalog" hidden><i data-lucide="file-up"></i>Import master SKUs</button>
           <button class="btn" id="newSku" type="button" data-cap="inventory.catalog" hidden><i data-lucide="tag"></i>New master SKU</button>
+          <button class="btn" id="incomingBtn" type="button" data-cap="inventory.move" hidden><i data-lucide="truck"></i>Incoming stock</button>
+          <button class="btn" id="returnStock" type="button" data-cap="inventory.move" hidden><i data-lucide="undo-2"></i>Return stock</button>
           <button class="btn primary" id="addInventory" type="button" data-cap="inventory.move" hidden><i data-lucide="plus"></i>Add inventory</button>
         </div>
       </div>
@@ -69,10 +71,11 @@
             </select>
             <select class="select" id="fexpiring" aria-label="Expiry">
               <option value="">Expiry</option><option value="expired">Expired (with stock)</option>
+              <option value="near">Near expiry</option><option value="unknown">Unknown expiry</option>
               <option value="30">Within 30 days</option><option value="60">Within 60 days</option><option value="90">Within 90 days</option>
             </select>
             <select class="select" id="fstock" aria-label="Stock level">
-              <option value="">Stock level</option><option value="low">Low stock</option><option value="out">Out of stock</option>
+              <option value="">Stock level</option><option value="low">Low stock</option><option value="out">Out of stock (Nil)</option><option value="incoming">Incoming</option>
             </select>
             <button type="button" class="linkish" id="fclear" hidden>Clear</button>
           </div>

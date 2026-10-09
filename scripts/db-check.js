@@ -2120,7 +2120,8 @@ await step('amazon import history is recorded', async () => {
 // Test SKUs, suppliers and warehouses start with this prefix; purgeTestInventory removes them.
 const TS = 'DBCHECK-INV';
 const INV = {};
-const dayOffset = (n) => new Date(Date.now() + n * 86400000).toISOString().slice(0, 10);
+// The team's calendar day (IST), as the app decides expiry — the UTC day differs between 00:00 and 05:30 IST.
+const dayOffset = (n) => new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Kolkata' }).format(new Date(Date.now() + n * 86400000));
 const COA_PDF = Buffer.from('%PDF-1.4\n1 0 obj<<>>endobj\ntrailer<<>>\n%%EOF\n');
 const rid = () => crypto.randomUUID();
 const stockOf = async (id) => { const s = await getSku(id); return { on: s.on_hand, res: s.reserved, av: s.available }; };
@@ -2142,13 +2143,14 @@ await step('inventory: create SKU; duplicate (any letter case) rejected', async 
   INV.b = (await createSku({ sku: `${TS}-B12-30`, product_name: 'Vitamin B12', reorder_level: 5 }, { actor: ACTOR })).id;
   INV.c = (await createSku({ sku: `${TS}-EASEN`, product_name: 'Easen' }, { actor: ACTOR })).id;
   await expectErr('duplicate', () => createSku({ sku: `${TS}-d3-60`, product_name: 'x' }, { actor: ACTOR }), (e) => e.status === 409);
-  await expectErr('spaces', () => createSku({ sku: `${TS} BAD`, product_name: 'x' }, { actor: ACTOR }), (e) => e.status === 400);
+  // Single spaces are allowed (FORME COLLAGEN SINGLE SACHET); a double space, a tab or a stray symbol is not.
+  for (const bad of [`${TS}  BAD`, `${TS}\tBAD`, `${TS} BAD!`]) await expectErr(`invalid code ${JSON.stringify(bad)}`, () => createSku({ sku: bad, product_name: 'x' }, { actor: ACTOR }), (e) => e.status === 400);
   await expectErr('code change', () => updateSku(INV.b, { sku: 'OTHER' }, { actor: ACTOR }), (e) => e.status === 400);
   // An Amazon seller SKU cannot point at a second SKU, nor be another SKU's code.
   await expectErr('amazon clash', () => updateSku(INV.b, { amazon_seller_sku: `${TS}-D3-60` }, { actor: ACTOR }), (e) => e.status === 409);
   const after = (await getPool().query('SELECT count(*)::int n FROM skus')).rows[0].n;
   if (after !== before + 3) throw new Error('count');
-  return '3 SKUs; duplicate, spaces, code change and Amazon-code clash refused';
+  return '3 SKUs; duplicate, double space / tab / symbol, code change and Amazon-code clash refused';
 });
 await step('inventory: add a batch of 100 → ledger +100, stock 100; COA uploaded to the batch', async () => {
   const r = await receiveInventory({ sku_id: INV.a, batch_number: 'D3260812', mfg_date: '2026-08-01', expiry_date: '2028-08',
@@ -2459,6 +2461,207 @@ await step('inventory: on hand vs sellable vs reserved vs available to dispatch 
   await releaseShipmentStock(sid, { actor: ACTOR });
   return 'on hand 1,000 = sellable 880 + expired 100 + quarantined 20; available to dispatch = 880 − 50 = 830; blocked batch → 0 available';
 });
+await step('inventory: SKU codes with spaces (FORME COLLAGEN SINGLE SACHET) — trimmed, single spaces only, case-insensitive duplicates refused, searchable, import accepts them; existing codes unchanged', async () => {
+  const bad = [];
+  const code = `${TS} FORME COLLAGEN SINGLE SACHET`;
+  const id = (await createSku({ sku: `  ${code}  `, product_name: 'Forme Collagen — single sachet', unit_type: 'sachet' }, { actor: ACTOR })).id;
+  const s = await getSku(id);
+  if (s.sku !== code || s.unit_type !== 'sachet') bad.push(`stored as ${JSON.stringify(s.sku)}`);
+  await expectErr('double space', () => createSku({ sku: `${TS} H2LYTE  SINGLE SACHET`, product_name: 'x' }, { actor: ACTOR }), (e) => e.status === 400 && /single spaces/.test(e.message));
+  await expectErr('case-insensitive duplicate', () => createSku({ sku: code.toLowerCase(), product_name: 'x' }, { actor: ACTOR }), (e) => e.status === 409);
+  for (const c of [`${TS} H2LYTE SINGLE SACHET`, `${TS} EASEN SINGLE SACHET`, `${TS} OPTIITAL OPAQUE 60 CAPSULES`]) {
+    if (!(await createSku({ sku: c, product_name: c, unit_type: 'sachet' }, { actor: ACTOR })).id) bad.push(`not created ${c}`);
+  }
+  const ov = await inventoryOverview({ q: 'collagen single' });
+  if (!ov.rows.some((r) => r.sku_id === id)) bad.push('search with a space does not find it');
+  let plan; try { plan = planSkuSheet([['Briyo SKU', 'Product Name'], [`${TS} EASEN SINGLE SACHET X`, 'Easen sachet x']]); } catch (e) { plan = { err: e.message }; }
+  if (plan.err || (plan.errors || []).some((e) => /not valid/.test(e.reason))) bad.push(`import refuses spaces ${JSON.stringify(plan).slice(0, 160)}`);
+  // The code never changes on edit (no silent rename): asking to is refused, and nothing changes.
+  await expectErr('rename', () => updateSku(id, { sku: 'RENAMED' }, { actor: ACTOR, version: s.version }), (e) => e.status === 400);
+  if ((await getSku(id)).sku !== code) bad.push('code changed on edit');
+  if (bad.length) throw new Error(bad.join(' | '));
+  return `"${code}" stored trimmed as typed, unit sachet; double space 400; lower-case duplicate 409; three more sachet/capsule codes; "collagen single" finds it; import accepts spaces; rename refused, code unchanged`;
+});
+
+await step('inventory: nil stock and independent variants — 0 stays a number (out of stock), alternatives are links only (each keeps its own stock), shown for an out-of-stock SKU, self/duplicate links refused, no movement written', async () => {
+  const bad = [];
+  const db = getPool();
+  const opaque = (await createSku({ sku: `${TS}-OPQ60`, product_name: 'Optiital', variant_name: 'Opaque — 60 capsules', unit_type: 'bottle' }, { actor: ACTOR })).id;
+  const clear = (await createSku({ sku: `${TS}-TRN90`, product_name: 'Optiital', variant_name: 'Transparent — 90 capsules', unit_type: 'bottle' }, { actor: ACTOR })).id;
+  await receiveInventory({ sku_id: clear, batch_number: 'TRN-1', expiry_date: dayOffset(400), quantity: 150, request_id: rid() }, { actor: ACTOR });
+  const IB = await import('../lib/inventory-inbound.js');
+  const mv0 = (await db.query('SELECT count(*)::int n FROM inventory_movements')).rows[0].n;
+  await IB.addAlternative(opaque, { alternative_sku_id: clear, note: 'Same formula, larger pack' }, { actor: ACTOR });
+  await expectErr('self link', () => IB.addAlternative(opaque, { alternative_sku_id: opaque }, { actor: ACTOR }), (e) => e.status === 400);
+  await expectErr('duplicate link', () => IB.addAlternative(opaque, { alternative_sku_id: clear }, { actor: ACTOR }), (e) => e.status === 409);
+  if ((await db.query('SELECT count(*)::int n FROM inventory_movements')).rows[0].n !== mv0) bad.push('a link wrote a movement');
+  const o = await getSku(opaque); const c = await getSku(clear);
+  if (o.available !== 0 || typeof o.available !== 'number' || !o.out_of_stock || c.available !== 150 || c.out_of_stock) bad.push(`stock ${o.available}/${c.available}`);
+  const ov = await inventoryOverview({ q: `${TS}-OPQ60` });
+  const row = ov.rows.find((r) => r.sku_id === opaque);
+  if (!row?.empty || row.sku_available !== 0 || row.alternatives?.[0]?.sku_id !== clear || row.alternatives[0].available !== 150) bad.push(`overview ${JSON.stringify(row).slice(0, 200)}`);
+  const d = await skuDetail(opaque);
+  if (d.alternatives.length !== 1 || d.alternatives[0].available !== 150 || d.alternatives[0].note !== 'Same formula, larger pack') bad.push('detail alternatives');
+  const ovc = await inventoryOverview({ q: `${TS}-TRN90` });
+  if (ovc.rows.some((r) => r.alternatives?.length)) bad.push('in-stock SKU shows alternatives');
+  await IB.removeAlternative(d.alternatives[0].id, { actor: ACTOR });
+  if ((await skuDetail(opaque)).alternatives.length) bad.push('not removed');
+  INV.opaque = opaque; INV.clear = clear;
+  if (bad.length) throw new Error(bad.join(' | '));
+  return 'Opaque 60: available 0 (number), out of stock; Transparent 90: 150, in stock — never shared; link Opaque → Transparent shown on the out-of-stock row with 150 available, not on the in-stock one; self 400, duplicate 409; no movement; removable (audited)';
+});
+
+await step('inventory: returns — sellable into its batch (available +n), damaged/quarantined into a held batch (on hand +n, available unchanged), expired batch refused for sellable, same reference needs a reason, retries are no-ops, append-only', async () => {
+  const bad = [];
+  const db = getPool();
+  const IB = await import('../lib/inventory-inbound.js');
+  const sku = (await createSku({ sku: `${TS}-RET`, product_name: 'Return test', unit_type: 'bottle' }, { actor: ACTOR })).id;
+  const good = (await receiveInventory({ sku_id: sku, batch_number: 'RET-A', expiry_date: dayOffset(300), quantity: 20, request_id: rid() }, { actor: ACTOR })).batchId;
+  const old = (await receiveInventory({ sku_id: sku, batch_number: 'RET-OLD', expiry_date: dayOffset(30), quantity: 5, request_id: rid() }, { actor: ACTOR })).batchId;
+  const st = async () => { const s = await getSku(sku); return { on: s.on_hand, av: s.available, q: s.quarantined, b: s.blocked }; };
+  const base = { sku_id: sku, source: 'customer', returned_by: 'Riya S.', reason: 'Wrong flavour ordered' };
+  const s0 = await st();
+  const req = rid();
+  const r1 = await IB.recordReturn({ ...base, quantity: 3, condition: 'sellable', batch_id: good, reference: 'ORD-1001', request_id: req, remarks: 'Seal intact' }, { actor: ACTOR });
+  const again = await IB.recordReturn({ ...base, quantity: 3, condition: 'sellable', batch_id: good, reference: 'ORD-1001', request_id: req }, { actor: ACTOR });
+  const s1 = await st();
+  if (s1.on !== s0.on + 3 || s1.av !== s0.av + 3 || !again.repeated || again.returnId !== r1.returnId) bad.push(`sellable ${JSON.stringify([s0, s1, again])}`);
+  await expectErr('same reference without confirming', () => IB.recordReturn({ ...base, quantity: 1, condition: 'sellable', batch_id: good, reference: 'ord-1001', request_id: rid() }, { actor: ACTOR }), (e) => e.status === 409 && e.duplicate);
+  await expectErr('confirmed without a reason', () => IB.recordReturn({ ...base, quantity: 1, condition: 'sellable', batch_id: good, reference: 'ORD-1001', confirm_duplicate: true, request_id: rid() }, { actor: ACTOR }), (e) => e.status === 400);
+  await IB.recordReturn({ ...base, quantity: 1, condition: 'sellable', batch_id: good, reference: 'ORD-1001', confirm_duplicate: true, duplicate_reason: 'Second parcel from the same order', request_id: rid() }, { actor: ACTOR });
+  const s2 = await st();
+  const dmg = await IB.recordReturn({ ...base, quantity: 2, condition: 'damaged', batch_id: good, source: 'courier_rto', returned_by: 'Delhivery', reason: 'Crushed in transit', request_id: rid() }, { actor: ACTOR });
+  const qr = await IB.recordReturn({ ...base, quantity: 4, condition: 'quarantined', source: 'retailer', returned_by: 'Medkart Vadodara', reason: 'Storage temperature unknown', request_id: rid() }, { actor: ACTOR });
+  const s3 = await st();
+  if (s3.on !== s2.on + 6 || s3.av !== s2.av || s3.b !== s2.b + 2 || s3.q !== s2.q + 4) bad.push(`held ${JSON.stringify([s2, s3])}`);
+  const hb = (await db.query(`SELECT batch_number, status, expiry_date::text e FROM inventory_batches WHERE id = ANY($1) ORDER BY id`, [[dmg.batchId, qr.batchId]])).rows;
+  if (hb[0].status !== 'blocked' || !hb[0].batch_number.startsWith('RET-A-RET') || hb[0].e !== dayOffset(300) || hb[1].status !== 'quarantined' || !hb[1].batch_number.startsWith('UNKNOWN-RET') || hb[1].e !== null) bad.push(`held batches ${JSON.stringify(hb)}`);
+  // An expired batch never takes sellable units back.
+  await db.query(`UPDATE inventory_batches SET expiry_date = $2 WHERE id = $1`, [old, dayOffset(-1)]);
+  await expectErr('sellable into an expired batch', () => IB.recordReturn({ ...base, quantity: 1, condition: 'sellable', batch_id: old, request_id: rid() }, { actor: ACTOR }), (e) => e.status === 409 && e.unsellable);
+  await expectErr('another SKU\'s batch', () => IB.recordReturn({ ...base, quantity: 1, condition: 'sellable', batch_id: INV.a1, request_id: rid() }, { actor: ACTOR }), (e) => e.status === 400);
+  for (const [label, patch] of [['no returned_by', { returned_by: '' }], ['no reason', { reason: ' ' }], ['bad condition', { condition: 'fine' }], ['no batch for sellable', { batch_id: null }], ['zero', { quantity: 0 }], ['future date', { return_date: dayOffset(2) }]]) {
+    await expectErr(label, () => IB.recordReturn({ ...base, quantity: 1, condition: 'sellable', batch_id: good, request_id: rid(), ...patch }, { actor: ACTOR }), (e) => e.status === 400);
+  }
+  // Concurrent retries of one request: one return, one movement.
+  const same = rid();
+  const both = await Promise.allSettled([1, 2].map(() => IB.recordReturn({ ...base, quantity: 1, condition: 'sellable', batch_id: good, request_id: same }, { actor: ACTOR })));
+  const n = (await db.query(`SELECT count(*)::int n FROM stock_returns WHERE request_key = $1`, [`return:${same}`])).rows[0].n;
+  const m = (await db.query(`SELECT count(*)::int n FROM inventory_movements WHERE idempotency_key = $1`, [`return:${same}`])).rows[0].n;
+  if (n !== 1 || m !== 1 || !both.some((x) => x.status === 'fulfilled')) bad.push(`concurrent retry: ${n} returns, ${m} movements`);
+  await expectErr('append-only', () => db.query('UPDATE stock_returns SET quantity = 99 WHERE id = $1', [r1.returnId]), () => true);
+  const list = await IB.listReturns({ skuId: sku });
+  const types = (await db.query(`SELECT DISTINCT movement_type FROM inventory_movements WHERE reference_type = 'stock_return' AND sku_id = $1`, [sku])).rows.map((r) => r.movement_type);
+  if (list.length !== 5 || JSON.stringify(types) !== '["customer_return"]' || !list.some((r) => r.remarks === 'Seal intact' && r.returned_by === 'Riya S.' && r.source === 'customer')) bad.push(`list ${list.length} ${types}`);
+  if (bad.length) throw new Error(bad.join(' | '));
+  return 'sellable 3 → on hand +3, available +3; retry → same return; same reference 409 until confirmed with a reason; damaged 2 → blocked batch RET-A-RET<id> (dates copied), quarantined 4 (unknown source) → quarantined batch UNKNOWN-RET<id> (expiry unknown): on hand +6, available unchanged; expired batch / other SKU / missing fields / future date refused; two concurrent retries → 1 return, 1 movement; append-only; every return is one customer_return ledger row';
+});
+
+await step('inventory: expiry by batch — near expiry (≤ 90 days, configurable) orange, expired red, unknown expiry never guessed, boundaries on the IST day; expired never available', async () => {
+  const bad = [];
+  const sku = (await createSku({ sku: `${TS}-EXPST`, product_name: 'Expiry states' }, { actor: ACTOR })).id;
+  const mk = async (bn, exp) => (await receiveInventory({ sku_id: sku, batch_number: bn, expiry_date: exp, quantity: 2, request_id: rid() }, { actor: ACTOR })).batchId;
+  const ids = { d0: await mk('E-0', dayOffset(0)), d90: await mk('E-90', dayOffset(90)), d91: await mk('E-91', dayOffset(91)), past: await mk('E-PAST', dayOffset(400)), none: await mk('E-NONE', null) };
+  await getPool().query('UPDATE inventory_batches SET expiry_date = $2 WHERE id = $1', [ids.past, dayOffset(-1)]);
+  const states = async () => Object.fromEntries((await skuDetail(sku)).batches.map((b) => [b.batch_number, [b.expiry_state, b.available]]));
+  let st = await states();
+  const want = { 'E-0': 'near_expiry', 'E-90': 'near_expiry', 'E-91': 'ok', 'E-PAST': 'expired', 'E-NONE': 'unknown_expiry' };
+  for (const [k, v] of Object.entries(want)) if (st[k][0] !== v) bad.push(`${k} ${st[k][0]} (want ${v})`);
+  if (st['E-PAST'][1] !== 0 || st['E-0'][1] !== 2 || st['E-NONE'][1] !== 2) bad.push(`availability ${JSON.stringify(st)}`);
+  const ov = await inventoryOverview({ q: `${TS}-EXPST` });
+  if ((await inventoryOverview({ q: `${TS}-EXPST`, expiring: 'near' })).rows.length !== 2 || (await inventoryOverview({ q: `${TS}-EXPST`, expiring: 'unknown' })).rows.length !== 1 || !(ov.cards.nearExpiry >= 2) || ov.cards.nearExpiryDays !== 90) bad.push('filters/cards');
+  process.env.INVENTORY_NEAR_EXPIRY_DAYS = '30';
+  try { st = await states(); if (st['E-90'][0] !== 'ok' || st['E-0'][0] !== 'near_expiry') bad.push('threshold not configurable'); } finally { delete process.env.INVENTORY_NEAR_EXPIRY_DAYS; }
+  process.env.INVENTORY_NEAR_EXPIRY_DAYS = 'banana';
+  try { if ((await skuDetail(sku)).nearExpiryDays !== 90) bad.push('bad setting not ignored'); } finally { delete process.env.INVENTORY_NEAR_EXPIRY_DAYS; }
+  if (bad.length) throw new Error(bad.join(' | '));
+  return 'IST today and +90 → near expiry, +91 → ok, yesterday → expired (0 available), no expiry → unknown (never guessed, still available); near/unknown filters and cards; INVENTORY_NEAR_EXPIRY_DAYS=30 moves +90 to ok; an invalid setting falls back to 90';
+});
+
+await step('inventory: incoming stock — expected never available, partial receipts wait for acceptance, accept/reject through the ledger once, status follows receipts, cancel only when nothing is pending, concurrent accepts write one movement', async () => {
+  const bad = [];
+  const db = getPool();
+  const IB = await import('../lib/inventory-inbound.js');
+  const sku = (await createSku({ sku: `${TS} H2LYTE INCOMING SACHET`, product_name: 'H2Lyte sachet', unit_type: 'sachet' }, { actor: ACTOR })).id;
+  const av = async () => (await getSku(sku)).available;
+  const inc = async (id) => IB.getIncoming(id);
+  const one = (await IB.createIncoming({ sku_id: sku, expected_quantity: 100, expected_date: dayOffset(7), status: 'ordered', supplier_name: `${TS}-SUP`, reference: 'PO-77' }, { actor: ACTOR })).id;
+  let ov = await inventoryOverview({ q: 'H2LYTE INCOMING' });
+  if ((await av()) !== 0 || ov.rows[0]?.sku_incoming !== 100 || !ov.rows[0]?.out_of_stock || (await inventoryOverview({ q: 'H2LYTE INCOMING', stock: 'incoming' })).rows.length !== 1) bad.push(`expected counted as stock / not shown ${JSON.stringify(ov.rows[0]).slice(0, 160)}`);
+  if (!ov.cards.unitTotals.sachet || ov.cards.unitTotals.sachet.incoming < 100) bad.push('sachet totals not kept apart');
+  await IB.updateIncoming(one, { status: 'in_transit' }, { actor: ACTOR });
+  const rq = rid();
+  const rc1 = (await IB.recordReceipt(one, { quantity: 40, batch_number: 'H2-A', expiry_date: dayOffset(500), request_id: rq }, { actor: ACTOR })).receiptId;
+  if ((await IB.recordReceipt(one, { quantity: 40, batch_number: 'H2-A', request_id: rq }, { actor: ACTOR })).receiptId !== rc1) bad.push('duplicate receipt');
+  let i = await inc(one);
+  if (i.status !== 'partially_received' || (await av()) !== 0 || i.receipts.length !== 1 || i.outstanding !== 100) bad.push(`after receipt: ${i.status} ${await av()} ${i.outstanding}`);
+  await expectErr('stage change after arrival', () => IB.updateIncoming(one, { status: 'planned' }, { actor: ACTOR }), (e) => e.status === 409);
+  const concurrent = await Promise.allSettled([1, 2].map(() => IB.decideReceipt(rc1, { decision: 'accept' }, { actor: ACTOR })));
+  const mv = (await db.query(`SELECT count(*)::int n FROM inventory_movements WHERE idempotency_key = $1`, [`incoming-receipt:${rc1}`])).rows[0].n;
+  i = await inc(one);
+  if (mv !== 1 || (await av()) !== 40 || i.status !== 'partially_received' || i.outstanding !== 60 || !concurrent.every((x) => x.status === 'fulfilled')) bad.push(`accept: ${mv} movements, available ${await av()}, ${i.status}, outstanding ${i.outstanding}`);
+  const rc2 = (await IB.recordReceipt(one, { quantity: 60, batch_number: 'H2-B', request_id: rid() }, { actor: ACTOR })).receiptId;
+  if ((await inc(one)).status !== 'received_pending_acceptance' || (await av()) !== 40) bad.push('pending acceptance');
+  await expectErr('partial accept without a reason', () => IB.decideReceipt(rc2, { decision: 'accept', accepted_quantity: 50 }, { actor: ACTOR }), (e) => e.status === 400);
+  await expectErr('accept more than arrived', () => IB.decideReceipt(rc2, { decision: 'accept', accepted_quantity: 61, note: 'x' }, { actor: ACTOR }), (e) => e.status === 400);
+  await IB.decideReceipt(rc2, { decision: 'accept', accepted_quantity: 50, note: '10 sachets torn' }, { actor: ACTOR });
+  i = await inc(one);
+  const b = (await skuDetail(sku)).batches.find((x) => x.batch_number === 'H2-B');
+  if (i.status !== 'accepted' || i.outstanding !== 0 || i.accepted_quantity !== 90 || i.rejected_quantity !== 10 || (await av()) !== 90 || b.expiry_state !== 'unknown_expiry' || i.open) bad.push(`final ${i.status} ${i.accepted_quantity}/${i.rejected_quantity} available ${await av()} ${b?.expiry_state}`);
+  const again = await IB.decideReceipt(rc2, { decision: 'reject', note: 'late change of mind' }, { actor: ACTOR });
+  if (!again.repeated || again.status !== 'accepted' || (await av()) !== 90) bad.push('decided twice');
+  await expectErr('receipt on an accepted expectation', () => IB.recordReceipt(one, { quantity: 1, batch_number: 'H2-C' }, { actor: ACTOR }), (e) => e.status === 409);
+  // Cancel: refused while a receipt waits; a rejection needs a reason; then cancelled, nothing in stock from it.
+  const two = (await IB.createIncoming({ sku_id: sku, expected_quantity: 30 }, { actor: ACTOR })).id;
+  const rc3 = (await IB.recordReceipt(two, { quantity: 30, batch_number: 'H2-D' }, { actor: ACTOR })).receiptId;
+  await expectErr('cancel with a pending receipt', () => IB.cancelIncoming(two, { reason: 'supplier issue' }, { actor: ACTOR }), (e) => e.status === 409);
+  await expectErr('reject without a reason', () => IB.decideReceipt(rc3, { decision: 'reject' }, { actor: ACTOR }), (e) => e.status === 400);
+  await IB.decideReceipt(rc3, { decision: 'reject', note: 'Wrong product delivered' }, { actor: ACTOR });
+  const i2 = await inc(two);
+  if (i2.status !== 'partially_received' && i2.status !== 'accepted') bad.push(`after reject ${i2.status}`);
+  const three = (await IB.createIncoming({ sku_id: sku, expected_quantity: 25 }, { actor: ACTOR })).id;
+  await IB.cancelIncoming(three, { reason: 'Order withdrawn' }, { actor: ACTOR });
+  if ((await inc(three)).status !== 'cancelled' || (await inc(three)).outstanding !== 0 || (await av()) !== 90) bad.push('cancel');
+  if ((await IB.cancelIncoming(three, { reason: 'again' }, { actor: ACTOR })).repeated !== true) bad.push('cancel not idempotent');
+  for (const [label, input] of [['no SKU', { expected_quantity: 1 }], ['zero', { sku_id: sku, expected_quantity: 0 }], ['received stage', { sku_id: sku, expected_quantity: 1, status: 'accepted' }]]) {
+    await expectErr(label, () => IB.createIncoming(input, { actor: ACTOR }), (e) => e.status === 400);
+  }
+  if (bad.length) throw new Error(bad.join(' | '));
+  return 'expected 100 (ordered → in transit): available 0, shown as incoming 100 on an out-of-stock row (filter, sachet totals apart); receipt 40 → partially received, still 0 available; retry → same receipt; two concurrent accepts → 1 movement, 40 available, 60 outstanding; receipt 60 → pending acceptance; accept 50 (reason for the 10) → accepted, 90 available, unknown expiry kept unknown; deciding again → first decision; cancel refused while pending, rejection needs a reason, cancel idempotent';
+});
+
+await step('inventory: returns, incoming and alternatives keep the existing permissions (view reads; move records stock; catalog links variants) and the page shows Nil, expiry states as text, incoming apart, units never summed across types', async () => {
+  const bad = [];
+  const app = express();
+  app.use((req, _res, next) => { req.session = JSON.parse(req.get('x-test-session') || '{}'); next(); });
+  app.use(express.json());
+  app.use('/api/inventory', inventoryRouterForTest);
+  const server = app.listen(0);
+  const base = `http://127.0.0.1:${server.address().port}/api/inventory`;
+  const call = (method, path, caps, body) => fetch(`${base}${path}`, { method, headers: { 'x-test-session': JSON.stringify({ caps }), 'content-type': 'application/json' }, body: body ? JSON.stringify(body) : undefined }).then((r) => r.status);
+  try {
+    const V = ['inventory.view']; const M = ['inventory.view', 'inventory.move']; const C = ['inventory.view', 'inventory.catalog'];
+    for (const p of ['/returns', '/incoming', '/incoming?open=1&receipts=1']) if (await call('GET', p, V) !== 200) bad.push(`viewer cannot read ${p}`);
+    if (await call('GET', '/returns', ['logistics.view']) !== 403) bad.push('logistics-only reads returns');
+    for (const [m, p] of [['POST', '/returns'], ['POST', '/incoming'], ['PATCH', '/incoming/1'], ['POST', '/incoming/1/cancel'], ['POST', '/incoming/1/receipts'], ['POST', '/incoming/receipts/1/decision'], ['POST', `/skus/${INV.opaque}/alternatives`], ['DELETE', '/alternatives/1']]) {
+      if (await call(m, p, V, {}) !== 403) bad.push(`viewer ${m} ${p}`);
+    }
+    if (await call('POST', `/skus/${INV.opaque}/alternatives`, M, { alternative_sku_id: INV.clear }) !== 403) bad.push('an operator links variants (catalog only)');
+    if (await call('POST', '/returns', C, {}) !== 403) bad.push('a catalog-only manager records stock');
+    if (await call('POST', '/returns', M, {}) !== 400) bad.push('operator cannot reach returns');
+  } finally { server.close(); }
+  const js = await fsp.readFile(new URL('../public/inventory.js', import.meta.url), 'utf8');
+  const html = await fsp.readFile(new URL('../public/inventory.html', import.meta.url), 'utf8');
+  for (const t of ["const nil = (n) => (Number(n) === 0 ? '<span class=\"nil\">Nil</span>'", 'Near expiry · ', 'Unknown expiry', '>Expired</span>', '+${count(n)} incoming', 'Alternatives: ',
+    'Units of different types are never added together.', "kind === 'stock-return'", "kind === 'incoming-new'", "kind === 'receipt'", "kind === 'decide'", "'/api/inventory/returns'", 'data-act="stock-return"'])
+    if (!js.includes(t)) bad.push(`page missing ${t}`);
+  if (/b\.days_to_expiry <= 90/.test(js)) bad.push('expiry threshold hard-coded in the page');
+  for (const id of ['id="returnStock" type="button" data-cap="inventory.move"', 'id="incomingBtn" type="button" data-cap="inventory.move"', '<option value="near">Near expiry</option>', '<option value="unknown">Unknown expiry</option>', '<option value="incoming">Incoming</option>'])
+    if (!html.includes(id)) bad.push(`html missing ${id}`);
+  if (bad.length) throw new Error(bad.join(' | '));
+  return 'viewer reads returns/incoming, never writes (8 routes 403); logistics-only 403; operator records returns but cannot link variants; catalog-only cannot record stock; page: Nil for 0, near/expired/unknown labels, +N incoming, alternatives line, per-unit totals note, four new forms, buttons gated by inventory.move, near/unknown/incoming filters';
+});
+
 await step('inventory: month-only expiry is the last calendar day, stored as a date, never shifted', async () => {
   const id = (await createSku({ sku: `${TS}-EXPIRY`, product_name: 'Expiry dates' }, { actor: ACTOR })).id;
   const cases = [['08/2028', '2028-08-31'], ['2028-08', '2028-08-31'], ['02/2028', '2028-02-29'], ['02/2027', '2027-02-28'], ['31/12/2029', '2029-12-31'], ['2029-01-15', '2029-01-15']];

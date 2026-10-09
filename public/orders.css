@@ -596,3 +596,24 @@ dl.facts dd { margin: 0; min-width: 0; overflow-wrap: anywhere; }
 .rv-actions { display: flex; gap: 8px; flex-wrap: wrap; }
 .rv-time { color: var(--text-2); }
 .rv-time.before { color: #B54708; border-color: #FEDF89; }
+
+/* ---------------- Inventory: nil stock, expiry states, incoming, alternatives (always a text label beside the colour) */
+.nil { color: var(--text-3); font-weight: 500; }
+.xtag { display: inline-block; margin-left: 6px; padding: 0 6px; font-size: 10.5px; font-weight: 500; line-height: 16px; border: 1px solid var(--border); border-radius: 5px; background: var(--surface); color: var(--text-2); white-space: nowrap; vertical-align: 1px; }
+.xtag.near { color: #B54708; border-color: #FEC84B; background: #FFFAEB; }        /* near expiry: orange */
+.xtag.expired { color: var(--error-text); border-color: #FECDCA; background: #FEF3F2; } /* expired: red */
+.xtag.unknown { color: #93370D; border-color: #FEDF89; background: #FFFCF5; }       /* unknown expiry: muted amber */
+.xtag.held { color: var(--text-2); border-color: var(--border); background: var(--surface-2); } /* quarantined / blocked: grey */
+.xtag.incoming { color: var(--info-text); border-color: #B2CCFF; background: var(--info-soft); } /* incoming: blue */
+.xtag.out { color: var(--text-2); border-color: var(--border); background: var(--surface-2); }  /* out of stock: neutral grey */
+.xtag.ok { color: var(--success-text, #067647); border-color: #ABEFC6; background: #ECFDF3; }
+.alt-line { display: block; margin-top: 3px; font-size: 11.5px; color: var(--text-2); white-space: normal; }
+.alt-line .mono { font-size: 11px; }
+.unit-split { display: block; font-size: 11.5px; font-weight: 400; color: var(--text-2); margin-top: 2px; }
+.inc-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 10px; }
+.inc-list > li { padding: 10px 12px; border: 1px solid var(--border-soft); border-radius: 8px; font-size: 13px; }
+.inc-list .inc-head { display: flex; flex-wrap: wrap; gap: 4px 10px; align-items: baseline; justify-content: space-between; }
+.inc-list .inc-actions { display: flex; flex-wrap: wrap; gap: 6px 12px; margin-top: 6px; }
+.inc-list .inc-receipts { margin: 6px 0 0; padding-left: 16px; font-size: 12.5px; color: var(--text-2); }
+.alt-add { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 8px; }
+.alt-add .select { flex: 1; min-width: 180px; }
