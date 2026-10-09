@@ -7,7 +7,13 @@
  */
 import { $, esc, icon, renderIcons, initShell, setAvatar, toast, roleSummary, initials } from './ui/components.js';
 
-const state = { me: null, profile: null, home: '/overview', wasIncomplete: false, saving: false };
+const state = { me: null, profile: null, home: '/overview', next: null, wasIncomplete: false, saving: false };
+/** The page asked for before completing the profile: a same-site path only (the server applies the same rule). */
+function safeNext(v) {
+  const s = String(v ?? '');
+  if (!s.startsWith('/') || s.startsWith('//') || /[\\\s]/.test(s) || s.length > 500) return null;
+  return /^\/(profile|login|logout|auth|api|no-access)(\/|\.|$)/.test(s.split(/[?#]/)[0]) ? null : s;
+}
 const CAP_LABEL = {
   'logistics.view': 'See orders, shipments, couriers and destinations', 'logistics.edit': 'Create and update orders and shipments',
   'logistics.setup': 'Manage couriers and destinations', 'inventory.view': 'See stock, batches and SKUs',
@@ -33,14 +39,25 @@ function renderAvatar(url) {
 function render() {
   const p = state.profile;
   const incomplete = !p.complete;
-  // New members are held here until complete; existing members keep full access while they finish.
-  const held = incomplete && p.required;
-  document.querySelector('.app').classList.toggle('locked', held);
-  $('#pfTitle').textContent = incomplete ? 'Complete your profile' : 'Your profile';
-  $('#pfSub').textContent = held
-    ? 'Briyo OS opens once your profile has your name, email and a photo. It takes a minute.'
-    : incomplete ? 'Add what is missing so the team knows who you are. You can keep using Briyo OS meanwhile.'
-      : 'How you appear to the team across Briyo OS.';
+  // Anyone with an incomplete profile is held here (the server sends every other page and API here too).
+  document.querySelector('.app').classList.toggle('locked', incomplete);
+  $('#pfTitle').textContent = incomplete ? 'Complete Your Profile' : 'Your profile';
+  $('#topTitle').textContent = incomplete ? 'Complete Your Profile' : 'Your profile';
+  document.title = `${incomplete ? 'Complete Your Profile' : 'Your profile'} — Briyo OS`;
+  $('#pfSub').textContent = incomplete
+    ? 'Before accessing Briyo OS, please complete the required details in your profile. This helps us keep our team directory accurate.'
+    : 'How you appear to the team across Briyo OS.';
+  $('#pfSave').textContent = incomplete ? 'Save and Continue' : 'Save profile';
+  // Each missing field is marked where it is filled in.
+  const miss = new Set(p.missing);
+  $('#pfName').closest('.fld').classList.toggle('missing', miss.has('name'));
+  $('#pfEmail').closest('.fld').classList.toggle('missing', miss.has('email'));
+  document.querySelector('.pf-photo').classList.toggle('missing', miss.has('photo'));
+  if (incomplete) {
+    if (miss.has('name') && !$('#pfNameErr').textContent) $('#pfNameErr').textContent = 'Required: your full name.';
+    if (miss.has('email') && !$('#pfEmailErr').textContent) $('#pfEmailErr').textContent = 'Required: a valid email address.';
+    if (miss.has('photo') && !$('#pfPhotoErr').textContent) $('#pfPhotoErr').textContent = 'Required: upload a photo of yourself.';
+  }
   $('#pfMeter').innerHTML = `<span class="pf-meter" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${p.completion}" aria-label="Profile complete"><span style="width:${p.completion}%"></span></span> ${p.completion}%`;
   $('#pfGate').innerHTML = incomplete
     ? `<div class="alert warn pf-gate">${icon('user-round-pen')}<div><b>Profile incomplete</b><ul class="pf-missing">${p.missing.map((m) => `<li>${esc(FIELD_LABEL[m] || m)}</li>`).join('')}</ul></div></div>` : '';
@@ -95,7 +112,7 @@ async function uploadPhoto(file) {
     const out = await api('/api/profile/photo', { method: 'POST', headers: { 'Content-Type': 'image/jpeg', 'X-Filename': 'photo.jpg' }, body: blob });
     state.profile = out.profile;
     render();
-    toast('Photo saved');
+    if (!(state.wasIncomplete && state.profile.complete)) toast('Photo saved');
     afterSave();
   } catch (err) {
     fieldError('photo', err.message);
@@ -113,10 +130,10 @@ async function saveFields(e) {
   state.saving = true; $('#pfSave').disabled = true; $('#pfSaved').textContent = 'Saving…';
   try {
     const out = await api('/api/profile', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name, email }) });
-    state.profile = out.profile;
+    state.profile = out.profile;          // as saved: completeness is worked out by the server from the database
     $('#pfSaved').textContent = '';
     render();
-    toast('Profile saved');
+    if (!(state.wasIncomplete && state.profile.complete)) toast(state.profile.complete ? 'Profile saved' : 'Saved — still missing: ' + state.profile.missing.map((m) => FIELD_LABEL[m] || m).join(', '));
     afterSave();
   } catch (err) {
     $('#pfSaved').textContent = '';
@@ -124,21 +141,25 @@ async function saveFields(e) {
   } finally { state.saving = false; $('#pfSave').disabled = false; }
 }
 
-/** The moment a profile becomes complete, Briyo OS opens. */
-function afterSave() {
-  if (state.wasIncomplete && state.profile.complete) {
-    try { sessionStorage.removeItem('briyo.nudge.hidden'); } catch { /* ignore */ }
-    toast(state.profile.required ? 'Profile complete — welcome to Briyo OS' : 'Profile complete — thank you');
-    // A new member was waiting for this to open Briyo OS; an existing one just carries on here.
-    if (state.profile.required) setTimeout(() => { window.location.href = state.home; }, 700);
-  }
+/**
+ * The moment the server says the profile is complete, Briyo OS opens: back to the page that was asked for (if
+ * safe), otherwise home. Re-checked with the server first, so a form that "looks" saved never opens anything.
+ */
+async function afterSave() {
+  if (!(state.wasIncomplete && state.profile.complete)) return;
+  const fresh = await api('/api/profile').catch(() => null);
+  if (!fresh?.profile?.complete) return;
+  try { sessionStorage.removeItem('briyo.nudge.hidden'); } catch { /* ignore */ }
+  toast('Profile complete — welcome to Briyo OS');
+  setTimeout(() => { window.location.href = state.next || state.home; }, 900);
 }
 
 (async function init() {
   try {
     const [me, prof] = await Promise.all([api('/auth/me'), api('/api/profile')]);
     if (!me.authenticated) { window.location.href = '/login'; return; }
-    state.me = me; state.profile = prof.profile; state.home = prof.home === '/no-access' ? '/no-access' : '/overview';
+    state.me = me; state.profile = prof.profile; state.home = prof.home === '/no-access' ? '/no-access' : (prof.home || '/overview');
+    state.next = safeNext(new URLSearchParams(window.location.search).get('next'));
     state.wasIncomplete = !prof.profile.complete;
     initShell({ ...me, name: prof.profile.name, photoUrl: prof.profile.photoUrl });
     render();

@@ -183,8 +183,7 @@ function renderMember(m, act) {
     </section>
 
     <section class="dsec"><h3 class="dsec-title">Profile <span><span class="pf-meter"><span style="width:${pct}%"></span></span> ${pct}%</span></h3>
-      ${m.profile_complete ? '' : `<p class="mb-missing">${icon('circle-alert')} Missing: ${esc(m.profile_missing.map((x) => FIELD_LABEL[x]).join(', '))}. ${m.profile_required
-        ? 'They must complete it before using Briyo OS.' : 'They can keep working; Briyo OS reminds them to finish it.'}</p>`}
+      ${m.profile_complete ? '' : `<p class="mb-missing">${icon('circle-alert')} Missing: ${esc(m.profile_missing.map((x) => FIELD_LABEL[x]).join(', '))}. They must complete it before using Briyo OS.</p>`}
       <form id="mbProfile" class="form-grid" novalidate>
         <label class="fld"><span>Full name</span><input class="input" name="name" value="${esc(m.name)}" maxlength="60" /></label>
         <label class="fld"><span>Email</span><input class="input" name="email" type="email" value="${esc(m.email || '')}" maxlength="254" /></label>

@@ -474,7 +474,9 @@ export function initShell(me, { onSearch } = {}) {
 
   // A profile that became incomplete (e.g. an admin took the photo down) is
   // completed before anything else; the server enforces the same on every request.
-  if (me && me.profileComplete === false && me.profileRequired && window.location.pathname !== '/profile') { window.location.href = '/profile'; return; }
+  if (me && me.profileComplete === false && window.location.pathname !== '/profile') {
+    window.location.href = `/profile?next=${encodeURIComponent(window.location.pathname + window.location.search)}`; return;
+  }
   profileNudge(me);
   if (me?.name) {
     $('#userName').textContent = me.profile?.name || me.name;

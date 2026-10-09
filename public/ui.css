@@ -1204,6 +1204,10 @@ a.ov-metric:hover { background: var(--surface-2); }
 .pf-fields .fld:last-child { grid-column: 1 / -1; }
 .fld .err, .pf-photo .err { font-size: var(--fs-meta); color: var(--error-text); margin: 4px 0 0; }
 .fld .err:empty, .pf-photo .err:empty { display: none; }
+/* Complete Your Profile: each missing field is marked where it is filled in */
+.fld.missing .input { border-color: var(--warning-text); }
+.pf-photo.missing .pf-avatar { box-shadow: 0 0 0 2px var(--warning-text); }
+.fld.missing .err, .pf-photo.missing .err { color: var(--warning-text); }
 .pf-actions { display: flex; align-items: center; justify-content: flex-end; gap: var(--sp-3); }
 .pf-meter { display: inline-block; vertical-align: middle; width: 72px; height: 6px; border-radius: 3px; background: var(--surface-3); overflow: hidden; }
 .pf-meter span { display: block; height: 100%; background: var(--success); }

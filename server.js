@@ -271,7 +271,8 @@ const callbackUrl = (req) =>
 // so without it req.session is never populated and requireAdmin refuses even a
 // signed-in admin. It also gives a signed-out browser a redirect to /login
 // rather than a page of JSON.
-app.get('/auth/shopify/install', requireAuth, requireAdmin, (req, res) => {
+// It sits above the global profile gate (app.use(requireCompleteProfile) below), so it applies the gate itself.
+app.get('/auth/shopify/install', requireAuth, requireCompleteProfile, requireAdmin, (req, res) => {
   const shop = normaliseShop(req.query.shop || process.env.SHOPIFY_STORE_DOMAIN);
   if (!shop) {
     return res.status(400).send('Set SHOPIFY_STORE_DOMAIN to your <store>.myshopify.com domain first.');
