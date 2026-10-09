@@ -5405,6 +5405,96 @@ await step('shopify orders cleanup', async () => {
   return 'test orders, items, shipments, stock and sync runs removed';
 });
 
+await step('inventory prices: Cost Price (CP = the existing unit cost), Selling Price (SP) and MRP per batch — saved, read back, edited one at a time, blanks stay blank, validated; value from CP only; stock untouched by price edits', async () => {
+  const bad = [];
+  const db = getPool();
+  const sku = (await createSku({ sku: `${TS}-PRICES`, product_name: 'Price test' }, { actor: ACTOR })).id;
+  const batchOf = async (id) => (await skuDetail(sku)).batches.find((b) => b.id === id);
+  const ledger = async () => (await db.query('SELECT count(*)::int n, coalesce(sum(quantity),0)::int q FROM inventory_movements WHERE sku_id = $1', [sku])).rows[0];
+  // Schema: two new nullable columns beside unit_cost; nothing renamed or dropped.
+  const cols = (await db.query(`SELECT column_name, is_nullable, data_type FROM information_schema.columns WHERE table_name = 'inventory_batches' AND column_name IN ('unit_cost','selling_price','mrp') ORDER BY column_name`)).rows;
+  if (cols.map((c) => `${c.column_name}:${c.is_nullable}:${c.data_type}`).join() !== 'mrp:YES:numeric,selling_price:YES:numeric,unit_cost:YES:numeric') bad.push(`columns ${JSON.stringify(cols)}`);
+  // B. All three saved and read back (decimals; ₹ and commas as typed are fine).
+  const r1 = await receiveInventory({ sku_id: sku, batch_number: 'PR-1', quantity: 10, unit_cost: '180.50', selling_price: '₹249', mrp: '1,299.00' }, { actor: ACTOR });
+  let b = await batchOf(r1.batchId);
+  if (b.unit_cost !== 180.5 || b.selling_price !== 249 || b.mrp !== 1299 || b.on_hand !== 10) bad.push(`saved ${JSON.stringify([b.unit_cost, b.selling_price, b.mrp, b.on_hand])}`);
+  // Value comes from CP only.
+  if (b.value !== 1805 || (await getSku(sku)).value !== 1805) bad.push(`value ${b.value}`);
+  // Blank SP and MRP stay blank (null), never derived from CP; zero is a valid price.
+  const r2 = await receiveInventory({ sku_id: sku, batch_number: 'PR-2', quantity: 4, unit_cost: '0', selling_price: '', mrp: null }, { actor: ACTOR });
+  b = await batchOf(r2.batchId);
+  if (b.unit_cost !== 0 || b.selling_price !== null || b.mrp !== null) bad.push(`blanks ${JSON.stringify([b.unit_cost, b.selling_price, b.mrp])}`);
+  const r3 = await receiveInventory({ sku_id: sku, batch_number: 'PR-3', quantity: 2 }, { actor: ACTOR });   // an old client sending no prices
+  b = await batchOf(r3.batchId);
+  if (b.unit_cost !== null || b.selling_price !== null || b.mrp !== null) bad.push('a receipt without prices got some');
+  // A second delivery of the same batch keeps its CP, and only fills SP/MRP where still blank.
+  await receiveInventory({ sku_id: sku, batch_number: 'PR-1', quantity: 5, unit_cost: '999', selling_price: '1', mrp: '1' }, { actor: ACTOR });
+  await receiveInventory({ sku_id: sku, batch_number: 'PR-2', quantity: 1, selling_price: '199', mrp: '249' }, { actor: ACTOR });
+  b = await batchOf(r1.batchId);
+  const b2 = await batchOf(r2.batchId);
+  if (b.unit_cost !== 180.5 || b.selling_price !== 249 || b.mrp !== 1299 || b.on_hand !== 15) bad.push(`redelivery changed prices ${JSON.stringify([b.unit_cost, b.selling_price, b.mrp])}`);
+  if (b2.selling_price !== 199 || b2.mrp !== 249 || b2.unit_cost !== 0) bad.push('blank SP/MRP not filled by a later delivery');
+  // Update one price without touching the other two — or the stock.
+  const l0 = await ledger();
+  const onHand0 = (await getSku(sku)).on_hand;
+  let v = (await batchOf(r1.batchId)).version;
+  await updateBatch(r1.batchId, { selling_price: '259.99' }, { actor: ACTOR, version: v });
+  b = await batchOf(r1.batchId);
+  if (b.selling_price !== 259.99 || b.unit_cost !== 180.5 || b.mrp !== 1299) bad.push(`SP edit ${JSON.stringify([b.unit_cost, b.selling_price, b.mrp])}`);
+  await updateBatch(r1.batchId, { mrp: '' }, { actor: ACTOR, version: b.version });     // cleared: blank, not zero
+  b = await batchOf(r1.batchId);
+  if (b.mrp !== null || b.selling_price !== 259.99 || b.unit_cost !== 180.5) bad.push('MRP clear touched others');
+  await updateBatch(r1.batchId, { unit_cost: '175' }, { actor: ACTOR, version: b.version });
+  b = await batchOf(r1.batchId);
+  if (b.unit_cost !== 175 || b.selling_price !== 259.99 || b.value !== 175 * 15) bad.push(`CP edit / value ${b.unit_cost} ${b.value}`);
+  // SP and MRP never reach stock value; a price-only edit moves no stock.
+  await updateBatch(r1.batchId, { selling_price: '100000', mrp: '200000' }, { actor: ACTOR, version: b.version });
+  const s1 = await getSku(sku);
+  if (s1.value !== 175 * 15 + 0 * 5 || (await batchOf(r1.batchId)).value !== 175 * 15) bad.push(`value used SP/MRP: ${s1.value}`);
+  const l1 = await ledger();
+  if (l1.n !== l0.n || l1.q !== l0.q || s1.on_hand !== onHand0) bad.push('a price edit moved stock');
+  const aud = (await db.query(`SELECT metadata FROM inventory_audit WHERE batch_id = $1 AND action = 'batch_updated' ORDER BY id`, [r1.batchId])).rows.map((r) => Object.keys(r.metadata.changes).sort().join('+'));
+  if (aud.join() !== 'selling_price,mrp,unit_cost,mrp+selling_price') bad.push(`audit ${aud}`);
+  // C. Validation: negative, NaN, Infinity, exponents, 3 decimals, text, too large — refused; nothing written.
+  for (const [field, value] of [['unit_cost', '-1'], ['selling_price', 'NaN'], ['mrp', 'Infinity'], ['selling_price', '1e3'], ['mrp', '12.345'], ['unit_cost', 'abc'],
+    ['mrp', -5], ['selling_price', Number.NaN], ['unit_cost', Number.POSITIVE_INFINITY], ['mrp', '12345678901'], ['selling_price', { x: 1 }]]) {
+    await expectErr(`receive ${field}=${String(value)}`, () => receiveInventory({ sku_id: sku, batch_number: 'PR-BAD', quantity: 1, [field]: value }, { actor: ACTOR }), (e) => e.status === 400);
+    const cur = await batchOf(r1.batchId);
+    await expectErr(`edit ${field}=${String(value)}`, () => updateBatch(r1.batchId, { [field]: value }, { actor: ACTOR, version: cur.version }), (e) => e.status === 400);
+  }
+  if ((await db.query(`SELECT count(*)::int n FROM inventory_batches WHERE sku_id = $1 AND batch_number = 'PR-BAD'`, [sku])).rows[0].n) bad.push('a refused receipt made a batch');
+  // Transfers carry all three prices to the batch in the other warehouse.
+  const wh2 = (await db.query(`SELECT id FROM warehouses WHERE active AND id <> (SELECT warehouse_id FROM inventory_batches WHERE id = $1) ORDER BY id LIMIT 1`, [r1.batchId])).rows[0]?.id;
+  if (wh2) {
+    const t = await transferStock({ batch_id: r1.batchId, to_warehouse_id: wh2, quantity: 1 }, { actor: ACTOR });
+    const moved = (await skuDetail(sku)).batches.find((x) => x.id === t.batchId);
+    if (moved.unit_cost !== 175 || moved.selling_price !== 100000 || moved.mrp !== 200000) bad.push('transfer dropped prices');
+  }
+  if (bad.length) throw new Error(bad.join(' | '));
+  return 'unit_cost kept as CP; selling_price and mrp added (nullable NUMERIC(12,2) ≥ 0); saved/read with ₹ and commas; blanks and old clients → null (never derived); zero allowed; redelivery keeps CP, fills blank SP/MRP only; one price edited at a time, cleared to blank; value = on hand × CP only (SP/MRP 100000/200000 changed nothing); price edits move no stock, audited per field; negative/NaN/Infinity/1e3/3 decimals/text/too large/object refused on receipt and edit; transfer carries all three';
+});
+
+await step('inventory page: Add inventory and batch forms show CP, SP and MRP as three separate boxes (no price-type dropdown), one row on desktop, stacked on a phone; other receipt fields unchanged', async () => {
+  const bad = [];
+  const js = await fsp.readFile(new URL('../public/inventory.js', import.meta.url), 'utf8');
+  const css = await fsp.readFile(new URL('../public/orders.css', import.meta.url), 'utf8');
+  const form = (kind) => js.slice(js.indexOf(`} else if (kind === '${kind}') {`), js.indexOf('} else if', js.indexOf(`} else if (kind === '${kind}') {`) + 10));
+  for (const kind of ['receive', 'batch']) {
+    const f = form(kind);
+    const labels = ['Cost Price (CP) ₹', 'Selling Price (SP) ₹', 'Maximum Retail Price (MRP) ₹'];
+    const helps = ['Purchase cost per unit paid by Briyo.', 'Selling price per unit charged to customers.', 'Maximum retail price printed on the product packaging.'];
+    const names = ['unit_cost', 'selling_price', 'mrp'];
+    if (!/<div class="price-row wide">/.test(f)) bad.push(`${kind}: no price row`);
+    labels.forEach((l, i) => { if (!f.includes(`<span>${l}</span><input class="input" name="${names[i]}" inputmode="decimal"`) || !f.includes(helps[i])) bad.push(`${kind}: ${l}`); });
+    if (/Unit cost/.test(f) || /<select[^>]*name="(price_type|price_kind)"/.test(f)) bad.push(`${kind}: old field or a dropdown`);
+  }
+  const recv = form('receive');
+  for (const n of ['sku_id', 'batch_number', 'quantity', 'mfg_date', 'expiry_date', 'received_date', 'supplier_name', 'po_number', 'grn_number', 'warehouse_id', 'location', 'coa', 'notes']) if (!recv.includes(`name="${n}"`)) bad.push(`receive lost ${n}`);
+  if (!/\.price-row \{[^}]*grid-template-columns: repeat\(3, minmax\(0, 1fr\)\)/.test(css) || !/@media \(max-width: 760px\) \{ \.price-row \{ grid-template-columns: 1fr; \}/.test(css)) bad.push('layout');
+  if (bad.length) throw new Error(bad.join(' | '));
+  return 'both forms: three labelled inputs (unit_cost/selling_price/mrp, decimal keypad) with their helper texts, no dropdown, no "Unit cost"; receipt keeps SKU, batch, quantity, dates, received date, supplier, PO, GRN, warehouse, location, COA, notes; 3 columns on desktop, 1 below 760 px';
+});
+
 await step('inventory cleanup', async () => {
   const { skus, paths } = await purgeTestInventory(TS);
   for (const p of paths) await storage().remove(p).catch(() => {});

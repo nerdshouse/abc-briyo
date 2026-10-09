@@ -272,11 +272,17 @@ function renderSku() {
   $('#dSub').textContent = [s.product_name, s.variant_name, s.category, !s.active && 'Inactive'].filter(Boolean).join(' · ');
   const live = batches.filter((b) => b.on_hand > 0 || b.effective_status !== 'depleted');
   const old = batches.filter((b) => !live.includes(b));
+  // CP (with the stock value it gives), SP and MRP — each only when entered; value always comes from CP.
+  const priceLine = (b) => {
+    const parts = [b.unit_cost !== null && `CP ${esc(money(b.unit_cost))} (value ${esc(money(b.value))})`,
+      b.selling_price !== null && `SP ${esc(money(b.selling_price))}`, b.mrp !== null && `MRP ${esc(money(b.mrp))}`].filter(Boolean);
+    return parts.length ? `<span class="cell-sub muted price-line">${parts.join(' · ')}</span>` : '';
+  };
   const batchRow = (b) => `<tr>
       <td><span class="mono" style="font-weight:500">${esc(b.batch_number)}</span>
         <span class="cell-sub muted">${esc(b.warehouse_name)}${b.location ? ` · ${esc(b.location)}` : ''}</span>
-        <span class="cell-sub muted">${[b.mfg_date && `Mfg ${esc(day(b.mfg_date))}`, b.supplier_name ? esc(b.supplier_name) : 'No supplier', b.grn_number && `GRN ${esc(b.grn_number)}`,
-          b.unit_cost !== null && `${esc(money(b.unit_cost))} each · ${esc(money(b.value))}`].filter(Boolean).join(' · ')}</span></td>
+        <span class="cell-sub muted">${[b.mfg_date && `Mfg ${esc(day(b.mfg_date))}`, b.supplier_name ? esc(b.supplier_name) : 'No supplier', b.grn_number && `GRN ${esc(b.grn_number)}`].filter(Boolean).join(' · ')}</span>
+        ${priceLine(b)}</td>
       <td class="r num">${count(b.on_hand)}${b.reserved ? `<span class="cell-sub muted">${count(b.reserved)} reserved</span>` : ''}</td>
       <td>${expiryCell(b)}</td>
       <td>${statusTag(b.effective_status)}</td>
@@ -492,7 +498,14 @@ function openForm(kind, ctx = {}) {
       <label class="fld"><span>Manufacturing date</span><input class="input" name="mfg_date" placeholder="08-2026 or 01-08-2026" autocomplete="off" /></label>
       <label class="fld"><span>Expiry</span><input class="input" name="expiry_date" placeholder="08-2028 or 31-08-2028" autocomplete="off" />
         <span class="help">A month alone means its last day: 08/2028 = 31 Aug 2028.</span></label>
-      <label class="fld"><span>Unit cost (₹)</span><input class="input" name="unit_cost" inputmode="decimal" placeholder="180" /></label>
+      <div class="price-row wide">
+        <label class="fld"><span>Cost Price (CP) ₹</span><input class="input" name="unit_cost" inputmode="decimal" placeholder="180" />
+          <span class="help">Purchase cost per unit paid by Briyo.</span></label>
+        <label class="fld"><span>Selling Price (SP) ₹</span><input class="input" name="selling_price" inputmode="decimal" placeholder="249" />
+          <span class="help">Selling price per unit charged to customers.</span></label>
+        <label class="fld"><span>Maximum Retail Price (MRP) ₹</span><input class="input" name="mrp" inputmode="decimal" placeholder="299" />
+          <span class="help">Maximum retail price printed on the product packaging.</span></label>
+      </div>
       <label class="fld"><span>Received date</span><input class="input" name="received_date" placeholder="Today if empty" autocomplete="off" /></label>
       <label class="fld"><span>Supplier</span><input class="input" name="supplier_name" list="supList" maxlength="120" autocomplete="off" /><datalist id="supList">${sup}</datalist>
         <span class="help">Pick one or type a new name; it is added to the supplier list.</span></label>
@@ -539,7 +552,14 @@ function openForm(kind, ctx = {}) {
         <span class="help">Quarantined, blocked and expired stock is never offered for dispatch.</span></label>
       <label class="fld"><span>Reason for a status change</span><input class="input" name="reason" maxlength="300" /></label>
       <label class="fld"><span>Location / rack</span><input class="input" name="location" value="${esc(batch.location || '')}" maxlength="80" /></label>
-      <label class="fld"><span>Unit cost (₹)</span><input class="input" name="unit_cost" inputmode="decimal" value="${esc(batch.unit_cost ?? '')}" /></label>
+      <div class="price-row wide">
+        <label class="fld"><span>Cost Price (CP) ₹</span><input class="input" name="unit_cost" inputmode="decimal" placeholder="180" value="${esc(batch.unit_cost ?? '')}" />
+          <span class="help">Purchase cost per unit paid by Briyo.</span></label>
+        <label class="fld"><span>Selling Price (SP) ₹</span><input class="input" name="selling_price" inputmode="decimal" placeholder="249" value="${esc(batch.selling_price ?? '')}" />
+          <span class="help">Selling price per unit charged to customers.</span></label>
+        <label class="fld"><span>Maximum Retail Price (MRP) ₹</span><input class="input" name="mrp" inputmode="decimal" placeholder="299" value="${esc(batch.mrp ?? '')}" />
+          <span class="help">Maximum retail price printed on the product packaging.</span></label>
+      </div>
       <label class="fld"><span>Manufacturing date</span><input class="input" name="mfg_date" value="${esc(batch.mfg_date ? formatDayKey(batch.mfg_date) : '')}" placeholder="08-2026" autocomplete="off" /></label>
       <label class="fld"><span>Expiry</span><input class="input" name="expiry_date" value="${esc(batch.expiry_date ? formatDayKey(batch.expiry_date) : '')}" placeholder="08-2028 or 31-08-2028" autocomplete="off" />
         <span class="help">A month alone means its last day.</span></label>

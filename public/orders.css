@@ -484,3 +484,10 @@ html.scroll-locked .drawer-scrim { touch-action: none; }
 .amazon-facts { display: flex; flex-wrap: wrap; gap: 4px 14px; margin-top: 4px; font-size: 12.5px; }
 /* Shopify sync stopped: the short summary under the heading */
 .stop-facts { display: flex; flex-wrap: wrap; gap: 4px 14px; margin: 4px 0; font-size: 12.5px; }
+
+/* Inventory: Cost Price, Selling Price and MRP side by side; stacked on a phone */
+.price-row { grid-column: 1 / -1; display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
+/* A label that wraps (the MRP one, in a narrow drawer) keeps the three boxes level: labels sit on a shared line. */
+.price-row .fld > span:first-child { min-height: 2.6em; display: flex; align-items: flex-end; line-height: 1.3; }
+@media (max-width: 760px) { .price-row { grid-template-columns: 1fr; } .price-row .fld > span:first-child { min-height: 0; } }
+.price-line { white-space: normal; max-width: none; }
