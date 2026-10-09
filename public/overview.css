@@ -84,10 +84,11 @@
 /* Module accents: a pale tint on the header and a coloured top edge identify the
    module; figures stay ink, so colour still means status everywhere else.
    Scoped to these Overview modules only. */
-.ox-mod.m-shopify   { --mod-accent: #7FC8A9; --mod-tint: #F1FAF5; }
-.ox-mod.m-affiliate { --mod-accent: #B7A6E8; --mod-tint: #F6F3FD; }
-.ox-mod.m-shipments { --mod-accent: #8DB8EC; --mod-tint: #F1F6FD; }
-.ox-mod.m-inventory { --mod-accent: #E9C08A; --mod-tint: #FDF7EE; }
+/* Module cards take the shell's module identity (ui.css --mod-*): the same colour as the department in the sidebar. */
+.ox-mod.m-shopify   { --mod-accent: var(--mod-logistics);  --mod-tint: color-mix(in srgb, var(--mod-logistics) 6%, #fff); }
+.ox-mod.m-affiliate { --mod-accent: var(--mod-affiliates); --mod-tint: color-mix(in srgb, var(--mod-affiliates) 6%, #fff); }
+.ox-mod.m-shipments { --mod-accent: var(--mod-logistics);  --mod-tint: color-mix(in srgb, var(--mod-logistics) 6%, #fff); }
+.ox-mod.m-inventory { --mod-accent: var(--mod-inventory);  --mod-tint: color-mix(in srgb, var(--mod-inventory) 6%, #fff); }
 .ox-mod.m-shopify, .ox-mod.m-affiliate, .ox-mod.m-shipments, .ox-mod.m-inventory { border-top: 3px solid var(--mod-accent); }
 .ox-mod.m-shopify > .ox-mod-head, .ox-mod.m-affiliate > .ox-mod-head, .ox-mod.m-shipments > .ox-mod-head, .ox-mod.m-inventory > .ox-mod-head {
   background: var(--mod-tint); border-radius: calc(var(--ox-r) - 2px) calc(var(--ox-r) - 2px) 0 0;
@@ -242,7 +243,7 @@ a.ox-sig:hover .ox-chev, a.ox-sig:focus-visible .ox-chev { opacity: 1; }
 .ox-camp-spend { font-weight: 500; }
 .ox-camp-roas { text-align: right; color: var(--text-2); }
 
-.ox-delayed { display: flex; gap: 8px; align-items: flex-start; margin: 0; padding: 9px var(--ox-pad); background: var(--warning-soft); border-bottom: 1px solid #FEDF89; color: var(--warning-text); font-size: var(--fs-meta); }
+.ox-delayed { display: flex; gap: 8px; align-items: flex-start; margin: 0; padding: 9px var(--ox-pad); background: var(--warning-soft); border-bottom: 1px solid var(--warning-border); color: var(--warning-text); font-size: var(--fs-meta); }
 .ox-delayed .lucide { width: 15px; height: 15px; flex: none; margin-top: 1px; }
 .ox-foot { margin: 0; padding: 9px var(--ox-pad); border-top: 1px solid var(--ox-line); font-size: var(--fs-meta); color: var(--text-2); }
 
@@ -278,7 +279,7 @@ a.ox-sig:hover .ox-chev, a.ox-sig:focus-visible .ox-chev { opacity: 1; }
 .ox-exc-gh { display: flex; align-items: center; gap: 8px; margin: 0; padding: 8px var(--ox-pad); font-size: var(--fs-meta); font-weight: 500; background: var(--surface-2); border-bottom: 1px solid var(--ox-line); }
 .ox-exc-gh .num { color: var(--text-3); font-weight: 500; }
 .ox-exc-group.g-critical { border-color: #FDA29B; }
-.ox-exc-group.g-critical .ox-exc-gh { background: var(--error-soft); border-bottom-color: #FECDCA; }
+.ox-exc-group.g-critical .ox-exc-gh { background: var(--error-soft); border-bottom-color: var(--error-border); }
 .ox-exc-group.g-critical .health { color: var(--error-text); }
 .ox-exc-group.g-warning .health { color: var(--warning-text); }
 .ox-exc-group.g-attention .health { color: var(--text-2); }
