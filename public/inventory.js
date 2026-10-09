@@ -13,6 +13,7 @@ import {
 const fetch = pageFetch();
 
 const FILTERS = ['q', 'warehouse', 'location', 'status', 'expiring', 'stock'];
+let incomingAct = () => null;   // set in bind(): the incoming actions (record, accept/reject, stage, cancel)
 const state = {
   me: null, meta: null, data: null, view: '', f: Object.fromEntries(FILTERS.map((k) => [k, ''])),
   openSku: null, detail: null, form: null,
@@ -46,14 +47,26 @@ const STATUS = {
   expired: ['lost', 'Expired'], depleted: ['new', 'Depleted'],
 };
 const statusTag = (s) => `<span class="status ${STATUS[s]?.[0] || ''}"><span class="dot"></span>${esc(STATUS[s]?.[1] || s)}</span>`;
+/**
+ * A batch's expiry, with its state as text beside the colour (never colour alone): near expiry orange (≤ the
+ * configured days), expired red, unknown expiry muted amber (no date recorded — never guessed), held grey.
+ */
 const expiryCell = (b) => {
-  if (!b.expiry_date) return '<span class="muted-cell">—</span>';
+  const st = b.expiry_state;
   const d = b.days_to_expiry;
-  const tone = d !== null && d < 0 ? 'bad' : d !== null && d <= 90 && b.on_hand > 0 ? 'warn' : '';
-  const note = d === null ? '' : d < 0 ? 'expired' : d <= 90 ? `${d} d` : '';
-  return `<span class="${tone ? `exp-${tone}` : ''}">${esc(day(b.expiry_date))}</span>${note && b.on_hand > 0 ? ` <span class="mini-tag ${tone === 'bad' ? 'warn' : ''}">${esc(note)}</span>` : ''}`;
+  const date = b.expiry_date ? `<span class="${st === 'expired' ? 'exp-bad' : st === 'near_expiry' ? 'exp-warn' : ''}">${esc(day(b.expiry_date))}</span>` : '';
+  if (st === 'unknown_expiry') return '<span class="xtag unknown" style="margin-left:0">Unknown expiry</span>';
+  if (!b.expiry_date) return '<span class="muted-cell">—</span>';
+  if (st === 'expired') return `${date}<span class="xtag expired">Expired</span>`;
+  if (st === 'near_expiry') return `${date}<span class="xtag near">Near expiry · ${d === 0 ? 'today' : `${count(d)} d`}</span>`;
+  return date;
 };
-const stockFlag = (r) => (r.out_of_stock ? '<span class="mini-tag warn">Out of stock</span>' : r.low_stock ? '<span class="mini-tag warn">Low stock</span>' : '');
+const stockFlag = (r) => (r.out_of_stock ? '<span class="xtag out" style="margin-left:0">Out of stock</span>' : r.low_stock ? '<span class="mini-tag warn">Low stock</span>' : '');
+/** Zero is stored as the number 0 and shown as "Nil". */
+const nil = (n) => (Number(n) === 0 ? '<span class="nil">Nil</span>' : count(n));
+const plural = (n, unit) => `${count(n)} ${unit || 'unit'}${n === 1 ? '' : /(s|x|ch|sh)$/i.test(unit || '') ? 'es' : 's'}`;
+const incomingTag = (n) => (n > 0 ? `<span class="xtag incoming">+${count(n)} incoming</span>` : '');
+const altLine = (alts) => (alts?.length ? `<span class="alt-line">Alternatives: ${alts.map((a) => `<span class="mono">${esc(a.sku)}</span>${a.variant_name ? ` (${esc(a.variant_name)})` : ''} — ${a.available ? `${count(a.available)} available` : 'Nil'}`).join('; ')}</span>` : '');
 
 // ------------------------------------------------------------------ URL
 
@@ -142,32 +155,43 @@ function renderUnmappedRows() {
 
 function render() {
   const { cards: c, rows, unmapped } = state.data;
-  const title = state.view === 'unmapped' ? 'Unmapped SKUs' : state.f.stock === 'low' ? 'Low stock'
-    : state.f.expiring ? 'Expiring stock' : 'Inventory';
+  const title = state.view === 'unmapped' ? 'Unmapped SKUs' : state.f.stock === 'low' ? 'Low stock' : state.f.stock === 'incoming' ? 'Incoming stock'
+    : state.f.stock === 'out' ? 'Out of stock' : state.f.expiring === 'unknown' ? 'Unknown expiry' : state.f.expiring ? 'Expiring stock' : 'Inventory';
   $('#pageTitle').textContent = title;
   $('#crumbHere').textContent = title === 'Inventory' ? 'Stock' : title;
   $('#topTitle').textContent = title;
   document.title = `${title} — Briyo OS`;
-  $('#pageSub').textContent = `${count(c.totalSkus)} active SKUs · ${count(c.availableUnits)} available to dispatch of ${count(c.onHandUnits)} on hand · ${money(c.inventoryValue)} at cost`
+  // Units are only added up within one unit type: bottles and sachets never make one "total".
+  const units = Object.entries(c.unitTotals || {});
+  const mixed = units.length > 1;
+  const perUnit = (k) => units.map(([u, t]) => plural(t[k], u)).join(' · ');
+  $('#pageSub').textContent = mixed
+    ? `${count(c.totalSkus)} active SKUs · available to dispatch: ${perUnit('available')} · ${money(c.inventoryValue)} at cost`
+    : `${count(c.totalSkus)} active SKUs · ${count(c.availableUnits)} available to dispatch of ${count(c.onHandUnits)} on hand · ${money(c.inventoryValue)} at cost`
     + (c.unitsWithoutCost ? ` · ${count(c.unitsWithoutCost)} units without a cost` : '');
 
   const card = (n, label, { tone = '', filter = null, title: tip = '' } = {}) => `<button type="button" class="imp-stat inv-card ${tone}"
       ${filter ? `data-filter='${esc(JSON.stringify(filter))}'` : 'disabled'} title="${esc(tip)}"><b>${typeof n === 'number' ? count(n) : esc(n)}</b><span>${esc(label)}</span></button>`;
+  const unitCard = (k, label, opts) => (mixed
+    ? `<div class="imp-stat inv-card ${opts.tone || ''}" title="${esc(opts.title || '')}"><b>${units.map(([u, t]) => `<span class="unit-split">${esc(plural(t[k], u))}</span>`).join('')}</b><span>${esc(label)}</span></div>`
+    : card(k === 'on_hand' ? c.onHandUnits : k === 'available' ? c.availableUnits : c.reservedSellableUnits, label, opts));
   $('#cards').innerHTML = [
-    card(c.onHandUnits, 'On hand', { title: 'Physically in stock: every batch, whatever its status' }),
-    card(c.sellableUnits, 'Sellable', { title: 'On hand in active, unexpired batches' }),
-    card(c.reservedSellableUnits, 'Reserved', { title: 'Sellable stock set aside for shipments not yet dispatched' }),
-    card(c.availableUnits, 'Available to dispatch', { tone: 'good', title: 'Sellable − reserved' }),
+    unitCard('on_hand', 'On hand', { title: 'Physically in stock: every batch, whatever its status' }),
+    ...(mixed ? [] : [card(c.sellableUnits, 'Sellable', { title: 'On hand in active, unexpired batches' })]),
+    unitCard('reserved', 'Reserved', { title: 'Sellable stock set aside for shipments not yet dispatched' }),
+    unitCard('available', 'Available to dispatch', { tone: 'good', title: 'Sellable − reserved' }),
     card(c.expiredUnits, 'Expired', { tone: c.expiredUnits ? 'bad' : '', filter: { status: 'expired' } }),
     card(c.quarantinedUnits + c.blockedUnits, c.blockedUnits ? 'Quarantined / blocked' : 'Quarantined', { tone: c.quarantinedUnits + c.blockedUnits ? 'warn' : '', filter: { status: 'quarantined' },
       title: `${c.quarantinedUnits} quarantined, ${c.blockedUnits} blocked` }),
     card(c.lowStock, 'Low stock SKUs', { tone: c.lowStock ? 'warn' : '', filter: { stock: 'low' }, title: 'Available to dispatch at or under the reorder level' }),
     card(c.outOfStock, 'Out of stock SKUs', { tone: c.outOfStock ? 'bad' : '', filter: { stock: 'out' }, title: 'Nothing available to dispatch' }),
-    card(c.expiring90, 'Batches expiring ≤ 90 d', { tone: c.expiring90 ? 'warn' : '', filter: { expiring: '90' },
-      title: `${c.expiring30} within 30 days, ${c.expiring60} within 60 days` }),
+    card(c.nearExpiry, `Near expiry (≤ ${c.nearExpiryDays} d)`, { tone: c.nearExpiry ? 'warn' : '', filter: { expiring: 'near' },
+      title: `Batches with stock expiring within ${c.nearExpiryDays} days · ${c.expiring30} within 30, ${c.expiring60} within 60` }),
+    card(c.unknownExpiry, 'Unknown expiry', { filter: { expiring: 'unknown' }, title: 'Batches with stock and no expiry date recorded' }),
+    card(c.incomingSkus, 'SKUs with incoming', { filter: { stock: 'incoming' }, title: 'Expected stock not yet accepted. Never counted as available.' }),
     card(money(c.inventoryValue), 'Inventory value', { title: 'On hand × unit cost, per batch (all statuses). Not selling price.' }),
   ].join('');
-  $('#formula').textContent = `On hand ${count(c.onHandUnits)} = sellable ${count(c.sellableUnits)} + expired ${count(c.expiredUnits)} + quarantined ${count(c.quarantinedUnits)} + blocked ${count(c.blockedUnits)}.`
+  $('#formula').textContent = mixed ? 'On hand = sellable + expired + quarantined + blocked, and available to dispatch = sellable − reserved, for each unit type. Units of different types are never added together.' : `On hand ${count(c.onHandUnits)} = sellable ${count(c.sellableUnits)} + expired ${count(c.expiredUnits)} + quarantined ${count(c.quarantinedUnits)} + blocked ${count(c.blockedUnits)}.`
     + ` Available to dispatch ${count(c.availableUnits)} = sellable ${count(c.sellableUnits)} − reserved ${count(c.reservedSellableUnits)}.`;
 
   renderUnmapped();
@@ -186,7 +210,7 @@ function render() {
     <tr class="orow${r.sku_id === state.openSku ? ' open' : ''}" data-sku="${r.sku_id}" tabindex="0">
       <td><span class="cell-main mono" style="font-weight:500">${esc(r.sku)}</span>${r.sku_active === false ? '<span class="mini-tag">Inactive</span>' : ''}</td>
       <td><span class="cell-main">${esc(r.product_name)}</span>${r.variant_name ? `<span class="cell-sub muted">${esc(r.variant_name)}</span>` : ''}</td>
-      <td class="r num">${r.empty ? '<span class="muted-cell">—</span>' : count(r.available)}${stockFlag(r) ? `<span class="cell-sub">${stockFlag(r)}</span>` : ''}</td>
+      <td class="r num">${r.empty ? nil(r.sku_available) : nil(r.available)}${stockFlag(r) || r.sku_incoming ? `<span class="cell-sub">${stockFlag(r)}${incomingTag(r.sku_incoming)}</span>` : ''}${altLine(r.alternatives)}</td>
       <td class="r num">${r.empty || !r.reserved ? '<span class="muted-cell">—</span>' : count(r.reserved)}</td>
       <td>${r.empty ? '<span class="muted-cell">No stock yet</span>' : `<span class="mono">${esc(r.batch_number)}</span><span class="cell-sub muted">${count(r.on_hand)} on hand</span>`}</td>
       <td>${r.empty ? '<span class="muted-cell">—</span>' : expiryCell(r)}</td>
@@ -198,8 +222,9 @@ function render() {
       <div class="oi-top"><span class="oi-id mono">${esc(r.sku)}</span>${r.empty ? '' : `<span class="oi-val">${statusTag(r.effective_status)}</span>`}</div>
       <div class="oi-sub">${esc(r.product_name)}${r.variant_name ? ` · ${esc(r.variant_name)}` : ''}</div>
       <div class="oi-sub">${r.empty ? 'No stock yet' : `Batch <span class="mono">${esc(r.batch_number)}</span> · ${esc(r.warehouse_name)}${r.location ? ` · ${esc(r.location)}` : ''}`}</div>
-      ${r.empty ? '' : `<div class="oi-stat"><span class="soft" style="font-size:12.5px">${count(r.available)} available${r.reserved ? ` · ${count(r.reserved)} reserved` : ''}</span>
-        <span style="font-size:12.5px">${expiryCell(r)}</span>${stockFlag(r)}</div>`}
+      ${r.empty ? `<div class="oi-stat"><span class="soft" style="font-size:12.5px">Available: ${nil(r.sku_available)}</span>${stockFlag(r)}${incomingTag(r.sku_incoming)}</div>${altLine(r.alternatives)}`
+        : `<div class="oi-stat"><span class="soft" style="font-size:12.5px">Available: ${nil(r.available)}${r.reserved ? ` · ${count(r.reserved)} reserved` : ''}</span>
+        <span style="font-size:12.5px">${expiryCell(r)}</span>${stockFlag(r)}${incomingTag(r.sku_incoming)}</div>${altLine(r.alternatives)}`}
     </li>`).join('');
   renderIcons();
 }
@@ -267,7 +292,7 @@ const refText = (m) => {
 };
 
 function renderSku() {
-  const { sku: s, batches, movements, reservations, orderLines } = state.detail;
+  const { sku: s, batches, movements, reservations, orderLines, alternatives = [], returns = [], incoming = [] } = state.detail;
   $('#dTitle').innerHTML = `<span class="mono">${esc(s.sku)}</span>`;
   $('#dSub').textContent = [s.product_name, s.variant_name, s.category, !s.active && 'Inactive'].filter(Boolean).join(' · ');
   const live = batches.filter((b) => b.on_hand > 0 || b.effective_status !== 'depleted');
@@ -298,7 +323,7 @@ function renderSku() {
       </div>
       ${canMove() ? `<div class="batch-actions">
         <button type="button" class="linkish" data-act="adjust" data-batch="${b.id}">Adjust / write off</button>
-        <button type="button" class="linkish" data-act="return" data-batch="${b.id}">Customer return</button>
+        <button type="button" class="linkish" data-act="stock-return" data-batch="${b.id}">Return stock</button>
         <button type="button" class="linkish" data-act="transfer" data-batch="${b.id}">Transfer</button>
         <button type="button" class="linkish" data-act="batch" data-batch="${b.id}">Status &amp; details</button>
       </div>` : ''}
@@ -311,7 +336,7 @@ function renderSku() {
         <div class="imp-stat"><b>${count(s.on_hand)}</b><span>On hand</span></div>
         <div class="imp-stat"><b>${count(s.sellable)}</b><span>Sellable</span></div>
         <div class="imp-stat"><b>${count(s.reserved_sellable)}</b><span>Reserved</span></div>
-        <div class="imp-stat ${s.out_of_stock ? 'bad' : s.low_stock ? 'warn' : 'good'}"><b>${count(s.available)}</b><span>Available to dispatch</span></div>
+        <div class="imp-stat ${s.out_of_stock ? 'bad' : s.low_stock ? 'warn' : 'good'}"><b>${nil(s.available)}</b><span>Available to dispatch (${esc(s.unit_type || 'unit')})</span></div>
       </div>
       <div class="imp-stats stock-cards" style="margin-top:8px">
         <div class="imp-stat ${s.expired ? 'bad' : ''}"><b>${count(s.expired)}</b><span>Expired</span></div>
@@ -321,7 +346,9 @@ function renderSku() {
       </div>
       <p class="imp-note">On hand = sellable + expired + quarantined + blocked. Available to dispatch = sellable − reserved.
         ${s.track_inventory ? '' : '<b>Not inventory-tracked:</b> orders for this SKU dispatch without a stock check. '}Reorder level ${count(s.reorder_level)}${s.reorder_quantity ? `, reorder quantity ${count(s.reorder_quantity)}` : ''}.</p>
-      ${canMove() || canCatalog() ? `<div class="form-actions">${canMove() ? `<button class="btn primary" type="button" data-act="receive">${icon('plus')}Add inventory</button>` : ''}
+      ${canMove() || canCatalog() ? `<div class="form-actions">${canMove() ? `<button class="btn primary" type="button" data-act="receive">${icon('plus')}Add inventory</button>
+        <button class="btn" type="button" data-act="stock-return">${icon('undo-2')}Return stock</button>
+        <button class="btn" type="button" data-act="incoming-new">${icon('truck')}Expect incoming</button>` : ''}
         ${canCatalog() ? `<button class="btn" type="button" data-act="edit-sku">${icon('pencil')}Edit master SKU</button>` : ''}</div>` : ''}
     </section>
 
@@ -340,6 +367,10 @@ function renderSku() {
         ${r.tracking_id ? ` · AWB <span class="mono">${esc(r.tracking_id)}</span>` : ''} · batch <span class="mono">${esc(r.batch_number)}</span></span>
         <span class="d-when">${count(r.quantity)} · ${esc(r.created_by || '')}</span></li>`).join('')}</ul>
     </section>` : ''}
+
+    ${incomingSection(incoming, s)}
+    ${alternativesSection(alternatives, s)}
+    ${returnsSection(returns)}
 
     <section class="dsec">
       <h3 class="dsec-title">Master SKU <span class="dsec-meta soft">Briyo's internal identifier · holds the stock</span></h3>
@@ -370,6 +401,58 @@ function renderSku() {
       </tbody></table></div>` : '<p class="soft" style="margin:0">No movements yet.</p>'}
     </section>`;
   renderIcons();
+}
+
+const INCOMING_TONE = { accepted: 'ok', cancelled: 'held' };
+/** One expectation: what is due, what arrived, what was accepted, and the next step for an operator. */
+function incomingItem(i, { withSku = false } = {}) {
+  const facts = [`expected ${plural(i.expected_quantity, i.unit)}`, i.expected_date && `due ${day(i.expected_date)}`, i.supplier_name, i.reference && `ref ${i.reference}`,
+    i.batch_number && `batch ${i.batch_number}`].filter(Boolean).map(esc).join(' · ');
+  const receipts = (i.receipts || []);
+  return `<li>
+    <div class="inc-head"><span>${withSku ? `<b class="mono">${esc(i.sku)}</b> · ` : ''}<span class="xtag ${INCOMING_TONE[i.status] || 'incoming'}" style="margin-left:0">${esc(i.status_label)}</span></span>
+      <span class="soft">${i.open ? `${plural(i.outstanding, i.unit)} still to come in` : ''}</span></div>
+    <div class="soft" style="margin-top:4px">${facts}</div>
+    <div class="soft">Received ${count(i.received_quantity)} · accepted ${count(i.accepted_quantity)}${i.rejected_quantity ? ` · turned away ${count(i.rejected_quantity)}` : ''}${i.pending_quantity ? ` · <b>${count(i.pending_quantity)} waiting for acceptance</b>` : ''}${i.cancel_reason ? ` · cancelled: ${esc(i.cancel_reason)}` : ''}</div>
+    ${receipts.length ? `<ul class="inc-receipts">${receipts.map((x) => `<li>${count(x.quantity)} in batch <span class="mono">${esc(x.batch_number)}</span> on ${esc(day(x.received_date))}${x.expiry_date ? `, expiry ${esc(day(x.expiry_date))}` : ', expiry unknown'} —
+      ${x.status === 'pending' ? `waiting${canMove() ? ` <button type="button" class="linkish" data-inc-act="decide" data-receipt="${x.id}" data-incoming="${i.id}">Accept or reject</button>` : ''}`
+        : x.status === 'accepted' ? `accepted ${count(x.accepted_quantity)} by ${esc(x.decided_by || '—')}` : `rejected by ${esc(x.decided_by || '—')}${x.decision_note ? `: ${esc(x.decision_note)}` : ''}`}</li>`).join('')}</ul>` : ''}
+    ${canMove() && i.open ? `<div class="inc-actions"><button type="button" class="linkish" data-inc-act="receipt" data-incoming="${i.id}">Record a delivery</button>
+      ${['planned', 'ordered', 'in_transit'].includes(i.status) && !i.received_quantity ? `<button type="button" class="linkish" data-inc-act="stage" data-incoming="${i.id}">Change stage</button>` : ''}
+      <button type="button" class="linkish" data-inc-act="cancel" data-incoming="${i.id}">Cancel the rest</button></div>` : ''}
+  </li>`;
+}
+function incomingSection(list, s) {
+  const open = list.filter((i) => i.open);
+  if (!list.length) return '';
+  return `<section class="dsec">
+    <h3 class="dsec-title">Incoming <span class="dsec-meta soft">${open.length ? `${plural(open.reduce((n, i) => n + i.outstanding, 0), s.unit_type)} expected · not available until accepted` : 'nothing open'}</span></h3>
+    <ul class="inc-list">${list.slice(0, 20).map((i) => incomingItem(i)).join('')}</ul>
+  </section>`;
+}
+function alternativesSection(alts, s) {
+  if (!alts.length && !canCatalog()) return '';
+  const others = (state.skus || []).filter((x) => x.id !== s.id && x.active && !alts.some((a) => a.sku_id === x.id));
+  return `<section class="dsec">
+    <h3 class="dsec-title">Alternatives <span class="dsec-meta soft">information only — each keeps its own stock; nothing is substituted automatically</span></h3>
+    ${alts.length ? `<ul class="d-history">${alts.map((a) => `<li><span><a class="linkish mono" href="#" data-open-sku="${a.sku_id}">${esc(a.sku)}</a> ${esc(a.product_name)}${a.variant_name ? ` · ${esc(a.variant_name)}` : ''}
+        ${a.note ? `<span class="soft"> — ${esc(a.note)}</span>` : ''}</span>
+      <span class="d-when">${a.available ? `${esc(plural(a.available, a.unit_type))} available` : '<span class="xtag out" style="margin-left:0">Nil</span>'}
+        ${canCatalog() ? ` <button type="button" class="linkish" data-alt-remove="${a.id}">Remove</button>` : ''}</span></li>`).join('')}</ul>`
+      : '<p class="soft" style="margin:0">No alternatives listed.</p>'}
+    ${canCatalog() ? `<div class="alt-add"><select class="select" id="altSku" aria-label="Alternative SKU">${opt('', 'Add an alternative variant…', true)}${others.map((x) => opt(x.id, `${x.sku} — ${x.product_name}${x.variant_name ? ` (${x.variant_name})` : ''}`)).join('')}</select>
+      <input class="input" id="altNote" maxlength="300" placeholder="Note (optional)" style="flex:1;min-width:140px" /><button type="button" class="btn" id="altAdd">Add</button></div>` : ''}
+  </section>`;
+}
+const CONDITION_TAG = { sellable: '<span class="xtag ok" style="margin-left:0">Sellable</span>', damaged: '<span class="xtag expired" style="margin-left:0">Damaged</span>', quarantined: '<span class="xtag held" style="margin-left:0">Quarantined</span>' };
+function returnsSection(list) {
+  if (!list.length) return '';
+  return `<section class="dsec">
+    <h3 class="dsec-title">Returns <span class="dsec-meta soft">${count(list.length)}${list.length >= 50 ? ' (latest 50)' : ''}</span></h3>
+    <ul class="d-history">${list.map((r) => `<li><span>${CONDITION_TAG[r.condition] || ''} ${esc(plural(r.quantity, r.unit))} from ${esc(r.returned_by)} <span class="soft">(${esc(state.meta.returnSources?.[r.source] || r.source)})</span> — ${esc(r.reason)}
+        <span class="cell-sub muted">into batch <span class="mono">${esc(r.batch_number)}</span>${r.reference ? ` · ref ${esc(r.reference)}` : ''}${r.remarks ? ` · ${esc(r.remarks)}` : ''}</span></span>
+      <span class="d-when">${esc(day(r.return_date))} · ${esc(r.recorded_by || '')}</span></li>`).join('')}</ul>
+  </section>`;
 }
 
 /**
@@ -433,7 +516,7 @@ function openForm(kind, ctx = {}) {
     submit = kind === 'sku' ? 'Create master SKU' : 'Save';
     body = `<section class="dsec"><div class="form-grid">
       <label class="fld"><span>Master Briyo SKU</span><input class="input mono" name="sku" value="${esc(s.sku || '')}" ${kind === 'edit-sku' ? 'readonly' : 'required'} maxlength="64" placeholder="BS002E90" autocomplete="off" />
-        <span class="help">${kind === 'edit-sku' ? 'A master SKU code never changes.' : "Briyo's internal code: letters, numbers, - _ . / — no spaces. The website/Shopify uses it as is."}</span></label>
+        <span class="help">${kind === 'edit-sku' ? 'A master SKU code never changes.' : "Briyo's internal code: letters, numbers, - _ . / and single spaces (FORME COLLAGEN SINGLE SACHET). The website/Shopify uses it as is."}</span></label>
       <label class="fld"><span>Product name</span><input class="input" name="product_name" value="${esc(s.product_name || '')}" required maxlength="200" placeholder="Vitamin D3 2000 IU" /></label>
       <label class="fld"><span>Variant</span><input class="input" name="variant_name" value="${esc(s.variant_name || '')}" maxlength="120" placeholder="60 Capsules" /></label>
       <label class="fld"><span>Category</span><input class="input" name="category" value="${esc(s.category || '')}" maxlength="120" /></label>
@@ -566,6 +649,82 @@ function openForm(kind, ctx = {}) {
       <label class="fld"><span>PO number</span><input class="input mono" name="po_number" value="${esc(batch.po_number || '')}" /></label>
       <label class="fld"><span>GRN number</span><input class="input mono" name="grn_number" value="${esc(batch.grn_number || '')}" /></label>
       <label class="fld wide"><span>Notes</span><textarea class="input" name="notes" maxlength="1000">${esc(batch.notes || '')}</textarea></label>
+    </div></section>`;
+  } else if (kind === 'stock-return') {
+    title = 'Return stock';
+    sub = 'Sellable units go back into the batch they came from. Damaged or quarantined units are held in a batch of their own and are never available.';
+    submit = 'Record return';
+    const skuSel = ctx.skuId || '';
+    const batchesOf = (skuSel && state.detail && Number(state.detail.sku.id) === Number(skuSel)) ? state.detail.batches : [];
+    body = `<section class="dsec"><div class="form-grid">
+      <label class="fld wide"><span>SKU</span>${skuSel ? `<input type="hidden" name="sku_id" value="${esc(skuSel)}" /><span class="mono">${esc(state.detail.sku.sku)}</span>`
+        : `<select class="select" name="sku_id" required>${skuOptions('')}</select><span class="help">To put sellable units back into a batch, open the SKU and use Return stock there (its batches are listed).</span>`}</label>
+      <label class="fld"><span>Quantity${skuSel ? ` (${esc(state.detail.sku.unit_type || 'units')})` : ''}</span><input class="input" name="quantity" inputmode="numeric" required /></label>
+      <label class="fld"><span>Return date</span><input class="input" name="return_date" placeholder="DD-MM-YYYY (today if blank)" autocomplete="off" /></label>
+      <label class="fld"><span>Condition</span><select class="select" name="condition" required>${opt('', 'Choose…', true)}${Object.entries(m.returnConditions || {}).map(([k, t]) => opt(k, t)).join('')}</select></label>
+      <label class="fld"><span>Batch it came from</span><select class="select" name="batch_id">${opt('', batchesOf.length ? 'Choose the batch' : 'Unknown', !ctx.batchId)}${batchesOf.map((b) => opt(b.id, `${b.batch_number}${b.expiry_date ? ` · exp ${day(b.expiry_date)}` : ' · expiry unknown'} · ${STATUS[b.effective_status]?.[1] || b.effective_status}`, b.id === ctx.batchId)).join('')}</select>
+        <span class="help">Required for sellable units. An expired or held batch cannot take sellable units back.</span></label>
+      <label class="fld"><span>Returned from</span><select class="select" name="source" required>${opt('', 'Choose…', true)}${Object.entries(m.returnSources || {}).map(([k, t]) => opt(k, t)).join('')}</select></label>
+      <label class="fld"><span>Returned by</span><input class="input" name="returned_by" required maxlength="160" placeholder="Person or organisation" /></label>
+      <label class="fld wide"><span>Reason</span><input class="input" name="reason" required maxlength="300" placeholder="Customer ordered the wrong flavour" /></label>
+      <label class="fld"><span>Order / return reference</span><input class="input mono" name="reference" maxlength="80" /></label>
+      <label class="fld wide"><span>Remarks</span><textarea class="input" name="remarks" maxlength="1000" placeholder="Seal intact, inspected by …"></textarea></label>
+      <div class="fld wide" id="dupFld" hidden><span>This reference is already recorded for this SKU — say why this is a separate return</span>
+        <input class="input" name="duplicate_reason" id="dupReturnReason" maxlength="300" placeholder="Second parcel from the same order" />
+        <input type="hidden" name="confirm_duplicate" id="dupConfirm" value="" /></div>
+    </div></section>`;
+  } else if (kind === 'incoming-new') {
+    title = 'Expect incoming stock';
+    sub = 'Expected stock is shown as incoming and is never counted as available. It becomes stock only when a delivery is accepted.';
+    submit = 'Save expectation';
+    body = `<section class="dsec"><div class="form-grid">
+      <label class="fld wide"><span>SKU</span><select class="select" name="sku_id" required>${skuOptions(ctx.skuId || '')}</select></label>
+      <label class="fld"><span>Expected quantity</span><input class="input" name="expected_quantity" inputmode="numeric" required /></label>
+      <label class="fld"><span>Expected arrival</span><input class="input" name="expected_date" placeholder="DD-MM-YYYY" autocomplete="off" /></label>
+      <label class="fld"><span>Stage</span><select class="select" name="status">${opt('planned', 'Planned', true)}${opt('ordered', 'Ordered')}${opt('in_transit', 'In transit')}</select></label>
+      <label class="fld"><span>Supplier</span><input class="input" name="supplier_name" list="supList" maxlength="120" /><datalist id="supList">${m.suppliers.map((x) => `<option value="${esc(x.name)}">`).join('')}</datalist></label>
+      <label class="fld"><span>PO / reference</span><input class="input mono" name="reference" maxlength="80" /></label>
+      <label class="fld"><span>Batch number (if known)</span><input class="input mono" name="batch_number" maxlength="80" /></label>
+      <label class="fld"><span>Manufacturing date (if known)</span><input class="input" name="mfg_date" placeholder="08-2026" autocomplete="off" /></label>
+      <label class="fld"><span>Expiry (if known)</span><input class="input" name="expiry_date" placeholder="08-2028" autocomplete="off" /></label>
+      <label class="fld wide"><span>Notes</span><textarea class="input" name="notes" maxlength="1000"></textarea></label>
+    </div></section>`;
+  } else if (kind === 'incoming-list') {
+    title = 'Incoming stock';
+    sub = 'Open expectations, earliest first. Nothing here is available until a delivery is accepted.';
+    submit = 'Done';
+    body = `<div class="form-actions" style="margin-bottom:12px"><button type="button" class="btn" data-inc-act="new">${icon('plus')}Expect incoming stock</button></div>
+      <ul class="inc-list" id="incList"><li class="soft">Loading…</li></ul>`;
+    // With their deliveries, so a waiting delivery can be accepted from here.
+    api('/api/inventory/incoming?open=1&receipts=1').then((r) => {
+      if (state.form?.kind !== 'incoming-list') return;
+      $('#incList').innerHTML = r.incoming.length ? r.incoming.map((i) => incomingItem(i, { withSku: true })).join('') : '<li class="soft">Nothing is expected right now.</li>';
+      renderIcons();
+    }).catch((err) => { formError(err.message); });
+  } else if (kind === 'receipt') {
+    const i = ctx.incoming;
+    title = 'Record a delivery';
+    sub = `${i.sku} · expected ${plural(i.expected_quantity, i.unit)}, ${count(i.received_quantity)} received so far. It waits for acceptance before it becomes stock.`;
+    submit = 'Record delivery';
+    body = `<section class="dsec"><div class="form-grid">
+      <label class="fld"><span>Quantity received</span><input class="input" name="quantity" inputmode="numeric" required value="${esc(Math.max(i.expected_quantity - i.received_quantity, 0) || '')}" /></label>
+      <label class="fld"><span>Batch number</span><input class="input mono" name="batch_number" maxlength="80" value="${esc(i.batch_number || '')}" required /></label>
+      <label class="fld"><span>Manufacturing date</span><input class="input" name="mfg_date" placeholder="08-2026" value="${esc(i.mfg_date ? formatDayKey(i.mfg_date) : '')}" autocomplete="off" /></label>
+      <label class="fld"><span>Expiry</span><input class="input" name="expiry_date" placeholder="Leave blank if unknown" value="${esc(i.expiry_date ? formatDayKey(i.expiry_date) : '')}" autocomplete="off" /></label>
+      <label class="fld"><span>Received on</span><input class="input" name="received_date" placeholder="DD-MM-YYYY (today if blank)" autocomplete="off" /></label>
+      <label class="fld"><span>Warehouse</span><select class="select" name="warehouse_id">${wh('')}</select></label>
+      <label class="fld wide"><span>Notes</span><textarea class="input" name="notes" maxlength="1000"></textarea></label>
+    </div></section>`;
+  } else if (kind === 'decide') {
+    const x = ctx.receipt;
+    title = 'Accept or reject a delivery';
+    sub = `${count(x.quantity)} received in batch ${x.batch_number}${x.expiry_date ? `, expiry ${day(x.expiry_date)}` : ', expiry unknown'}. Accepted units are added to stock once; the rest is recorded as turned away.`;
+    submit = 'Save decision';
+    body = `<section class="dsec"><div class="form-grid">
+      <label class="fld"><span>Decision</span><select class="select" name="decision">${opt('accept', 'Accept into stock', true)}${opt('reject', 'Reject all of it')}</select></label>
+      <label class="fld"><span>Quantity accepted</span><input class="input" name="accepted_quantity" inputmode="numeric" value="${esc(x.quantity)}" />
+        <span class="help">Less than received needs a reason below.</span></label>
+      <label class="fld wide"><span>Reason / note</span><input class="input" name="note" maxlength="300" placeholder="10 sachets torn" /></label>
     </div></section>`;
   } else if (kind === 'import') {
     title = 'Import master SKUs';
@@ -777,6 +936,31 @@ async function submitForm(e) {
     } else if (kind === 'adjust' || kind === 'return') {
       await api('/api/inventory/adjust', { method: 'POST', body: JSON.stringify({ ...v, batch_id: ctx.batchId, request_id: state.form.requestId }) });
       openAfter = state.detail.sku.id;
+    } else if (kind === 'stock-return') {
+      try {
+        await api('/api/inventory/returns', { method: 'POST', body: JSON.stringify({ ...v, batch_id: v.batch_id || null, request_id: state.form.requestId }) });
+      } catch (err) {
+        // The same reference again: say so, ask for a reason, and send again only with it.
+        if (err.data?.duplicate && $('#dupFld').hidden) { $('#dupFld').hidden = false; $('#dupConfirm').value = 'true'; $('#dupReturnReason').focus(); }
+        throw err;
+      }
+      state.notice = 'Return recorded.';
+      openAfter = Number(v.sku_id);
+    } else if (kind === 'incoming-new') {
+      await api('/api/inventory/incoming', { method: 'POST', body: JSON.stringify(v) });
+      state.notice = 'Incoming stock recorded. It is not available until a delivery is accepted.';
+      openAfter = Number(v.sku_id);
+    } else if (kind === 'incoming-list') {
+      closeForm();
+      return;
+    } else if (kind === 'receipt') {
+      await api(`/api/inventory/incoming/${ctx.incoming.id}/receipts`, { method: 'POST', body: JSON.stringify({ ...v, request_id: state.form.requestId }) });
+      state.notice = 'Delivery recorded. Accept it to add it to stock.';
+      openAfter = ctx.incoming.sku_id;
+    } else if (kind === 'decide') {
+      const r = await api(`/api/inventory/incoming/receipts/${ctx.receipt.id}/decision`, { method: 'POST', body: JSON.stringify(v) });
+      state.notice = r.status === 'accepted' ? `${count(r.acceptedQuantity)} accepted into stock.` : 'Delivery rejected.';
+      openAfter = ctx.skuId;
     } else if (kind === 'transfer') {
       await api('/api/inventory/transfer', { method: 'POST', body: JSON.stringify({ ...v, batch_id: ctx.batchId, request_id: state.form.requestId }) });
       openAfter = state.detail.sku.id;
@@ -851,6 +1035,35 @@ function bind() {
   });
   $('#refresh').addEventListener('click', () => { load(); if (state.openSku) openSku(state.openSku); });
   $('#addInventory').addEventListener('click', () => openForm('receive'));
+  $('#returnStock').addEventListener('click', () => openForm('stock-return'));
+  $('#incomingBtn').addEventListener('click', () => openForm('incoming-list'));
+  // Incoming actions, from the SKU drawer and from the Incoming list.
+  incomingAct = async (b) => {
+    const act = b.dataset.incAct;
+    if (act === 'new') return openForm('incoming-new', {});
+    const id = Number(b.dataset.incoming);
+    try {
+      const { incoming } = await api(`/api/inventory/incoming/${id}`);
+      if (act === 'receipt') return openForm('receipt', { incoming });
+      if (act === 'decide') return openForm('decide', { receipt: incoming.receipts.find((x) => x.id === Number(b.dataset.receipt)), skuId: incoming.sku_id });
+      if (act === 'stage') {
+        const next = window.prompt('Stage: planned, ordered or in_transit', incoming.status);
+        if (!next) return null;
+        await api(`/api/inventory/incoming/${id}`, { method: 'PATCH', body: JSON.stringify({ status: next.trim(), version: incoming.version }) });
+      } else if (act === 'cancel') {
+        const reason = window.prompt('Why is the rest of this cancelled? Anything already accepted stays in stock.');
+        if (!reason || !reason.trim()) return null;
+        await api(`/api/inventory/incoming/${id}/cancel`, { method: 'POST', body: JSON.stringify({ reason }) });
+      }
+      if (state.form?.kind === 'incoming-list') openForm('incoming-list');
+      await load();
+      if (state.openSku) await openSku(state.openSku);
+    } catch (err) {
+      if (state.form) formError(err.message); else { $('#dSaved').className = 'saved failed'; $('#dSaved').textContent = err.message; }
+    }
+    return null;
+  };
+  $('#invForm').addEventListener('click', (e) => { const b = e.target.closest('[data-inc-act]'); if (b) { e.preventDefault(); incomingAct(b); } });
   $('#newSku').addEventListener('click', () => openForm('sku'));
   $('#places').addEventListener('click', () => openForm('places'));
   $('#importSkus').addEventListener('click', () => openForm('import'));
@@ -897,6 +1110,22 @@ function bind() {
     } catch (err) { formError(err.message); }
   });
   $('#dBody').addEventListener('click', async (e) => {
+    const ia = e.target.closest('[data-inc-act]');
+    if (ia) return incomingAct(ia);
+    const os = e.target.closest('[data-open-sku]');
+    if (os) { e.preventDefault(); return openSku(Number(os.dataset.openSku)); }
+    if (e.target.closest('#altAdd')) {
+      try {
+        await api(`/api/inventory/skus/${state.detail.sku.id}/alternatives`, { method: 'POST', body: JSON.stringify({ alternative_sku_id: $('#altSku').value, note: $('#altNote').value }) });
+        await openSku(state.detail.sku.id); load();
+      } catch (err) { $('#dSaved').className = 'saved failed'; $('#dSaved').textContent = err.message; }
+      return null;
+    }
+    const ar = e.target.closest('[data-alt-remove]');
+    if (ar) {
+      try { await api(`/api/inventory/alternatives/${ar.dataset.altRemove}`, { method: 'DELETE' }); await openSku(state.detail.sku.id); load(); } catch (err) { $('#dSaved').className = 'saved failed'; $('#dSaved').textContent = err.message; }
+      return null;
+    }
     const a = e.target.closest('[data-act]');
     if (a) {
       const batchId = a.dataset.batch ? Number(a.dataset.batch) : null;
