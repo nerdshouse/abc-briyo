@@ -497,9 +497,9 @@ app.get('/no-access', (req, res) => {
   if ((req.session?.caps || []).length) return res.redirect(homeFor(req.session.caps));
   return res.sendFile(path.join(PUBLIC, 'no-access.html'));
 });
-const ORDER_PAGES = { '/orders': 'orders.html', '/couriers': 'couriers.html', '/destinations': 'destinations.html', '/inventory': 'inventory.html' };
-const PAGE_CAP = { '/orders': 'logistics.view', '/couriers': 'logistics.view', '/destinations': 'logistics.view', '/inventory': 'inventory.view' };
-app.get(['/orders', '/orders.html', '/couriers', '/couriers.html', '/destinations', '/destinations.html', '/inventory', '/inventory.html'],
+const ORDER_PAGES = { '/orders': 'orders.html', '/couriers': 'couriers.html', '/destinations': 'destinations.html', '/inventory': 'inventory.html', '/stock-outward': 'stock-outward.html' };
+const PAGE_CAP = { '/orders': 'logistics.view', '/couriers': 'logistics.view', '/destinations': 'logistics.view', '/inventory': 'inventory.view', '/stock-outward': 'inventory.view' };
+app.get(['/orders', '/orders.html', '/couriers', '/couriers.html', '/destinations', '/destinations.html', '/inventory', '/inventory.html', '/stock-outward', '/stock-outward.html'],
   (req, res, next) => requirePage(PAGE_CAP[req.path.replace(/\.html$/, '')])(req, res, next),
   (req, res) => res.sendFile(path.join(PUBLIC, ORDER_PAGES[req.path.replace(/\.html$/, '')])));
 app.use('/api/orders', requirePermission('logistics.view'), ordersRouter);

@@ -597,29 +597,44 @@ function itemsSection(o, items) {
   if (!items.length && !manual) return '';
   const open = manualLinesOpen(o);
   const units = items.reduce((n, it) => n + it.quantity, 0);
+  const skus = state.lineSkus || [];
+  const skuOptions = skus.map((k) => `<option value="${k.id}">${esc(k.sku)} — ${esc([k.product_name, k.variant_name].filter(Boolean).join(' '))}</option>`).join('');
   const row = (it) => {
     const own = open && String(it.source_line_item_id || '').startsWith('manual:');
+    // The retailer's own name/code (e.g. Medkart), kept beside the Briyo product, never in place of it.
+    const retailer = it.retailer_product_name || it.retailer_product_code
+      ? `Retailer: ${esc(it.retailer_product_name || '—')}${it.retailer_product_code ? ` · code ${esc(it.retailer_product_code)}` : ' · no code'}` : '';
+    const label = it.needs_review ? `<span class="warn-text">Not matched to a Briyo product yet — no stock is taken until it is.</span>` : '';
     return `
-        <div class="item-row">
-          <div class="t"><div>${esc(it.title || it.sku || 'Item')}</div>
-            <div class="muted" style="font-size:12px">${[skuLine(o, it),
+        <div class="item-row${it.needs_review ? ' needs-review' : ''}">
+          <div class="t"><div>${esc(it.needs_review ? (it.retailer_product_name || 'Retailer product') : (it.canonical_product && it.retailer_product_name ? it.canonical_product : it.title || it.sku || 'Item'))}</div>
+            <div class="muted" style="font-size:12px">${[it.needs_review ? '' : skuLine(o, it), retailer,
               it.promotion_discount ? `Discount ${esc(money(it.promotion_discount))}` : '',
-              it.shipping_price ? `Shipping ${esc(money(it.shipping_price))}` : ''].filter(Boolean).join(' · ')}</div></div>
-          ${own ? `<div class="n ml-edit"><input class="input ml-qty" type="number" min="1" step="1" inputmode="numeric" value="${esc(it.quantity)}" aria-label="Quantity of ${esc(it.sku)}" data-line-qty="${it.id}" />
-            <button class="btn" type="button" data-line-save="${it.id}">Save</button><button class="linkish" type="button" data-line-remove="${it.id}" data-line-sku="${esc(it.sku)}">Remove</button></div>`
+              it.shipping_price ? `Shipping ${esc(money(it.shipping_price))}` : ''].filter(Boolean).join(' · ')}</div>
+            ${label ? `<div style="font-size:12px">${label}</div>` : ''}
+            ${it.needs_review && open ? `<div class="ml-row ml-match"><select class="select" data-line-match-sku="${it.id}" aria-label="Briyo product for ${esc(it.retailer_product_name || 'this line')}"><option value="">Choose the Briyo product</option>${skuOptions}</select>
+              <button class="btn" type="button" data-line-match="${it.id}">Match product</button></div>` : ''}</div>
+          ${own ? `<div class="n ml-edit"><input class="input ml-qty" type="number" min="1" step="1" inputmode="numeric" value="${esc(it.quantity)}" aria-label="Quantity of ${esc(it.sku || it.retailer_product_name || 'line')}" data-line-qty="${it.id}" />
+            <input class="input ml-amt" inputmode="decimal" value="${esc(it.item_price ?? '')}" placeholder="₹ amount" aria-label="Line amount (₹)" data-line-amt="${it.id}" />
+            <button class="btn" type="button" data-line-save="${it.id}">Save</button><button class="linkish" type="button" data-line-remove="${it.id}" data-line-sku="${esc(it.sku || it.retailer_product_name || 'this line')}">Remove</button></div>`
           : `<div class="n"><div>× ${esc(it.quantity)}</div><div class="muted" style="font-size:12px">${esc(amount(it.item_price))}</div></div>`}
         </div>`;
   };
-  const skus = state.lineSkus || [];
   return `<section class="dsec" id="dItems">
       <h3 class="dsec-title">${manual ? 'Products' : 'Items'} <span class="dsec-meta soft">${count(items.length)} line${items.length === 1 ? '' : 's'} · ${count(units)} unit${units === 1 ? '' : 's'}</span></h3>
       ${items.length ? `<div class="item-list">${items.map(row).join('')}</div>` : ''}
       ${manual && !items.length && !open ? '<p class="muted" style="margin:0">No products recorded on this order.</p>' : ''}
       ${open ? `<div class="ml-add">
-        <p class="muted" style="margin:${items.length ? '12px' : '0'} 0 8px">Add product / inventory line — the master SKU and how many units travel. After the stock cutover a parcel cannot be dispatched until its products are here.</p>
+        <p class="muted" style="margin:${items.length ? '12px' : '0'} 0 8px">Add product / inventory line — the master SKU and how many units travel. After the stock cutover a parcel cannot be dispatched until its products are here.
+          For a retailer that orders by its own product names (e.g. Medkart), add its name and code too; if you are not sure which Briyo product it is, choose "Not matched yet" — it is flagged and takes no stock until matched.</p>
         <div class="ml-row">
-          <select class="select" id="mlSku" aria-label="Product (master SKU)"><option value="">Choose a product</option>${skus.map((k) => `<option value="${k.id}">${esc(k.sku)} — ${esc([k.product_name, k.variant_name].filter(Boolean).join(' '))}</option>`).join('')}</select>
+          <select class="select" id="mlSku" aria-label="Product (master SKU)"><option value="">Choose a product</option><option value="unmatched">Not matched yet (match later)</option>${skuOptions}</select>
           <input class="input ml-qty" id="mlQty" type="number" min="1" step="1" inputmode="numeric" value="1" aria-label="Quantity (units)" />
+          <input class="input ml-amt" id="mlAmt" inputmode="decimal" placeholder="₹ line amount" aria-label="Line amount (₹), optional" />
+        </div>
+        <div class="ml-row">
+          <input class="input" id="mlRName" maxlength="300" placeholder="Retailer's product name (optional)" aria-label="Retailer's product name" />
+          <input class="input" id="mlRCode" maxlength="120" placeholder="Retailer's code (optional)" aria-label="Retailer's product code" />
           <button class="btn" type="button" id="mlAdd">Add product / inventory line</button>
         </div></div>`
       : manual && items.length ? '<p class="muted" style="margin:10px 0 0;font-size:12px">Products are fixed once stock is reserved or the parcel has left.</p>' : ''}
@@ -815,9 +830,13 @@ function describeEvent(e) {
     }
     case 'shopify_sync_conflict': return ['triangle-alert', 'warn', `Shopify sync conflict: ${esc(md.detail || md.kind)}`];
     case 'note_added': return ['message-square-text', '', `Note: ${esc(md.note)}`];
-    case 'item_added': return ['package-plus', 'info', `Product added · ${esc(md.sku)} × ${esc(md.quantity)}`];
+    case 'item_added': return md.needs_review
+      ? ['package-plus', 'warn', `Retailer line added (not matched yet) · ${esc(md.retailer_product)}${md.retailer_code ? ` · code ${esc(md.retailer_code)}` : ''} × ${esc(md.quantity)}`]
+      : ['package-plus', 'info', `Product added · ${esc(md.sku)} × ${esc(md.quantity)}${md.retailer_product ? ` · retailer: ${esc(md.retailer_product)}` : ''}`];
+    case 'item_matched': return ['link', 'info', `Retailer line matched · ${esc(md.retailer_product)}${md.retailer_code ? ` (${esc(md.retailer_code)})` : ''} → <b>${esc(md.sku)}</b>`];
+    case 'item_updated': return ['pencil', '', `Line changed · ${esc(md.sku || md.retailer_product || '')}: ${esc(Object.keys(md.changes || {}).join(', '))}`];
     case 'item_quantity_changed': return ['pencil', '', `Product quantity · ${esc(md.sku)}: ${esc(md.from)} → <b>${esc(md.to)}</b>`];
-    case 'item_removed': return ['package-minus', 'warn', `Product removed · ${esc(md.sku)} × ${esc(md.quantity)}`];
+    case 'item_removed': return ['package-minus', 'warn', `Product removed · ${esc(md.sku || md.retailer_product || 'line')} × ${esc(md.quantity)}`];
     case 'stock_released': return ['package-open', 'warn', `Reserved stock released${md.reason === 'order cancelled' ? ' — order cancelled' : ''}`];
     case 'amazon_import_lines_locked': return ['lock', 'warn', `Amazon import did not change ${md.lines} item${md.lines > 1 ? 's' : ''}: stock for this order has already been dispatched`];
     default: return ['activity', '', esc(label(e.event_type))];
@@ -992,17 +1011,25 @@ dBody.addEventListener('click', async (e) => {
     return closeDrawer();
   }
   // Products on a hand-entered order: nothing is saved until a product and quantity are chosen and added.
-  const lineAct = e.target.closest('#mlAdd, [data-line-save], [data-line-remove]');
+  const lineAct = e.target.closest('#mlAdd, [data-line-save], [data-line-remove], [data-line-match]');
   if (lineAct) {
     const oid = state.detail.order.id;
     let req; let done;
     if (lineAct.id === 'mlAdd') {
       if (!$('#mlSku').value) { $('#dSaved').className = 'saved failed'; $('#dSaved').textContent = 'Choose the product first.'; return; }
-      req = [`/api/orders/${oid}/items`, { method: 'POST', body: JSON.stringify({ sku_id: $('#mlSku').value, quantity: $('#mlQty').value }) }];
-      done = 'Product added';
+      const unmatched = $('#mlSku').value === 'unmatched';
+      req = [`/api/orders/${oid}/items`, { method: 'POST', body: JSON.stringify({ ...(unmatched ? { unmatched: true } : { sku_id: $('#mlSku').value }), quantity: $('#mlQty').value,
+        item_price: $('#mlAmt').value, retailer_product_name: $('#mlRName').value, retailer_product_code: $('#mlRCode').value }) }];
+      done = unmatched ? 'Line added — not matched yet' : 'Product added';
+    } else if (lineAct.dataset.lineMatch) {
+      const sku = $(`[data-line-match-sku="${lineAct.dataset.lineMatch}"]`).value;
+      if (!sku) { $('#dSaved').className = 'saved failed'; $('#dSaved').textContent = 'Choose the Briyo product first.'; return; }
+      req = [`/api/orders/${oid}/items/${lineAct.dataset.lineMatch}/match`, { method: 'POST', body: JSON.stringify({ sku_id: sku }) }];
+      done = 'Line matched';
     } else if (lineAct.dataset.lineSave) {
-      req = [`/api/orders/${oid}/items/${lineAct.dataset.lineSave}`, { method: 'PATCH', body: JSON.stringify({ quantity: $(`[data-line-qty="${lineAct.dataset.lineSave}"]`).value }) }];
-      done = 'Quantity saved';
+      const id = lineAct.dataset.lineSave;
+      req = [`/api/orders/${oid}/items/${id}`, { method: 'PATCH', body: JSON.stringify({ quantity: $(`[data-line-qty="${id}"]`).value, item_price: $(`[data-line-amt="${id}"]`).value }) }];
+      done = 'Line saved';
     } else {
       if (!confirm(`Remove ${lineAct.dataset.lineSku} from this order?`)) return;
       req = [`/api/orders/${oid}/items/${lineAct.dataset.lineRemove}`, { method: 'DELETE' }];
