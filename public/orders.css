@@ -540,3 +540,5 @@ dl.facts dd { margin: 0; min-width: 0; overflow-wrap: anywhere; }
 .rv-cand { border: 1px solid var(--border); border-radius: var(--r-sm, 8px); padding: 10px 12px; margin-bottom: 10px; display: flex; flex-direction: column; gap: 6px; font-size: 13px; }
 .rv-cand .tag { display: inline-block; margin: 2px 4px 0 0; }
 .rv-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+.rv-time { color: var(--text-2); }
+.rv-time.before { color: #B54708; border-color: #FEDF89; }

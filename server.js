@@ -38,7 +38,7 @@ import { ensureAffiliateSchema } from './lib/affiliates.js';
 import { ensureAffiliateVerificationSchema } from './lib/affiliate-verification.js';
 import { ensureHrSchema, retryPendingRemovals } from './lib/hr.js';
 import { overviewFor } from './lib/overview.js';
-import { recoveryReport, decideMatch, revertDecision, decisionHistory } from './lib/recovery-verification.js';
+import { recoveryReport, decideMatch, revertDecision, decisionHistory, ensureRecoverySchema } from './lib/recovery-verification.js';
 import { router as marketingRouter } from './lib/marketing-routes.js';
 import { router as ordersRouter, courierRouter, destinationRouter } from './lib/orders-routes.js';
 import { router as inventoryRouter } from './lib/inventory-routes.js';
@@ -1273,6 +1273,10 @@ app.listen(port, async () => {
       ensureOrderFinancialSnapshotSchema()
         .then(() => console.log('Order financial snapshot schema ready'))
         .catch((e) => console.error('Order financial snapshot schema setup failed (will retry on the next Shopify sync):', e.message));
+      // Recovery verification: its decisions table and the phone index on orders, once, here rather than in a request.
+      ensureRecoverySchema()
+        .then(() => console.log('Recovery verification schema ready'))
+        .catch((e) => console.error('Recovery verification schema setup failed (will retry on first request):', e.message));
       ensureHrSchema()
         .then(() => console.log('HR schema ready'))
         // Resume removals interrupted after the file was deleted are finished here.

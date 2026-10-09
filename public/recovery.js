@@ -20,6 +20,16 @@ const api = async (url, opts = {}) => {
 };
 const note = (msg) => { $('#alerts').innerHTML = msg ? `<div class="alert">${icon('circle-alert')}<span>${esc(msg)}</span></div>` : ''; renderIcons(); };
 const tag = (status, label) => `<span class="tag ${STATUS_TONE[status] || ''}">${esc(label)}</span>`;
+/**
+ * When the order was placed relative to the cart being marked Recovered. An order placed before it cannot have been
+ * prompted by that call; neither says the call caused the purchase.
+ */
+function timing(orderDate, recoveredAt) {
+  if (!orderDate) return '';
+  if (!recoveredAt) return '<span class="tag rv-time">Recovery time not recorded</span>';
+  const before = new Date(orderDate) < new Date(recoveredAt);
+  return `<span class="tag rv-time${before ? ' before' : ''}" title="${before ? 'The order was placed before the agent marked the cart Recovered.' : 'The order was placed after the agent marked the cart Recovered.'}">${before ? 'Ordered before marked Recovered' : 'Ordered after marked Recovered'}</span>`;
+}
 
 async function load() {
   const qs = new URLSearchParams(Object.entries({ from: $('#fFrom').value, to: $('#fTo').value, agent: $('#fAgent').value, window: $('#fWindow').value }).filter(([, v]) => v));
@@ -41,6 +51,8 @@ async function load() {
     s.withoutRecoveryTime ? `${count(s.withoutRecoveryTime)} cart(s) have no recorded recovery time — at most a possible match.` : '',
     s.excludedNoRecoveryTime ? `${count(s.excludedNoRecoveryTime)} cart(s) without a recovery time are left out of this date range.` : '',
     s.paidWithoutValue ? `${count(s.paidWithoutValue)} paid order(s) have no recorded value and are not in the revenue.` : '',
+    s.basis && s.verifiedOrders ? `Counted: ${count(s.basis.verifiedAutomatic)} order(s) matched by the rules and ${count(s.basis.verifiedConfirmed)} confirmed by a person (paid: ${count(s.basis.paidAutomatic)} and ${count(s.basis.paidConfirmed)}). Possible matches and those needing review are never counted.` : '',
+    'Orders placed before a cart was marked Recovered are labelled as such; an order can be associated with a recovered cart without the call having caused it.',
   ].filter(Boolean).join(' ');
   const counts = {}; for (const r of d.results) counts[r.status] = (counts[r.status] || 0) + 1;
   const seg = [['', 'All', d.results.length], ...Object.entries({ verified_paid: 'Verified — paid', verified_placed: 'Verified — order placed', possible: 'Possible match', needs_review: 'Needs review', no_match: 'No matching order', cancelled_refunded: 'Cancelled / refunded' }).map(([k, l]) => [k, l, counts[k] || 0])];
@@ -56,10 +68,10 @@ function renderRows() {
       <td>${r.recoveryTimeRecorded ? esc(when(r.recoveredAt)) : '<span class="warn-text">Not recorded</span>'}<span class="cell-sub muted">${esc(r.method || '')}</span></td>
       <td>${esc(r.agent || '—')}</td>
       <td class="r num">${esc(amt(r.cartValue, r.cartCurrency))}</td>
-      <td>${r.order ? `${esc(r.order.name || r.order.id)}<span class="cell-sub muted">${esc(when(r.order.date))}</span>` : r.candidates.length ? `<span class="muted">${count(r.candidates.length)} candidate${r.candidates.length > 1 ? 's' : ''}</span>` : '—'}</td>
+      <td>${r.order ? `${esc(r.order.name || r.order.id)}<span class="cell-sub muted">${esc(when(r.order.date))}</span><span class="cell-sub">${timing(r.order.date, r.recoveredAt)}</span>` : r.candidates.length ? `<span class="muted">${count(r.candidates.length)} candidate${r.candidates.length > 1 ? 's' : ''}</span>` : '—'}</td>
       <td class="r num">${r.order ? esc(amt(r.order.value, r.order.currency)) : '—'}</td>
       <td>${r.order ? esc(PAYMENT[r.order.payment] || r.order.payment) : '—'}</td>
-      <td>${tag(r.status, r.statusLabel)}<span class="cell-sub muted">${esc(r.reason || '')}</span></td></tr>`).join('')
+      <td>${tag(r.status, r.statusLabel)}${r.tier === 'manual' ? ' <span class="tag">Confirmed by a person</span>' : ''}<span class="cell-sub muted">${esc(r.reason || '')}</span></td></tr>`).join('')
     : '<tr><td colspan="9" class="muted">No recovered carts in this view.</td></tr>';
 }
 
@@ -71,7 +83,7 @@ function openCart(id) {
   $('#dSub').textContent = `Cart ${r.cartRef || r.cartId} · ${r.phone || 'no phone'}`;
   const product = (p) => `${esc(p.title)}${p.sku ? ` <span class="mono muted">${esc(p.sku)}</span>` : ''} × ${count(p.quantity || 1)}`;
   const cand = (c) => `<div class="rv-cand">
-      <div class="rv-cand-h"><b>${esc(c.order.name || c.order.id)}</b> · ${esc(when(c.order.date))} · ${esc(amt(c.order.value, c.order.currency))} · ${esc(PAYMENT[c.order.payment] || c.order.payment)}${c.order.financialStatus ? ` <span class="muted">(${esc(c.order.financialStatus)})</span>` : ''}</div>
+      <div class="rv-cand-h"><b>${esc(c.order.name || c.order.id)}</b> · ${esc(when(c.order.date))} · ${esc(amt(c.order.value, c.order.currency))} · ${esc(PAYMENT[c.order.payment] || c.order.payment)}${c.order.financialStatus ? ` <span class="muted">(${esc(c.order.financialStatus)})</span>` : ''} ${timing(c.order.date, r.recoveredAt)}</div>
       <div class="muted">${c.order.products.map(product).join(' · ') || 'No products recorded'}</div>
       <div>${c.reasons.map((x) => `<span class="tag ok">${esc(x)}</span>`).join(' ')} ${c.conflicts.map((x) => `<span class="tag bad">${esc(x)}</span>`).join(' ')}</div>
       ${r.decision ? '' : `<div class="rv-actions"><button class="btn" type="button" data-decide="confirmed" data-order="${c.order.id}">Confirm this order</button><button class="btn" type="button" data-decide="rejected" data-order="${c.order.id}">Not this order</button></div>`}
@@ -87,7 +99,8 @@ function openCart(id) {
       <dt>Matching window</dt><dd>${esc(when(r.window.from))} → ${esc(when(r.window.to))}</dd>
     </dl></section>
     ${r.order ? `<section class="dsec"><h3 class="dsec-title">Matched order</h3>${cand({ order: r.order, reasons: [r.reason], conflicts: [] }).replace(/<div class="rv-actions">[\s\S]*?<\/div>/, '')}</section>` : ''}
-    ${r.decision ? `<section class="dsec"><h3 class="dsec-title">Decision</h3><p>Confirmed by ${esc(r.decision.by || '—')} on ${esc(when(r.decision.at))}${r.decision.note ? ` — ${esc(r.decision.note)}` : ''}.</p>
+    ${r.decision ? `<section class="dsec"><h3 class="dsec-title">Decision</h3><p>Match confirmed by ${esc(r.decision.by || '—')} on ${esc(when(r.decision.at))}${r.decision.note ? ` — ${esc(r.decision.note)}` : ''}.</p>
+      <p class="muted">A confirmation records which order belongs to this cart. It does not show that the call caused the purchase.</p>
       <button class="btn" type="button" data-revert="${r.decision.id}">Revert this decision</button></section>` : ''}
     ${r.candidates.length && !(r.order && r.candidates.length === 1 && r.candidates[0].order.id === r.order.id && r.status !== 'possible') ? `<section class="dsec"><h3 class="dsec-title">Candidate orders</h3>${r.candidates.map(cand).join('')}</section>` : ''}
     <section class="dsec"><h3 class="dsec-title">Decision history</h3><div id="dHist" class="muted">Loading…</div></section>`;
@@ -107,7 +120,8 @@ $('#dBody').addEventListener('click', async (e) => {
   const btn = d || rv; btn.disabled = true;
   try {
     if (d) {
-      const why = d.dataset.decide === 'rejected' ? prompt('Why is this not the order? (optional)') : prompt('Note (optional)');
+      const why = d.dataset.decide === 'rejected' ? prompt('Why is this not the order? (optional)')
+        : prompt('Confirm that this order belongs to this cart. (This records the match only — not that the call caused the sale.) Note (optional):');
       if (why === null) { btn.disabled = false; return; }
       await api('/api/recovery-verification/decisions', { method: 'POST', body: JSON.stringify({ cart_id: state.open.cartId, order_id: Number(d.dataset.order), decision: d.dataset.decide, note: why }) });
     } else {

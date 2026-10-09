@@ -57,7 +57,7 @@ import { jobPostingLd } from '../lib/careers-pages.js';
 import nodeCrypto from 'node:crypto';
 import { metricsFrom, rawFromRow, rangeParams, classifyMetaError, createMetaClient, createCache, MetaError, createMetaService, metaConfig, todayIn, resolvePurchaseType, _resetMetaService, billingFrom } from '../lib/meta-ads.js';
 import { overviewFor, profileCompleteSql as profileCompleteSqlForTest } from '../lib/overview.js';
-import { phone10, paymentOf, matchRecoveries, summarise } from '../lib/recovery-verification.js';
+import { phone10, paymentOf, matchRecoveries, summarise, ensureRecoverySchema } from '../lib/recovery-verification.js';
 import { ensureAffiliateSchema, newAffiliatePublicId, rateAt, getAffiliateSetting, setAffiliateSetting, purgeTestAffiliates, _resetAffiliateSchemaForTest, createAffiliate } from '../lib/affiliates.js';
 import { receiveOrdersCreate, processWebhookDelivery, processPendingWebhooks, verifyWebhookHmac, ensureShopifyWebhookSchema } from '../lib/shopify-webhooks.js';
 import { startIncrementalSync, shopifySyncStatus, cancelShopifySync, syncBusy, startFullHistorySync, fullHistoryStatus, grantedAccessScopes, hasReadAllOrders, _resetScopeCache, assertNoSyncRunning } from '../lib/shopify-orders.js';
@@ -7628,6 +7628,9 @@ await step('recovery verification: end to end on the database and the real serve
     const c1 = await dec({ cart_id: cartIds[6], order_id: o6, decision: 'confirmed', note: 'customer confirmed on the phone' });
     rep = await report();
     if (c1.status !== 201 || rep.mine[6].status !== 'verified_paid' || rep.mine[6].tier !== 'manual' || rep.mine[7].status !== 'no_match') bad.push(`confirm ${c1.status} ${rep.mine[6]?.status} ${rep.mine[7]?.status}`);
+    const mineTotals = (rp) => summarise(Object.values(rp.mine).map((x) => ({ status: x.status, tier: x.tier, matchedOrder: x.order ? { id: x.order.id, current_total_price: x.order.value, shop_currency: x.order.currency } : null })));
+    const afterConfirm = mineTotals(rep);
+    if (afterConfirm.paidOrders !== 3 || afterConfirm.revenue[0].amount !== 3897 || afterConfirm.basis.paidConfirmed !== 1 || afterConfirm.basis.paidAutomatic !== 2) bad.push(`revenue after confirm ${JSON.stringify(afterConfirm)}`);
     if ((await dec({ cart_id: cartIds[7], order_id: o6, decision: 'confirmed' })).status !== 409) bad.push('the same order confirmed for a second cart');
     if ((await dec({ cart_id: cartIds[3], order_id: o12, decision: 'confirmed' })).status !== 409) bad.push('a non-candidate confirmed');
     const { rows: [d] } = await db.query('SELECT id, auto_result, decided_by FROM recovery_match_decisions WHERE cart_id = $1 AND reverted_at IS NULL', [cartIds[6]]);
@@ -7638,6 +7641,8 @@ await step('recovery verification: end to end on the database and the real serve
     if ((await internal('adm', 'POST', `/api/recovery-verification/decisions/${d.id}/revert`, {})).status !== 404) bad.push('reverted twice');
     rep = await report();
     if (rep.mine[6].status !== 'needs_review') bad.push('revert did not restore the automatic result');
+    const afterRevert = mineTotals(rep);
+    if (afterRevert.paidOrders !== 2 || afterRevert.revenue[0].amount !== 2598 || afterRevert.basis.paidConfirmed !== 0) bad.push(`revenue after revert ${JSON.stringify(afterRevert)}`);
     const hist = (await internal('adm', 'GET', `/api/recovery-verification/carts/${cartIds[6]}/decisions`)).body.decisions;
     if (hist.length !== 1 || !hist[0].reverted_at || !hist[0].reverted_by) bad.push('history lost the reverted decision');
     // Reject one of cart 8's two orders → one candidate left, with no shared product → a possible match only.
@@ -7666,6 +7671,43 @@ await step('recovery verification: end to end on the database and the real serve
   }
   if (bad.length) throw new Error(bad.join(' | '));
   return 'identifier → paid; +91 phone + SKU → paid; pending; after the window → none; no recovery time → possible (and left out of a date range); one order for two carts and two orders for one cart → needs review; cancelled and refunded; no financial record → order placed, payment unknown, no revenue; refresh identical; paid revenue each order once at Shopify\'s current total; agent filter; confirm takes the order from the other cart, a second confirmation and a non-candidate refused, original automatic result kept, decisions not editable/deletable, revert once restores it, history keeps it; rejection applied; non-admins refused (API, decisions, page); cart statuses, orders, stock, shipments, attribution unchanged';
+});
+
+await step('recovery verification: decisions and revenue — confirmed and automatic matches counted once each and reported apart; an order confirmed for one cart is never another cart\'s (identifier included); reject/revert move revenue exactly; possible/needs-review never counted', async () => {
+  const bad = [];
+  const T = Date.parse('2026-10-05T10:00:00Z'); const at = (h) => new Date(T + h * 3600000).toISOString();
+  const cart = (id, o = {}) => ({ id, phone: o.phone ?? `98765100${String(id).padStart(2, '0')}`, abandoned_at: at(-5), received_at: at(-5), marked_at: at(0), items: [], recovered_order_name: o.oname || null });
+  const order = (id, o = {}) => ({ id, shopify_name: o.name || `#${id}`, legacy_id: String(id), customer_phone: o.phone ?? null, order_date: at(2), financial_status: o.fin || 'PAID', current_total_price: o.value ?? 1000, shop_currency: 'INR', lines: [] });
+  const sum = (carts, orders, dec = []) => { const res = matchRecoveries(carts, orders, dec); return { res: Object.fromEntries(res.map((r) => [r.cart.id, r])), s: summarise(res) }; };
+  // Cart 1 has GoKwik's order #X on it; a person confirmed #X for cart 2 → cart 1 is not also verified for it.
+  let { res, s } = sum([cart(1, { phone: '', oname: '#X' }), cart(2)], [order(500, { name: '#X', phone: '9876510002' })], [{ decision: 'confirmed', cart_id: 2, order_id: 500 }]);
+  if (res[2].status !== 'verified_paid' || res[2].tier !== 'manual' || res[1].status !== 'needs_review' || res[1].matchedOrder) bad.push(`identifier vs confirmation ${res[1].status}`);
+  if (s.paidOrders !== 1 || s.revenue[0].amount !== 1000 || s.basis.paidConfirmed !== 1 || s.basis.paidAutomatic !== 0) bad.push(`once ${JSON.stringify(s)}`);
+  // Automatic + confirmed together: reported apart, each order once.
+  ({ res, s } = sum([cart(3), cart(4)], [order(501, { phone: '9876510003', value: 700 }), order(502, { phone: '9876510004', value: 300, fin: 'PENDING' })], [{ decision: 'confirmed', cart_id: 4, order_id: 502 }]));
+  if (s.verifiedOrders !== 2 || s.basis.verifiedAutomatic !== 1 || s.basis.verifiedConfirmed !== 1 || s.paidOrders !== 1 || s.revenue[0].amount !== 700 || s.pendingOrders !== 1) bad.push(`basis ${JSON.stringify(s)}`);
+  // Never counted: possible and needs review (even when they have candidate orders).
+  ({ res, s } = sum([cart(5, { phone: '9876510055' }), cart(6, { phone: '9876510055' }), { ...cart(7), marked_at: null }], [order(503, { phone: '9876510055' }), order(504, { phone: '9876510007', value: 900 })]));
+  if (res[5].status !== 'needs_review' || res[7].status !== 'possible' || s.verifiedOrders !== 0 || s.revenue.length) bad.push(`uncounted ${JSON.stringify(s)}`);
+  if (bad.length) throw new Error(bad.join(' | '));
+  return 'an order confirmed for one cart is never also another cart\'s (the identifier path too) → that cart needs review; one paid order = one count and ₹1,000 once; automatic and confirmed orders counted apart (verified 1+1, paid 1 automatic); possible and needs-review orders never in any total';
+});
+
+await step('recovery verification: schema at start-up — the phone index exists once, valid, created only when missing; repeat and concurrent setup are no-ops; the page labels orders placed before / after the cart was marked Recovered and never presents a confirmation as proof', async () => {
+  const bad = [];
+  await Promise.all([ensureRecoverySchema(), ensureRecoverySchema()]);
+  const { rows } = await getPool().query(`SELECT i.indisvalid, pg_get_indexdef(i.indexrelid) AS def FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid WHERE c.relname = 'orders_website_phone10_idx'`);
+  if (rows.length !== 1 || !rows[0].indisvalid || !/WHERE \(channel = 'website'::text\)/.test(rows[0].def)) bad.push(`index ${JSON.stringify(rows)}`);
+  const lib = await fsp.readFile(new URL('../lib/recovery-verification.js', import.meta.url), 'utf8');
+  if (!/FROM pg_indexes WHERE schemaname = current_schema\(\) AND indexname = 'orders_website_phone10_idx'/.test(lib) || !/\['42P07', '23505'\]\.includes\(err\.code\)/.test(lib)) bad.push('index not created only-when-missing / race-tolerant');
+  const server = await fsp.readFile(new URL('../server.js', import.meta.url), 'utf8');
+  if (!/ensureRecoverySchema\(\)\s*\.then\(\(\) => console\.log\('Recovery verification schema ready'\)\)/.test(server)) bad.push('not set up at start-up');
+  const js = await fsp.readFile(new URL('../public/recovery.js', import.meta.url), 'utf8');
+  for (const t of ['Ordered before marked Recovered', 'Ordered after marked Recovered', 'Recovery time not recorded', 'Confirmed by a person',
+    'It does not show that the call caused the purchase.', 'not that the call caused the sale', 'confirmed by a person (paid:', 'Possible matches and those needing review are never counted.']) if (!js.includes(t)) bad.push(`page text: ${t}`);
+  if ((js.match(/timing\(/g) || []).length < 3) bad.push('timing not shown in the table and the candidates');
+  if (bad.length) throw new Error(bad.join(' | '));
+  return 'one valid partial index (channel = website); setup checks pg_indexes first and tolerates a concurrent creator; run at start-up in the background (requests wait on the same promise); page: before/after/not-recorded labels in the table and on every candidate; confirmation worded as recording the match, not causation; the summary says which orders were rule-matched vs confirmed';
 });
 
 await step('call board: Recovered tab green, Lost tab red (text, count, selected); other tabs unchanged; Recovery verification linked for admins only', async () => {
