@@ -162,8 +162,11 @@ async function swapTo(url, { push, scroll }) {
   }
   // Shell text that differs per page.
   document.title = doc.title;
+  // The top bar stays on screen, but its title element is the incoming page's — id and all: pages write to it
+  // (#topTitle), so keeping the previous page's element left them writing into nothing.
   const topTitle = doc.querySelector('.topbar-title');
-  if (topTitle) document.querySelector('.topbar-title').textContent = topTitle.textContent;
+  const shownTitle = document.querySelector('.topbar-title');
+  if (topTitle && shownTitle) shownTitle.replaceWith(document.importNode(topTitle, true));
   const brand = doc.querySelector('.sidebar .brand');
   if (brand) document.querySelector('.sidebar .brand').innerHTML = brand.innerHTML;
   dropOldStyles();

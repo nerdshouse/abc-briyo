@@ -2662,6 +2662,51 @@ await step('inventory: returns, incoming and alternatives keep the existing perm
   return 'viewer reads returns/incoming, never writes (8 routes 403); logistics-only 403; operator records returns but cannot link variants; catalog-only cannot record stock; page: Nil for 0, near/expired/unknown labels, +N incoming, alternatives line, per-unit totals note, four new forms, buttons gated by inventory.move, near/unknown/incoming filters';
 });
 
+await step('shell navigation: the top bar title is the incoming page\'s element (id included) — arriving at Inventory from Stock outward or Recovery no longer throws "Cannot set properties of null (setting \'textContent\')"', async () => {
+  const bad = [];
+  const nav = await fsp.readFile(new URL('../public/ui/nav.js', import.meta.url), 'utf8');
+  if (!/shownTitle\.replaceWith\(document\.importNode\(topTitle, true\)\)/.test(nav) || /\.topbar-title'\)\.textContent = topTitle\.textContent/.test(nav)) bad.push('nav.js copies text instead of swapping the title element');
+  const dir = new URL('../public/', import.meta.url);
+  for (const f of (await fsp.readdir(dir)).filter((x) => x.endsWith('.html'))) {
+    const html = await fsp.readFile(new URL(f, dir), 'utf8');
+    for (const m of html.matchAll(/<span class="topbar-title"[^>]*>/g)) if (!/id="topTitle"/.test(m[0])) bad.push(`${f}: top bar title without id="topTitle"`);
+  }
+  if (bad.length) throw new Error(bad.join(' | '));
+  return 'nav.js replaces the shown .topbar-title with the incoming page\'s (id kept); every page\'s top bar title carries id="topTitle" (stock-outward and recovery were missing it)';
+});
+
+await step('inventory forms: native date pickers (date-only text, month-only expiry), whole-number quantities, two-decimal amounts, the field is pointed at before anything is sent; the server still refuses malformed input and writes nothing', async () => {
+  const bad = [];
+  const js = await fsp.readFile(new URL('../public/inventory.js', import.meta.url), 'utf8');
+  const form = (kind) => js.slice(js.indexOf(`} else if (kind === '${kind}') {`), js.indexOf('} else if', js.indexOf(`} else if (kind === '${kind}') {`) + 10));
+  const recv = form('receive');
+  for (const t of ["intField('quantity', 'Quantity')", "dateField('mfg_date'", "dateField('expiry_date', 'Expiry', { monthOption: true", "dateField('received_date', 'Received date', { value: istToday(), notFuture: true })"]) if (!recv.includes(t)) bad.push(`receive: ${t}`);
+  for (const n of ['unit_cost', 'selling_price', 'mrp']) if (!recv.includes(`name="${n}" inputmode="decimal" \${MONEY_ATTRS}`)) bad.push(`receive: ${n} not numeric`);
+  if (!/type="\$\{monthOnly \? 'month' : 'date'\}"/.test(js) || !/data-month-for/.test(js)) bad.push('no date / month picker');
+  if (/new Date\([^)]*expiry/.test(js)) bad.push('an expiry passes through a JS Date');
+  if (!/const problem = checkFields\(f\);\s*formError\(problem\);\s*if \(problem\) return;/.test(js)) bad.push('no check before sending');
+  if (/name="(quantity|expected_quantity|accepted_quantity)" inputmode="numeric" required/.test(js)) bad.push('a text quantity input remains');
+  if (!/\.fld \.opt \{/.test(await fsp.readFile(new URL('../public/orders.css', import.meta.url), 'utf8')) || /<em>optional<\/em>/i.test(js)) bad.push('optional shown in the required style');
+  // Server: malformed quantities are refused and nothing reaches the ledger; dates are stored exactly as sent.
+  const sku = (await createSku({ sku: `${TS} FORME COLLAGEN FORM TEST`, product_name: 'Form test', unit_type: 'sachet' }, { actor: ACTOR })).id;
+  const ledger0 = await ledgerSum(sku);
+  for (const q of ['abc', '1.5', '-3', '0', 'Infinity', 'NaN', '1e3', ' ', '', '10000001', '12abc']) {
+    await expectErr(`quantity ${JSON.stringify(q)}`, () => receiveInventory({ sku_id: sku, batch_number: 'FT-1', quantity: q, request_id: rid() }, { actor: ACTOR }), (e) => e.status === 400);
+  }
+  for (const [label, patch] of [['unit cost text', { unit_cost: 'abc' }], ['unit cost 3 decimals', { unit_cost: '1.555' }], ['bad date', { expiry_date: '2028-02-30' }], ['bad month', { expiry_date: '2028-13' }]]) {
+    await expectErr(label, () => receiveInventory({ sku_id: sku, batch_number: 'FT-1', quantity: '5', request_id: rid(), ...patch }, { actor: ACTOR }), (e) => e.status === 400);
+  }
+  if ((await ledgerSum(sku)) !== ledger0 || (await getPool().query('SELECT count(*)::int n FROM inventory_batches WHERE sku_id = $1', [sku])).rows[0].n !== 0) bad.push('a refused receipt wrote something');
+  const r1 = await receiveInventory({ sku_id: sku, batch_number: 'FT-1', quantity: '5', mfg_date: '2026-08-01', expiry_date: '2028-08', received_date: dayOffset(0), unit_cost: '180.50', request_id: rid() }, { actor: ACTOR });
+  const b = (await getPool().query(`SELECT mfg_date::text m, expiry_date::text e, received_date::text r, unit_cost::text c FROM inventory_batches WHERE id = $1`, [r1.batchId])).rows[0];
+  if (b.m !== '2026-08-01' || b.e !== '2028-08-31' || b.r !== dayOffset(0) || b.c !== '180.50') bad.push(`stored ${JSON.stringify(b)}`);
+  // A SKU code with spaces moves stock like any other: receive, adjust, overview search.
+  await adjustStock({ movement_type: 'damaged', batch_id: r1.batchId, quantity: '2', reason: 'Torn sachets', request_id: rid() }, { actor: ACTOR });
+  if ((await getSku(sku)).available !== 3 || !(await inventoryOverview({ q: 'collagen form test' })).rows.some((r) => r.sku_id === sku)) bad.push('space SKU movement/search');
+  if (bad.length) throw new Error(bad.join(' | '));
+  return 'receive form: number quantity, date pickers (mfg, expiry with month-only switch, received ≤ today IST), numeric CP/SP/MRP; checked before sending; server refuses abc / 1.5 / −3 / 0 / Infinity / NaN / 1e3 / blank / > 10M / 12abc, text and 3-decimal costs, 30 Feb and month 13 — no batch, no ledger row; 2026-08-01 and 2028-08 stored as 2026-08-01 / 2028-08-31, ₹180.50 kept; a spaced SKU code receives, adjusts (5 − 2 = 3) and is found by search';
+});
+
 await step('inventory: month-only expiry is the last calendar day, stored as a date, never shifted', async () => {
   const id = (await createSku({ sku: `${TS}-EXPIRY`, product_name: 'Expiry dates' }, { actor: ACTOR })).id;
   const cases = [['08/2028', '2028-08-31'], ['2028-08', '2028-08-31'], ['02/2028', '2028-02-29'], ['02/2027', '2027-02-28'], ['31/12/2029', '2029-12-31'], ['2029-01-15', '2029-01-15']];
@@ -5905,7 +5950,7 @@ await step('inventory page: Add inventory and batch forms show CP, SP and MRP as
     if (/Unit cost/.test(f) || /<select[^>]*name="(price_type|price_kind)"/.test(f)) bad.push(`${kind}: old field or a dropdown`);
   }
   const recv = form('receive');
-  for (const n of ['sku_id', 'batch_number', 'quantity', 'mfg_date', 'expiry_date', 'received_date', 'supplier_name', 'po_number', 'grn_number', 'warehouse_id', 'location', 'coa', 'notes']) if (!recv.includes(`name="${n}"`)) bad.push(`receive lost ${n}`);
+  for (const n of ['sku_id', 'batch_number', 'quantity', 'mfg_date', 'expiry_date', 'received_date', 'supplier_name', 'po_number', 'grn_number', 'warehouse_id', 'location', 'coa', 'notes']) if (!recv.includes(`name="${n}"`) && !new RegExp(`(intField|dateField)\\('${n}'`).test(recv)) bad.push(`receive lost ${n}`);
   if (!/\.price-row \{[^}]*grid-template-columns: repeat\(3, minmax\(0, 1fr\)\)/.test(css) || !/@media \(max-width: 760px\) \{ \.price-row \{ grid-template-columns: 1fr; \}/.test(css)) bad.push('layout');
   if (bad.length) throw new Error(bad.join(' | '));
   return 'both forms: three labelled inputs (unit_cost/selling_price/mrp, decimal keypad) with their helper texts, no dropdown, no "Unit cost"; receipt keeps SKU, batch, quantity, dates, received date, supplier, PO, GRN, warehouse, location, COA, notes; 3 columns on desktop, 1 below 760 px';

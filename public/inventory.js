@@ -524,8 +524,8 @@ function openForm(kind, ctx = {}) {
       <label class="fld"><span>Status</span><select class="select" name="active">${opt('true', 'Active', s.active !== false)}${opt('false', 'Inactive', s.active === false)}</select></label>
       <label class="fld"><span>Inventory</span><select class="select" name="track_inventory">${opt('true', 'Tracked (physical stock)', s.track_inventory !== false)}${opt('false', 'Not tracked', s.track_inventory === false)}</select>
         <span class="help">Tracked SKUs must have stock reserved before a shipment can be dispatched.</span></label>
-      <label class="fld"><span>Reorder level</span><input class="input" name="reorder_level" inputmode="numeric" value="${esc(s.reorder_level ?? '')}" placeholder="0" /></label>
-      <label class="fld"><span>Reorder quantity</span><input class="input" name="reorder_quantity" inputmode="numeric" value="${esc(s.reorder_quantity ?? '')}" placeholder="0" /></label>
+      <label class="fld"><span>Reorder level</span><input class="input" name="reorder_level" type="number" inputmode="numeric" step="1" min="0" data-kind="int" value="${esc(s.reorder_level ?? '')}" placeholder="0" /></label>
+      <label class="fld"><span>Reorder quantity</span><input class="input" name="reorder_quantity" type="number" inputmode="numeric" step="1" min="0" data-kind="int" value="${esc(s.reorder_quantity ?? '')}" placeholder="0" /></label>
     </div></section>
     <section class="dsec"><h3 class="dsec-title">Amazon listing details <span class="dsec-meta soft">optional</span></h3>
       <p class="imp-note" style="margin:0 0 10px">Amazon seller SKUs, like every platform's SKUs, are added under <b>Platform SKUs</b> on this product's page.</p>
@@ -577,19 +577,18 @@ function openForm(kind, ctx = {}) {
     body = `<section class="dsec"><div class="form-grid">
       <label class="fld wide"><span>SKU</span><select class="select" name="sku_id" required>${skuOptions(ctx.skuId || '')}</select></label>
       <label class="fld"><span>Batch number</span><input class="input mono" name="batch_number" required maxlength="80" autocomplete="off" /></label>
-      <label class="fld"><span>Quantity</span><input class="input" name="quantity" inputmode="numeric" required /></label>
-      <label class="fld"><span>Manufacturing date</span><input class="input" name="mfg_date" placeholder="08-2026 or 01-08-2026" autocomplete="off" /></label>
-      <label class="fld"><span>Expiry</span><input class="input" name="expiry_date" placeholder="08-2028 or 31-08-2028" autocomplete="off" />
-        <span class="help">A month alone means its last day: 08/2028 = 31 Aug 2028.</span></label>
+      ${intField('quantity', 'Quantity')}
+      ${dateField('mfg_date', 'Manufacturing date')}
+      ${dateField('expiry_date', 'Expiry', { monthOption: true, help: 'Leave empty if the batch has no expiry date; it shows as Unknown expiry.' })}
       <div class="price-row wide">
-        <label class="fld"><span>Cost Price (CP) ₹</span><input class="input" name="unit_cost" inputmode="decimal" placeholder="180" />
+        <label class="fld"><span>Cost Price (CP) ₹</span><input class="input" name="unit_cost" inputmode="decimal" ${MONEY_ATTRS} placeholder="180" />
           <span class="help">Purchase cost per unit paid by Briyo.</span></label>
-        <label class="fld"><span>Selling Price (SP) ₹</span><input class="input" name="selling_price" inputmode="decimal" placeholder="249" />
+        <label class="fld"><span>Selling Price (SP) ₹</span><input class="input" name="selling_price" inputmode="decimal" ${MONEY_ATTRS} placeholder="249" />
           <span class="help">Selling price per unit charged to customers.</span></label>
-        <label class="fld"><span>Maximum Retail Price (MRP) ₹</span><input class="input" name="mrp" inputmode="decimal" placeholder="299" />
+        <label class="fld"><span>Maximum Retail Price (MRP) ₹</span><input class="input" name="mrp" inputmode="decimal" ${MONEY_ATTRS} placeholder="299" />
           <span class="help">Maximum retail price printed on the product packaging.</span></label>
       </div>
-      <label class="fld"><span>Received date</span><input class="input" name="received_date" placeholder="Today if empty" autocomplete="off" /></label>
+      ${dateField('received_date', 'Received date', { value: istToday(), notFuture: true })}
       <label class="fld"><span>Supplier</span><input class="input" name="supplier_name" list="supList" maxlength="120" autocomplete="off" /><datalist id="supList">${sup}</datalist>
         <span class="help">Pick one or type a new name; it is added to the supplier list.</span></label>
       <label class="fld"><span>PO number</span><input class="input mono" name="po_number" maxlength="80" /></label>
@@ -610,7 +609,7 @@ function openForm(kind, ctx = {}) {
         const mt = m.movementTypes.find((x) => x.key === t);
         return opt(t, `${mt.sign > 0 ? '+' : '−'} ${mt.label}`, false);
       }).join('')}</select></label>
-      <label class="fld"><span>Quantity</span><input class="input" name="quantity" inputmode="numeric" required /></label>
+      ${intField('quantity', 'Quantity')}
       <label class="fld wide"><span>Reason</span><input class="input" name="reason" required maxlength="300" placeholder="${kind === 'return' ? 'Returned sealed, inspected and sellable' : '5 bottles damaged during handling'}" /></label>
       ${kind === 'return' ? `<label class="fld"><span>Return / order reference</span><input class="input mono" name="reference_id" required maxlength="80" /></label>
         <p class="imp-note wide">Only sellable returns come back into stock. A damaged return is not added here.</p>` : ''}
@@ -622,7 +621,7 @@ function openForm(kind, ctx = {}) {
     submit = 'Transfer';
     body = `<section class="dsec"><div class="form-grid">
       <label class="fld"><span>To warehouse</span><select class="select" name="to_warehouse_id" required>${m.warehouses.filter((w) => w.active && w.id !== batch.warehouse_id).map((w) => opt(w.id, w.name)).join('')}</select></label>
-      <label class="fld"><span>Quantity</span><input class="input" name="quantity" inputmode="numeric" required /></label>
+      ${intField('quantity', 'Quantity')}
       <label class="fld"><span>Location / rack there</span><input class="input" name="location" maxlength="80" /></label>
       <label class="fld wide"><span>Notes</span><textarea class="input" name="notes" maxlength="1000"></textarea></label>
     </div></section>`;
@@ -636,16 +635,15 @@ function openForm(kind, ctx = {}) {
       <label class="fld"><span>Reason for a status change</span><input class="input" name="reason" maxlength="300" /></label>
       <label class="fld"><span>Location / rack</span><input class="input" name="location" value="${esc(batch.location || '')}" maxlength="80" /></label>
       <div class="price-row wide">
-        <label class="fld"><span>Cost Price (CP) ₹</span><input class="input" name="unit_cost" inputmode="decimal" placeholder="180" value="${esc(batch.unit_cost ?? '')}" />
+        <label class="fld"><span>Cost Price (CP) ₹</span><input class="input" name="unit_cost" inputmode="decimal" ${MONEY_ATTRS} placeholder="180" value="${esc(batch.unit_cost ?? '')}" />
           <span class="help">Purchase cost per unit paid by Briyo.</span></label>
-        <label class="fld"><span>Selling Price (SP) ₹</span><input class="input" name="selling_price" inputmode="decimal" placeholder="249" value="${esc(batch.selling_price ?? '')}" />
+        <label class="fld"><span>Selling Price (SP) ₹</span><input class="input" name="selling_price" inputmode="decimal" ${MONEY_ATTRS} placeholder="249" value="${esc(batch.selling_price ?? '')}" />
           <span class="help">Selling price per unit charged to customers.</span></label>
-        <label class="fld"><span>Maximum Retail Price (MRP) ₹</span><input class="input" name="mrp" inputmode="decimal" placeholder="299" value="${esc(batch.mrp ?? '')}" />
+        <label class="fld"><span>Maximum Retail Price (MRP) ₹</span><input class="input" name="mrp" inputmode="decimal" ${MONEY_ATTRS} placeholder="299" value="${esc(batch.mrp ?? '')}" />
           <span class="help">Maximum retail price printed on the product packaging.</span></label>
       </div>
-      <label class="fld"><span>Manufacturing date</span><input class="input" name="mfg_date" value="${esc(batch.mfg_date ? formatDayKey(batch.mfg_date) : '')}" placeholder="08-2026" autocomplete="off" /></label>
-      <label class="fld"><span>Expiry</span><input class="input" name="expiry_date" value="${esc(batch.expiry_date ? formatDayKey(batch.expiry_date) : '')}" placeholder="08-2028 or 31-08-2028" autocomplete="off" />
-        <span class="help">A month alone means its last day.</span></label>
+      ${dateField('mfg_date', 'Manufacturing date', { value: batch.mfg_date || '' })}
+      ${dateField('expiry_date', 'Expiry', { value: batch.expiry_date || '', monthOption: true })}
       <label class="fld"><span>PO number</span><input class="input mono" name="po_number" value="${esc(batch.po_number || '')}" /></label>
       <label class="fld"><span>GRN number</span><input class="input mono" name="grn_number" value="${esc(batch.grn_number || '')}" /></label>
       <label class="fld wide"><span>Notes</span><textarea class="input" name="notes" maxlength="1000">${esc(batch.notes || '')}</textarea></label>
@@ -659,8 +657,8 @@ function openForm(kind, ctx = {}) {
     body = `<section class="dsec"><div class="form-grid">
       <label class="fld wide"><span>SKU</span>${skuSel ? `<input type="hidden" name="sku_id" value="${esc(skuSel)}" /><span class="mono">${esc(state.detail.sku.sku)}</span>`
         : `<select class="select" name="sku_id" required>${skuOptions('')}</select><span class="help">To put sellable units back into a batch, open the SKU and use Return stock there (its batches are listed).</span>`}</label>
-      <label class="fld"><span>Quantity${skuSel ? ` (${esc(state.detail.sku.unit_type || 'units')})` : ''}</span><input class="input" name="quantity" inputmode="numeric" required /></label>
-      <label class="fld"><span>Return date</span><input class="input" name="return_date" placeholder="DD-MM-YYYY (today if blank)" autocomplete="off" /></label>
+      <label class="fld"><span>Quantity${skuSel ? ` (${esc(state.detail.sku.unit_type || 'units')})` : ''}</span><input class="input" id="ff-quantity" name="quantity" type="number" inputmode="numeric" step="1" min="1" max="10000000" data-kind="int" required /></label>
+      ${dateField('return_date', 'Return date', { value: istToday(), notFuture: true })}
       <label class="fld"><span>Condition</span><select class="select" name="condition" required>${opt('', 'Choose…', true)}${Object.entries(m.returnConditions || {}).map(([k, t]) => opt(k, t)).join('')}</select></label>
       <label class="fld"><span>Batch it came from</span><select class="select" name="batch_id">${opt('', batchesOf.length ? 'Choose the batch' : 'Unknown', !ctx.batchId)}${batchesOf.map((b) => opt(b.id, `${b.batch_number}${b.expiry_date ? ` · exp ${day(b.expiry_date)}` : ' · expiry unknown'} · ${STATUS[b.effective_status]?.[1] || b.effective_status}`, b.id === ctx.batchId)).join('')}</select>
         <span class="help">Required for sellable units. An expired or held batch cannot take sellable units back.</span></label>
@@ -679,14 +677,14 @@ function openForm(kind, ctx = {}) {
     submit = 'Save expectation';
     body = `<section class="dsec"><div class="form-grid">
       <label class="fld wide"><span>SKU</span><select class="select" name="sku_id" required>${skuOptions(ctx.skuId || '')}</select></label>
-      <label class="fld"><span>Expected quantity</span><input class="input" name="expected_quantity" inputmode="numeric" required /></label>
-      <label class="fld"><span>Expected arrival</span><input class="input" name="expected_date" placeholder="DD-MM-YYYY" autocomplete="off" /></label>
+      ${intField('expected_quantity', 'Expected quantity')}
+      ${dateField('expected_date', 'Expected arrival')}
       <label class="fld"><span>Stage</span><select class="select" name="status">${opt('planned', 'Planned', true)}${opt('ordered', 'Ordered')}${opt('in_transit', 'In transit')}</select></label>
       <label class="fld"><span>Supplier</span><input class="input" name="supplier_name" list="supList" maxlength="120" /><datalist id="supList">${m.suppliers.map((x) => `<option value="${esc(x.name)}">`).join('')}</datalist></label>
       <label class="fld"><span>PO / reference</span><input class="input mono" name="reference" maxlength="80" /></label>
       <label class="fld"><span>Batch number (if known)</span><input class="input mono" name="batch_number" maxlength="80" /></label>
-      <label class="fld"><span>Manufacturing date (if known)</span><input class="input" name="mfg_date" placeholder="08-2026" autocomplete="off" /></label>
-      <label class="fld"><span>Expiry (if known)</span><input class="input" name="expiry_date" placeholder="08-2028" autocomplete="off" /></label>
+      ${dateField('mfg_date', 'Manufacturing date (if known)')}
+      ${dateField('expiry_date', 'Expiry (if known)', { monthOption: true })}
       <label class="fld wide"><span>Notes</span><textarea class="input" name="notes" maxlength="1000"></textarea></label>
     </div></section>`;
   } else if (kind === 'incoming-list') {
@@ -707,11 +705,11 @@ function openForm(kind, ctx = {}) {
     sub = `${i.sku} · expected ${plural(i.expected_quantity, i.unit)}, ${count(i.received_quantity)} received so far. It waits for acceptance before it becomes stock.`;
     submit = 'Record delivery';
     body = `<section class="dsec"><div class="form-grid">
-      <label class="fld"><span>Quantity received</span><input class="input" name="quantity" inputmode="numeric" required value="${esc(Math.max(i.expected_quantity - i.received_quantity, 0) || '')}" /></label>
+      ${intField('quantity', 'Quantity received', { value: Math.max(i.expected_quantity - i.received_quantity, 0) || '', unit: i.unit })}
       <label class="fld"><span>Batch number</span><input class="input mono" name="batch_number" maxlength="80" value="${esc(i.batch_number || '')}" required /></label>
-      <label class="fld"><span>Manufacturing date</span><input class="input" name="mfg_date" placeholder="08-2026" value="${esc(i.mfg_date ? formatDayKey(i.mfg_date) : '')}" autocomplete="off" /></label>
-      <label class="fld"><span>Expiry</span><input class="input" name="expiry_date" placeholder="Leave blank if unknown" value="${esc(i.expiry_date ? formatDayKey(i.expiry_date) : '')}" autocomplete="off" /></label>
-      <label class="fld"><span>Received on</span><input class="input" name="received_date" placeholder="DD-MM-YYYY (today if blank)" autocomplete="off" /></label>
+      ${dateField('mfg_date', 'Manufacturing date', { value: i.mfg_date || '' })}
+      ${dateField('expiry_date', 'Expiry', { value: i.expiry_date || '', monthOption: true, help: 'Leave empty if unknown.' })}
+      ${dateField('received_date', 'Received on', { value: istToday(), notFuture: true })}
       <label class="fld"><span>Warehouse</span><select class="select" name="warehouse_id">${wh('')}</select></label>
       <label class="fld wide"><span>Notes</span><textarea class="input" name="notes" maxlength="1000"></textarea></label>
     </div></section>`;
@@ -722,7 +720,7 @@ function openForm(kind, ctx = {}) {
     submit = 'Save decision';
     body = `<section class="dsec"><div class="form-grid">
       <label class="fld"><span>Decision</span><select class="select" name="decision">${opt('accept', 'Accept into stock', true)}${opt('reject', 'Reject all of it')}</select></label>
-      <label class="fld"><span>Quantity accepted</span><input class="input" name="accepted_quantity" inputmode="numeric" value="${esc(x.quantity)}" />
+      <label class="fld"><span>Quantity accepted</span><input class="input" id="ff-accepted_quantity" name="accepted_quantity" type="number" inputmode="numeric" step="1" min="1" max="${esc(x.quantity)}" data-kind="int" value="${esc(x.quantity)}" />
         <span class="help">Less than received needs a reason below.</span></label>
       <label class="fld wide"><span>Reason / note</span><input class="input" name="note" maxlength="300" placeholder="10 sachets torn" /></label>
     </div></section>`;
@@ -768,6 +766,52 @@ function closeForm() {
   state.form = null;
 }
 const formError = (msg) => { const e = $('#fError'); e.textContent = msg; e.hidden = !msg; };
+
+/*
+ * Form controls. Dates are native date pickers (typing still works): their value is the calendar date
+ * 'YYYY-MM-DD' exactly as chosen, sent as text — never through a JS Date, so no timezone can move it. An expiry
+ * may be month-only, as printed on a label: the picker then switches to a month and the server stores that
+ * month's last day. Quantities are whole numbers, amounts have at most two decimals. The checks below only
+ * point at the field before anything is sent; the server checks everything again.
+ */
+const istToday = () => new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Kolkata' }).format(new Date());
+const fieldId = (name) => `ff-${name}`;
+function dateField(name, label, { value = '', required = false, notFuture = false, monthOption = false, help = '', wide = false } = {}) {
+  const monthOnly = monthOption && /^\d{4}-\d{2}$/.test(value);
+  // A div, not a label: the month-only switch has its own label, and labels never nest.
+  return `<div class="fld${wide ? ' wide' : ''}"><span><label for="${fieldId(name)}">${esc(label)}</label>${required ? '' : ' <span class="opt">optional</span>'}</span>
+    <input class="input" id="${fieldId(name)}" name="${name}" type="${monthOnly ? 'month' : 'date'}" value="${esc(value)}" data-kind="date"${required ? ' required' : ''}${notFuture ? ` max="${istToday()}"` : ''} />
+    ${monthOption ? `<span class="month-only"><input type="checkbox" data-month-for="${name}"${monthOnly ? ' checked' : ''} id="${fieldId(name)}-m" /><label for="${fieldId(name)}-m">Label shows a month only (stored as the month's last day)</label></span>` : ''}
+    ${help ? `<span class="help">${help}</span>` : ''}</div>`;
+}
+function intField(name, label, { value = '', required = true, min = 1, max = 10000000, help = '', unit = '' } = {}) {
+  return `<label class="fld"><span>${esc(label)}${unit ? ` (${esc(unit)})` : ''}${required ? '' : ' <span class="opt">optional</span>'}</span>
+    <input class="input" id="${fieldId(name)}" name="${name}" type="number" inputmode="numeric" step="1" min="${min}" max="${max}" value="${esc(value)}" data-kind="int"${required ? ' required' : ''} />
+    ${help ? `<span class="help">${help}</span>` : ''}</label>`;
+}
+const MONEY_ATTRS = 'type="number" min="0" step="0.01" data-kind="money"';
+const labelOf = (el) => (el.closest('.fld')?.querySelector(':scope > span')?.childNodes[0]?.textContent || el.name).trim();
+/** The first problem in the form, marked on its field; '' when there is none. */
+function checkFields(form) {
+  let first = null; let msg = '';
+  for (const el of form.querySelectorAll('input[data-kind], select[required], input[required], textarea[required]')) {
+    if (el.disabled || el.type === 'hidden') continue;
+    const v = el.value.trim(); const name = labelOf(el);
+    let bad = '';
+    if (el.validity?.badInput) bad = el.dataset.kind === 'date' ? `${name}: choose a valid date.` : el.dataset.kind === 'money' ? `${name} must be an amount like 180 or 175.50.` : `${name} must be a whole number.`;
+    else if (!v && el.required) bad = `${name} is required.`;
+    else if (v && el.dataset.kind === 'int' && !/^\d+$/.test(v)) bad = `${name} must be a whole number.`;
+    else if (v && el.dataset.kind === 'int' && Number(v) < Number(el.min || 0)) bad = `${name} must be at least ${el.min}.`;
+    else if (v && el.dataset.kind === 'int' && Number(v) > Number(el.max || Infinity)) bad = `${name} is too large.`;
+    else if (v && el.dataset.kind === 'money' && !/^\d+(\.\d{1,2})?$/.test(v)) bad = `${name} must be an amount like 180 or 175.50.`;
+    else if (v && el.dataset.kind === 'date' && el.max && v > el.max) bad = `${name} cannot be in the future.`;
+    el.toggleAttribute('aria-invalid', Boolean(bad));
+    if (bad) el.setAttribute('aria-describedby', 'fError'); else el.removeAttribute('aria-describedby');
+    if (bad && !first) { first = el; msg = bad; }
+  }
+  if (first) first.focus();
+  return msg;
+}
 
 async function uploadDoc(batchId, file, type = 'coa') {
   const res = await fetch(`/api/inventory/batches/${batchId}/documents?type=${encodeURIComponent(type)}`, {
@@ -886,9 +930,12 @@ async function submitForm(e) {
     return;
   }
   const f = $('#invForm');
+  // Point at the field first; nothing is sent while a field is invalid (the server checks again regardless).
+  const problem = checkFields(f);
+  formError(problem);
+  if (problem) return;
   const v = Object.fromEntries(new FormData(f).entries());
   delete v.coa;
-  formError('');
   $('#fSubmit').disabled = true;
   $('#fSaved').textContent = 'Saving…';
   try {
@@ -968,8 +1015,8 @@ async function submitForm(e) {
       const batch = state.detail.batches.find((b) => b.id === ctx.batchId);
       if (v.status === batch.status) delete v.status;
       // Shown as DD-MM-YYYY; unchanged when it still reads the same date.
-      if (v.mfg_date === (batch.mfg_date ? formatDayKey(batch.mfg_date) : '')) delete v.mfg_date;
-      if (v.expiry_date === (batch.expiry_date ? formatDayKey(batch.expiry_date) : '')) delete v.expiry_date;
+      if (v.mfg_date === (batch.mfg_date || '')) delete v.mfg_date;
+      if (v.expiry_date === (batch.expiry_date || '')) delete v.expiry_date;
       await api(`/api/inventory/batches/${ctx.batchId}`, { method: 'PATCH', body: JSON.stringify({ ...v, version: batch.version }) });
       openAfter = state.detail.sku.id;
     }
@@ -1075,6 +1122,19 @@ function bind() {
   });
   $('#invForm').addEventListener('input', (e) => {
     if (e.target.id === 'dupReason') $('#fSubmit').disabled = !e.target.value.trim();
+    // Editing a field marked wrong clears its mark; the message goes when nothing is marked any more.
+    if (e.target.hasAttribute('aria-invalid')) {
+      e.target.removeAttribute('aria-invalid'); e.target.removeAttribute('aria-describedby');
+      if (!$('#invForm [aria-invalid]')) formError('');
+    }
+  });
+  // "Label shows a month only": the expiry picker becomes a month picker (and back), keeping what was chosen.
+  $('#invForm').addEventListener('change', (e) => {
+    const name = e.target.dataset?.monthFor;
+    if (!name) return;
+    const input = $(`#invForm [name="${name}"]`);
+    const v = input.value;
+    if (e.target.checked) { input.type = 'month'; input.value = v ? v.slice(0, 7) : ''; } else { input.type = 'date'; input.value = /^\d{4}-\d{2}$/.test(v) ? '' : v; }
   });
   $('#invForm').addEventListener('change', async (e) => {
     if (e.target.id !== 'impFile') return;
