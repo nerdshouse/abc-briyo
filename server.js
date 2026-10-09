@@ -38,6 +38,7 @@ import { ensureAffiliateSchema } from './lib/affiliates.js';
 import { ensureAffiliateVerificationSchema } from './lib/affiliate-verification.js';
 import { ensureHrSchema, retryPendingRemovals } from './lib/hr.js';
 import { overviewFor } from './lib/overview.js';
+import { recoveryReport, decideMatch, revertDecision, decisionHistory, ensureRecoverySchema } from './lib/recovery-verification.js';
 import { router as marketingRouter } from './lib/marketing-routes.js';
 import { router as ordersRouter, courierRouter, destinationRouter } from './lib/orders-routes.js';
 import { router as inventoryRouter } from './lib/inventory-routes.js';
@@ -777,6 +778,35 @@ function requireAdminPage(req, res, next) {
 
 app.get('/dashboard', requireAdminPage, (_req, res) => res.sendFile(path.join(PUBLIC, 'dashboard.html')));
 
+// Recovery verification (Support): recovered carts against the Shopify orders already imported. Admin-only, like the
+// dashboard: it shows every agent's carts with customer phones and order money. Read-only except a person's decision
+// on a proposed match (lib/recovery-verification.js).
+app.get('/recovery-verification', requireAdminPage, (_req, res) => res.sendFile(path.join(PUBLIC, 'recovery.html')));
+app.get('/api/recovery-verification', requireAdmin, async (req, res) => {
+  try {
+    if (MOCK) return res.status(400).json({ ok: false, error: 'Recovery verification needs a database.' });
+    const day = (v) => (/^\d{4}-\d{2}-\d{2}$/.test(String(v || '')) ? String(v) : undefined);
+    res.json({ ok: true, ...(await recoveryReport({ from: day(req.query.from), to: day(req.query.to), agent: req.query.agent ? String(req.query.agent).slice(0, 120) : undefined, windowHours: req.query.window })) });
+  } catch (err) { recoveryError(res, err); }
+});
+app.get('/api/recovery-verification/carts/:id/decisions', requireAdmin, async (req, res) => {
+  try { res.json({ ok: true, decisions: await decisionHistory(req.params.id) }); } catch (err) { recoveryError(res, err); }
+});
+app.post('/api/recovery-verification/decisions', requireAdmin, async (req, res) => {
+  try {
+    const { cart_id: cartId, order_id: orderId, decision, note } = req.body ?? {};
+    res.status(201).json({ ok: true, ...(await decideMatch({ cartId, orderId, decision, note }, { actor: await currentUserName(req) })) });
+  } catch (err) { recoveryError(res, err); }
+});
+app.post('/api/recovery-verification/decisions/:id/revert', requireAdmin, async (req, res) => {
+  try { res.json({ ok: true, ...(await revertDecision(req.params.id, { actor: await currentUserName(req) })) }); } catch (err) { recoveryError(res, err); }
+});
+function recoveryError(res, err) {
+  if (err.status && err.status < 500) return res.status(err.status).json({ ok: false, error: err.message });
+  console.error('Recovery verification failed:', String(err.message).slice(0, 300));
+  return res.status(500).json({ ok: false, error: 'Something went wrong.' });
+}
+
 /** Everything the overview needs, in one round trip. Admin-only: it aggregates
  *  every caller's performance, which is not the whole team's business. */
 app.get('/api/admin/overview', requireAdmin, async (req, res) => {
@@ -1243,6 +1273,10 @@ app.listen(port, async () => {
       ensureOrderFinancialSnapshotSchema()
         .then(() => console.log('Order financial snapshot schema ready'))
         .catch((e) => console.error('Order financial snapshot schema setup failed (will retry on the next Shopify sync):', e.message));
+      // Recovery verification: its decisions table and the phone index on orders, once, here rather than in a request.
+      ensureRecoverySchema()
+        .then(() => console.log('Recovery verification schema ready'))
+        .catch((e) => console.error('Recovery verification schema setup failed (will retry on first request):', e.message));
       ensureHrSchema()
         .then(() => console.log('HR schema ready'))
         // Resume removals interrupted after the file was deleted are finished here.
