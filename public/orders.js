@@ -1817,24 +1817,52 @@ async function stopShopifySync() {
   if (b.dataset.mode !== 'running' || b.disabled) return;
   shopifyBusy(true, 'stopping');
   syncNote('Stopping the Shopify sync after the current page…');
-  try { await api('/api/orders/shopify/sync/cancel', { method: 'POST' }); } catch (err) {
-    // Nothing running any more (it just finished): the status poll shows how it ended.
-    if (err.status !== 409) { shopifyBusy(true); syncNote(esc(err.message), 'error'); }
+  // The run being stopped (from the last status): the server refuses a stop meant for a run that already ended.
+  try { await api('/api/orders/shopify/sync/cancel', { method: 'POST', body: JSON.stringify({ runId: Number(b.dataset.runId) || null }) }); } catch (err) {
+    // Nothing running any more (it just finished, or the stop was for an older run): show how it actually ended.
+    if (err.status !== 409) { shopifyBusy(true); syncNote(esc(err.message), 'error'); return; }
   }
+  // Keep "Stopping…" until the server reports an end; the status poll (and a cut-off run, at once) settles it.
+  followShopifySync();
 }
 const onShopifyClick = () => ($('#shopifyOrders').dataset.mode === 'running' ? stopShopifySync() : startShopifySync());
 
+/** "12 s ago" / "3 min ago" for the run's last heartbeat. */
+const agoText = (iso) => { const ms = Date.now() - new Date(iso).getTime(); return !Number.isFinite(ms) ? '' : ms < 60000 ? `${Math.max(1, Math.round(ms / 1000))} s ago` : `${Math.round(ms / 60000)} min ago`; };
+const istTime = (iso) => new Date(iso).toLocaleString('en-GB', { timeZone: 'Asia/Kolkata', day: '2-digit', month: '2-digit', year: 'numeric', hour: '2-digit', minute: '2-digit', hour12: false }).replace(/\//g, '-').replace(',', '');
+// One status poll at a time: a stop click also asks, so the page never runs two polling loops.
+let shopifyFollowing = false;
+let shopifyTimer = null;
 async function followShopifySync() {
+  clearTimeout(shopifyTimer);
+  if (shopifyFollowing) return;
+  shopifyFollowing = true;
   let s;
-  try { s = await api('/api/orders/shopify/sync-updates'); } catch (err) { shopifyBusy(false); syncNote(esc(err.message), 'error'); return; }
+  try { s = await api('/api/orders/shopify/sync-updates'); } catch (err) {
+    shopifyFollowing = false;
+    // A failed status request says nothing about the sync: keep the button as it was, say so, and ask again shortly.
+    syncNote(`Could not check the Shopify sync (${esc(err.message)}). Checking again…`, 'error');
+    shopifyTimer = setTimeout(followShopifySync, 5000);
+    return;
+  }
+  shopifyFollowing = false;
+  if (s.runId) $('#shopifyOrders').dataset.runId = s.runId;
   if (s.state === 'running') {
     shopifyBusy(true, s.stopping || $('#shopifyOrders').dataset.mode === 'stopping' ? 'stopping' : 'running');
-    syncNote(s.stopping ? `Stopping the Shopify sync after the current page… <span class="soft">${count(s.fetched || 0)} fetched so far</span>`
-      : `Syncing new and changed Shopify orders… <span class="soft">${count(s.fetched || 0)} fetched so far</span>`);
-    setTimeout(followShopifySync, 2500);
+    // Facts, not an animation: what was fetched, where it is (fetching, applying a page, waiting for Shopify's rate limit), and when it last moved.
+    const doing = s.phase === 'waiting' ? 'waiting for Shopify’s rate limit' : s.phase === 'applying' ? 'saving a page' : 'fetching';
+    const facts = `<span class="soft">${count(s.fetched || 0)} fetched so far${s.pages ? ` · ${count(s.pages)} page${s.pages === 1 ? '' : 's'} saved` : ''} · ${doing}${s.lastProgressAt ? ` · last progress ${esc(agoText(s.lastProgressAt))}` : ''}</span>`;
+    syncNote(s.stopping ? `Stopping the Shopify sync after the current page… ${facts}`
+      : `Syncing new and changed Shopify orders… ${facts}`);
+    shopifyTimer = setTimeout(followShopifySync, 2500);
     return;
   }
   shopifyBusy(false);
+  if (s.state === 'interrupted') {
+    syncNote(`<b>Shopify sync interrupted</b> — no progress since ${esc(istTime(s.lastProgressAt))} IST, after ${count(s.fetched)} fetched (the server restarted or the run stopped responding). Orders saved before then are kept; nothing after that was marked as synced. Click Shopify to continue.`, 'error');
+    load();
+    return;
+  }
   if (s.state === 'completed') {
     syncNote(`<b>Shopify ${s.mode === 'all' ? 'full-history sync' : 'orders up to date'}</b>${s.durationMs ? ` · ${esc(duration(s.durationMs))}` : ''}<div class="sync-facts">
       <span>${count(s.fetched)} fetched</span><span>${count(s.created)} new</span><span>${count(s.updated)} updated</span>
@@ -1923,8 +1951,8 @@ async function followAmazonSync() {
   } else if (s.state === 'partial') {
     amazonNote(`<b>Amazon sync paused part-way</b> after ${count(s.fetched)} orders${s.throttled ? ' — Amazon asked us to slow down' : ''}. Click Amazon to continue from where it stopped.${amazonFacts(s)}`);
     load();
-  } else if (s.state === 'failed') {
-    const why = s.throttled ? 'Amazon kept limiting requests. Wait a few minutes, then click Amazon to continue from where it stopped.'
+  } else if (s.state === 'failed' || s.state === 'interrupted') {
+    const why = s.state === 'interrupted' ? 'it stopped making progress (the server restarted). Click Amazon to continue from where it stopped.' : s.throttled ? 'Amazon kept limiting requests. Wait a few minutes, then click Amazon to continue from where it stopped.'
       : `${esc(s.failure || 'The sync stopped')}${/[.!?]$/.test(s.failure || '') ? '' : '.'} Click Amazon to continue from where it stopped.`;
     amazonNote(`<b>Amazon sync stopped</b> — ${why}${amazonFacts(s)}`, 'error');
     load();
@@ -2046,7 +2074,7 @@ function bind() {
     // Shopify connection and sync are admin-only (the API enforces it too).
     $('#shopifyOrders').hidden = !me.isAdmin;
     // A sync already under way (started elsewhere, or before a reload): show it and follow it.
-    if (me.isAdmin) api('/api/orders/shopify/sync-updates').then((st) => { if (st.state === 'running') followShopifySync(); }).catch(() => {});
+    if (me.isAdmin) api('/api/orders/shopify/sync-updates').then((st) => { if (st.state === 'running' || st.state === 'interrupted') followShopifySync(); }).catch(() => {});
     // Amazon sync is admin-only too (the API enforces it); follow one already running.
     $('#amazonOrders').hidden = !me.isAdmin;
     if (me.isAdmin) api('/api/orders/amazon/sync/status').then((st) => { if (st.state === 'running') followAmazonSync(); }).catch(() => {});

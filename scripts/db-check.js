@@ -5373,6 +5373,216 @@ await step('shopify orders: Stop Shopify Sync — admin only, 409 when idle, sto
   return 'operator 403; nothing running → 409; stop while page 2 is fetched → page 2 applied, page 3 never requested, run partial + stopped_at, checkpoint unchanged, status "stopped" (20 fetched, 20 new), not busy; stop during a 20 s backoff → ends within ~0.3 s, that page not applied, checkpoint unchanged; next click → all 25 once from checkpoint − 5 min, checkpoint = new watermark; BWA shipment once; no movements, reservations or attributions; a Shopify stop never touches a running Amazon sync';
 });
 
+await step('shopify sync lifecycle: a run cut off by a restart shows as interrupted (never "running" for ever), Stop reaches any process by run id, bounded requests, no cursor loops, a failed page keeps the checkpoint, heartbeat and live counts', async () => {
+  const bad = [];
+  const db = getPool();
+  const R = await import('../lib/order-sync-runner.js');
+  const SO = await import('../lib/shopify-orders.js');
+  const SH = await import('../lib/shopify.js');
+  const CK = 'shopify_orders_checkpoint';
+  const ckNow = async () => (await db.query('SELECT value FROM system_state WHERE key = $1', [CK])).rows[0]?.value ?? null;
+  const setCk = (v) => db.query(`INSERT INTO system_state (key, value, updated_at) VALUES ($1, $2, now()) ON CONFLICT (key) DO UPDATE SET value = $2, updated_at = now()`, [CK, v]);
+  const savedCk = await ckNow();
+  const iso = (msAgo) => new Date(Date.now() - msAgo).toISOString();
+  const gidOf = (n) => `${SH_PREFIX}${String(n).padStart(4, '0')}`;
+  const count = async (lo, hi) => { let all = 0; let dup = 0; for (let n = lo; n <= hi; n += 1) { const c = (await db.query('SELECT count(*)::int n FROM orders WHERE source_order_id = $1', [gidOf(n)])).rows[0].n; all += c ? 1 : 0; dup += c > 1 ? 1 : 0; } return { all, dup }; };
+  const row = async (id) => (await db.query('SELECT id, status, rows_processed, orders_created, details FROM order_imports WHERE id = $1', [id])).rows[0];
+  const lastRun = async () => (await db.query(`SELECT id, status, rows_processed, orders_created, details FROM order_imports WHERE kind = 'shopify_sync' AND imported_by = $1 ORDER BY id DESC LIMIT 1`, [SH_ACTOR])).rows[0];
+  const app = express();
+  app.use((req, _res, next) => { req.session = JSON.parse(req.get('x-test-session') || '{}'); next(); });
+  app.use('/api/orders', ordersRouterForTest);
+  const server = app.listen(0);
+  const base = `http://127.0.0.1:${server.address().port}/api/orders/shopify`;
+  const ADMIN = { isAdmin: true, caps: ['logistics.view', 'logistics.edit'] };
+  const cancel = async (runId) => { const r = await fetch(`${base}/sync/cancel`, { method: 'POST', headers: { 'x-test-session': JSON.stringify(ADMIN), 'Content-Type': 'application/json' }, body: JSON.stringify(runId === undefined ? {} : { runId }) }); return { status: r.status, body: await r.json() }; };
+  const statusApi = async () => (await (await fetch(`${base}/sync-updates`, { headers: { 'x-test-session': JSON.stringify(ADMIN) } })).json());
+  // A 'running' row as another (or a dead) process leaves it: a full-history run with a cursor, its last heartbeat `beatAgoMs` ago.
+  const fakeRunning = async (beatAgoMs, { startedAgoMs = beatAgoMs + 60000, actor = SH_ACTOR } = {}) => {
+    const { rows: [r] } = await db.query(
+      `INSERT INTO order_imports (channel, kind, status, started_at, imported_by, filename, rows_processed, orders_in_file, orders_created, orders_updated, orders_unchanged,
+         items_created, items_updated, promotion_rows, duplicate_rows, error_rows, details)
+       VALUES ('website', 'shopify_sync', 'running', now() - ($1 || ' milliseconds')::interval, $2, 'Shopify full history', 930, 930, 0, 0, 0, 0, 0, 0, 0, 0,
+         jsonb_build_object('window', jsonb_build_object('mode', 'all'), 'cursor', 'dbcheck-cursor', 'heartbeat_at', now() - ($3 || ' milliseconds')::interval)) RETURNING id`,
+      [String(startedAgoMs), actor, String(beatAgoMs)]);
+    return Number(r.id);
+  };
+  const realFetch = globalThis.fetch;
+  const savedToken = process.env.SHOPIFY_ACCESS_TOKEN; const savedDomain = process.env.SHOPIFY_STORE_DOMAIN;
+  const made = [];
+  try {
+    await setCk(iso(3600000));
+    const ck0 = await ckNow();
+
+    // 1. The production symptom: a run cut off mid-way (heartbeat 25 min ago, nothing advancing it) is "interrupted",
+    //    not "running": the page offers Shopify again, it never blocks a new sync, and Stop marks it interrupted.
+    const dead = await fakeRunning(25 * 60000); made.push(dead);
+    let st = await statusApi();
+    if (st.state !== 'interrupted' || st.runId !== dead || st.fetched !== 930 || !st.lastProgressAt) bad.push(`dead run status ${JSON.stringify(st).slice(0, 220)}`);
+    await SO.assertNoSyncRunning(db);                                           // never blocks
+    const wrong = await cancel(dead - 1);
+    if (wrong.status !== 409 || (await row(dead)).status !== 'running') bad.push(`stop for another run id → ${wrong.status}`);
+    const c1 = await cancel(dead);
+    const after1 = await row(dead);
+    if (c1.status !== 202 || !c1.body.interrupted || after1.status !== 'failed' || !after1.details.interrupted || !('interrupted_by' in after1.details)
+      || !after1.details.last_progress_at || !/Interrupted: no progress since/.test(after1.details.failure || '') || after1.details.cursor !== 'dbcheck-cursor') bad.push(`stop on a dead run ${c1.status} ${JSON.stringify(after1.details).slice(0, 240)}`);
+    const c2 = await cancel(dead);
+    if (c2.status !== 409) bad.push(`repeated stop → ${c2.status}`);
+    st = await statusApi();
+    if (st.state !== 'interrupted' || !/Interrupted/.test(st.failure || '')) bad.push(`after marking: ${st.state}`);
+    if ((await ckNow()) !== ck0) bad.push('checkpoint moved by an interrupted run');
+
+    // 2. A run alive in another process (heartbeat 20 s ago): running, blocks a second sync, and Stop is recorded on its row
+    //    (that process sees it at its next heartbeat) — never marked interrupted.
+    const alive = await fakeRunning(20000, { startedAgoMs: 45 * 60000 }); made.push(alive);
+    st = await statusApi();
+    if (st.state !== 'running' || st.runId !== alive) bad.push(`live run status ${st.state}`);
+    await expectErr('second sync while another process runs', () => SO.assertNoSyncRunning(db), (e) => e.status === 409);
+    if ((await R.createSyncRunner({ kind: 'shopify_sync', label: 't', staleMs: SO.SYNC_STALE_MS }).markInterrupted(db, { actor: SH_ACTOR })).includes(alive)) bad.push('live run marked interrupted');
+    const c3 = await cancel(alive);
+    const a3 = await row(alive);
+    if (c3.status !== 202 || !c3.body.stopping || a3.status !== 'running' || !a3.details.cancel_requested) bad.push(`stop for a run in another process ${c3.status} ${JSON.stringify(a3.details).slice(0, 200)}`);
+    if (!(await statusApi()).stopping) bad.push('status does not show the stop request');
+    const hb = await R.heartbeat(db, alive, { phase: 'fetching' });
+    if (!hb.cancel || hb.lost) bad.push(`heartbeat does not carry the stop ${JSON.stringify(hb)}`);
+    // Starting a sync marks a dead run interrupted (with who started it) but leaves a live one.
+    await db.query(`UPDATE order_imports SET details = details || jsonb_build_object('heartbeat_at', now() - interval '11 minutes') WHERE id = $1`, [alive]);
+    const hb2 = await R.heartbeat(db, alive, {});                                 // it beats again: alive
+    if (hb2.lost) bad.push('a live run reported lost');
+    await db.query(`UPDATE order_imports SET status = 'failed', completed_at = now() WHERE id = $1`, [alive]);
+    const lost = await R.heartbeat(db, alive, {});
+    if (!lost.lost) bad.push('a closed run not reported lost to its process');
+
+    // 3. A real chain: heartbeat, phase and live counts while it runs; a stop asked through the row (as another process
+    //    would) ends it after the page in progress; the checkpoint stays; the next click continues with no duplicate.
+    const store = Array.from({ length: 25 }, (_, i) => ({ ...shOrder(4101 + i, { created: iso(3000000 - i * 1000) }), updatedAt: iso(3000000 - i * 1000) }));
+    const fake = shFake(() => store);
+    let seen = null; let pagesSeen = 0;
+    const viaRow = async (q, v) => {
+      if (/^query BriyoOrdersPage/.test(q)) {
+        pagesSeen += 1;
+        if (pagesSeen === 2) {
+          const r = await lastRun();
+          seen = { st: await statusApi(), row: r };
+          await R.requestCancel(db, r.id, { actor: 'Other Process Admin' });
+        }
+      }
+      return fake(q, v);
+    };
+    const r1 = await SO.startIncrementalSync({ actor: SH_ACTOR, gql: viaRow, backoffMs: 1 });
+    const res1 = await r1.done;
+    const run1 = await lastRun();
+    if (!seen || seen.st.state !== 'running' || !seen.st.lastProgressAt || !seen.st.phase || seen.st.pages !== 1 || seen.row.orders_created !== 10 || !seen.row.details.heartbeat_at) bad.push(`progress while running ${JSON.stringify(seen && { st: seen.st, created: seen.row.orders_created }).slice(0, 260)}`);
+    if (!res1.summary.stopped || run1.status !== 'partial' || run1.rows_processed !== 20 || run1.details.stopped_by !== 'Other Process Admin' || (await ckNow()) !== ck0) bad.push(`stop through the row: ${run1.status} ${run1.rows_processed} ${run1.details.stopped_by}`);
+    if (SO.syncBusy()) bad.push('busy after a stop');
+    const r2 = await SO.startIncrementalSync({ actor: SH_ACTOR, gql: fake, backoffMs: 1 });
+    await r2.done;
+    const c25 = await count(4101, 4125);
+    if (c25.all !== 25 || c25.dup || (await lastRun()).status !== 'completed') bad.push(`continue after stop: ${JSON.stringify(c25)}`);
+    await setCk(ck0);
+
+    // 4. Pagination that does not move: a cursor Shopify already gave, or "more" with no cursor, fails the run — no loop,
+    //    no completion, checkpoint unchanged, the pages already saved stay saved once.
+    for (const [label, pageInfo] of [['repeated cursor', (pi) => ({ hasNextPage: true, endCursor: 'SAME' })], ['no cursor', () => ({ hasNextPage: true, endCursor: null })]]) {
+      let calls = 0;
+      const looping = async (q, v) => {
+        const out = await fake(q, v);
+        if (/^query BriyoOrdersPage/.test(q)) { calls += 1; out.orders.pageInfo = pageInfo(out.orders.pageInfo); }
+        return out;
+      };
+      const r = await SO.startIncrementalSync({ actor: SH_ACTOR, gql: looping, backoffMs: 1 });
+      const err = await r.done.then(() => null, (e) => e);
+      const run = await lastRun();
+      if (!err || run.status !== 'failed' || calls > 2 || (await ckNow()) !== ck0 || !/cursor/.test(run.details.failure || '')) bad.push(`${label}: ${run.status} after ${calls} pages ${String(err?.message).slice(0, 80)}`);
+      if (SO.syncBusy()) bad.push(`${label}: still busy`);
+    }
+    // An empty last page (no orders, no next page) simply ends the run.
+    const emptyStore = [];
+    const r3 = await SO.startIncrementalSync({ actor: SH_ACTOR, gql: shFake(() => emptyStore), backoffMs: 1 });
+    await r3.done;
+    if ((await lastRun()).status !== 'completed') bad.push('empty page did not complete');
+    await setCk(ck0);
+
+    // 5. A page whose write fails: that page rolls back, the run fails with the reason, the cursor stays at the last
+    //    saved page, the checkpoint stays; the next sync writes every order once.
+    const more = Array.from({ length: 15 }, (_, i) => ({ ...shOrder(4201 + i, { created: iso(2000000 - i * 1000) }), updatedAt: iso(2000000 - i * 1000) }));
+    const fake2 = shFake(() => more);
+    await db.query(`CREATE OR REPLACE FUNCTION dbcheck_fail_order() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN
+      IF NEW.source_order_id = '${gidOf(4213)}' THEN RAISE EXCEPTION 'dbcheck: simulated write failure'; END IF; RETURN NEW; END $$`);
+    await db.query(`CREATE TRIGGER dbcheck_fail_order BEFORE INSERT ON orders FOR EACH ROW EXECUTE FUNCTION dbcheck_fail_order()`);
+    try {
+      const r4 = await SO.startIncrementalSync({ actor: SH_ACTOR, gql: fake2, backoffMs: 1 });
+      const e4 = await r4.done.then(() => null, (e) => e);
+      const run4 = await lastRun();
+      const c = await count(4201, 4215);
+      if (!e4 || run4.status !== 'failed' || !/simulated write failure/.test(run4.details.failure || '') || c.all !== 10 || run4.orders_created !== 10 || !run4.details.cursor || (await ckNow()) !== ck0) bad.push(`page write failure: ${run4.status} saved ${c.all} created ${run4.orders_created} ck ${(await ckNow()) === ck0}`);
+    } finally {
+      await db.query('DROP TRIGGER IF EXISTS dbcheck_fail_order ON orders');
+      await db.query('DROP FUNCTION IF EXISTS dbcheck_fail_order()');
+    }
+    const r5 = await SO.startIncrementalSync({ actor: SH_ACTOR, gql: fake2, backoffMs: 1 });
+    await r5.done;
+    const c15 = await count(4201, 4215);
+    if (c15.all !== 15 || c15.dup || (await ckNow()) === ck0) bad.push(`after a failed page: ${JSON.stringify(c15)}`);
+    await setCk(ck0);
+
+    // 6. Retry exhaustion: a gateway error on every attempt fails the run clearly (3 tries), never loops, lock released.
+    let tries = 0;
+    const down = async (q, v) => { if (/^query BriyoOrdersPage/.test(q)) { tries += 1; throw Object.assign(new Error('Shopify HTTP 503: upstream'), { transient: true }); } return fake(q, v); };
+    const r6 = await SO.startIncrementalSync({ actor: SH_ACTOR, gql: down, backoffMs: 1 });
+    await r6.done.catch(() => {});
+    const run6 = await lastRun();
+    if (tries !== 3 || run6.status !== 'failed' || !/503/.test(run6.details.failure || '') || SO.syncBusy() || (await ckNow()) !== ck0) bad.push(`retry exhaustion: ${tries} tries, ${run6.status}`);
+    // Rate-limit waits are shown as waiting (with until when) and counted as retries.
+    let thr = 0; let waitingSeen = null;
+    const slow = async (q, v) => {
+      if (/^query BriyoOrdersPage/.test(q) && thr < 2) { thr += 1; throw Object.assign(new Error('Shopify rate limit hit (HTTP 429).'), { throttled: true }); }
+      if (/^query BriyoOrdersPage/.test(q) && !waitingSeen) { const r = await lastRun(); waitingSeen = r.details.progress; }
+      return fake(q, v);
+    };
+    const r7 = await SO.startIncrementalSync({ actor: SH_ACTOR, gql: slow, backoffMs: 1 });
+    await r7.done;
+    if (!waitingSeen || !(waitingSeen.retries >= 2) || (await lastRun()).status !== 'completed') bad.push(`rate-limit wait not visible ${JSON.stringify(waitingSeen)}`);
+    await setCk(ck0);
+
+    // 7. Every Shopify request carries a timeout; a timed-out request is a transient failure with a plain message.
+    process.env.SHOPIFY_ACCESS_TOKEN = 'dbcheck-not-a-real-token'; process.env.SHOPIFY_STORE_DOMAIN = 'dbcheck.invalid';
+    let signal = null;
+    globalThis.fetch = async (_u, opts) => { signal = opts?.signal; throw Object.assign(new Error('The operation was aborted due to timeout'), { name: 'TimeoutError' }); };
+    const te = await SH.graphql('query { shop { name } }').then(() => null, (e) => e);
+    globalThis.fetch = realFetch;
+    if (!(signal instanceof AbortSignal) || !te?.transient || !/did not answer within 60 s/.test(te.message) || SH.SHOPIFY_REQUEST_TIMEOUT_MS !== 60000) bad.push(`request timeout: ${String(te?.message).slice(0, 100)} transient=${te?.transient}`);
+    if (SO.SYNC_STALE_MS < 5 * SH.SHOPIFY_REQUEST_TIMEOUT_MS) bad.push('stale window not well above the request timeout');
+  } finally {
+    globalThis.fetch = realFetch;
+    if (savedToken === undefined) delete process.env.SHOPIFY_ACCESS_TOKEN; else process.env.SHOPIFY_ACCESS_TOKEN = savedToken;
+    if (savedDomain === undefined) delete process.env.SHOPIFY_STORE_DOMAIN; else process.env.SHOPIFY_STORE_DOMAIN = savedDomain;
+    server.close();
+    if (savedCk === null) await db.query('DELETE FROM system_state WHERE key = $1', [CK]); else await setCk(savedCk);
+    if (made.length) await db.query('DELETE FROM order_imports WHERE id = ANY($1)', [made]);
+  }
+  if (bad.length) throw new Error(bad.join(' | '));
+  return 'cut-off run (heartbeat 25 min ago) → "interrupted" with its 930 fetched, never blocks; Stop with another run id → 409, with its id → marked failed+interrupted (who, last progress, cursor kept), again → 409, checkpoint unchanged; live run elsewhere (beat 20 s ago) → running, blocks, never marked, Stop recorded on its row and read by its heartbeat, closed row → lost; real chain shows phase, last progress, pages and live created count; stop via the row ends it after the page (partial, stopped_by), next click 25/25 once; repeated cursor / "more" with no cursor → failed in ≤2 pages, no loop, checkpoint kept; empty page completes; failed page write → that page rolled back, 10 saved, cursor kept, checkpoint kept, next sync 15/15 once; 503 ×3 → failed, unlocked; rate-limit waits visible as retries; every request has a 60 s timeout → transient "did not answer"';
+});
+
+await step('orders page: Shopify status is factual — interrupted banner and idle button for a cut-off run, last progress / phase / pages while running, Stop sends the run id and waits for the server, one polling loop, status errors never fake an end', async () => {
+  const bad = [];
+  const js = await fsp.readFile(new URL('../public/orders.js', import.meta.url), 'utf8');
+  const stop = js.slice(js.indexOf('async function stopShopifySync'), js.indexOf('const onShopifyClick'));
+  const follow = js.slice(js.indexOf('let shopifyFollowing'), js.indexOf('/* ------------------------------------------------------------------ Amazon button'));
+  if (!/body: JSON\.stringify\(\{ runId: Number\(b\.dataset\.runId\) \|\| null \}\)/.test(stop)) bad.push('stop does not send the run id');
+  if (!/followShopifySync\(\);\s*\}$/.test(stop.trim())) bad.push('stop does not ask the server how it ended');
+  if (/shopifyBusy\(false\)/.test(stop)) bad.push('stop resets the button on its own');
+  if (!/s\.state === 'interrupted'/.test(follow) || !/Shopify sync interrupted/.test(follow) || !/Click Shopify to continue\./.test(follow)) bad.push('no interrupted state');
+  if (!/shopifyBusy\(false\);\s*if \(s\.state === 'interrupted'\)/.test(follow)) bad.push('interrupted run keeps the Stop button');
+  if (!/last progress/.test(follow) || !/rate limit/.test(follow) || !/saving a page/.test(follow) || !/page\$\{s\.pages === 1/.test(follow)) bad.push('running facts');
+  if (!/clearTimeout\(shopifyTimer\)/.test(follow) || !/if \(shopifyFollowing\) return;/.test(follow)) bad.push('more than one polling loop possible');
+  const errBranch = follow.slice(follow.indexOf('} catch (err) {'), follow.indexOf('shopifyFollowing = false;\n  if (s.runId)'));
+  if (/shopifyBusy\(false\)/.test(errBranch) || !/Checking again/.test(errBranch)) bad.push('a failed status request ends the sync in the page');
+  if (/%|percent|progress-bar/i.test(follow)) bad.push('invented percentage');
+  if (bad.length) throw new Error(bad.join(' | '));
+  return 'interrupted → idle Shopify button + "Shopify sync interrupted — no progress since <IST> after N fetched … Click Shopify to continue."; running → fetched · pages saved · fetching / saving a page / waiting for Shopify’s rate limit · last progress Ns ago (no percentages); Stop sends {runId}, keeps "Stopping…" and asks the server; one polling loop; a failed status request says so and retries instead of ending the sync';
+});
+
 await step('orders page: Shopify button turns into a red "Stop Shopify Sync" while syncing — one cancel request, Stopping…, stopped summary, resumes on the next click, mobile wrap', async () => {
   const bad = [];
   const js = await fsp.readFile(new URL('../public/orders.js', import.meta.url), 'utf8');
