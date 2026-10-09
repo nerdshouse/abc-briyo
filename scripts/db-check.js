@@ -23,7 +23,7 @@ import {
   shipmentMembers, sharedShipmentOf, attachToShipment, detachFromShipment, attachableOrders, createShipmentForOrders,
   addManualOrderLine, updateManualOrderLine, removeManualOrderLine, manualLineSkuOptions, matchManualOrderLine,
 } from '../lib/orders.js';
-import { saveUploadedDocument, router as ordersRouterForTest } from '../lib/orders-routes.js';
+import { saveUploadedDocument, router as ordersRouterForTest, destinationRouter as destinationRouterForTest } from '../lib/orders-routes.js';
 import { planAmazon, readTable, previewAmazonImport, commitAmazonImport } from '../lib/amazon-import.js';
 import { orderItems } from '../lib/orders.js';
 import {
@@ -5814,6 +5814,33 @@ await step('retailer product matches (e.g. Medkart): saved only when a person co
       const r = await fetch(`http://127.0.0.1:${server.address().port}/api/orders/${o2}/items/${d2.itemId}/match`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-test-session': JSON.stringify({ caps: ['logistics.view'] }) }, body: JSON.stringify({ sku_id: zinc, remember: true }) });
       if (r.status !== 403 || !(await line(o2, d2.itemId)).needs_review) bad.push(`viewer match → ${r.status}`);
     } finally { server.close(); }
+    // 10. Isolation. A retailer cannot use a sales channel's list, nor share another destination's — checked by the server.
+    for (const ch of ['amazon', 'website', 'blinkit']) await expectErr(`link to ${ch}`, () => saveDestination({ id: plain.id, sku_platform: ch }), (e) => e.status === 400);
+    await expectErr('share a list', () => saveDestination({ id: plain.id, sku_platform: pf.key }), (e) => e.status === 409);
+    const dApp = express();
+    dApp.use((req, _r, next) => { req.session = { caps: ['logistics.view'] }; next(); });
+    dApp.use('/d', destinationRouterForTest);
+    const dServer = dApp.listen(0);
+    let listed;
+    try { listed = await (await fetch(`http://127.0.0.1:${dServer.address().port}/d`)).json(); } finally { dServer.close(); }
+    if (listed.platforms.some((p) => ['amazon', 'website', 'blinkit', 'zepto', 'tata_1mg', 'netmeds'].includes(p.key)) || !listed.platforms.some((p) => p.key === pf.key)) bad.push('destination page offers channel lists');
+    // Medkart's matches live only on its own list: Amazon's (and every other) mappings are untouched and unaffected.
+    const others = (await db.query(`SELECT platform, count(*)::int n FROM sku_platform_mappings WHERE platform <> $1 AND (lower(platform_sku) IN ('mk-2','mk-1') OR platform_sku LIKE 'name:%') GROUP BY platform`, [pf.key])).rows;
+    if (others.length || (await resolveSkuIds(db, 'amazon', ['MK-2'])).size || (await resolveSkuIds(db, 'retailers', ['MK-2'])).size) bad.push(`leaked ${JSON.stringify(others)}`);
+    // Even if a channel's list were attached behind the server's back, it is never used for retailer matching.
+    await db.query('UPDATE dispatch_destinations SET sku_platform = $2 WHERE id = $1', [plain.id, 'amazon']);
+    const sneak = await addManualOrderLine((await order(plain.id)), { unmatched: true, quantity: 1, retailer_product_name: 'x', retailer_product_code: 'MK-2' }, { actor: ACTOR });
+    await db.query('UPDATE dispatch_destinations SET sku_platform = $2 WHERE id = $1', [plain.id, pf.key]);   // and a shared list: ignored for both
+    const shared = await addManualOrderLine((await order()), { unmatched: true, quantity: 1, retailer_product_name: 'x', retailer_product_code: 'MK-2' }, { actor: ACTOR });
+    await db.query('UPDATE dispatch_destinations SET sku_platform = NULL WHERE id = $1', [plain.id]);
+    if (!sneak.needsReview || !shared.needsReview) bad.push('a channel or shared list was used for matching');
+    // Changing the destination's list never remaps existing lines (matched stay as they are; unmatched stay unmatched).
+    const before = (await db.query('SELECT id, sku_id FROM order_items WHERE order_id = ANY($1) ORDER BY id', [[o1, o2, o3, o4]])).rows;
+    await saveDestination({ id: dest.id, sku_platform: '' });
+    await saveDestination({ id: dest.id, sku_platform: pf.key });
+    await addPlatformMappings(zinc, pf.key, ['MK-999'], { actor: ACTOR });   // a new mapping for d2's code, added on the SKU page
+    const after = (await db.query('SELECT id, sku_id FROM order_items WHERE order_id = ANY($1) ORDER BY id', [[o1, o2, o3, o4]])).rows;
+    if (JSON.stringify(before) !== JSON.stringify(after) || !(await line(o2, d2.itemId)).needs_review) bad.push('existing lines remapped');
   } finally {
     await saveDestination({ id: dest.id, sku_platform: '' });   // unlinked, so the test platform can be removed with the test SKUs
     await saveDestination({ id: dest.id, active: false });
