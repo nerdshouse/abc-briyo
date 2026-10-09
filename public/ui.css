@@ -76,7 +76,55 @@
 
   --font: Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
   --sidebar-w: 240px;
+
+  /* weights and leading */
+  --fw-regular: 400; --fw-medium: 500; --fw-semibold: 600;
+  --lh-tight: 1.2; --lh-body: 1.45; --lh-relaxed: 1.6;
+
+  /* control and row heights: one size per role, so forms and tables line up across pages */
+  --h-control: 34px;     /* buttons, inputs, selects */
+  --h-control-sm: 28px;  /* compact controls, sidebar sub-items */
+  --h-nav: 32px;         /* sidebar department rows */
+  --h-row: 44px;         /* table rows with one line of secondary text */
+
+  /* drawers */
+  --drawer-w: min(520px, 100vw);
+  --drawer-w-wide: min(720px, 100vw);
+
+  /* focus: always visible, never colour-only (2px outline with offset) */
+  --focus: #3978F6;
+  --focus-ring: 0 0 0 3px rgba(57, 120, 246, 0.22);
+
+  /* motion: short and functional; everything collapses under prefers-reduced-motion */
+  --dur-fast: 120ms; --dur: 180ms; --dur-slow: 220ms;
+  --ease: cubic-bezier(0.2, 0, 0, 1);
+
+  /* breakpoints (custom properties cannot be read inside @media, so these are the documented values used below):
+     640px phone · 760px tables become lists · 1024px sidebar becomes a drawer · 1280px compact desktop */
+
+  /* module identity — where you are, not what state something is in. Used only for the active nav marker,
+     department icons and the breadcrumb icon; never for backgrounds, buttons, rows or status. Each meets 3:1
+     against white (non-text graphics); status keeps the semantic colours above (red stays red in Inventory). */
+  --mod-overview: #4F46E5;
+  --mod-logistics: #2563EB;
+  --mod-inventory: #0F766E;
+  --mod-support: #7C3AED;
+  --mod-marketing: #EA580C;
+  --mod-affiliates: #059669;
+  --mod-hr: #E11D48;
+  --mod-admin: #475569;
+  --mod: var(--ink);
 }
+
+/* Which module a part of the screen belongs to: sidebar departments, and each page by its data-section. */
+[data-module="overview"], main.page[data-section="overview"] { --mod: var(--mod-overview); }
+[data-module="logistics"], main.page[data-section="orders"] { --mod: var(--mod-logistics); }
+[data-module="inventory"], main.page[data-section="inventory"] { --mod: var(--mod-inventory); }
+[data-module="support"], main.page[data-section="recovery"], main.page[data-section="support"] { --mod: var(--mod-support); }
+[data-module="marketing"], main.page[data-section="marketing"] { --mod: var(--mod-marketing); }
+[data-module="affiliates"], main.page[data-section="affiliates"] { --mod: var(--mod-affiliates); }
+[data-module="hr"], main.page[data-section="hr"] { --mod: var(--mod-hr); }
+[data-module="admin"], main.page[data-section="admin"], main.page[data-section="import"] { --mod: var(--mod-admin); }
 
 * { box-sizing: border-box; }
 [hidden] { display: none !important; }
@@ -140,8 +188,8 @@ button { font: inherit; color: inherit; }
 .brand-mark .lucide { width: 14px; height: 14px; stroke-width: 2; }
 .brand-name { font-size: 14px; font-weight: 600; letter-spacing: -0.01em; }
 .brand-sub { font-size: 11px; color: var(--text-3); margin-top: 1px; }
-/* The Briyo Supplements wordmark (public/brand): its own ratio, never stretched. */
-.sidebar .brand { flex-direction: column; align-items: flex-start; gap: 6px; padding: 4px 6px 12px; }
+/* The Briyo Supplements wordmark (public/brand): its own ratio, never stretched, centred in the logo area. */
+.sidebar .brand { flex-direction: column; align-items: center; justify-content: center; gap: 6px; padding: 6px 6px 14px; }
 .brand-logo { display: block; height: 22px; width: auto; max-width: 100%; }
 
 .side-search { position: relative; display: flex; align-items: center; margin: 2px 0 6px; }
@@ -204,6 +252,12 @@ button { font: inherit; color: inherit; }
 .user-role { font-size: 12px; color: var(--text-3); }
 .user-card .avatar { position: relative; }
 .user-card .live { position: absolute; right: -1px; bottom: -1px; width: 9px; height: 9px; border-radius: 50%; background: var(--success); border: 2px solid #fff; }
+/* "Active session" is this browser's signed-in session; offline turns the dot grey and says so in words. */
+.user-card.offline .live { background: var(--neutral); }
+.user-text { min-width: 0; }
+.user-presence { font-size: var(--fs-label); color: var(--text-3); line-height: 1.3; }
+.user-presence:empty { display: none; }
+.user-card.offline .user-presence { color: var(--warning-text); }
 .user-card .icon-btn { margin-left: auto; }
 
 .topbar { display: none; }
@@ -1377,3 +1431,26 @@ a.mb-stat:hover { background: var(--surface-2); }
 @media (max-width: 900px) { .mk-kpis { grid-template-columns: repeat(2, minmax(0, 1fr)); } .mk-kpis .ov-metric:nth-child(4n) { border-right: 1px solid var(--border-soft); } .mk-kpis .ov-metric:nth-child(2n) { border-right: 0; } .mk-kpis .ov-metric:nth-child(n+5) { border-bottom: 1px solid var(--border-soft); } .mk-kpis .ov-metric:nth-child(n+7) { border-bottom: 0; } }
 @media (max-width: 640px) { .mk-legend { margin-left: 0; flex-wrap: wrap; } .mk-range .seg { flex-wrap: wrap; height: auto; max-width: 100%; } .mk-range .seg button { white-space: nowrap; } }
 .mk-table .cell-main, .mk-table .cell-sub { display: block; }
+
+/* --------------------------------------------------------------------------
+   Module identity in the shell (tokens above): a 2px marker on the active link, the department icon, and the
+   breadcrumb icon. Status colours are untouched.
+   -------------------------------------------------------------------------- */
+.nav-dept > .nav-item .lucide, .nav-item[data-module] .lucide { color: var(--mod); }
+.nav-item.active { box-shadow: inset 2px 0 0 var(--mod), 0 1px 2px rgba(16, 24, 40, 0.04); }
+.nav-item.active .lucide { color: var(--mod); }
+.nav-tree .nav-item.active::before { background: var(--mod); }
+.nav-item { transition: background-color var(--dur-fast) var(--ease), color var(--dur-fast) var(--ease); }
+main.page .crumbs > .lucide:first-child { color: var(--mod); }
+
+/* Drawers slide in (transform + opacity only); the scrim fades. */
+@keyframes drawer-in { from { transform: translateX(12px); opacity: 0; } to { transform: none; opacity: 1; } }
+@keyframes fade-in { from { opacity: 0; } to { opacity: 1; } }
+.drawer:not([hidden]) { animation: drawer-in var(--dur) var(--ease); }
+.drawer-scrim:not([hidden]) { animation: fade-in var(--dur) var(--ease); }
+.btn:active:not(:disabled) { transform: translateY(0.5px); }
+
+/* Reduced motion: no animation or transition anywhere. */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation-duration: 0.01ms !important; animation-iteration-count: 1 !important; transition-duration: 0.01ms !important; scroll-behavior: auto !important; }
+}

@@ -363,11 +363,12 @@ export const initials = (name) => String(name || '?').split(/\s+/).filter(Boolea
  *   PEOPLE      HR
  *   ADMIN       Members · Import carts · Export report
  */
-const navLink = (href, label, ico, { count: n = null, id = '', view = '', alert = false, download = false } = {}) => `<a class="nav-item" href="${href}"${view ? ` data-view-link="${view}"` : ''}${download ? ' download' : ''}>`
+const navLink = (href, label, ico, { count: n = null, id = '', view = '', alert = false, download = false, module = '' } = {}) => `<a class="nav-item" href="${href}"${view ? ` data-view-link="${view}"` : ''}${download ? ' download' : ''}${module ? ` data-module="${module}"` : ''}>`
   + `${ico ? `<i data-lucide="${ico}"></i>` : ''}<span class="nav-label">${esc(label)}</span>`
   + `${id ? `<span class="nav-count${alert ? ' alert' : ''}" id="${id}" hidden></span>` : n ? `<span class="nav-count">${count(n)}</span>` : ''}</a>`;
-const navDept = (label, ico, href, body = '') => `<div class="nav-dept">${navLink(href, label, ico)}${body ? `<div class="nav-tree">${body}</div>` : ''}</div>`;
-const navSection = (caption, body) => (body ? `<div class="nav-group"><div class="nav-caption">${caption}</div>${body}</div>` : '');
+// `module` names the department's identity colour (ui.css: --mod-*): its icon and the active marker use it.
+const navDept = (label, ico, href, body = '', module = '') => `<div class="nav-dept"${module ? ` data-module="${module}"` : ''}>${navLink(href, label, ico)}${body ? `<div class="nav-tree">${body}</div>` : ''}</div>`;
+const navSection = (caption, body, module = '') => (body ? `<div class="nav-group"${module ? ` data-module="${module}"` : ''}><div class="nav-caption">${caption}</div>${body}</div>` : '');
 
 function sidebarHtml(me) {
   const has = (c) => hasCap(me, c);
@@ -383,31 +384,32 @@ function sidebarHtml(me) {
       <kbd>⌘ K</kbd>
     </form>` : ''}
     <nav aria-label="Departments">
-      <div class="nav-group nav-top">${navLink('/overview', 'Overview', 'layout-dashboard')}</div>
+      <div class="nav-group nav-top">${navLink('/overview', 'Overview', 'layout-dashboard', { module: 'overview' })}</div>
       ${navSection('Operations', '<div id="opsNav"></div>')}
       ${navSection('Customer', support ? navDept('Support', 'headset', '/?mode=tocall',
         navLink('/?mode=tocall', 'To call', '', { id: 'countToCall', view: 'tocall' })
         + navLink('/?mode=callbacks', 'Callbacks', '', { id: 'countCallbacks', view: 'callbacks' })
         + navLink('/?mode=mine', 'My queue', '', { view: 'mine' })
         + navLink('/?mode=all', 'All carts', '', { view: 'all' })
-        + (admin ? navLink('/recovery-verification', 'Recovery verification') : '')) : '')}
+        + (admin ? navLink('/recovery-verification', 'Recovery verification') : ''), 'support') : '')}
       ${navSection('Growth', (has('marketing.view') ? navDept('Marketing', 'megaphone', '/marketing',
-        navLink('/marketing', 'Overview') + navLink('/marketing?view=campaigns', 'Campaigns')) : '')
-        + (has('affiliate.view') ? navLink('/affiliates', 'Affiliates', 'handshake') : ''))}
+        navLink('/marketing', 'Overview') + navLink('/marketing?view=campaigns', 'Campaigns'), 'marketing') : '')
+        + (has('affiliate.view') ? navLink('/affiliates', 'Affiliates', 'handshake', { module: 'affiliates' }) : ''))}
       ${navSection('People', has('hr.view') ? navDept('HR', 'briefcase', '/hr/jobs',
-        navLink('/hr/jobs', 'Jobs') + navLink('/hr/candidates', 'Candidates')) : '')}
+        navLink('/hr/jobs', 'Jobs') + navLink('/hr/candidates', 'Candidates'), 'hr') : '')}
       ${navSection('Admin', admin ? navLink('/admin', 'Members', 'users')
         + navLink('/dashboard', 'Analytics', 'chart-no-axes-column')
         + navLink('/import', 'Import carts', 'upload')
-        + navLink('/api/admin/report.csv?period=day', 'Export report', 'download', { download: true }) : '')}
+        + navLink('/api/admin/report.csv?period=day', 'Export report', 'download', { download: true }) : '', 'admin')}
     </nav>
     <div class="sidebar-foot">
       <div class="sidebar-app">Briyo OS</div>
       <a class="user-card" href="/profile" title="Your profile">
-        <span class="avatar" id="userAvatar">·<span class="live"></span></span>
-        <div style="min-width:0">
+        <span class="avatar" id="userAvatar">·<span class="live" aria-hidden="true"></span></span>
+        <div class="user-text">
           <div class="user-name" id="userName">Signed in</div>
           <div class="user-role" id="userRole"></div>
+          <div class="user-presence" id="userPresence" role="status" aria-live="polite"></div>
         </div>
       </a>
       <button class="icon-btn bare sign-out" id="signOut" type="button" title="Sign out" aria-label="Sign out"><i data-lucide="log-out"></i></button>
@@ -433,6 +435,9 @@ export function initShell(me, { onSearch } = {}) {
     toggle?.setAttribute('aria-expanded', 'false');
     toggle?.addEventListener('click', open);
     $('#scrim')?.addEventListener('click', close);
+    // Presence is this browser only: online/offline as the browser reports it. No heartbeat, no claim about others.
+    window.addEventListener('online', syncPresence);
+    window.addEventListener('offline', syncPresence);
     document.addEventListener('keydown', (e) => {
       if (e.key === 'Escape' && app.classList.contains('nav-open')) { close(); toggle?.focus(); }
       // ⌘K only where the customer search is actually shown.
@@ -484,8 +489,24 @@ export function initShell(me, { onSearch } = {}) {
     $('#userRole').textContent = roleSummary(me);
     setAvatar($('#userAvatar'), { name: me.profile?.name || me.name, photoUrl: me.photoUrl || me.profile?.photoUrl });
   }
+  syncPresence();
   syncSidebarActive();
   renderIcons();
+}
+
+/**
+ * The dot by your name says what Briyo OS actually knows: you are signed in here (the page loaded with your
+ * session) and whether this browser is online. "Active session" while online; "Offline" when the browser loses
+ * its connection (saves will fail until it is back). It never claims anything about other people.
+ */
+function syncPresence() {
+  const el = $('#userPresence');
+  const card = $('.sidebar-foot .user-card');
+  if (!el || !card) return;
+  const online = navigator.onLine !== false;
+  card.classList.toggle('offline', !online);
+  el.textContent = online ? 'Active session' : 'Offline';
+  card.title = online ? 'Your profile · signed in, active session on this device' : 'Your profile · this browser is offline; changes cannot be saved until it reconnects';
 }
 
 /**
@@ -692,12 +713,12 @@ async function renderOrdersNav(me) {
     navLink('/orders', 'All orders')
     + Object.entries(meta.views || {}).map(([k, label]) => navLink(`/orders?view=${k}`, label, '', { count: meta.viewCounts?.[k] })).join('')
     + (meta.dispatchTypes || []).map((t) => navLink(`/orders?type=${encodeURIComponent(t.key)}`, t.label)).join('')
-    + navLink('/couriers', 'Couriers') + navLink('/destinations', 'Destinations')) : ''}${inventory ? navDept('Inventory', 'boxes', '/inventory',
+    + navLink('/couriers', 'Couriers') + navLink('/destinations', 'Destinations'), 'logistics') : ''}${inventory ? navDept('Inventory', 'boxes', '/inventory',
     navLink('/inventory', 'Stock')
     + navLink('/inventory?stock=low', 'Low stock')
     + navLink('/inventory?expiring=90', 'Expiring soon')
     + navLink('/inventory?view=unmapped', 'Unmapped SKUs', '', { count: meta.inventory?.unmappedSkus })
-    + navLink('/stock-outward', 'Stock outward')) : ''}`;
+    + navLink('/stock-outward', 'Stock outward'), 'inventory') : ''}`;
   // Re-rendered on every page; replaced only if something (a count) changed.
   if (host.dataset.html === html) return;
   host.dataset.html = html;

@@ -2662,6 +2662,30 @@ await step('inventory: returns, incoming and alternatives keep the existing perm
   return 'viewer reads returns/incoming, never writes (8 routes 403); logistics-only 403; operator records returns but cannot link variants; catalog-only cannot record stock; page: Nil for 0, near/expired/unknown labels, +N incoming, alternatives line, per-unit totals note, four new forms, buttons gated by inventory.move, near/unknown/incoming filters';
 });
 
+await step('design system and shell: documented tokens (weights, heights, focus, motion, module identity), module colours only on nav markers/icons/breadcrumbs, centred logo, honest presence (this session + browser online state, no heartbeat), reduced motion', async () => {
+  const bad = [];
+  const css = await fsp.readFile(new URL('../public/ui.css', import.meta.url), 'utf8');
+  const comp = await fsp.readFile(new URL('../public/ui/components.js', import.meta.url), 'utf8');
+  const root = css.slice(css.indexOf(':root {'), css.indexOf('\n}', css.indexOf(':root {')));
+  for (const t of ['--fw-medium', '--lh-body', '--h-control', '--h-row', '--drawer-w', '--focus-ring', '--dur', '--ease', '--mod-overview', '--mod-logistics', '--mod-inventory', '--mod-support', '--mod-marketing', '--mod-affiliates', '--mod-hr', '--mod-admin']) if (!root.includes(`${t}:`)) bad.push(`token ${t} missing`);
+  for (const m of ['overview', 'logistics', 'inventory', 'support', 'marketing', 'affiliates', 'hr', 'admin']) if (!new RegExp(`\\[data-module="${m}"\\][^{]*\\{ --mod: var\\(--mod-${m}\\); \\}`).test(css)) bad.push(`module ${m} not mapped`);
+  // Module colour never paints backgrounds, buttons or status.
+  for (const m of css.matchAll(/([^{}]+)\{([^}]*var\(--mod\)[^}]*)\}/g)) {
+    const sel = m[1].trim();
+    // Allowed: nav items/markers, department icons, the breadcrumb icon. Never buttons, status, table rows, cards.
+    if (/\.btn|\.status|\btr\b|tbody|\.card|\.badge/.test(sel) || (/background/.test(m[2]) && !/::before/.test(sel))) bad.push(`module colour used beyond markers: ${sel.slice(0, 60)}`);
+  }
+  if (!/\.sidebar \.brand \{[^}]*align-items: center/.test(css)) bad.push('logo not centred');
+  if (!/function syncPresence\(\)/.test(comp) || !/'Active session' : 'Offline'/.test(comp) || !/addEventListener\('online', syncPresence\)/.test(comp)) bad.push('presence not honest');
+  const presence = comp.slice(comp.indexOf('function syncPresence()'), comp.indexOf('function enhanceDrawers'));
+  if (/setInterval|setTimeout|fetch\(|api\(/.test(presence)) bad.push('presence polls or calls the server');
+  if (!/@media \(prefers-reduced-motion: reduce\) \{\s*\*, \*::before, \*::after \{ animation-duration: 0\.01ms/.test(css)) bad.push('no global reduced-motion rule');
+  for (const [k, ico] of [['logistics', "'Logistics', 'truck'"], ['inventory', "'Inventory', 'boxes'"]]) if (!comp.includes(`'${k}') : ''}`)) bad.push(`ops nav ${k} has no module`);
+  if (!(await fsp.readFile(new URL('../public/inventory.html', import.meta.url), 'utf8')).includes('data-section="inventory"')) bad.push('inventory page not in the inventory module');
+  if (bad.length) throw new Error(bad.join(' | '));
+  return 'tokens for weights, leading, control/row heights, drawer widths, focus, motion and 8 module colours documented in :root; data-module / data-section map each module; colour only on the active marker, department icons and breadcrumb icon; logo centred; presence = "Active session" / "Offline" from this browser (no heartbeat); reduced motion collapses all motion';
+});
+
 await step('inventory: month-only expiry is the last calendar day, stored as a date, never shifted', async () => {
   const id = (await createSku({ sku: `${TS}-EXPIRY`, product_name: 'Expiry dates' }, { actor: ACTOR })).id;
   const cases = [['08/2028', '2028-08-31'], ['2028-08', '2028-08-31'], ['02/2028', '2028-02-29'], ['02/2027', '2027-02-28'], ['31/12/2029', '2029-12-31'], ['2029-01-15', '2029-01-15']];
