@@ -617,3 +617,11 @@ dl.facts dd { margin: 0; min-width: 0; overflow-wrap: anywhere; }
 .inc-list .inc-receipts { margin: 6px 0 0; padding-left: 16px; font-size: 12.5px; color: var(--text-2); }
 .alt-add { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 8px; }
 .alt-add .select { flex: 1; min-width: 180px; }
+
+/* Inventory forms: optional marker (never the required style), month-only expiry switch, a field marked wrong */
+.fld .opt { margin-left: 4px; font-size: 11px; font-weight: 400; color: var(--text-3); }
+.fld .month-only { display: flex; align-items: center; gap: 6px; margin-top: 4px; font-size: 12px; color: var(--text-2); }
+.fld .month-only input { margin: 0; }
+.fld .month-only label { font-weight: 400; }
+#invForm .input[aria-invalid] { border-color: var(--error, #D92D20); box-shadow: 0 0 0 3px rgba(217, 45, 32, .12); }
+#invForm input[type=number] { font-variant-numeric: tabular-nums; }
