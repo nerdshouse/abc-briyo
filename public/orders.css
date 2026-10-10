@@ -1,17 +1,21 @@
 /* Orders & Logistics — additions on top of ui.css. Nothing here restyles an
    existing selector, so the dashboard and call board are untouched. */
 
-.ord-table { table-layout: fixed; min-width: 1060px; }
-.ord-table col.c-order { width: 19%; }   /* room for the SKU lines under the number */
-.ord-table col.c-chan { width: 14%; }
-.ord-table col.c-courier { width: 118px; }
-.ord-table col.c-track { width: 14%; }
-.ord-table col.c-ship { width: 136px; }
-.ord-table col.c-inv { width: 98px; }
-.ord-table col.c-date { width: 92px; }
-.ord-table col.c-cust { width: 13%; }
-.ord-table col.c-amt { width: 88px; }
-.ord-table col.c-act { width: 52px; }
+/* Eight columns: Order · Customer · Channel · Shipment (status, courier · AWB) · Proof · Date · Amount · open.
+   Amount and the logistics facts stay visible down to tablet width; Customer folds under the order number first. */
+.ord-table { table-layout: fixed; min-width: 860px; }
+.ord-table col.c-order { width: 22%; }   /* room for the SKU lines under the number */
+.ord-table col.c-cust { width: 15%; }
+.ord-table col.c-chan { width: 15%; }
+.ord-table col.c-ship { width: 21%; }
+.ord-table col.c-inv { width: 84px; }
+.ord-table col.c-date { width: 112px; }
+.ord-table col.c-amt { width: 112px; }
+.ord-table col.c-act { width: 44px; }
+.ord-table th .th-sub { font-weight: 400; color: var(--text-3); margin-left: 4px; }
+.ord-table .ship-sub { margin-top: 3px; }
+.ord-table .ship-sub .track-link, .ord-table .ship-sub .mono { font-size: 11.5px; }
+.ord-table .cust-inline { display: none; }
 .ord-table td { overflow: hidden; text-overflow: ellipsis; }
 .ord-table td:last-child { text-overflow: clip; }
 .date-range { display: inline-flex; gap: 8px; flex-wrap: nowrap; }
@@ -93,11 +97,15 @@
 .cp-table td .input { width: 100%; padding-left: 10px; height: 30px; }
 .cp-table { table-layout: fixed; }
 
-@media (max-width: 1360px) {
-  /* customer and amount give way first; the logistics columns stay */
-  .ord-table .col-cust, .ord-table .col-amt { display: none; }
-  .ord-table col.c-cust, .ord-table col.c-amt { display: none; }
-  .ord-table { min-width: 860px; }
+@media (max-width: 1100px) {
+  /* the Customer column folds under the order number; Amount and the logistics columns stay */
+  .ord-table .col-cust, .ord-table col.c-cust { display: none; }
+  .ord-table .cust-inline { display: block; }
+  /* tablet: every remaining column fits without a sideways scroll (Amount included) */
+  .ord-table { min-width: 680px; }
+  .ord-table col.c-inv { width: 64px; }
+  .ord-table col.c-date { width: 112px; }
+  .ord-table col.c-amt { width: 100px; }
 }
 @media (max-width: 760px) {
   .table-wrap:has(.ord-table) { display: none; }
@@ -611,3 +619,40 @@ dl.facts dd { margin: 0; min-width: 0; overflow-wrap: anywhere; }
 .fld .month-only label { font-weight: 400; }
 #invForm .input[aria-invalid] { border-color: var(--error, #D92D20); box-shadow: 0 0 0 3px rgba(217, 45, 32, .12); }
 #invForm input[type=number] { font-variant-numeric: tabular-nums; }
+
+/* ---------------- Orders & Logistics: grouped filters, drawer facts */
+.filters-toggle { gap: 6px; }
+/* the Orders filter row: search, channel, shipment, dates and More filters on one line at laptop width
+   (phones keep the full-width stacking from ui.css) */
+@media (min-width: 761px) {
+  .board-filters:has(#filtersMore) .search .input { width: 200px; }
+}
+.filters-toggle .lucide { width: 14px; height: 14px; }
+.filters-toggle.on { border-color: var(--ink); color: var(--text); }
+.filters-count { display: inline-grid; place-items: center; min-width: 18px; height: 18px; padding: 0 5px; border-radius: 9px;
+  font-size: var(--fs-label); font-weight: var(--fw-semibold); color: #fff; background: var(--ink); font-variant-numeric: tabular-nums; }
+.filters-more { flex: 1 1 100%; display: flex; flex-wrap: wrap; gap: 8px; padding-top: 8px; margin-top: 2px; border-top: 1px dashed var(--border); }
+.filters-more:not([hidden]) { animation: fade-in var(--dur-fast) var(--ease); }
+.order-facts { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 1px; margin: 12px 16px 0;
+  background: var(--border-soft); border: 1px solid var(--border-soft); border-radius: var(--r-input); overflow: hidden; }
+.order-facts .of { background: var(--surface); padding: 8px 10px; min-width: 0; }
+.order-facts .of > span { display: block; font-size: var(--fs-label); color: var(--text-3); text-transform: uppercase; letter-spacing: .03em; }
+.order-facts .of > b { display: block; margin-top: 2px; font-size: 13px; font-weight: var(--fw-medium); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-variant-numeric: tabular-nums; }
+@media (max-width: 520px) { .order-facts { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+@media (max-width: 760px) {
+  .filters-toggle { flex: 0 0 auto; }
+  /* Orders dates on a phone: the word above its picker, so both fit side by side (native pickers have a minimum width) */
+  .date-range .date-pick { flex-direction: column; align-items: stretch; gap: 2px; }
+}
+
+/* Couriers on a phone: each courier is a small stacked block (name, link pattern, then status · verified · save)
+   instead of five fixed columns squeezing the inputs to nothing. The header row is hidden; inputs keep their labels. */
+@media (max-width: 760px) {
+  .cp-table, .cp-table tbody, .cp-table tr, .cp-table td { display: block; width: 100%; }
+  .cp-table colgroup, .cp-table thead { display: none; }
+  .cp-table tr { padding: 10px 12px; border-bottom: 1px solid var(--border-soft); }
+  .cp-table td { height: auto; padding: 3px 0 !important; border: 0; white-space: normal; }
+  .cp-table td:nth-child(3), .cp-table td:nth-child(4) { display: inline-block; width: auto; margin-right: 14px; }
+  .cp-table td.r { display: inline-block; width: auto; float: right; margin-top: -2px; }
+  .cp-table tr::after { content: ''; display: block; clear: both; }
+}

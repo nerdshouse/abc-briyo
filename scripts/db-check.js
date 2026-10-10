@@ -2804,6 +2804,32 @@ await step('shared UI patterns: one outlined label (tag / xtag / mini-tag) on to
   return 'labels: one outlined pattern at 11px on tokens (5 tones), unknown expiry dashed; duplicates removed; tables share row/head tokens, tabular numerics, focusable/selected rows, keyboard sort with aria-sort on the call board and Analytics, a scroll edge cue; stateBlock announces loading/errors and replaces hand-rolled loading in HR, Inventory, Affiliates; inventory: labelled stage/cancel forms, confirm dialogs, unsaved-change guard, one submit at a time, SKU list fetched once (5 filter changes: 10 → 5 requests)';
 });
 
+await step('orders & logistics UI: eight-column table (shipment = status + courier · AWB, Amount kept on screen to tablet width), grouped filters with a counted "More filters", drawer facts first and items/details before proof, one save at a time, cancel confirmed, loading/error never shown as "no orders", stale answers ignored, couriers stacked on phones', async () => {
+  const bad = [];
+  const read = (f) => fsp.readFile(new URL(`../public/${f}`, import.meta.url), 'utf8');
+  const html = await read('orders.html'); const js = await read('orders.js'); const css = await read('orders.css');
+  // Every filter and control the page already had is still there, by id (their handlers and query semantics are unchanged).
+  for (const id of ['q', 'fchannel', 'fdest', 'fstatus', 'fshipment', 'fcourier', 'finvoice', 'ftracking', 'ffrom', 'fto', 'fclear', 'refresh', 'shopifyOrders', 'amazonOrders', 'importOrders', 'newShipment', 'selBar', 'rows', 'clist', 'more'])
+    if (!html.includes(`id="${id}"`)) bad.push(`#${id} missing`);
+  const thead = html.slice(html.indexOf('<thead>'), html.indexOf('</thead>'));
+  if ((thead.match(/<th[\s>]/g) || []).length !== 8 || !/<th class="r col-amt">Amount<\/th>/.test(thead) || !/Shipment <span class="th-sub">courier · AWB<\/span>/.test(thead)) bad.push('table head');
+  if (/@media \(max-width: 1360px\)[^}]*col-amt/.test(css) || /\.col-amt[^{]*\{[^}]*display: none/.test(css)) bad.push('Amount hidden on laptops again');
+  if (!/<td class="r num col-amt">\$\{o\.order_value === null \|\| o\.order_value === undefined \? '<span class="muted-cell" title="No value entered">—<\/span>' : esc\(amount\(o\.order_value\)\)\}<\/td>/.test(js)) bad.push('amount cell (shared money formatter, no value never ₹0)');
+  if (!/aria-controls="moreFilters"/.test(html) || !/const MORE_FILTERS = \['destination', 'status', 'courier', 'invoice', 'tracking'\];/.test(js) || !/\$\('#filtersCount'\)\.textContent/.test(js)) bad.push('More filters toggle / count');
+  if (!/function orderFacts\(o\)/.test(js) || (js.match(/\$\{orderFacts\(o\)\}/g) || []).length !== 2) bad.push('drawer facts');
+  const common = js.slice(js.indexOf('function drawerCommon('), js.indexOf('function orderDetailsSection('));
+  if (!(common.indexOf('itemsSection(') < common.indexOf('orderDetailsSection(') && common.indexOf('orderDetailsSection(') < common.indexOf('Dispatch Proof'))) bad.push('drawer order');
+  if (!/if \(patching\) return;/.test(js) || !/drawerActions\(\)\.forEach\(\(b\) => \{ b\.disabled = true; \}\)/.test(js)) bad.push('single save');
+  if (!/e\.target\.value === 'cancelled' && !\(await confirmDialog\(/.test(js)) bad.push('cancel not confirmed');
+  if (!/const seq = \+\+loadSeq;/.test(js) || (js.match(/if \(seq !== loadSeq\) return;/g) || []).length !== 2) bad.push('stale answers not ignored');
+  if (!/stateBlock\('loading', 'Loading orders…'/.test(js) || !/stateBlock\('error', 'Could not load orders\.'/.test(js)) bad.push('loading / error states');
+  if (!/@media \(max-width: 760px\) \{\s*\.cp-table, \.cp-table tbody, \.cp-table tr, \.cp-table td \{ display: block/.test(css)) bad.push('couriers not stacked on phones');
+  // Sync controls: unchanged wiring, nothing started on load.
+  if (/startShopifySync\(\);\s*\}\)\(\)|startAmazonSync\(\);\s*\}\)\(\)/.test(js) || !/api\('\/api\/orders\/shopify\/sync-updates'\)\.then\(\(st\) => \{ if \(st\.state === 'running' \|\| st\.state === 'interrupted'\) followShopifySync\(\); \}\)/.test(js)) bad.push('sync on load changed');
+  if (bad.length) throw new Error(bad.join(' | '));
+  return 'all 20 page controls kept by id; 8 columns (Order · Customer · Channel · Shipment[courier · AWB] · Proof · Date · Amount · open), Amount never hidden by width, no value shows —; search/channel/shipment/dates + "More filters" (destination, order status, courier, invoice, tracking) with a count; drawer: value/payment/customer/status strip, then shipment, items, details, proof, notes, activity; one save at a time; cancelling asks first; stale responses dropped; loading and error states in the table; couriers stacked on phones; sync status only read on load';
+});
+
 await step('inventory: month-only expiry is the last calendar day, stored as a date, never shifted', async () => {
   const id = (await createSku({ sku: `${TS}-EXPIRY`, product_name: 'Expiry dates' }, { actor: ACTOR })).id;
   const cases = [['08/2028', '2028-08-31'], ['2028-08', '2028-08-31'], ['02/2028', '2028-02-29'], ['02/2027', '2027-02-28'], ['31/12/2029', '2029-12-31'], ['2029-01-15', '2029-01-15']];

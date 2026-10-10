@@ -6,7 +6,7 @@ import { formatDayKey } from './ui/ist.js';
  */
 import {
   $, $$, esc, money, count, icon, renderIcons, setTimezone, dateShort, dateTime, initShell, pageFetch,
-  navigate, pageSignal, onLeave, onQueryChange, ordersMeta,
+  navigate, pageSignal, onLeave, onQueryChange, ordersMeta, stateBlock, confirmDialog,
 } from './ui/components.js';
 
 // Requests belong to this page: cancelled, and never rendered, once it is left.
@@ -150,9 +150,17 @@ const ordersUrl = (append) => {
 };
 
 /** `pending` is an orders request already in flight (the first load starts it early). */
+let loadSeq = 0;
 async function load({ append = false, pending = null } = {}) {
+  // Filters can change faster than answers arrive: only the newest request's answer is shown.
+  const seq = ++loadSeq;
+  if (!append && !state.orders.length) {
+    $('#rows').innerHTML = `<tr><td colspan="8">${stateBlock('loading', 'Loading orders…', '', { compact: true })}</td></tr>`;
+    $('#clist').innerHTML = `<li class="oitem">${stateBlock('loading', 'Loading orders…', '', { compact: true })}</li>`;
+  }
   try {
     const data = await (pending || api(ordersUrl(append)));
+    if (seq !== loadSeq) return;
     state.orders = append ? [...state.orders, ...data.orders] : data.orders;
     state.offset = state.orders.length;
     state.total = data.total;
@@ -161,7 +169,16 @@ async function load({ append = false, pending = null } = {}) {
     renderRows();
     $('#alerts').innerHTML = '';
   } catch (err) {
+    if (seq !== loadSeq) return;
     $('#alerts').innerHTML = `<div class="alert">${icon('circle-alert')}<span>${esc(err.message)}</span></div>`;
+    // A failed load is never shown as "no orders", and rows from the previous filters are not left looking current:
+    // the table says it could not load. ("Show more" failing keeps the rows already shown; they are still right.)
+    if (!append) {
+      state.orders = [];
+      $('#rows').innerHTML = `<tr><td colspan="8">${stateBlock('error', 'Could not load orders.', err.message, { compact: true })}</td></tr>`;
+      $('#clist').innerHTML = `<li class="oitem">${stateBlock('error', 'Could not load orders.', err.message, { compact: true })}</li>`;
+      $('#pageSub').textContent = '';
+    }
     renderIcons();
   }
 }
@@ -184,10 +201,23 @@ function renderHead(data) {
     ? `Showing ${count(state.orders.length)} of ${count(data.total)} matching the filters`
     : `Showing ${count(state.orders.length)} of ${count(data.total)}, newest order date first`;
   $('#fclear').hidden = !anyFilter();
+  syncMoreFilters();
   $('#more').hidden = state.orders.length >= data.total;
 }
 
 const anyFilter = () => FILTER_KEYS.some((k) => state.f[k]);
+/** The folded filters: they open by themselves when one is set (from a link or a reload), can be folded again, and the toggle always shows how many are on. */
+const MORE_FILTERS = ['destination', 'status', 'courier', 'invoice', 'tracking'];
+function syncMoreFilters({ toggle = false } = {}) {
+  const on = MORE_FILTERS.filter((k) => state.f[k]).length;
+  const panel = $('#moreFilters');
+  const open = toggle ? panel.hidden : (on > 0 || !panel.hidden);
+  panel.hidden = !open;
+  $('#filtersMore').setAttribute('aria-expanded', String(open));
+  $('#filtersMore').classList.toggle('on', on > 0);
+  $('#filtersCount').hidden = !on;
+  $('#filtersCount').textContent = on ? String(on) : '';
+}
 
 function renderTabs(data) {
   const tabs = [{ key: '', label: 'All', n: data.allCount },
@@ -233,23 +263,22 @@ function renderRows() {
       : '<b>No orders yet.</b>Add a shipment with New Shipment, or Import orders.')
     : '';
   if (empty) {
-    $('#rows').innerHTML = `<tr><td colspan="10"><div class="empty-note">${empty}</div></td></tr>`;
+    $('#rows').innerHTML = `<tr><td colspan="8"><div class="empty-note">${empty}</div></td></tr>`;
     $('#clist').innerHTML = `<li class="oitem"><div class="empty-note">${empty}</div></li>`;
     return;
   }
   $('#rows').innerHTML = state.orders.map((o) => `
     <tr class="orow${o.id === state.openId ? ' open' : ''}" data-id="${o.id}" tabindex="0">
-      <td><span class="cell-main mono" style="font-weight:500">${pickBox(o)}${esc(orderNo(o))}${cancelledTag(o)}</span>${lineSkus(o)}</td>
+      <td><span class="cell-main mono ord-no" title="${esc(orderNo(o))}">${pickBox(o)}${esc(orderNo(o))}${cancelledTag(o)}</span>${lineSkus(o)}
+        ${o.customer_name ? `<span class="cell-sub cust-inline" title="${esc(o.customer_name)}">${esc(o.customer_name)}</span>` : ''}</td>
+      <td class="col-cust">${o.customer_name ? `<span class="cell-main cust" title="${esc(o.customer_name)}">${esc(o.customer_name)}</span>` : '<span class="muted-cell">—</span>'}</td>
       <td><span class="cell-main chan">${esc(channelOf(o))}</span>${o.destination_name
         ? `<span class="cell-sub muted" title="${esc(o.destination_name)}">${esc(o.destination_name)}</span>`
         : o.dispatch_type ? `<span class="cell-sub muted">${esc(typeLabel(o.dispatch_type))}</span>` : ''}</td>
-      <td>${o.courier_name ? esc(o.courier_name) : '<span class="muted-cell">—</span>'}</td>
-      <td>${trackingCell(o)}</td>
-      <td>${shipIndicator(o)}</td>
+      <td>${shipIndicator(o)}${o.shipment_id ? `<span class="cell-sub ship-sub">${o.courier_name ? esc(o.courier_name) : 'No courier'}${o.tracking_id ? ` · ${trackingCell(o)}` : ' · no AWB yet'}</span>` : ''}</td>
       <td>${proofCell(o)}</td>
       <td class="num"${o.order_date ? '' : ' title="No order date — shown by when it was entered"'}>${esc(day(o.order_date))}</td>
-      <td class="col-cust"><span class="cell-main">${o.customer_name ? esc(o.customer_name) : '<span class="muted-cell">—</span>'}</span></td>
-      <td class="r num col-amt">${esc(amount(o.order_value))}</td>
+      <td class="r num col-amt">${o.order_value === null || o.order_value === undefined ? '<span class="muted-cell" title="No value entered">—</span>' : esc(amount(o.order_value))}</td>
       <td class="r"><button class="icon-btn bare" type="button" data-open="${o.id}" title="Open" aria-label="Open order ${esc(orderNo(o))}">${icon('chevron-right')}</button></td>
     </tr>`).join('');
   $('#clist').innerHTML = state.orders.map((o) => `
@@ -498,6 +527,7 @@ function renderDrawer() {
   queueMicrotask(() => loadStock(ship.id));
 
   $('#dBody').innerHTML = `
+    ${orderFacts(o)}
     <section class="dsec">
       <h3 class="dsec-title">Shipment <span class="dsec-meta">${indicator(ship.shipment_status)}</span></h3>
       ${sharedBlock(o, ship)}
@@ -694,9 +724,28 @@ function amazonDetails(a) {
 }
 
 /** Proof, notes, items, order details and activity: the same with or without a shipment. */
+/**
+ * The facts people look for first, in one line at the top of the drawer: value, payment, customer, order status.
+ * The full, editable details stay in "Order details" below.
+ */
+function orderFacts(o) {
+  const pay = [o.payment_method && label(o.payment_method), o.payment_status && label(o.payment_status)].filter(Boolean).join(' · ');
+  const fact = (k, v) => `<div class="of"><span>${esc(k)}</span><b>${v}</b></div>`;
+  return `<div class="order-facts">
+    ${fact('Value', o.order_value === null || o.order_value === undefined ? '<span class="muted">Not entered</span>' : esc(`${money(o.order_value)}${o.currency && o.currency !== 'INR' ? ` ${o.currency}` : ''}`))}
+    ${fact('Payment', pay ? esc(pay) : '<span class="muted">Not known</span>')}
+    ${fact('Customer', o.customer_name ? esc(o.customer_name) : '<span class="muted">—</span>')}
+    ${fact('Order', indicator(o.order_status))}
+  </div>`;
+}
+
 function drawerCommon(o, documents, proofDocs, events, notes) {
   const m = state.meta;
+  // What was ordered and the order's details come before proof and notes: they are what people open the drawer for.
   return `
+    ${itemsSection(o, state.detail.items || [])}
+    ${orderDetailsSection(o, m)}
+
     <section class="dsec">
       <h3 class="dsec-title">Dispatch Proof &amp; Documents</h3>
       ${retryBanner(o.id)}
@@ -712,7 +761,21 @@ function drawerCommon(o, documents, proofDocs, events, notes) {
         <li><span style="min-width:0;white-space:pre-wrap">${esc(n.metadata.note)}</span><span class="d-when">${esc(n.actor || 'Someone')}, ${esc(dateTime(n.at))}</span></li>`).join('')}</ul>` : ''}
     </section>
 
-    ${itemsSection(o, state.detail.items || [])}
+    <section class="dsec">
+      <h3 class="dsec-title">Activity</h3>
+      <div class="timeline">${events.map((e) => {
+        const [ico, tone, text] = describeEvent(e);
+        return `<div class="act">
+          <span class="act-ico ${tone}">${icon(ico)}</span>
+          <div style="min-width:0"><div class="act-title">${text}</div><div class="act-meta">${esc(e.actor || 'System')}</div></div>
+          <span class="act-time">${esc(dateTime(e.at))}</span></div>`;
+      }).join('')}</div>
+    </section>`;
+}
+
+/** Order details: collapsed (its summary line carries value and customer), with the order status control. */
+function orderDetailsSection(o, m) {
+  return `
     <details class="dsec more-sec">
       <summary class="dsec-title">Order details <span class="dsec-meta soft">${esc([amount(o.order_value), o.customer_name].filter((x) => x && x !== '—').join(' · ') || 'value, customer, payment')}</span></summary>
       <dl class="kv" style="margin-top:10px">
@@ -736,18 +799,7 @@ function drawerCommon(o, documents, proofDocs, events, notes) {
       </div>
       <div class="form-actions"><button class="btn" type="button" id="dEdit">${icon('pencil')}Edit order details</button></div>`
         : `<dl class="kv" style="margin-top:10px"><dt>Order Status</dt><dd>${indicator(o.order_status)}</dd></dl>`}
-    </details>
-
-    <section class="dsec">
-      <h3 class="dsec-title">Activity</h3>
-      <div class="timeline">${events.map((e) => {
-        const [ico, tone, text] = describeEvent(e);
-        return `<div class="act">
-          <span class="act-ico ${tone}">${icon(ico)}</span>
-          <div style="min-width:0"><div class="act-title">${text}</div><div class="act-meta">${esc(e.actor || 'System')}</div></div>
-          <span class="act-time">${esc(dateTime(e.at))}</span></div>`;
-      }).join('')}</div>
-    </section>`;
+    </details>`;
 }
 
 /** An order no shipment has been made for yet, e.g. one just imported from Amazon. */
@@ -759,6 +811,7 @@ function renderDrawerNoShipment() {
   $('#dSub').textContent = [o.channel_label, o.dispatch_type && typeLabel(o.dispatch_type), o.destination_name, o.order_date && dateTime(o.order_date),
     o.order_status === 'cancelled' && 'Order cancelled'].filter(Boolean).join(' · ');
   $('#dBody').innerHTML = `
+    ${orderFacts(o)}
     <section class="dsec">
       <h3 class="dsec-title">Shipment <span class="dsec-meta">${NO_SHIPMENT}</span></h3>
       <p class="imp-note" style="margin:0 0 12px">Nothing has been shipped for this order. When it is packed, create a shipment — several orders can share one parcel and AWB.</p>
@@ -849,7 +902,20 @@ function describeEvent(e) {
  * Every edit carries the version it was based on; a stale one is refused.
  * Order fields and shipment fields are separate records with separate versions.
  */
+// One drawer save at a time: a double click on Save or a status button sends one request (the second used to
+// come back as a version conflict). The buttons are disabled while it is out.
+let patching = false;
+const drawerActions = () => [...document.querySelectorAll('#dShipSave, #dBody [data-step], #dOrderStatus')];
 async function patchOrder(fields, doneText = 'Saved', { shipment = false } = {}) {
+  if (patching) return;
+  patching = true;
+  drawerActions().forEach((b) => { b.disabled = true; });
+  try { await patchOrderNow(fields, doneText, { shipment }); } finally {
+    patching = false;
+    drawerActions().forEach((b) => { b.disabled = false; });
+  }
+}
+async function patchOrderNow(fields, doneText, { shipment }) {
   const o = state.detail.order;
   const ship = currentShip();
   const url = shipment ? `/api/orders/${ship.order_id || o.id}/shipments/${ship.id}` : `/api/orders/${o.id}`;
@@ -914,7 +980,15 @@ dBody.addEventListener('change', async (e) => {
     e.target.form.file.accept = acceptFor(e.target.value);
     return;
   }
-  if (e.target.id === 'dOrderStatus') patchOrder({ order_status: e.target.value }, 'Order status saved');
+  if (e.target.id === 'dOrderStatus') {
+    // Cancelling an order is confirmed first (nothing else about it changes); saying no puts the select back.
+    if (e.target.value === 'cancelled' && !(await confirmDialog({ title: `Cancel order ${orderNo(state.detail.order)}?`,
+      body: 'The order is marked cancelled and the change is recorded in its activity.', confirmLabel: 'Cancel order', danger: true }))) {
+      e.target.value = state.detail.order.order_status;
+      return;
+    }
+    patchOrder({ order_status: e.target.value }, 'Order status saved');
+  }
   if (e.target.name === 'courier_partner_id') {
     // Show straight away whether the link will be generated or typed.
     const c = courierById(e.target.value);
@@ -1978,6 +2052,7 @@ function bind() {
     writeUrl(); load();
   });
   $('#fdest').addEventListener('change', (e) => { state.f.destination = e.target.value; writeUrl(); load(); });
+  $('#filtersMore').addEventListener('click', () => syncMoreFilters({ toggle: true }));
   let t;
   $('#q').addEventListener('input', (e) => {
     clearTimeout(t);
