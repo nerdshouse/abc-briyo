@@ -7,7 +7,7 @@
  */
 import {
   $, $$, esc, count, icon, renderIcons, relative, initShell, pageFetch,
-  pageSignal, onQueryChange,
+  pageSignal, onQueryChange, stateBlock,
 } from './ui/components.js';
 // Every HR time is shown in IST (Asia/Kolkata), whatever the board's timezone or the viewer's computer.
 import { istDateTime } from './ui/ist.js';
@@ -131,8 +131,8 @@ function frame() {
 }
 
 function skeleton() {
-  $('#rows').innerHTML = `<tr><td colspan="5"><div class="empty-note">Loading…</div></td></tr>`;
-  $('#clist').innerHTML = '<li class="oitem"><div class="empty-note">Loading…</div></li>';
+  $('#rows').innerHTML = `<tr><td colspan="5">${stateBlock('loading', 'Loading…', '', { compact: true })}</td></tr>`;
+  $('#clist').innerHTML = `<li class="oitem">${stateBlock('loading', 'Loading…', '', { compact: true })}</li>`;
 }
 function failed(err) {
   $('#pageSub').textContent = '';
@@ -279,14 +279,14 @@ async function openJob(id) {
     return renderJob();
   }
   showDrawer('Loading…');
-  $('#dBody').innerHTML = '<div class="empty-note">Loading…</div>'; $('#dButtons').innerHTML = '';
+  $('#dBody').innerHTML = stateBlock('loading', 'Loading…', '', { compact: true }); $('#dButtons').innerHTML = '';
   try {
     state.job = (await api(`/api/hr/jobs/${id}`)).job;
     if (state.openJob !== String(id)) return null;
     return renderJob();
   } catch (err) {
     $('#dTitle').textContent = 'Job';
-    $('#dBody').innerHTML = `<div class="empty-note"><b>Could not open this job.</b>${esc(err.message)}</div>`;
+    $('#dBody').innerHTML = stateBlock('error', 'Could not open this job.', err.message, { compact: true });
     return null;
   }
 }
@@ -511,7 +511,7 @@ async function openApp(id) {
   state.openApp = id; state.openJob = null; writeUrl();
   $$('.orow').forEach((r) => r.classList.toggle('open', Number(r.dataset.app) === id));
   showDrawer(state.app?.application.id === id ? state.app.application.full_name : 'Loading…');
-  if (state.app?.application.id !== id) { $('#dBody').innerHTML = '<div class="empty-note">Loading…</div>'; }
+  if (state.app?.application.id !== id) { $('#dBody').innerHTML = stateBlock('loading', 'Loading…', '', { compact: true }); }
   $('#dButtons').innerHTML = '<button class="btn" type="button" data-close>Close</button>';
   try {
     const d = await api(`/api/hr/applications/${id}`);
@@ -520,7 +520,7 @@ async function openApp(id) {
     renderApp();
   } catch (err) {
     $('#dTitle').textContent = 'Application';
-    $('#dBody').innerHTML = `<div class="empty-note"><b>Could not open this application.</b>${esc(err.message)}</div>`;
+    $('#dBody').innerHTML = stateBlock('error', 'Could not open this application.', err.message, { compact: true });
   }
 }
 

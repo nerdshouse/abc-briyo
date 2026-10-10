@@ -15,8 +15,8 @@ export const $$ = (sel, root = document) => [...root.querySelectorAll(sel)];
 export const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => (
   { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 
-const inr = new Intl.NumberFormat('en-IN', { style: 'currency', currency: 'INR', maximumFractionDigits: 0 });
-export const money = (v) => inr.format(Number(v || 0));
+// Money is formatted to two decimals in one place (public/ui/format.js): ₹180.50, never ₹181.
+export { money, moneyIn } from './format.js';
 export const count = (v) => new Intl.NumberFormat('en-IN').format(Number(v || 0));
 export const pct = (n, d) => (d ? Math.round((n / d) * 100) : 0);
 
@@ -470,6 +470,10 @@ export function initShell(me, { onSearch } = {}) {
     });
     startRouter();
     enhanceDrawers();
+    document.addEventListener('keydown', (e) => {
+      const th = e.target.closest?.('th.sortable[tabindex]');
+      if (th && (e.key === 'Enter' || e.key === ' ')) { e.preventDefault(); th.click(); }
+    });
     if (!document.querySelector('.skip-link')) {
       document.body.insertAdjacentHTML('afterbegin', '<a class="skip-link" href="#main">Skip to content</a>');
     }
@@ -621,10 +625,14 @@ export function confirmDialog({ title, body = '', confirmLabel = 'Confirm', dang
   });
 }
 
-/** One loading / empty / error block for every page. */
-export function stateBlock(kind, title, detail = '', { action = '', iconName = '' } = {}) {
+/**
+ * One loading / empty / error block for every page. Loading is announced politely (role=status), an error at
+ * once (role=alert). `compact` fits a table cell or a drawer body.
+ */
+export function stateBlock(kind, title, detail = '', { action = '', iconName = '', compact = false } = {}) {
   const ico = iconName || { loading: 'loader', empty: 'inbox', error: 'circle-alert' }[kind] || 'info';
-  return `<div class="state ${kind}"${kind === 'loading' ? ' aria-busy="true"' : ''}>${icon(ico)}<b>${esc(title)}</b>${detail ? `<span>${esc(detail)}</span>` : ''}${action}</div>`;
+  const role = kind === 'error' ? ' role="alert"' : kind === 'loading' ? ' role="status" aria-busy="true"' : '';
+  return `<div class="state ${kind}${compact ? ' compact' : ''}"${role}>${icon(ico)}<b>${esc(title)}</b>${detail ? `<span>${esc(detail)}</span>` : ''}${action}</div>`;
 }
 
 /**

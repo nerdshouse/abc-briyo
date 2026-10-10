@@ -2761,6 +2761,49 @@ await step('inventory forms: native date pickers (date-only text, month-only exp
   return 'receive form: number quantity, date pickers (mfg, expiry with month-only switch, received ≤ today IST), numeric CP/SP/MRP; checked before sending; server refuses abc / 1.5 / −3 / 0 / Infinity / NaN / 1e3 / blank / > 10M / 12abc, text and 3-decimal costs, 30 Feb and month 13 — no batch, no ledger row; 2026-08-01 and 2028-08 stored as 2026-08-01 / 2028-08-31, ₹180.50 kept; a spaced SKU code receives, adjusts (5 − 2 = 3) and is found by search';
 });
 
+await step('money display: two decimals everywhere the shared formatter is used (₹180.50 never ₹181), foreign currency kept, stored values and CSVs untouched', async () => {
+  const bad = [];
+  const { money, moneyIn } = await import('../public/ui/format.js');
+  const cases = [[180.5, '₹180.50'], ['180.50', '₹180.50'], [249, '₹249.00'], [0.1 + 0.2, '₹0.30'], [3258575, '₹32,58,575.00'], [null, '₹0.00'], ['21.675', '₹21.68']];
+  for (const [v, want] of cases) if (money(v) !== want) bad.push(`money(${JSON.stringify(v)}) = ${money(v)}, want ${want}`);
+  if (moneyIn('USD', 20) !== '$20.00' || moneyIn('INR', 1.5) !== '₹1.50' || !/1\.50/.test(moneyIn('XYZ', 1.5))) bad.push('moneyIn');
+  const read = (f) => fsp.readFile(new URL(`../public/${f}`, import.meta.url), 'utf8');
+  const comp = await read('ui/components.js');
+  if (!/export \{ money, moneyIn \} from '\.\/format\.js';/.test(comp) || /maximumFractionDigits: 0 \}\);\s*export const money/.test(comp)) bad.push('components still rounds money');
+  if (!/minimumFractionDigits: 2, maximumFractionDigits: 2/.test(await read('import.js'))) bad.push('import page rounds money');
+  if (!/moneyIn\(cur, v\)/.test(await read('recovery.js'))) bad.push('recovery foreign currency');
+  // The stored value is what was entered: a batch at ₹180.50 reads back as 180.50 and values to the paisa.
+  const sku = (await createSku({ sku: `${TS}-MONEY`, product_name: 'Money display' }, { actor: ACTOR })).id;
+  await receiveInventory({ sku_id: sku, batch_number: 'M-1', quantity: '3', unit_cost: '180.50', selling_price: '249', mrp: '299.99', request_id: rid() }, { actor: ACTOR });
+  const d = await skuDetail(sku);
+  if (d.batches[0].unit_cost !== 180.5 || d.batches[0].value !== 541.5 || d.batches[0].mrp !== 299.99 || money(d.batches[0].unit_cost) !== '₹180.50' || money(d.batches[0].value) !== '₹541.50') bad.push(`stored/display ${JSON.stringify(d.batches[0]).slice(0, 160)}`);
+  if (bad.length) throw new Error(bad.join(' | '));
+  return '₹180.50, ₹249.00, ₹0.30, ₹32,58,575.00, ₹21.68 (display rounding only); USD/INR/unknown codes keep two decimals; components, import and recovery use it; a ₹180.50 batch stores 180.5 and values 3 × 180.50 = ₹541.50';
+});
+
+await step('shared UI patterns: one outlined label (tag / xtag / mini-tag) on tokens, unknown expiry distinct from near expiry, no duplicate .btn.danger / .status.none, table standard (row tokens, numeric columns, focusable selectable rows, keyboard sorting with aria-sort, scroll cue), stateBlock with roles used for loading/error, inventory forms: no prompts, confirm dialogs, unsaved-change guard, single submit, SKU list fetched once per change', async () => {
+  const bad = [];
+  const read = (f) => fsp.readFile(new URL(`../public/${f}`, import.meta.url), 'utf8');
+  const ui = await read('ui.css'); const ord = await read('orders.css');
+  if (!/\.tag, \.xtag, \.mini-tag \{[^}]*font-size: var\(--fs-label\)/.test(ui)) bad.push('labels not consolidated');
+  if (/^\.xtag \{|^\.tag \{ font-size|^\.mini-tag \{\s*display: inline-block/m.test(ui + ord)) bad.push('old label definitions remain');
+  if (!/\.xtag\.unknown \{[^}]*border-style: dashed/.test(ui)) bad.push('unknown expiry looks like near expiry');
+  if ((ui + ord).match(/^\.btn\.danger \{/gm)?.length !== 1 || (ui + ord).match(/^\.status\.none \{/gm)?.length !== 1) bad.push('duplicate component rules');
+  for (const t of ['--h-table-row:', '--table-head:', '--selected:', '.table tbody tr[tabindex]:focus-visible', '.table th.sortable:focus-visible', 'no-repeat local']) if (!ui.includes(t)) bad.push(`table standard: ${t}`);
+  for (const f of ['index.html', 'dashboard.html']) if ((await read(f)).match(/<th class="sortable[^"]*" tabindex="0" aria-sort="none"/g)?.length !== 7) bad.push(`${f}: sortable headers not focusable`);
+  for (const f of ['app.js', 'dashboard.js']) if (!/setAttribute\('aria-sort'/.test(await read(f))) bad.push(`${f}: aria-sort not updated`);
+  const comp = await read('ui/components.js');
+  if (!/th\.sortable\[tabindex\]/.test(comp) || !/role="alert"' : kind === 'loading' \? ' role="status" aria-busy="true"'/.test(comp)) bad.push('keyboard sort / stateBlock roles');
+  for (const f of ['hr.js', 'inventory.js', 'affiliates.js']) if (!/stateBlock\('loading'/.test(await read(f))) bad.push(`${f}: hand-rolled loading`);
+  const inv = await read('inventory.js');
+  if (/window\.prompt\('(Stage|Why is the rest)/.test(inv) || !/kind === 'incoming-stage'/.test(inv) || !/kind === 'incoming-cancel'/.test(inv)) bad.push('incoming prompts remain');
+  if (/window\.confirm\(`Remove platform SKU|window\.confirm\('Remove this document/.test(inv)) bad.push('destructive actions use window.confirm');
+  if (!/if \(state\.submitting\) return;/.test(inv) || !/state\.form\.dirty = true/.test(inv) || !/if \(!force && state\.form\?\.dirty/.test(inv)) bad.push('submit/dirty guards');
+  if (!/const needSkus = !state\.skus \|\| state\.skusStale;/.test(inv)) bad.push('SKU list refetched on every filter');
+  if (bad.length) throw new Error(bad.join(' | '));
+  return 'labels: one outlined pattern at 11px on tokens (5 tones), unknown expiry dashed; duplicates removed; tables share row/head tokens, tabular numerics, focusable/selected rows, keyboard sort with aria-sort on the call board and Analytics, a scroll edge cue; stateBlock announces loading/errors and replaces hand-rolled loading in HR, Inventory, Affiliates; inventory: labelled stage/cancel forms, confirm dialogs, unsaved-change guard, one submit at a time, SKU list fetched once (5 filter changes: 10 → 5 requests)';
+});
+
 await step('inventory: month-only expiry is the last calendar day, stored as a date, never shifted', async () => {
   const id = (await createSku({ sku: `${TS}-EXPIRY`, product_name: 'Expiry dates' }, { actor: ACTOR })).id;
   const cases = [['08/2028', '2028-08-31'], ['2028-08', '2028-08-31'], ['02/2028', '2028-02-29'], ['02/2027', '2027-02-28'], ['31/12/2029', '2029-12-31'], ['2029-01-15', '2029-01-15']];
