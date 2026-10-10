@@ -9397,9 +9397,13 @@ await step('referral: attribution through the existing Shopify sync — last eli
   // Orders placed just after the clicks (the sync window ends "now", so never in the future).
   const placed = () => new Date().toISOString();
   const att = (ref, click) => [{ key: '__briyo_ref', value: ref }, { key: '__briyo_click', value: click }, { key: 'gift_note', value: 'Happy birthday' }];
-  // A coupon asset (the reserved coupon path): only the database can hold one in this phase.
+  // A coupon asset (the reserved coupon path): only the database can hold one in this phase. It is dated explicitly,
+  // an hour before the orders below. A coupon counts only if it existed when the order was placed (created_at <=
+  // order time); left to the database default, now() (microseconds) could fall in the same millisecond as order
+  // 905's time (milliseconds, so rounded down), read as newer than the order, and B's click won now and then.
   const cid = (await getPool().query(`SELECT id FROM affiliates WHERE public_id = $1`, [C])).rows[0].id;
-  await getPool().query(`INSERT INTO affiliate_referral_assets (public_id, affiliate_id, type, code, created_by) VALUES ('CPNDBCHECK', $1, 'coupon', 'DBCHECKCPN10', 'db-check')`, [cid]);
+  const couponCreatedAt = new Date(Date.now() - 60 * 60 * 1000);
+  await getPool().query(`INSERT INTO affiliate_referral_assets (public_id, affiliate_id, type, code, created_by, created_at) VALUES ('CPNDBCHECK', $1, 'coupon', 'DBCHECKCPN10', 'db-check', $2)`, [cid, couponCreatedAt]);
   SH.store = [
     shOrder(901, { created: placed(), attributes: att(B, clickOf(b1)), total: 1499 }),                            // last click → B
     shOrder(902, { created: placed(), attributes: att(A, clickOf(a1)) }),                                       // A's click, but visitor's last click is B → B
@@ -9423,6 +9427,13 @@ await step('referral: attribution through the existing Shopify sync — last eli
     if (w === null ? got !== null : (got?.aff !== w[0] || got.m !== w[1] || got.v !== 'v1' || got.w !== 30)) bad.push(`order ${n}: ${got ? `${got.aff}/${got.m}/${got.v}/${got.w}` : 'none'}`);
   }
   if ((await who(902))?.click_id !== clickOf(b1)) bad.push('last click not the one recorded');
+  // The coupon's time rule at its boundary (read-only, fixed times): an order placed 1 ms before the coupon existed
+  // does not get it; 1 ms after, it does.
+  const { resolveOrderAttribution } = await import('../lib/affiliate-referrals.js');
+  const couponFor = (ms) => resolveOrderAttribution(getPool(), { orderedAt: new Date(couponCreatedAt.getTime() + ms).toISOString(), discountCodes: ['dbcheckcpn10'] });
+  if (await couponFor(-1) !== null) bad.push('coupon counted for an order placed before it existed');
+  const after = await couponFor(1);
+  if (after?.method !== 'coupon' || String(after.affiliateId) !== String(cid)) bad.push(`coupon not counted 1 ms after it existed: ${JSON.stringify(after)}`);
   if (r.summary.affiliateAttributionsRecorded !== 5) bad.push(`recorded ${r.summary.affiliateAttributionsRecorded}`);
   // Idempotent: another sync changes nothing, even after the affiliate is suspended.
   await af('manager', 'POST', `/api/affiliates/${B}/status`, { action: 'suspend', reason: 'db-check' });
@@ -9467,7 +9478,7 @@ await step('referral: attribution through the existing Shopify sync — last eli
   if (view.attributions.total < 2 || JSON.stringify(view).match(/Asha|buyer@|\+91|gift|visitor|ip_hash|"id":/)) bad.push('admin summary');
   if (process.env.SHOPIFY_ORDERS_POLL_ENABLED === 'true') bad.push('polling enabled');
   if (bad.length) throw new Error(bad.join(' | '));
-  return '9 orders: last click (incl. across affiliates) wins, bref/click mismatch and unknown click ignored, affiliate coupon beats the click, a non-affiliate coupon does not, ordered-before-click ignored, legacy keys read; preview = commit (5); re-sync idempotent; suspended affiliate loses new orders to the previous eligible click; 30 → 60-day window read from settings; rule v1 stored; totals, snapshots and stock untouched; DB refuses a second or orphan attribution and edits';
+  return '9 orders: last click (incl. across affiliates) wins, bref/click mismatch and unknown click ignored, affiliate coupon beats the click (only once it exists: 1 ms before → no, 1 ms after → yes), a non-affiliate coupon does not, ordered-before-click ignored, legacy keys read; preview = commit (5); re-sync idempotent; suspended affiliate loses new orders to the previous eligible click; 30 → 60-day window read from settings; rule v1 stored; totals, snapshots and stock untouched; DB refuses a second or orphan attribution and edits';
 });
 
 await step('affiliate commissions through the real Shopify sync: snapshot → attribution → one commission (rate, base, amount), a re-run sync adds nothing', async () => {
