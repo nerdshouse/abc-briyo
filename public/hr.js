@@ -668,7 +668,7 @@ function bind() {
   };
   for (const el of [$('#rows'), $('#clist')]) {
     el.addEventListener('click', pick);
-    el.addEventListener('keydown', (e) => { if (e.key === 'Enter') pick(e); });
+    el.addEventListener('keydown', (e) => { if (e.key === 'Enter' || (e.key === ' ' && e.target.matches('[data-job], [data-app]'))) { if (e.key === ' ') e.preventDefault(); pick(e); } });
   }
 
   $('#dBody').addEventListener('input', (e) => {

@@ -69,5 +69,10 @@ $('#cpRows').addEventListener('click', async (e) => {
     isAdmin = Boolean(me.caps?.includes('logistics.setup'));
     initShell(me);
     await load();
-  } catch (err) { note(err.message); }
+  } catch (err) {
+    note(err.message);
+    // A failed first load never leaves the table saying "Loading…".
+    const waiting = document.querySelector('#cpRows .empty-note[role=status]');
+    if (waiting) waiting.textContent = 'Could not load. See the message above.';
+  }
 })();

@@ -441,7 +441,7 @@ function alternativesSection(alts, s) {
         ${canCatalog() ? ` <button type="button" class="linkish" data-alt-remove="${a.id}">Remove</button>` : ''}</span></li>`).join('')}</ul>`
       : '<p class="soft" style="margin:0">No alternatives listed.</p>'}
     ${canCatalog() ? `<div class="alt-add"><select class="select" id="altSku" aria-label="Alternative SKU">${opt('', 'Add an alternative variant…', true)}${others.map((x) => opt(x.id, `${x.sku} — ${x.product_name}${x.variant_name ? ` (${x.variant_name})` : ''}`)).join('')}</select>
-      <input class="input" id="altNote" maxlength="300" placeholder="Note (optional)" style="flex:1;min-width:140px" /><button type="button" class="btn" id="altAdd">Add</button></div>` : ''}
+      <input class="input" id="altNote" maxlength="300" placeholder="Note (optional)" aria-label="Note about this alternative (optional)" style="flex:1;min-width:140px" /><button type="button" class="btn" id="altAdd">Add</button></div>` : ''}
   </section>`;
 }
 const CONDITION_TAG = { sellable: '<span class="xtag ok" style="margin-left:0">Sellable</span>', damaged: '<span class="xtag expired" style="margin-left:0">Damaged</span>', quarantined: '<span class="xtag held" style="margin-left:0">Quarantined</span>' };
@@ -741,11 +741,11 @@ function openForm(kind, ctx = {}) {
     body = `<section class="dsec"><h3 class="dsec-title">Warehouses</h3>
       <ul class="d-history">${m.warehouses.map((w) => `<li><span>${esc(w.name)}${w.active ? '' : ' <span class="mini-tag">Off</span>'}</span>
         <button type="button" class="linkish" data-toggle-wh="${w.id}" data-active="${w.active}">${w.active ? 'Switch off' : 'Switch on'}</button></li>`).join('')}</ul>
-      <div class="attach-new"><input class="input plain" id="newWh" placeholder="New warehouse, e.g. 3PL Warehouse" maxlength="120" /><button type="button" class="btn" id="addWh">Add</button></div>
+      <div class="attach-new"><input class="input plain" id="newWh" placeholder="New warehouse, e.g. 3PL Warehouse" aria-label="New warehouse name" maxlength="120" /><button type="button" class="btn" id="addWh">Add</button></div>
     </section>
     <section class="dsec"><h3 class="dsec-title">Suppliers</h3>
       <ul class="d-history">${m.suppliers.length ? m.suppliers.map((x) => `<li><span>${esc(x.name)}${x.reference ? ` <span class="soft">· ${esc(x.reference)}</span>` : ''}</span></li>`).join('') : '<li class="soft">None yet. They are also added from Add Inventory.</li>'}</ul>
-      <div class="attach-new"><input class="input plain" id="newSup" placeholder="Supplier name" maxlength="120" /><input class="input plain" id="newSupRef" placeholder="Reference (optional)" maxlength="120" /><button type="button" class="btn" id="addSup">Add</button></div>
+      <div class="attach-new"><input class="input plain" id="newSup" placeholder="Supplier name" aria-label="New supplier name" maxlength="120" /><input class="input plain" id="newSupRef" placeholder="Reference (optional)" aria-label="Supplier reference (optional)" maxlength="120" /><button type="button" class="btn" id="addSup">Add</button></div>
     </section>`;
   }
   $('#fTitle').textContent = title;
@@ -1068,7 +1068,7 @@ function bind() {
   const rowOpen = (e) => { const r = e.target.closest('[data-sku]'); if (r) openSku(Number(r.dataset.sku)); };
   for (const host of [$('#rows'), $('#clist')]) {
     host.addEventListener('click', rowOpen);
-    host.addEventListener('keydown', (e) => { if (e.key === 'Enter') rowOpen(e); });
+    host.addEventListener('keydown', (e) => { if (e.key === 'Enter' || (e.key === ' ' && e.target.matches('[data-sku]'))) { if (e.key === ' ') e.preventDefault(); rowOpen(e); } });
   }
   $('#unmapped').addEventListener('input', (e) => {
     if (e.target.id === 'umQ') { state.um.q = e.target.value; renderUnmappedRows(); }

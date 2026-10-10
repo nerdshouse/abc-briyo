@@ -2662,6 +2662,60 @@ await step('inventory: returns, incoming and alternatives keep the existing perm
   return 'viewer reads returns/incoming, never writes (8 routes 403); logistics-only 403; operator records returns but cannot link variants; catalog-only cannot record stock; page: Nil for 0, near/expired/unknown labels, +N incoming, alternatives line, per-unit totals note, four new forms, buttons gated by inventory.move, near/unknown/incoming filters';
 });
 
+await step('design system and shell: documented tokens (weights, heights, focus, motion, module identity), module colours only on nav markers/icons/breadcrumbs, centred logo, honest presence (this session + browser online state, no heartbeat), reduced motion', async () => {
+  const bad = [];
+  const css = await fsp.readFile(new URL('../public/ui.css', import.meta.url), 'utf8');
+  const comp = await fsp.readFile(new URL('../public/ui/components.js', import.meta.url), 'utf8');
+  const root = css.slice(css.indexOf(':root {'), css.indexOf('\n}', css.indexOf(':root {')));
+  for (const t of ['--fw-medium', '--lh-body', '--h-control', '--h-row', '--drawer-w', '--focus-ring', '--dur', '--ease', '--mod-overview', '--mod-logistics', '--mod-inventory', '--mod-support', '--mod-marketing', '--mod-affiliates', '--mod-hr', '--mod-admin']) if (!root.includes(`${t}:`)) bad.push(`token ${t} missing`);
+  for (const m of ['overview', 'logistics', 'inventory', 'support', 'marketing', 'affiliates', 'hr', 'admin']) if (!new RegExp(`\\[data-module="${m}"\\][^{]*\\{ --mod: var\\(--mod-${m}\\); \\}`).test(css)) bad.push(`module ${m} not mapped`);
+  // Module colour never paints backgrounds, buttons or status.
+  for (const m of css.matchAll(/([^{}]+)\{([^}]*var\(--mod\)[^}]*)\}/g)) {
+    const sel = m[1].trim();
+    // Allowed: nav items/markers, department icons, the breadcrumb icon. Never buttons, status, table rows, cards.
+    if (/\.btn|\.status|\btr\b|tbody|\.card|\.badge/.test(sel) || (/background/.test(m[2]) && !/::before/.test(sel))) bad.push(`module colour used beyond markers: ${sel.slice(0, 60)}`);
+  }
+  if (!/\.sidebar \.brand \{[^}]*align-items: center/.test(css)) bad.push('logo not centred');
+  if (!/function syncPresence\(\)/.test(comp) || !/'Active session' : 'Offline'/.test(comp) || !/addEventListener\('online', syncPresence\)/.test(comp)) bad.push('presence not honest');
+  const presence = comp.slice(comp.indexOf('function syncPresence()'), comp.indexOf('function enhanceDrawers'));
+  if (/setInterval|setTimeout|fetch\(|api\(/.test(presence)) bad.push('presence polls or calls the server');
+  if (!/@media \(prefers-reduced-motion: reduce\) \{\s*\*, \*::before, \*::after \{ animation-duration: 0\.01ms/.test(css)) bad.push('no global reduced-motion rule');
+  for (const [k, ico] of [['logistics', "'Logistics', 'truck'"], ['inventory', "'Inventory', 'boxes'"]]) if (!comp.includes(`'${k}') : ''}`)) bad.push(`ops nav ${k} has no module`);
+  if (!(await fsp.readFile(new URL('../public/inventory.html', import.meta.url), 'utf8')).includes('data-section="inventory"')) bad.push('inventory page not in the inventory module');
+  if (bad.length) throw new Error(bad.join(' | '));
+  return 'tokens for weights, leading, control/row heights, drawer widths, focus, motion and 8 module colours documented in :root; data-module / data-section map each module; colour only on the active marker, department icons and breadcrumb icon; logo centred; presence = "Active session" / "Offline" from this browser (no heartbeat); reduced motion collapses all motion';
+});
+
+await step('consistency and accessibility pass: no undefined CSS variables on shell pages, hard-coded tone/hover/focus colours tokenised, one focus ring for rows and menus, named inputs and icon links, Space opens rows, overdue counts in words, sign-out failure handled, loading rows that never stick, sync timers cleared on leave', async () => {
+  const bad = [];
+  const read = (f) => fsp.readFile(new URL(`../public/${f}`, import.meta.url), 'utf8');
+  const ui = await read('ui.css'); const ord = await read('orders.css'); const ov = await read('overview.css');
+  const defined = new Set([ui, ord, ov].flatMap((css) => [...css.matchAll(/(--[a-z0-9-]+)\s*:/g)].map((m) => m[1])));
+  for (const [f, css] of [['ui.css', ui], ['orders.css', ord], ['overview.css', ov]]) {
+    for (const m of css.matchAll(/var\((--[a-z0-9-]+)/g)) if (!defined.has(m[1]) && !/^--(ox|mk|bar|w)\b/.test(m[1])) bad.push(`${f}: var(${m[1]}) is not defined`);
+    for (const hex of ['#FECDCA', '#FEDF89', '#ABEFC6', '#FCFCFD', '#C5CBD5']) {
+      const n = (css.match(new RegExp(hex, 'gi')) || []).length - (f === 'ui.css' ? 1 : 0);
+      if (n > 0) bad.push(`${f}: ${hex} hard-coded ${n}×`);
+    }
+  }
+  if (/focus-visible \{ outline: 2px solid rgba\(32, 43, 60, \.25\)/.test(ui + ord)) bad.push('grey row focus ring left');
+  if (!/\.popover button:focus-visible \{ box-shadow: inset 0 0 0 2px var\(--focus\); \}/.test(ui)) bad.push('menu items have no focus ring');
+  const inv = await read('inventory.js'); const ojs = await read('orders.js'); const dash = await read('dashboard.js'); const comp = await read('ui/components.js');
+  for (const id of ['altNote', 'newWh', 'newSup', 'newSupRef']) if (!new RegExp(`id="${id}"[^>]*aria-label=`).test(inv)) bad.push(`inventory #${id} unnamed`);
+  for (const id of ['dAttachQ', 'dNewNum', 'dNewValue', 'dNote']) if (!new RegExp(`id="${id}"[^>]*aria-label=`).test(ojs)) bad.push(`orders #${id} unnamed`);
+  if ((dash.match(/class="icon-btn[^"]*" href=[^>]*title="[^"]*"(?![^>]*aria-label)/g) || []).length) bad.push('dashboard icon link without aria-label');
+  for (const f of ['inventory.js', 'orders.js', 'recovery.js', 'stock-outward.js', 'hr.js']) if (!/e\.key === 'Enter' \|\| \(e\.key === ' '/.test(await read(f))) bad.push(`${f}: rows open with Enter only`);
+  if (!/`\$\{count\(n\)\} overdue`/.test(comp)) bad.push('overdue count is colour only');
+  if (!/Could not sign out/.test(comp)) bad.push('sign-out failure unhandled');
+  for (const [f, id] of [['recovery.html', 'rows'], ['stock-outward.html', 'rows'], ['couriers.html', 'cpRows']]) {
+    if (!new RegExp(`<tbody id="${id}"><tr><td colspan="\\d+"><div class="empty-note" role="status">Loading…</div>`).test(await read(f))) bad.push(`${f}: no loading row`);
+  }
+  for (const f of ['recovery.js', 'stock-outward.js', 'couriers.js']) if (!/Could not load\. See the message above\./.test(await read(f))) bad.push(`${f}: loading row can stick after an error`);
+  if (!/onLeave\(\(\) => \{ clearTimeout\(shopifyTimer\); clearTimeout\(amazonTimer\); \}\)/.test(ojs) || !/amazonTimer = setTimeout\(followAmazonSync, 2500\)/.test(ojs)) bad.push('sync loops not cleared on leave');
+  if (bad.length) throw new Error(bad.join(' | '));
+  return 'every var() on shell CSS resolves (legacy --r-sm/--muted/--border-strong/--warn/--warn-border now aliases); 5 hard-coded colours tokenised (37 uses); rows and menus share the --focus ring; 8 placeholder-only inputs and 3 icon links named; Space opens rows on 5 pages; overdue counts say "N overdue"; sign-out failure shows a message; Recovery, Stock outward and Couriers show a loading row that turns into "Could not load" on error; Shopify/Amazon status loops cleared on leaving Orders';
+});
+
 await step('shell navigation: the top bar title is the incoming page\'s element (id included) — arriving at Inventory from Stock outward or Recovery no longer throws "Cannot set properties of null (setting \'textContent\')"', async () => {
   const bad = [];
   const nav = await fsp.readFile(new URL('../public/ui/nav.js', import.meta.url), 'utf8');

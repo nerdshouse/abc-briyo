@@ -17,7 +17,7 @@
 .date-range { display: inline-flex; gap: 8px; flex-wrap: nowrap; }
 .ord-table .cell-main, .ord-table .cell-sub { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .orow { cursor: pointer; }
-.orow:focus-visible { outline: 2px solid rgba(32, 43, 60, .25); outline-offset: -2px; }
+.orow:focus-visible { outline: 2px solid var(--focus); outline-offset: -2px; }
 .orow.open td { background: #F7F8FA !important; }
 
 /* channel: a word, not a logo-coloured badge */
@@ -46,7 +46,7 @@
 .more textarea.input { width: 100%; min-height: 64px; padding: 8px 10px; resize: vertical; line-height: 1.45; font-size: 13px; }
 
 /* new shipment: an existing order was found */
-.exists { margin: 12px 16px 0; padding: 12px; border: 1px solid #FEDF89; border-radius: 8px; background: var(--warning-soft); font-size: 12.5px; }
+.exists { margin: 12px 16px 0; padding: 12px; border: 1px solid var(--warning-border); border-radius: 8px; background: var(--warning-soft); font-size: 12.5px; }
 .exists .form-actions { margin-top: 10px; }
 .fld .file { font-size: 12px; min-width: 0; max-width: 100%; }
 .form-grid > .help.wide { grid-column: 1 / -1; font-size: 11.5px; color: var(--text-3); margin-top: -4px; }
@@ -137,7 +137,7 @@
 #cThumbs { margin-top: 10px; }
 .add-photos { margin: 10px 8px 0 0; height: 32px; cursor: pointer; }
 .proof-field .file { font-size: 12.5px; }
-.retry { margin-bottom: 12px; padding: 10px 12px; border: 1px solid #FECDCA; border-radius: 8px; background: var(--error-soft); font-size: 12.5px; color: var(--error-text); }
+.retry { margin-bottom: 12px; padding: 10px 12px; border: 1px solid var(--error-border); border-radius: 8px; background: var(--error-soft); font-size: 12.5px; color: var(--error-text); }
 .retry ul { margin: 6px 0 0; padding-left: 18px; }
 .retry .form-actions { margin-top: 8px; }
 /* list: compact proof summary, no taller rows */
@@ -385,7 +385,7 @@ html.scroll-locked .drawer-scrim { touch-action: none; }
   .hr-link { flex-wrap: wrap; }
   .hr-link .input { flex-basis: 100%; }
 }
-.hr-confirm { margin-top: 12px; padding: 12px; border: 1px solid #FECDCA; border-radius: 8px; background: var(--error-soft, #FEF3F2); font-size: 12.5px; }
+.hr-confirm { margin-top: 12px; padding: 12px; border: 1px solid var(--error-border); border-radius: 8px; background: var(--error-soft, #FEF3F2); font-size: 12.5px; }
 .hr-confirm p { margin: 0 0 8px; }
 .hr-confirm .input { width: 100%; padding-left: 10px; background: var(--surface); }
 .btn.danger { background: var(--error, #D92D20); border-color: var(--error, #D92D20); color: #fff; }
@@ -499,7 +499,7 @@ html.scroll-locked .drawer-scrim { touch-action: none; }
 /* Affiliates — professional verification (Phase 1D) */
 .af-verify .card-title .status { margin-left: 8px; font-size: 12.5px; }
 .af-verify .alert { margin-bottom: 14px; }
-.alert.af-ok { border-color: #ABEFC6; background: #ECFDF3; color: #067647; }
+.alert.af-ok { border-color: var(--success-border); background: #ECFDF3; color: #067647; }
 .af-verify-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 8px 32px; }
 .af-verify .dsec-title { margin: 0 0 6px; }
 .af-gap { margin-top: 18px !important; }
@@ -568,8 +568,8 @@ html.scroll-locked .drawer-scrim { touch-action: none; }
 dl.facts { display: grid; grid-template-columns: max-content 1fr; gap: 6px 14px; margin: 0; font-size: 13px; }
 dl.facts dt { color: var(--text-3); }
 dl.facts dd { margin: 0; min-width: 0; overflow-wrap: anywhere; }
-.tag.ok { color: var(--success-text); border-color: #ABEFC6; }
-.tag.warn { color: #B54708; border-color: #FEDF89; }
+.tag.ok { color: var(--success-text); border-color: var(--success-border); }
+.tag.warn { color: #B54708; border-color: var(--warning-border); }
 .check { display: inline-flex; gap: 8px; align-items: center; color: var(--text); }
 @media (max-width: 760px) { .so-filters .input, .so-filters .select { flex: 1 1 100%; } dl.facts { grid-template-columns: 1fr; } dl.facts dt { margin-top: 4px; } }
 .so-table .cell-sub, .so-rep .cell-sub { display: block; }
@@ -582,7 +582,7 @@ dl.facts dd { margin: 0; min-width: 0; overflow-wrap: anywhere; }
 .fld .fld-lbl { font-size: 12px; color: var(--text-2); }
 
 /* Recovery verification */
-.tag.bad { color: var(--error-text); border-color: #FECDCA; }
+.tag.bad { color: var(--error-text); border-color: var(--error-border); }
 .rv-filters { margin-bottom: 12px; align-items: flex-end; }
 .rv-filters .fld { flex: 1 1 160px; }
 .rv-stats { margin-bottom: 8px; }
@@ -595,18 +595,18 @@ dl.facts dd { margin: 0; min-width: 0; overflow-wrap: anywhere; }
 .rv-cand .tag { display: inline-block; margin: 2px 4px 0 0; }
 .rv-actions { display: flex; gap: 8px; flex-wrap: wrap; }
 .rv-time { color: var(--text-2); }
-.rv-time.before { color: #B54708; border-color: #FEDF89; }
+.rv-time.before { color: #B54708; border-color: var(--warning-border); }
 
 /* ---------------- Inventory: nil stock, expiry states, incoming, alternatives (always a text label beside the colour) */
 .nil { color: var(--text-3); font-weight: 500; }
 .xtag { display: inline-block; margin-left: 6px; padding: 0 6px; font-size: 10.5px; font-weight: 500; line-height: 16px; border: 1px solid var(--border); border-radius: 5px; background: var(--surface); color: var(--text-2); white-space: nowrap; vertical-align: 1px; }
 .xtag.near { color: #B54708; border-color: #FEC84B; background: #FFFAEB; }        /* near expiry: orange */
-.xtag.expired { color: var(--error-text); border-color: #FECDCA; background: #FEF3F2; } /* expired: red */
-.xtag.unknown { color: #93370D; border-color: #FEDF89; background: #FFFCF5; }       /* unknown expiry: muted amber */
+.xtag.expired { color: var(--error-text); border-color: var(--error-border); background: #FEF3F2; } /* expired: red */
+.xtag.unknown { color: #93370D; border-color: var(--warning-border); background: #FFFCF5; }       /* unknown expiry: muted amber */
 .xtag.held { color: var(--text-2); border-color: var(--border); background: var(--surface-2); } /* quarantined / blocked: grey */
 .xtag.incoming { color: var(--info-text); border-color: #B2CCFF; background: var(--info-soft); } /* incoming: blue */
 .xtag.out { color: var(--text-2); border-color: var(--border); background: var(--surface-2); }  /* out of stock: neutral grey */
-.xtag.ok { color: var(--success-text, #067647); border-color: #ABEFC6; background: #ECFDF3; }
+.xtag.ok { color: var(--success-text, #067647); border-color: var(--success-border); background: #ECFDF3; }
 .alt-line { display: block; margin-top: 3px; font-size: 11.5px; color: var(--text-2); white-space: normal; }
 .alt-line .mono { font-size: 11px; }
 .unit-split { display: block; font-size: 11.5px; font-weight: 400; color: var(--text-2); margin-top: 2px; }

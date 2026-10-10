@@ -543,8 +543,8 @@ function renderTable() {
       <td>${tagsOf(c).length ? esc(tagsOf(c).join(', ')) : '<span class="muted">—</span>'}</td>
       <td class="num soft">${esc(dateTime(c.received_at))}</td>
       <td><div class="cell-actions">
-        ${c.phone ? `<a class="icon-btn bare" href="tel:${esc(String(c.phone).replace(/\s/g, ''))}" title="Call">${icon('phone')}</a>` : ''}
-        <a class="icon-btn bare" href="${board}" title="Open on the call board">${icon('arrow-up-right')}</a>
+        ${c.phone ? `<a class="icon-btn bare" href="tel:${esc(String(c.phone).replace(/\s/g, ''))}" title="Call" aria-label="Call ${esc(c.customer_name || 'the customer')}">${icon('phone')}</a>` : ''}
+        <a class="icon-btn bare" href="${board}" title="Open on the call board" aria-label="Open ${esc(c.customer_name || 'this cart')} on the call board">${icon('arrow-up-right')}</a>
       </div></td>
     </tr>`;
   }).join('');
@@ -672,7 +672,7 @@ async function openDrawer(bucket, label) {
             <div style="margin-top:6px">${statusIndicator(c.status)}</div>
           </div>
           <span class="amt">${money(c.total_price)}</span>
-          ${c.phone ? `<a class="icon-btn" href="tel:${esc(c.phone)}" title="Call">${icon('phone')}</a>` : ''}
+          ${c.phone ? `<a class="icon-btn" href="tel:${esc(c.phone)}" title="Call" aria-label="Call ${esc(c.customer_name || 'the customer')}">${icon('phone')}</a>` : ''}
         </div>`).join('')
       : '<div class="empty-note"><b>Nothing in here</b>That is the good outcome.</div>';
     renderIcons();
