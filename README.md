@@ -795,7 +795,9 @@ time out, the second succeeds).
 Target domain: **`abc.briyo.xyz`**.
 
 Hosted on **Render's free tier** — no credit card, custom domain, managed TLS, and a deploy on
-every push to `main`. Config is in [`render.yaml`](render.yaml).
+every push to `main`. Config is in [`render.yaml`](render.yaml). The live service is
+`abc-briyo-sg` (Singapore), the only Render service; see
+[`docs/briyo-os/RENDER-SERVICES.md`](docs/briyo-os/RENDER-SERVICES.md).
 
 1. **Neon** — create the database first and copy the **pooled** connection string.
 2. Render dashboard → **New** → **Blueprint** → connect `nerdshouse/abc-briyo`. It reads
