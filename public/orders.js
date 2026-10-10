@@ -82,6 +82,8 @@ const api = async (url, opts = {}) => {
 
 // Value and date are optional on an order: unknown shows as a dash, never ₹0.
 const amount = (v) => (v === null || v === undefined ? '—' : money(v));
+/** Payment as recorded on the order ("Prepaid · Paid", "COD · Pending"); nothing when neither is known. */
+const payText = (o) => [o.payment_method && label(o.payment_method), o.payment_status && label(o.payment_status)].filter(Boolean).join(' · ');
 const day = (iso) => (iso ? dateShort(iso) : '—');
 
 const channelLabel = (key) => state.meta.channels.find((c) => c.key === key)?.label || key;
@@ -278,7 +280,7 @@ function renderRows() {
       <td>${shipIndicator(o)}${o.shipment_id ? `<span class="cell-sub ship-sub">${o.courier_name ? esc(o.courier_name) : 'No courier'}${o.tracking_id ? ` · ${trackingCell(o)}` : ' · no AWB yet'}</span>` : ''}</td>
       <td>${proofCell(o)}</td>
       <td class="num"${o.order_date ? '' : ' title="No order date — shown by when it was entered"'}>${esc(day(o.order_date))}</td>
-      <td class="r num col-amt">${o.order_value === null || o.order_value === undefined ? '<span class="muted-cell" title="No value entered">—</span>' : esc(amount(o.order_value))}</td>
+      <td class="r num col-amt">${o.order_value === null || o.order_value === undefined ? '<span class="muted-cell" title="No value entered">—</span>' : esc(amount(o.order_value))}${payText(o) ? `<span class="cell-sub pay-sub" title="Payment: ${esc(payText(o))}">${esc(payText(o))}</span>` : ''}</td>
       <td class="r"><button class="icon-btn bare" type="button" data-open="${o.id}" title="Open" aria-label="Open order ${esc(orderNo(o))}">${icon('chevron-right')}</button></td>
     </tr>`).join('');
   $('#clist').innerHTML = state.orders.map((o) => `
@@ -290,7 +292,7 @@ function renderRows() {
       <div class="oi-sub">${o.tracking_id ? `${esc(o.courier_name || '')} · <span class="mono">${esc(o.tracking_id)}</span>` : o.shipment_id ? 'No courier / AWB yet' : 'Not in a shipment yet'}</div>
       <div class="oi-stat"><span class="soft" style="font-size:12.5px">${esc(day(o.order_date))}</span>
         ${proofCell(o)}
-        ${o.order_value !== null ? `<span class="soft" style="font-size:12.5px">${esc(amount(o.order_value))}</span>` : ''}</div>
+        ${o.order_value !== null ? `<span class="soft" style="font-size:12.5px">${esc(amount(o.order_value))}${payText(o) ? ` · ${esc(payText(o))}` : ''}</span>` : ''}</div>
     </li>`).join('');
   renderSelection();
   renderIcons();

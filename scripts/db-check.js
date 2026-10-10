@@ -2814,7 +2814,8 @@ await step('orders & logistics UI: eight-column table (shipment = status + couri
   const thead = html.slice(html.indexOf('<thead>'), html.indexOf('</thead>'));
   if ((thead.match(/<th[\s>]/g) || []).length !== 8 || !/<th class="r col-amt">Amount<\/th>/.test(thead) || !/Shipment <span class="th-sub">courier · AWB<\/span>/.test(thead)) bad.push('table head');
   if (/@media \(max-width: 1360px\)[^}]*col-amt/.test(css) || /\.col-amt[^{]*\{[^}]*display: none/.test(css)) bad.push('Amount hidden on laptops again');
-  if (!/<td class="r num col-amt">\$\{o\.order_value === null \|\| o\.order_value === undefined \? '<span class="muted-cell" title="No value entered">—<\/span>' : esc\(amount\(o\.order_value\)\)\}<\/td>/.test(js)) bad.push('amount cell (shared money formatter, no value never ₹0)');
+  if (!/<td class="r num col-amt">\$\{o\.order_value === null \|\| o\.order_value === undefined \? '<span class="muted-cell" title="No value entered">—<\/span>' : esc\(amount\(o\.order_value\)\)\}/.test(js)) bad.push('amount cell (shared money formatter, no value never ₹0)');
+  if (!/const payText = \(o\) => \[o\.payment_method && label\(o\.payment_method\), o\.payment_status && label\(o\.payment_status\)\]/.test(js) || !/pay-sub/.test(js)) bad.push('payment not shown under the amount');
   if (!/aria-controls="moreFilters"/.test(html) || !/const MORE_FILTERS = \['destination', 'status', 'courier', 'invoice', 'tracking'\];/.test(js) || !/\$\('#filtersCount'\)\.textContent/.test(js)) bad.push('More filters toggle / count');
   if (!/function orderFacts\(o\)/.test(js) || (js.match(/\$\{orderFacts\(o\)\}/g) || []).length !== 2) bad.push('drawer facts');
   const common = js.slice(js.indexOf('function drawerCommon('), js.indexOf('function orderDetailsSection('));
