@@ -13,6 +13,10 @@ Briyo OS runs on **one** Render web service. As of 10-10-2026 there is no second
 
 ## `render.yaml` does not describe the live service (unresolved)
 
+> **Warning: `render.yaml` is an obsolete, non-production template. Do not apply it to the live
+> Render project** — not as a new Blueprint, not by syncing it — without a separately reviewed
+> migration plan. It does not manage `abc-briyo-sg`, and applying it is not safe.
+
 `render.yaml` (added in `fa13e56`, "Add a no-card free deployment path on Render") defines one
 web service: name `abc-briyo`, `plan: free`, region Singapore, build `npm ci`, start `npm start`
 (`node server.js`), auto-deploy from `main`. The live service differs: name `abc-briyo-sg`,
@@ -20,7 +24,7 @@ plan `0.5c-512mb`, build `npm install`.
 
 - Render shows **no Blueprint instances**, so the file is not linked to `abc-briyo-sg`; edits to
   it change nothing in production, and the live settings are managed in the dashboard.
-- **Do not apply it as a new Blueprint.** It would create a *second* service named `abc-briyo`
+- What applying it would do: create a *second* service named `abc-briyo`
   rather than update `abc-briyo-sg`. With production secrets entered at the prompts it would
   run against the production database with `APP_ENV=production` and
   `SHOPIFY_ORDERS_POLL_ENABLED=true` (lock-protected, but a second poller), and would send

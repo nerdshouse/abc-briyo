@@ -797,8 +797,8 @@ Target domain: **`abc.briyo.xyz`**.
 Hosted on **Render** — custom domain, managed TLS, and a deploy on every push to `main`. The
 live service is `abc-briyo-sg` (Singapore), the only Render service; its plan and settings are
 in [`docs/briyo-os/RENDER-SERVICES.md`](docs/briyo-os/RENDER-SERVICES.md). [`render.yaml`](render.yaml)
-and the steps below describe the original free-tier Blueprint setup, which does not match the
-live service — read that doc before applying it.
+and the steps below are the original free-tier Blueprint setup, kept for history only — **do not
+apply them to the live Render project** (that doc explains why).
 
 1. **Neon** — create the database first and copy the **pooled** connection string.
 2. Render dashboard → **New** → **Blueprint** → connect `nerdshouse/abc-briyo`. It reads
