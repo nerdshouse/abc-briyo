@@ -7,7 +7,7 @@ import { istDate, istDateTime, formatDayKey } from './ui/ist.js';
  */
 import {
   $, $$, esc, money, count, icon, renderIcons, setTimezone, dateTime, initShell, pageFetch,
-  pageSignal, onLeave, onQueryChange,
+  pageSignal, onLeave, onQueryChange, stateBlock, confirmDialog,
 } from './ui/components.js';
 
 const fetch = pageFetch();
@@ -89,13 +89,19 @@ const anyFilter = () => FILTERS.some((k) => state.f[k]);
 // ------------------------------------------------------------------ list
 
 async function load() {
+  // First load: say so in the table (it used to sit empty until the data arrived).
+  if (!state.data) $('#rows').innerHTML = `<tr><td colspan="8">${stateBlock('loading', 'Loading stock…', '', { compact: true })}</td></tr>`;
   const u = new URLSearchParams();
   for (const k of FILTERS) if (state.f[k]) u.set(k, state.f[k]);
   try {
-    // The forms list every SKU, not just the rows the filters show.
-    const [data, all] = await Promise.all([api(`/api/inventory?${u}`), api('/api/inventory/skus')]);
+    // The forms list every SKU, not just the rows the filters show. That list is reference data (codes, names,
+    // active) for the pickers — stock always comes from /api/inventory — so it is fetched once and again only after
+    // something that can change it (any save in the forms, alternatives, platform SKUs, Refresh): a filter change
+    // makes one request, not two.
+    const needSkus = !state.skus || state.skusStale;
+    const [data, all] = await Promise.all([api(`/api/inventory?${u}`), needSkus ? api('/api/inventory/skus') : null]);
     state.data = data;
-    state.skus = all.skus;
+    if (all) { state.skus = all.skus; state.skusStale = false; }
     render();
     $('#alerts').innerHTML = '';
   } catch (err) {
@@ -266,12 +272,12 @@ async function openSku(id) {
   $('#drawerScrim').hidden = false;
   syncScrollLock();
   $('#dSaved').textContent = '';
-  if (!state.detail || state.detail.sku.id !== id) { $('#dTitle').textContent = 'Loading…'; $('#dSub').textContent = ''; $('#dBody').innerHTML = ''; }
+  if (!state.detail || state.detail.sku.id !== id) { $('#dTitle').textContent = 'Loading…'; $('#dSub').textContent = ''; $('#dBody').innerHTML = stateBlock('loading', 'Loading…', '', { compact: true }); }
   try {
     state.detail = await api(`/api/inventory/skus/${id}`);
     renderSku();
   } catch (err) {
-    $('#dBody').innerHTML = `<div class="empty-note"><b>Could not open this SKU.</b>${esc(err.message)}</div>`;
+    $('#dBody').innerHTML = stateBlock('error', 'Could not open this SKU.', err.message, { compact: true });
   }
 }
 function closeSku() {
@@ -724,6 +730,22 @@ function openForm(kind, ctx = {}) {
         <span class="help">Less than received needs a reason below.</span></label>
       <label class="fld wide"><span>Reason / note</span><input class="input" name="note" maxlength="300" placeholder="10 sachets torn" /></label>
     </div></section>`;
+  } else if (kind === 'incoming-stage') {
+    const i = ctx.incoming;
+    title = 'Change stage';
+    sub = `${i.sku} · expected ${plural(i.expected_quantity, i.unit)}. Received and accepted follow from deliveries.`;
+    submit = 'Save stage';
+    body = `<section class="dsec"><div class="form-grid">
+      <label class="fld"><span>Stage</span><select class="select" name="status" required>${['planned', 'ordered', 'in_transit'].map((k) => opt(k, m.incomingStatuses?.[k] || k, i.status === k)).join('')}</select></label>
+    </div></section>`;
+  } else if (kind === 'incoming-cancel') {
+    const i = ctx.incoming;
+    title = 'Cancel the rest';
+    sub = `${i.sku} · ${plural(i.outstanding, i.unit)} still to come in. Anything already accepted stays in stock.`;
+    submit = 'Cancel the rest';
+    body = `<section class="dsec"><div class="form-grid">
+      <label class="fld wide"><span>Reason</span><input class="input" name="reason" required maxlength="300" placeholder="Supplier withdrew the order" /></label>
+    </div></section>`;
   } else if (kind === 'import') {
     title = 'Import master SKUs';
     sub = 'Import one row per Master SKU and Product Name. Preview first; nothing is saved until you import.';
@@ -759,7 +781,8 @@ function openForm(kind, ctx = {}) {
   renderIcons();
   f.querySelector('input:not([readonly]):not([type=file]), select')?.focus();
 }
-function closeForm() {
+function closeForm({ force = false } = {}) {
+  if (!force && state.form?.dirty && !window.confirm('Discard what you have entered?')) return;
   $('#formDrawer').hidden = true;
   if ($('#drawer').hidden) $('#drawerScrim').hidden = true;
   syncScrollLock();
@@ -905,7 +928,7 @@ async function addPlatformSku() {
     await openSku(req.skuId);
     $('#dSaved').className = 'saved';
     $('#dSaved').textContent = r.added.length ? `Added ${r.added[0]}${r.orderItemsMapped ? ` · ${r.orderItemsMapped} order line${r.orderItemsMapped > 1 ? 's' : ''} now resolve` : ''}` : 'Already mapped to this Master SKU.';
-    load();
+    state.skusStale = true; load();
   } catch (err) {
     if (err.data?.duplicateMapping) return openForm('dup-map', { ...req, dup: err.data.duplicateMapping });
     showError(err.data?.invalidPlatformSku ? 'SKU cannot contain spaces.' : err.message);
@@ -920,6 +943,7 @@ const addMapping = ({ skuId, platform, codes, fromOrder = false, confirmDuplicat
 
 async function submitForm(e) {
   e.preventDefault();
+  if (state.submitting) return;
   const { kind, ctx } = state.form;
   // Duplicate platform SKU: "Add anyway" first asks why; it cannot be sent without a reason.
   if (kind === 'dup-map' && $('#dupReasonFld').hidden) {
@@ -937,6 +961,7 @@ async function submitForm(e) {
   const v = Object.fromEntries(new FormData(f).entries());
   delete v.coa;
   $('#fSubmit').disabled = true;
+  state.submitting = true;
   $('#fSaved').textContent = 'Saving…';
   try {
     let openAfter = null;
@@ -998,12 +1023,20 @@ async function submitForm(e) {
       state.notice = 'Incoming stock recorded. It is not available until a delivery is accepted.';
       openAfter = Number(v.sku_id);
     } else if (kind === 'incoming-list') {
-      closeForm();
+      closeForm({ force: true });
       return;
     } else if (kind === 'receipt') {
       await api(`/api/inventory/incoming/${ctx.incoming.id}/receipts`, { method: 'POST', body: JSON.stringify({ ...v, request_id: state.form.requestId }) });
       state.notice = 'Delivery recorded. Accept it to add it to stock.';
       openAfter = ctx.incoming.sku_id;
+    } else if (kind === 'incoming-stage') {
+      await api(`/api/inventory/incoming/${ctx.incoming.id}`, { method: 'PATCH', body: JSON.stringify({ status: v.status, version: ctx.incoming.version }) });
+      state.notice = 'Stage saved.';
+      openAfter = state.openSku || null;
+    } else if (kind === 'incoming-cancel') {
+      await api(`/api/inventory/incoming/${ctx.incoming.id}/cancel`, { method: 'POST', body: JSON.stringify({ reason: v.reason }) });
+      state.notice = 'The rest is cancelled. Accepted stock stays.';
+      openAfter = state.openSku || null;
     } else if (kind === 'decide') {
       const r = await api(`/api/inventory/incoming/receipts/${ctx.receipt.id}/decision`, { method: 'POST', body: JSON.stringify(v) });
       state.notice = r.status === 'accepted' ? `${count(r.acceptedQuantity)} accepted into stock.` : 'Delivery rejected.';
@@ -1020,7 +1053,8 @@ async function submitForm(e) {
       await api(`/api/inventory/batches/${ctx.batchId}`, { method: 'PATCH', body: JSON.stringify({ ...v, version: batch.version }) });
       openAfter = state.detail.sku.id;
     }
-    closeForm();
+    closeForm({ force: true });
+    state.skusStale = true;
     await refreshMeta();
     await load();
     if (openAfter) await openSku(openAfter);
@@ -1028,6 +1062,7 @@ async function submitForm(e) {
   } catch (err) {
     formError(err.message);
   } finally {
+    state.submitting = false;
     $('#fSubmit').disabled = state.form?.kind === 'dup-map' && !$('#dupReason')?.value.trim();
     $('#fSaved').textContent = '';
   }
@@ -1080,7 +1115,7 @@ function bind() {
     const b = e.target.closest('[data-map]');
     if (b) openForm('map', { code: b.dataset.map, platform: b.dataset.platform, platformLabel: b.dataset.platformLabel, title: b.dataset.title, asin: b.dataset.asin });
   });
-  $('#refresh').addEventListener('click', () => { load(); if (state.openSku) openSku(state.openSku); });
+  $('#refresh').addEventListener('click', () => { state.skusStale = true; load(); if (state.openSku) openSku(state.openSku); });
   $('#addInventory').addEventListener('click', () => openForm('receive'));
   $('#returnStock').addEventListener('click', () => openForm('stock-return'));
   $('#incomingBtn').addEventListener('click', () => openForm('incoming-list'));
@@ -1093,18 +1128,9 @@ function bind() {
       const { incoming } = await api(`/api/inventory/incoming/${id}`);
       if (act === 'receipt') return openForm('receipt', { incoming });
       if (act === 'decide') return openForm('decide', { receipt: incoming.receipts.find((x) => x.id === Number(b.dataset.receipt)), skuId: incoming.sku_id });
-      if (act === 'stage') {
-        const next = window.prompt('Stage: planned, ordered or in_transit', incoming.status);
-        if (!next) return null;
-        await api(`/api/inventory/incoming/${id}`, { method: 'PATCH', body: JSON.stringify({ status: next.trim(), version: incoming.version }) });
-      } else if (act === 'cancel') {
-        const reason = window.prompt('Why is the rest of this cancelled? Anything already accepted stays in stock.');
-        if (!reason || !reason.trim()) return null;
-        await api(`/api/inventory/incoming/${id}/cancel`, { method: 'POST', body: JSON.stringify({ reason }) });
-      }
-      if (state.form?.kind === 'incoming-list') openForm('incoming-list');
-      await load();
-      if (state.openSku) await openSku(state.openSku);
+      // Stage and cancel are labelled forms in the drawer (they were browser prompts).
+      if (act === 'stage') return openForm('incoming-stage', { incoming });
+      if (act === 'cancel') return openForm('incoming-cancel', { incoming });
     } catch (err) {
       if (state.form) formError(err.message); else { $('#dSaved').className = 'saved failed'; $('#dSaved').textContent = err.message; }
     }
@@ -1121,6 +1147,8 @@ function bind() {
     if (e.target.id === 'pfCode' && !$('#pfError').hidden) { $('#pfError').hidden = true; e.target.classList.remove('invalid'); }
   });
   $('#invForm').addEventListener('input', (e) => {
+    // Something typed: closing now asks before discarding it.
+    if (state.form && e.target.name && !e.target.closest('[data-no-dirty]')) state.form.dirty = true;
     if (e.target.id === 'dupReason') $('#fSubmit').disabled = !e.target.value.trim();
     // Editing a field marked wrong clears its mark; the message goes when nothing is marked any more.
     if (e.target.hasAttribute('aria-invalid')) {
@@ -1150,7 +1178,7 @@ function bind() {
   $('#fClose').addEventListener('click', closeForm);
   $('#fCancel').addEventListener('click', closeForm);
   $('#invForm').addEventListener('submit', (e) => {
-    if (state.form?.kind === 'places') { e.preventDefault(); return closeForm(); }
+    if (state.form?.kind === 'places') { e.preventDefault(); return closeForm({ force: true }); }
     return submitForm(e);
   });
   $('#invForm').addEventListener('click', async (e) => {
@@ -1177,7 +1205,7 @@ function bind() {
     if (e.target.closest('#altAdd')) {
       try {
         await api(`/api/inventory/skus/${state.detail.sku.id}/alternatives`, { method: 'POST', body: JSON.stringify({ alternative_sku_id: $('#altSku').value, note: $('#altNote').value }) });
-        await openSku(state.detail.sku.id); load();
+        state.skusStale = true; await openSku(state.detail.sku.id); load();
       } catch (err) { $('#dSaved').className = 'saved failed'; $('#dSaved').textContent = err.message; }
       return null;
     }
@@ -1197,16 +1225,18 @@ function bind() {
     const un = e.target.closest('[data-unmap]');
     if (un) {
       const lines = Number(un.dataset.lines);
-      if (!window.confirm(`Remove platform SKU ${un.dataset.code} from ${state.detail.sku.sku}?${lines ? ` ${lines} order line${lines > 1 ? 's' : ''} will become unmapped again.` : ''}`)) return null;
+      if (!(await confirmDialog({ title: `Remove platform SKU ${un.dataset.code}?`, danger: true, confirmLabel: 'Remove',
+        body: `It stops pointing at ${state.detail.sku.sku}.${lines ? ` ${lines} order line${lines > 1 ? 's' : ''} will become unmapped again.` : ''}` }))) return null;
       try {
         await api(`/api/inventory/platform-skus/${un.dataset.unmap}`, { method: 'DELETE' });
+        state.skusStale = true;
         await openSku(state.detail.sku.id);
         load();
       } catch (err) { $('#dSaved').className = 'saved failed'; $('#dSaved').textContent = err.message; }
       return null;
     }
     const rm = e.target.closest('[data-doc-remove]');
-    if (rm && window.confirm('Remove this document from the batch? It stays in the audit record.')) {
+    if (rm && await confirmDialog({ title: 'Remove this document from the batch?', body: 'It stays in the audit record.', danger: true, confirmLabel: 'Remove' })) {
       try {
         await api(`/api/inventory/batches/${rm.dataset.batch}/documents/${rm.dataset.docRemove}`, { method: 'DELETE' });
         await openSku(state.detail.sku.id);

@@ -516,7 +516,9 @@ function renderTable() {
     + (outside ? ` · includes ${outside} older callback${outside === 1 ? '' : 's'}` : '');
 
   $$('#cartTable th.sortable').forEach((th) => {
-    th.querySelector('.sort').textContent = th.dataset.sort === state.sort.key ? (state.sort.dir > 0 ? '↑' : '↓') : '↕';
+    const on = th.dataset.sort === state.sort.key;
+    th.querySelector('.sort').textContent = on ? (state.sort.dir > 0 ? '↑' : '↓') : '↕';
+    th.setAttribute('aria-sort', on ? (state.sort.dir > 0 ? 'ascending' : 'descending') : 'none');
   });
 
   if (!rows.length) {

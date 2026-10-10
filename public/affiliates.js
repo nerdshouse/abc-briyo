@@ -7,7 +7,7 @@
  * again. No commission, revenue or order figures: those systems do not exist yet.
  */
 import {
-  $, esc, count, icon, renderIcons, relative, initShell, pageFetch, pageSignal, onQueryChange,
+  $, esc, count, icon, renderIcons, relative, initShell, pageFetch, pageSignal, onQueryChange, stateBlock,
 } from './ui/components.js';
 import { istDate, istDateTime, istDayKey } from './ui/ist.js';
 
@@ -98,7 +98,7 @@ function listFrame() {
         <div class="table-wrap">
           <table class="table af-table">
             <thead><tr><th>Partner</th><th>Category</th><th>Status</th><th class="r">Current rate</th><th>Created</th><th>Last activity</th><th class="r"><span class="sr-only">Actions</span></th></tr></thead>
-            <tbody id="rows"><tr><td colspan="7"><div class="empty-note">Loading…</div></td></tr></tbody>
+            <tbody id="rows"><tr><td colspan="7">${stateBlock('loading', 'Loading…', '', { compact: true })}</td></tr></tbody>
           </table>
         </div>
         <ul class="clist" id="clist" aria-label="Affiliates"></ul>
