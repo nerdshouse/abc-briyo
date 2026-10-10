@@ -64,23 +64,28 @@
                      placeholder="Order number, AWB, customer" aria-label="Search orders" />
             </label>
             <select class="select" id="fchannel" aria-label="Channel"><option value="">All channels</option></select>
-            <select class="select wide-select" id="fdest" aria-label="Destination" hidden><option value="">All destinations</option></select>
-            <select class="select" id="fstatus" aria-label="Order status"><option value="">Order status</option></select>
-            <select class="select" id="fshipment" aria-label="Shipment"><option value="">Shipment</option></select>
-            <select class="select" id="fcourier" aria-label="Courier"><option value="">Courier</option></select>
-            <select class="select" id="finvoice" aria-label="Invoice">
-              <option value="">Invoice</option>
-              <option value="yes">Invoice uploaded</option>
-              <option value="no">No invoice</option>
-            </select>
-            <select class="select" id="ftracking" aria-label="Tracking">
-              <option value="">Tracking</option>
-              <option value="yes">AWB added</option>
-              <option value="no">No AWB</option>
-            </select>
+            <select class="select" id="fshipment" aria-label="Shipment status"><option value="">Shipment</option></select>
             <span class="date-range"><label class="date-pick" title="Order date from"><span>From</span><input class="input" id="ffrom" type="date" aria-label="Order date from" /></label>
             <label class="date-pick" title="Order date to"><span>To</span><input class="input" id="fto" type="date" aria-label="Order date to" /></label></span>
-            <button type="button" class="linkish" id="fclear" hidden>Clear</button>
+            <!-- Less-used filters fold away (open by themselves when one is set); the count says how many are on. -->
+            <button type="button" class="btn filters-toggle" id="filtersMore" aria-expanded="false" aria-controls="moreFilters">
+              <i data-lucide="sliders-horizontal"></i>More filters<span class="filters-count" id="filtersCount" hidden></span></button>
+            <button type="button" class="linkish" id="fclear" hidden>Clear filters</button>
+            <div class="filters-more" id="moreFilters" hidden>
+              <select class="select wide-select" id="fdest" aria-label="Destination" hidden><option value="">All destinations</option></select>
+              <select class="select" id="fstatus" aria-label="Order status"><option value="">Order status</option></select>
+              <select class="select" id="fcourier" aria-label="Courier"><option value="">Courier</option></select>
+              <select class="select" id="finvoice" aria-label="Invoice">
+                <option value="">Invoice</option>
+                <option value="yes">Invoice uploaded</option>
+                <option value="no">No invoice</option>
+              </select>
+              <select class="select" id="ftracking" aria-label="Tracking">
+                <option value="">Tracking</option>
+                <option value="yes">AWB added</option>
+                <option value="no">No AWB</option>
+              </select>
+            </div>
           </div>
           <div class="board-meta" id="resultNote" aria-live="polite"></div>
           <div class="selbar" id="selBar" hidden>
@@ -91,15 +96,16 @@
 
           <div class="table-wrap">
             <table class="table ord-table">
+              <!-- Shipment = status, with courier · AWB under it (one column instead of three), so Customer and Amount
+                   stay on screen at laptop widths. -->
               <colgroup>
-                <col class="c-order" /><col class="c-chan" /><col class="c-courier" /><col class="c-track" />
-                <col class="c-ship" /><col class="c-inv" /><col class="c-date" /><col class="c-cust" />
-                <col class="c-amt" /><col class="c-act" />
+                <col class="c-order" /><col class="c-cust" /><col class="c-chan" /><col class="c-ship" />
+                <col class="c-inv" /><col class="c-date" /><col class="c-amt" /><col class="c-act" />
               </colgroup>
               <thead><tr>
-                <th>Order</th><th>Channel · Destination</th><th>Courier</th><th>AWB / Tracking</th>
-                <th>Shipment status</th><th title="Dispatch photos and tax invoice">Proof</th><th>Order date</th>
-                <th class="col-cust">Customer</th><th class="r col-amt">Amount</th>
+                <th>Order</th><th class="col-cust">Customer</th><th>Channel · Destination</th>
+                <th>Shipment <span class="th-sub">courier · AWB</span></th><th title="Dispatch photos and tax invoice">Proof</th><th>Order date</th>
+                <th class="r col-amt">Amount</th>
                 <th class="r"><span class="sr-only">Actions</span></th>
               </tr></thead>
               <tbody id="rows"></tbody>
