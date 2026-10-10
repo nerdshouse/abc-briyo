@@ -6,11 +6,28 @@ Briyo OS runs on **one** Render web service. As of 10-10-2026 there is no second
 |---|---|---|---|---|
 | `abc-briyo-sg` | Singapore (Southeast Asia) | `abc.briyo.xyz` (internal app), `careers.briyo.xyz` (public careers site), `go.briyo.xyz` (affiliate referral redirects), plus `abc-briyo-sg.onrender.com` | Automatic on every push to `main` | Render dashboard → `abc-briyo-sg` → **Events** → **Rollback** on an earlier deploy |
 
+- Plan: the dashboard shows the compute plan as `0.5c-512mb` (read 10-10-2026), not Free.
 - Build: `npm install`. Start: `node server.js`. Health check: `/healthz`.
 - Environment variables are set in the Render dashboard only; see `.env.example` and the
   README for names. Values are never written in this repository.
-- `render.yaml` is the original Blueprint. Its service name (`abc-briyo`) is not the live
-  service's name; the live service was created separately as `abc-briyo-sg`.
+
+## `render.yaml` does not describe the live service (unresolved)
+
+`render.yaml` (added in `fa13e56`, "Add a no-card free deployment path on Render") defines one
+web service: name `abc-briyo`, `plan: free`, region Singapore, build `npm ci`, start `npm start`
+(`node server.js`), auto-deploy from `main`. The live service differs: name `abc-briyo-sg`,
+plan `0.5c-512mb`, build `npm install`.
+
+- Render shows **no Blueprint instances**, so the file is not linked to `abc-briyo-sg`; edits to
+  it change nothing in production, and the live settings are managed in the dashboard.
+- **Do not apply it as a new Blueprint.** It would create a *second* service named `abc-briyo`
+  rather than update `abc-briyo-sg`. With production secrets entered at the prompts it would
+  run against the production database with `APP_ENV=production` and
+  `SHOPIFY_ORDERS_POLL_ENABLED=true` (lock-protected, but a second poller), and would send
+  duplicate SLA alerts (see below).
+- Whether the mismatch is intentional is not recorded anywhere in the repository or the
+  dashboard. Until the owner decides, treat the dashboard as the source of truth. Options: update
+  `render.yaml` to match `abc-briyo-sg` (name, plan, build), or mark it as a template only.
 
 ## Removed: Oregon service `abc-briyo` (deleted 10-10-2026)
 
