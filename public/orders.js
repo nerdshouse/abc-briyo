@@ -82,8 +82,13 @@ const api = async (url, opts = {}) => {
 
 // Value and date are optional on an order: unknown shows as a dash, never ₹0.
 const amount = (v) => (v === null || v === undefined ? '—' : money(v));
-/** Payment as recorded on the order ("Prepaid · Paid", "COD · Pending"); nothing when neither is known. */
+/**
+ * Payment as recorded on the order: method and status are separate facts ("Prepaid · Paid", "COD · Pending"). A method
+ * never implies a status: with no status recorded only the method is shown, and payTitle says the status is not known.
+ * Nothing when neither is known.
+ */
 const payText = (o) => [o.payment_method && label(o.payment_method), o.payment_status && label(o.payment_status)].filter(Boolean).join(' · ');
+const payTitle = (o) => `Payment: ${payText(o)}${o.payment_method && !o.payment_status ? ' (payment status not recorded)' : ''}`;
 const day = (iso) => (iso ? dateShort(iso) : '—');
 
 const channelLabel = (key) => state.meta.channels.find((c) => c.key === key)?.label || key;
@@ -152,10 +157,20 @@ const ordersUrl = (append) => {
 };
 
 /** `pending` is an orders request already in flight (the first load starts it early). */
+// Filters can change faster than answers arrive: only the newest reload's answer is shown. "Show more" never
+// starts a new generation: it belongs to the rows on screen, so a reload that starts after it discards it, and it
+// is not started while a reload is still out (its offset would mix two result sets) or while another is out.
 let loadSeq = 0;
+let reloadPending = false;
+let appendPending = false;
 async function load({ append = false, pending = null } = {}) {
-  // Filters can change faster than answers arrive: only the newest request's answer is shown.
-  const seq = ++loadSeq;
+  if (append && (appendPending || reloadPending)) return;
+  const seq = append ? loadSeq : ++loadSeq;
+  if (append) {
+    appendPending = true;
+    $('#moreBtn').disabled = true;
+    $('#moreBtn').textContent = 'Loading…';
+  } else reloadPending = true;
   if (!append && !state.orders.length) {
     $('#rows').innerHTML = `<tr><td colspan="8">${stateBlock('loading', 'Loading orders…', '', { compact: true })}</td></tr>`;
     $('#clist').innerHTML = `<li class="oitem">${stateBlock('loading', 'Loading orders…', '', { compact: true })}</li>`;
@@ -182,6 +197,12 @@ async function load({ append = false, pending = null } = {}) {
       $('#pageSub').textContent = '';
     }
     renderIcons();
+  } finally {
+    if (append) {
+      appendPending = false;
+      $('#moreBtn').disabled = false;
+      $('#moreBtn').textContent = 'Show more';
+    } else if (seq === loadSeq) reloadPending = false;
   }
 }
 
@@ -271,7 +292,7 @@ function renderRows() {
   }
   $('#rows').innerHTML = state.orders.map((o) => `
     <tr class="orow${o.id === state.openId ? ' open' : ''}" data-id="${o.id}" tabindex="0">
-      <td><span class="cell-main mono ord-no" title="${esc(orderNo(o))}">${pickBox(o)}${esc(orderNo(o))}${cancelledTag(o)}</span>${lineSkus(o)}
+      <td><span class="cell-main mono ord-no" title="${esc(orderNo(o))}">${pickBox(o)}<span class="ord-num">${esc(orderNo(o))}</span>${cancelledTag(o)}</span>${lineSkus(o)}
         ${o.customer_name ? `<span class="cell-sub cust-inline" title="${esc(o.customer_name)}">${esc(o.customer_name)}</span>` : ''}</td>
       <td class="col-cust">${o.customer_name ? `<span class="cell-main cust" title="${esc(o.customer_name)}">${esc(o.customer_name)}</span>` : '<span class="muted-cell">—</span>'}</td>
       <td><span class="cell-main chan">${esc(channelOf(o))}</span>${o.destination_name
@@ -280,7 +301,7 @@ function renderRows() {
       <td>${shipIndicator(o)}${o.shipment_id ? `<span class="cell-sub ship-sub">${o.courier_name ? esc(o.courier_name) : 'No courier'}${o.tracking_id ? ` · ${trackingCell(o)}` : ' · no AWB yet'}</span>` : ''}</td>
       <td>${proofCell(o)}</td>
       <td class="num"${o.order_date ? '' : ' title="No order date — shown by when it was entered"'}>${esc(day(o.order_date))}</td>
-      <td class="r num col-amt">${o.order_value === null || o.order_value === undefined ? '<span class="muted-cell" title="No value entered">—</span>' : esc(amount(o.order_value))}${payText(o) ? `<span class="cell-sub pay-sub" title="Payment: ${esc(payText(o))}">${esc(payText(o))}</span>` : ''}</td>
+      <td class="r num col-amt">${o.order_value === null || o.order_value === undefined ? '<span class="muted-cell" title="No value entered">—</span>' : esc(amount(o.order_value))}${payText(o) ? `<span class="cell-sub pay-sub" title="${esc(payTitle(o))}">${esc(payText(o))}</span>` : ''}</td>
       <td class="r"><button class="icon-btn bare" type="button" data-open="${o.id}" title="Open" aria-label="Open order ${esc(orderNo(o))}">${icon('chevron-right')}</button></td>
     </tr>`).join('');
   $('#clist').innerHTML = state.orders.map((o) => `
@@ -731,11 +752,11 @@ function amazonDetails(a) {
  * The full, editable details stay in "Order details" below.
  */
 function orderFacts(o) {
-  const pay = [o.payment_method && label(o.payment_method), o.payment_status && label(o.payment_status)].filter(Boolean).join(' · ');
-  const fact = (k, v) => `<div class="of"><span>${esc(k)}</span><b>${v}</b></div>`;
+  const pay = payText(o) + (o.payment_method && !o.payment_status ? ' · status not recorded' : '');
+  const fact = (k, v, title = '') => `<div class="of"><span>${esc(k)}</span><b${title ? ` title="${esc(title)}"` : ''}>${v}</b></div>`;
   return `<div class="order-facts">
     ${fact('Value', o.order_value === null || o.order_value === undefined ? '<span class="muted">Not entered</span>' : esc(`${money(o.order_value)}${o.currency && o.currency !== 'INR' ? ` ${o.currency}` : ''}`))}
-    ${fact('Payment', pay ? esc(pay) : '<span class="muted">Not known</span>')}
+    ${fact('Payment', pay ? esc(pay) : '<span class="muted">Not known</span>', payText(o) ? payTitle(o) : '')}
     ${fact('Customer', o.customer_name ? esc(o.customer_name) : '<span class="muted">—</span>')}
     ${fact('Order', indicator(o.order_status))}
   </div>`;
@@ -909,10 +930,10 @@ function describeEvent(e) {
 let patching = false;
 const drawerActions = () => [...document.querySelectorAll('#dShipSave, #dBody [data-step], #dOrderStatus')];
 async function patchOrder(fields, doneText = 'Saved', { shipment = false } = {}) {
-  if (patching) return;
+  if (patching) return false;
   patching = true;
   drawerActions().forEach((b) => { b.disabled = true; });
-  try { await patchOrderNow(fields, doneText, { shipment }); } finally {
+  try { return await patchOrderNow(fields, doneText, { shipment }); } finally {
     patching = false;
     drawerActions().forEach((b) => { b.disabled = false; });
   }
@@ -932,6 +953,7 @@ async function patchOrderNow(fields, doneText, { shipment }) {
     await openOrder(o.id);
     saved.textContent = data.changed ? doneText : 'Nothing changed';
     load();
+    return true;
   } catch (err) {
     saved.className = 'saved failed';
     saved.textContent = err.message;
@@ -941,6 +963,7 @@ async function patchOrderNow(fields, doneText, { shipment }) {
       renderDrawer();
       load();
     }
+    return false;
   }
 }
 
@@ -985,11 +1008,13 @@ dBody.addEventListener('change', async (e) => {
   if (e.target.id === 'dOrderStatus') {
     // Cancelling an order is confirmed first (nothing else about it changes); saying no puts the select back.
     if (e.target.value === 'cancelled' && !(await confirmDialog({ title: `Cancel order ${orderNo(state.detail.order)}?`,
-      body: 'The order is marked cancelled and the change is recorded in its activity.', confirmLabel: 'Cancel order', danger: true }))) {
+      body: 'The order is marked cancelled and the change is recorded in its activity.', confirmLabel: 'Cancel order', cancelLabel: 'Keep order', danger: true }))) {
       e.target.value = state.detail.order.order_status;
       return;
     }
-    patchOrder({ order_status: e.target.value }, 'Order status saved');
+    // Not saved (refused or failed): the select goes back to what is stored, so it never shows a change that did not happen.
+    const sel = e.target;
+    if (!(await patchOrder({ order_status: sel.value }, 'Order status saved')) && sel.isConnected) sel.value = state.detail.order.order_status;
   }
   if (e.target.name === 'courier_partner_id') {
     // Show straight away whether the link will be generated or typed.

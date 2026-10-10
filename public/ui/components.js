@@ -587,8 +587,10 @@ export function toast(message, { tone = 'ok', ms = 3200 } = {}) {
  * A confirmation modal for anything destructive or hard to undo. Resolves true
  * only on an explicit confirm. `typeToConfirm`: the text the person must type
  * before the button enables (e.g. a phone number). Esc and Cancel resolve false.
+ * `cancelLabel` renames the dismiss button (default "Cancel") where "Cancel"
+ * would read like the action itself, e.g. "Keep order" beside "Cancel order".
  */
-export function confirmDialog({ title, body = '', confirmLabel = 'Confirm', danger = false, typeToConfirm = '' }) {
+export function confirmDialog({ title, body = '', confirmLabel = 'Confirm', cancelLabel = 'Cancel', danger = false, typeToConfirm = '' }) {
   return new Promise((resolve) => {
     const back = document.activeElement;
     const wrap = document.createElement('div');
@@ -597,7 +599,7 @@ export function confirmDialog({ title, body = '', confirmLabel = 'Confirm', dang
       <h2 class="modal-title" id="mdlTitle">${esc(title)}</h2>
       <div class="modal-body" id="mdlBody">${body}</div>
       ${typeToConfirm ? `<label class="fld"><span>Type <b class="mono">${esc(typeToConfirm)}</b> to confirm</span><input class="input" id="mdlType" autocomplete="off" /></label>` : ''}
-      <div class="modal-foot"><button class="btn" type="button" data-x="0">Cancel</button>
+      <div class="modal-foot"><button class="btn" type="button" data-x="0">${esc(cancelLabel)}</button>
         <button class="btn ${danger ? 'danger' : 'primary'}" type="button" data-x="1"${typeToConfirm ? ' disabled' : ''}>${esc(confirmLabel)}</button></div></div>`;
     document.body.appendChild(wrap);
     document.documentElement.classList.add('drawer-open');
