@@ -18,7 +18,7 @@
 .ord-table .cell-main, .ord-table .cell-sub { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .orow { cursor: pointer; }
 .orow:focus-visible { outline: 2px solid var(--focus); outline-offset: -2px; }
-.orow.open td { background: #F7F8FA !important; }
+.orow.open td { background: var(--selected) !important; }
 
 /* channel: a word, not a logo-coloured badge */
 .chan { font-size: 12.5px; color: var(--text-2); }
@@ -225,8 +225,6 @@
   border: 1px solid var(--border); border-radius: var(--r-sm); background: var(--surface-2); font-size: 13px; }
 .selbar #selText { margin-right: auto; }
 .selbar .warn-text { color: var(--warning-text); }
-.status.none .dot { background: transparent; border: 1px dashed var(--text-3); }
-.status.none { color: var(--text-3); }
 
 /* ------------------------------------------------------------ Inventory */
 .inv-cards { margin: 0 0 16px; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); }
@@ -388,7 +386,6 @@ html.scroll-locked .drawer-scrim { touch-action: none; }
 .hr-confirm { margin-top: 12px; padding: 12px; border: 1px solid var(--error-border); border-radius: 8px; background: var(--error-soft, #FEF3F2); font-size: 12.5px; }
 .hr-confirm p { margin: 0 0 8px; }
 .hr-confirm .input { width: 100%; padding-left: 10px; background: var(--surface); }
-.btn.danger { background: var(--error, #D92D20); border-color: var(--error, #D92D20); color: #fff; }
 .alert.hr-ok { color: var(--text); background: var(--surface); }
 .alert.hr-ok .lucide { color: var(--success); }
 
@@ -568,8 +565,6 @@ html.scroll-locked .drawer-scrim { touch-action: none; }
 dl.facts { display: grid; grid-template-columns: max-content 1fr; gap: 6px 14px; margin: 0; font-size: 13px; }
 dl.facts dt { color: var(--text-3); }
 dl.facts dd { margin: 0; min-width: 0; overflow-wrap: anywhere; }
-.tag.ok { color: var(--success-text); border-color: var(--success-border); }
-.tag.warn { color: #B54708; border-color: var(--warning-border); }
 .check { display: inline-flex; gap: 8px; align-items: center; color: var(--text); }
 @media (max-width: 760px) { .so-filters .input, .so-filters .select { flex: 1 1 100%; } dl.facts { grid-template-columns: 1fr; } dl.facts dt { margin-top: 4px; } }
 .so-table .cell-sub, .so-rep .cell-sub { display: block; }
@@ -582,7 +577,6 @@ dl.facts dd { margin: 0; min-width: 0; overflow-wrap: anywhere; }
 .fld .fld-lbl { font-size: 12px; color: var(--text-2); }
 
 /* Recovery verification */
-.tag.bad { color: var(--error-text); border-color: var(--error-border); }
 .rv-filters { margin-bottom: 12px; align-items: flex-end; }
 .rv-filters .fld { flex: 1 1 160px; }
 .rv-stats { margin-bottom: 8px; }
@@ -599,14 +593,6 @@ dl.facts dd { margin: 0; min-width: 0; overflow-wrap: anywhere; }
 
 /* ---------------- Inventory: nil stock, expiry states, incoming, alternatives (always a text label beside the colour) */
 .nil { color: var(--text-3); font-weight: 500; }
-.xtag { display: inline-block; margin-left: 6px; padding: 0 6px; font-size: 10.5px; font-weight: 500; line-height: 16px; border: 1px solid var(--border); border-radius: 5px; background: var(--surface); color: var(--text-2); white-space: nowrap; vertical-align: 1px; }
-.xtag.near { color: #B54708; border-color: #FEC84B; background: #FFFAEB; }        /* near expiry: orange */
-.xtag.expired { color: var(--error-text); border-color: var(--error-border); background: #FEF3F2; } /* expired: red */
-.xtag.unknown { color: #93370D; border-color: var(--warning-border); background: #FFFCF5; }       /* unknown expiry: muted amber */
-.xtag.held { color: var(--text-2); border-color: var(--border); background: var(--surface-2); } /* quarantined / blocked: grey */
-.xtag.incoming { color: var(--info-text); border-color: #B2CCFF; background: var(--info-soft); } /* incoming: blue */
-.xtag.out { color: var(--text-2); border-color: var(--border); background: var(--surface-2); }  /* out of stock: neutral grey */
-.xtag.ok { color: var(--success-text, #067647); border-color: var(--success-border); background: #ECFDF3; }
 .alt-line { display: block; margin-top: 3px; font-size: 11.5px; color: var(--text-2); white-space: normal; }
 .alt-line .mono { font-size: 11px; }
 .unit-split { display: block; font-size: 11.5px; font-weight: 400; color: var(--text-2); margin-top: 2px; }
@@ -617,3 +603,11 @@ dl.facts dd { margin: 0; min-width: 0; overflow-wrap: anywhere; }
 .inc-list .inc-receipts { margin: 6px 0 0; padding-left: 16px; font-size: 12.5px; color: var(--text-2); }
 .alt-add { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 8px; }
 .alt-add .select { flex: 1; min-width: 180px; }
+
+/* Inventory forms: optional marker (never the required style), month-only expiry switch, a field marked wrong */
+.fld .opt { margin-left: 4px; font-size: 11px; font-weight: 400; color: var(--text-3); }
+.fld .month-only { display: flex; align-items: center; gap: 6px; margin-top: 4px; font-size: 12px; color: var(--text-2); }
+.fld .month-only input { margin: 0; }
+.fld .month-only label { font-weight: 400; }
+#invForm .input[aria-invalid] { border-color: var(--error, #D92D20); box-shadow: 0 0 0 3px rgba(217, 45, 32, .12); }
+#invForm input[type=number] { font-variant-numeric: tabular-nums; }

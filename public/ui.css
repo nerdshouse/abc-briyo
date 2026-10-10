@@ -121,6 +121,11 @@
   --error-border: #FECDCA;
   --hover: #FCFCFD;          /* row / card hover */
   --focus-border: #C5CBD5;   /* input border while focused (the ring is --focus-ring) */
+  --info-border: #B2CCFF;
+  /* tables */
+  --table-head: #F9FAFB; --table-line: #F2F3F5; --selected: #F4F6F9;
+  --h-table-row: 50px; --h-table-row-compact: 40px;
+  --r-tag: 6px;
 
   /* names orders.css used that only the legacy styles.css defined (shell pages never load it): aliases, so those
      rules resolve instead of falling back to nothing */
@@ -572,7 +577,7 @@ button { font: inherit; color: inherit; }
 .table th {
   height: 36px; padding: 0 12px; text-align: left; white-space: nowrap;
   font-size: 12px; font-weight: 500; color: var(--text-2);
-  background: #F9FAFB; border-bottom: 1px solid var(--border-frame);
+  background: var(--table-head); border-bottom: 1px solid var(--border-frame);
 }
 .table th:first-child, .table td:first-child { padding-left: 16px; }
 .table th:last-child, .table td:last-child { padding-right: 16px; }
@@ -581,12 +586,12 @@ button { font: inherit; color: inherit; }
 .table th .sort { display: inline-block; width: 10px; margin-left: 4px; color: #C3C8D0; font-size: 10px; font-weight: 400; }
 .table th.sortable:hover .sort { color: var(--text-3); }
 .table td {
-  height: 50px; padding: 0 12px; border-bottom: 1px solid #F2F3F5;
+  height: var(--h-table-row); padding: 0 12px; border-bottom: 1px solid var(--table-line);
   vertical-align: middle; white-space: nowrap;
 }
 .table tbody tr:last-child td { border-bottom: 0; }
 .table tbody tr:hover td { background: var(--hover); }
-.table .r { text-align: right; }
+.table .r { text-align: right; font-variant-numeric: tabular-nums; }
 .table .num { font-variant-numeric: tabular-nums; }
 .cell-main { font-weight: 500; line-height: 1.3; max-width: 200px; overflow: hidden; text-overflow: ellipsis; }
 .cell-sub { font-size: 11.5px; line-height: 1.3; color: var(--text-3); max-width: 200px; overflow: hidden; text-overflow: ellipsis; }
@@ -594,7 +599,7 @@ button { font: inherit; color: inherit; }
 .table-more { display: flex; justify-content: center; padding: 10px; border-top: 1px solid var(--border-soft); }
 
 /* the smaller tables inside cards (callers, report) */
-.table.compact td { height: 40px; }
+.table.compact td { height: var(--h-table-row-compact); }
 
 /* status: a dot and a word — never a loud badge */
 .status { display: inline-flex; align-items: center; gap: 7px; font-size: 12.5px; font-weight: 500; color: var(--text); }
@@ -628,7 +633,6 @@ button { font: inherit; color: inherit; }
 .person .avatar { width: 26px; height: 26px; font-size: 11px; position: relative; }
 .person .live { position: absolute; right: -1px; bottom: -1px; width: 8px; height: 8px; border-radius: 50%; background: var(--success); border: 2px solid #fff; }
 .person .when { margin-left: auto; font-size: 12px; color: var(--text-3); font-variant-numeric: tabular-nums; }
-.tag { font-size: 11px; font-weight: 500; color: var(--text-2); border: 1px solid var(--border); border-radius: 6px; padding: 0 6px; }
 
 .hint { font-size: 12px; color: var(--text-3); margin: 12px 0 0; line-height: 1.5; }
 .footnote { font-size: 12px; color: var(--text-3); margin-top: 20px; font-variant-numeric: tabular-nums; }
@@ -855,12 +859,6 @@ button { font: inherit; color: inherit; }
 .flag.warn { color: var(--warning); }
 .flag.bad { color: var(--error); }
 
-.mini-tag {
-  display: inline-block; margin-left: 6px; padding: 0 5px; vertical-align: 1px;
-  font-size: 10.5px; font-weight: 500; line-height: 16px; color: var(--text-2);
-  border: 1px solid var(--border); border-radius: 5px; background: var(--surface);
-}
-.mini-tag.warn { color: var(--warning-text); border-color: var(--warning-border); background: var(--warning-soft); }
 
 .status-btn {
   display: inline-flex; align-items: center; gap: 4px; max-width: 100%;
@@ -1043,8 +1041,6 @@ main.page[aria-busy="true"] { opacity: .6; transition: opacity .15s .1s; }
    Admin dashboard — operations first, recovery below
    -------------------------------------------------------------------------- */
 .btn.spin .lucide { animation: spin .8s linear infinite; }
-.status.none .dot { background: transparent; border: 1px dashed var(--text-3); }
-.status.none { color: var(--text-3); }
 
 /* B. four current-state numbers, one row, each a way in */
 .okpis {
@@ -1470,3 +1466,53 @@ main.page .crumbs > .lucide:first-child { color: var(--mod); }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation-duration: 0.01ms !important; animation-iteration-count: 1 !important; transition-duration: 0.01ms !important; scroll-behavior: auto !important; }
 }
+
+/* --------------------------------------------------------------------------
+   Labels — three patterns, each for one job:
+     .status  dot + word    where something is in its lifecycle (Applied, In transit, Active)
+     .badge   filled pill   roles and counts (Admin, 3 overdue)
+     .tag     outlined      a flag or condition beside a value (Near expiry, Incoming, Removed)
+   .xtag and .mini-tag are the same outlined label under older names (kept so no page markup changes).
+   Tones use the semantic tokens; the word is always there, colour never stands alone.
+   -------------------------------------------------------------------------- */
+.tag, .xtag, .mini-tag {
+  display: inline-flex; align-items: center; gap: 4px; padding: 0 6px; vertical-align: 1px;
+  font-size: var(--fs-label); font-weight: var(--fw-medium); line-height: 18px; white-space: nowrap;
+  color: var(--text-2); background: var(--surface); border: 1px solid var(--border); border-radius: var(--r-tag);
+}
+.xtag, .mini-tag { margin-left: 6px; }
+.tag .lucide, .xtag .lucide { width: 12px; height: 12px; }
+.tag.ok, .xtag.ok { color: var(--success-text); border-color: var(--success-border); background: var(--success-soft); }
+.tag.warn, .mini-tag.warn, .xtag.near { color: var(--warning-text); border-color: var(--warning-border); background: var(--warning-soft); }
+.tag.bad, .xtag.expired { color: var(--error-text); border-color: var(--error-border); background: var(--error-soft); }
+.tag.info, .xtag.incoming { color: var(--info-text); border-color: var(--info-border); background: var(--info-soft); }
+.tag.neutral, .xtag.held, .xtag.out { color: var(--text-2); border-color: var(--border); background: var(--surface-2); }
+/* Unknown expiry is not "near expiry": no date was recorded. Muted, dashed, and it says so. */
+.xtag.unknown { color: var(--warning-text); border-color: var(--warning-border); border-style: dashed; background: var(--surface); }
+.status.none .dot { background: transparent; border: 1px dashed var(--text-3); }
+.status.none { color: var(--text-3); }
+
+/* --------------------------------------------------------------------------
+   Tables — one pattern (header, density, numerics, hover/focus/selected, sort, scroll cue). Pages keep their own
+   columns and actions; these rules only make the shared parts behave the same everywhere.
+   -------------------------------------------------------------------------- */
+.table th.r, .table td.r { text-align: right; }
+.table tbody tr[tabindex] { cursor: pointer; }
+.table tbody tr[tabindex]:focus-visible { outline: 2px solid var(--focus); outline-offset: -2px; }
+.table tbody tr.open td, .table tbody tr[aria-selected="true"] td { background: var(--selected); }
+.table th.sortable:focus-visible { outline: 2px solid var(--focus); outline-offset: -2px; }
+.table th[aria-sort="ascending"], .table th[aria-sort="descending"] { color: var(--text); }
+.table th[aria-sort="ascending"] .sort, .table th[aria-sort="descending"] .sort { color: var(--text-2); }
+/* More columns to the right (or left): a soft edge shadow that appears only while there is more to scroll. */
+.table-wrap {
+  background:
+    linear-gradient(to right, var(--surface) 30%, rgba(255, 255, 255, 0)) left center / 24px 100% no-repeat local,
+    linear-gradient(to left, var(--surface) 30%, rgba(255, 255, 255, 0)) right center / 24px 100% no-repeat local,
+    radial-gradient(farthest-side at 0 50%, rgba(16, 24, 40, 0.10), transparent) left center / 10px 100% no-repeat scroll,
+    radial-gradient(farthest-side at 100% 50%, rgba(16, 24, 40, 0.10), transparent) right center / 10px 100% no-repeat scroll;
+}
+
+/* stateBlock(kind, …, { compact }) inside a table cell or drawer: the same block, less padding, icon inline. */
+.state.compact { padding: 20px 12px; }
+.state.compact .lucide { display: block; margin: 0 auto 6px; width: 18px; height: 18px; }
+.state.loading .lucide { animation: spin 1s linear infinite; }

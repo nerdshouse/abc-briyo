@@ -514,6 +514,7 @@ function renderSortMarks() {
     const on = th.dataset.sort === state.sort;
     th.querySelector('.sort').textContent = on ? (state.dir > 0 ? '↑' : '↓') : '↕';
     th.classList.toggle('sorted', on);
+    th.setAttribute('aria-sort', on ? (state.dir > 0 ? 'ascending' : 'descending') : 'none');
   });
   $('#sort').value = ['value', 'risk', 'recent', 'callback'].includes(state.sort) ? state.sort : '';
 }

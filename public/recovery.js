@@ -2,7 +2,7 @@
  * Recovery verification (Support, admins): recovered carts against imported Shopify orders. The server does all the
  * matching and the sums; this page shows them and records a person's confirm / reject on a proposed match.
  */
-import { $, $$, esc, count, money, icon, renderIcons, initShell, pageFetch } from './ui/components.js';
+import { $, $$, esc, count, money, moneyIn, icon, renderIcons, initShell, pageFetch } from './ui/components.js';
 import { istDateTime } from './ui/ist.js';
 
 const fetch = pageFetch();
@@ -10,7 +10,7 @@ const state = { data: null, status: '', open: null };
 const STATUS_TONE = { verified_paid: 'ok', verified_placed: 'warn', possible: 'warn', no_match: '', cancelled_refunded: 'bad', needs_review: 'bad' };
 const PAYMENT = { paid: 'Paid', pending: 'Pending', cancelled: 'Cancelled', refunded: 'Refunded', unknown: 'No financial record' };
 const when = (v) => (v ? istDateTime(v) : '—');
-const amt = (v, cur) => (v === null || v === undefined ? '—' : cur && cur !== 'INR' ? `${cur} ${Number(v).toLocaleString('en-IN')}` : money(v));
+const amt = (v, cur) => (v === null || v === undefined ? '—' : cur && cur !== 'INR' ? moneyIn(cur, v) : money(v));
 
 const api = async (url, opts = {}) => {
   const res = await fetch(url, { ...opts, headers: opts.body ? { 'Content-Type': 'application/json' } : undefined });

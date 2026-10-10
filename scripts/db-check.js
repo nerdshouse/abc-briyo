@@ -2716,6 +2716,94 @@ await step('consistency and accessibility pass: no undefined CSS variables on sh
   return 'every var() on shell CSS resolves (legacy --r-sm/--muted/--border-strong/--warn/--warn-border now aliases); 5 hard-coded colours tokenised (37 uses); rows and menus share the --focus ring; 8 placeholder-only inputs and 3 icon links named; Space opens rows on 5 pages; overdue counts say "N overdue"; sign-out failure shows a message; Recovery, Stock outward and Couriers show a loading row that turns into "Could not load" on error; Shopify/Amazon status loops cleared on leaving Orders';
 });
 
+await step('shell navigation: the top bar title is the incoming page\'s element (id included) — arriving at Inventory from Stock outward or Recovery no longer throws "Cannot set properties of null (setting \'textContent\')"', async () => {
+  const bad = [];
+  const nav = await fsp.readFile(new URL('../public/ui/nav.js', import.meta.url), 'utf8');
+  if (!/shownTitle\.replaceWith\(document\.importNode\(topTitle, true\)\)/.test(nav) || /\.topbar-title'\)\.textContent = topTitle\.textContent/.test(nav)) bad.push('nav.js copies text instead of swapping the title element');
+  const dir = new URL('../public/', import.meta.url);
+  for (const f of (await fsp.readdir(dir)).filter((x) => x.endsWith('.html'))) {
+    const html = await fsp.readFile(new URL(f, dir), 'utf8');
+    for (const m of html.matchAll(/<span class="topbar-title"[^>]*>/g)) if (!/id="topTitle"/.test(m[0])) bad.push(`${f}: top bar title without id="topTitle"`);
+  }
+  if (bad.length) throw new Error(bad.join(' | '));
+  return 'nav.js replaces the shown .topbar-title with the incoming page\'s (id kept); every page\'s top bar title carries id="topTitle" (stock-outward and recovery were missing it)';
+});
+
+await step('inventory forms: native date pickers (date-only text, month-only expiry), whole-number quantities, two-decimal amounts, the field is pointed at before anything is sent; the server still refuses malformed input and writes nothing', async () => {
+  const bad = [];
+  const js = await fsp.readFile(new URL('../public/inventory.js', import.meta.url), 'utf8');
+  const form = (kind) => js.slice(js.indexOf(`} else if (kind === '${kind}') {`), js.indexOf('} else if', js.indexOf(`} else if (kind === '${kind}') {`) + 10));
+  const recv = form('receive');
+  for (const t of ["intField('quantity', 'Quantity')", "dateField('mfg_date'", "dateField('expiry_date', 'Expiry', { monthOption: true", "dateField('received_date', 'Received date', { value: istToday(), notFuture: true })"]) if (!recv.includes(t)) bad.push(`receive: ${t}`);
+  for (const n of ['unit_cost', 'selling_price', 'mrp']) if (!recv.includes(`name="${n}" inputmode="decimal" \${MONEY_ATTRS}`)) bad.push(`receive: ${n} not numeric`);
+  if (!/type="\$\{monthOnly \? 'month' : 'date'\}"/.test(js) || !/data-month-for/.test(js)) bad.push('no date / month picker');
+  if (/new Date\([^)]*expiry/.test(js)) bad.push('an expiry passes through a JS Date');
+  if (!/const problem = checkFields\(f\);\s*formError\(problem\);\s*if \(problem\) return;/.test(js)) bad.push('no check before sending');
+  if (/name="(quantity|expected_quantity|accepted_quantity)" inputmode="numeric" required/.test(js)) bad.push('a text quantity input remains');
+  if (!/\.fld \.opt \{/.test(await fsp.readFile(new URL('../public/orders.css', import.meta.url), 'utf8')) || /<em>optional<\/em>/i.test(js)) bad.push('optional shown in the required style');
+  // Server: malformed quantities are refused and nothing reaches the ledger; dates are stored exactly as sent.
+  const sku = (await createSku({ sku: `${TS} FORME COLLAGEN FORM TEST`, product_name: 'Form test', unit_type: 'sachet' }, { actor: ACTOR })).id;
+  const ledger0 = await ledgerSum(sku);
+  for (const q of ['abc', '1.5', '-3', '0', 'Infinity', 'NaN', '1e3', ' ', '', '10000001', '12abc']) {
+    await expectErr(`quantity ${JSON.stringify(q)}`, () => receiveInventory({ sku_id: sku, batch_number: 'FT-1', quantity: q, request_id: rid() }, { actor: ACTOR }), (e) => e.status === 400);
+  }
+  for (const [label, patch] of [['unit cost text', { unit_cost: 'abc' }], ['unit cost 3 decimals', { unit_cost: '1.555' }], ['bad date', { expiry_date: '2028-02-30' }], ['bad month', { expiry_date: '2028-13' }]]) {
+    await expectErr(label, () => receiveInventory({ sku_id: sku, batch_number: 'FT-1', quantity: '5', request_id: rid(), ...patch }, { actor: ACTOR }), (e) => e.status === 400);
+  }
+  if ((await ledgerSum(sku)) !== ledger0 || (await getPool().query('SELECT count(*)::int n FROM inventory_batches WHERE sku_id = $1', [sku])).rows[0].n !== 0) bad.push('a refused receipt wrote something');
+  const r1 = await receiveInventory({ sku_id: sku, batch_number: 'FT-1', quantity: '5', mfg_date: '2026-08-01', expiry_date: '2028-08', received_date: dayOffset(0), unit_cost: '180.50', request_id: rid() }, { actor: ACTOR });
+  const b = (await getPool().query(`SELECT mfg_date::text m, expiry_date::text e, received_date::text r, unit_cost::text c FROM inventory_batches WHERE id = $1`, [r1.batchId])).rows[0];
+  if (b.m !== '2026-08-01' || b.e !== '2028-08-31' || b.r !== dayOffset(0) || b.c !== '180.50') bad.push(`stored ${JSON.stringify(b)}`);
+  // A SKU code with spaces moves stock like any other: receive, adjust, overview search.
+  await adjustStock({ movement_type: 'damaged', batch_id: r1.batchId, quantity: '2', reason: 'Torn sachets', request_id: rid() }, { actor: ACTOR });
+  if ((await getSku(sku)).available !== 3 || !(await inventoryOverview({ q: 'collagen form test' })).rows.some((r) => r.sku_id === sku)) bad.push('space SKU movement/search');
+  if (bad.length) throw new Error(bad.join(' | '));
+  return 'receive form: number quantity, date pickers (mfg, expiry with month-only switch, received ≤ today IST), numeric CP/SP/MRP; checked before sending; server refuses abc / 1.5 / −3 / 0 / Infinity / NaN / 1e3 / blank / > 10M / 12abc, text and 3-decimal costs, 30 Feb and month 13 — no batch, no ledger row; 2026-08-01 and 2028-08 stored as 2026-08-01 / 2028-08-31, ₹180.50 kept; a spaced SKU code receives, adjusts (5 − 2 = 3) and is found by search';
+});
+
+await step('money display: two decimals everywhere the shared formatter is used (₹180.50 never ₹181), foreign currency kept, stored values and CSVs untouched', async () => {
+  const bad = [];
+  const { money, moneyIn } = await import('../public/ui/format.js');
+  const cases = [[180.5, '₹180.50'], ['180.50', '₹180.50'], [249, '₹249.00'], [0.1 + 0.2, '₹0.30'], [3258575, '₹32,58,575.00'], [null, '₹0.00'], ['21.675', '₹21.68']];
+  for (const [v, want] of cases) if (money(v) !== want) bad.push(`money(${JSON.stringify(v)}) = ${money(v)}, want ${want}`);
+  if (moneyIn('USD', 20) !== '$20.00' || moneyIn('INR', 1.5) !== '₹1.50' || !/1\.50/.test(moneyIn('XYZ', 1.5))) bad.push('moneyIn');
+  const read = (f) => fsp.readFile(new URL(`../public/${f}`, import.meta.url), 'utf8');
+  const comp = await read('ui/components.js');
+  if (!/export \{ money, moneyIn \} from '\.\/format\.js';/.test(comp) || /maximumFractionDigits: 0 \}\);\s*export const money/.test(comp)) bad.push('components still rounds money');
+  if (!/minimumFractionDigits: 2, maximumFractionDigits: 2/.test(await read('import.js'))) bad.push('import page rounds money');
+  if (!/moneyIn\(cur, v\)/.test(await read('recovery.js'))) bad.push('recovery foreign currency');
+  // The stored value is what was entered: a batch at ₹180.50 reads back as 180.50 and values to the paisa.
+  const sku = (await createSku({ sku: `${TS}-MONEY`, product_name: 'Money display' }, { actor: ACTOR })).id;
+  await receiveInventory({ sku_id: sku, batch_number: 'M-1', quantity: '3', unit_cost: '180.50', selling_price: '249', mrp: '299.99', request_id: rid() }, { actor: ACTOR });
+  const d = await skuDetail(sku);
+  if (d.batches[0].unit_cost !== 180.5 || d.batches[0].value !== 541.5 || d.batches[0].mrp !== 299.99 || money(d.batches[0].unit_cost) !== '₹180.50' || money(d.batches[0].value) !== '₹541.50') bad.push(`stored/display ${JSON.stringify(d.batches[0]).slice(0, 160)}`);
+  if (bad.length) throw new Error(bad.join(' | '));
+  return '₹180.50, ₹249.00, ₹0.30, ₹32,58,575.00, ₹21.68 (display rounding only); USD/INR/unknown codes keep two decimals; components, import and recovery use it; a ₹180.50 batch stores 180.5 and values 3 × 180.50 = ₹541.50';
+});
+
+await step('shared UI patterns: one outlined label (tag / xtag / mini-tag) on tokens, unknown expiry distinct from near expiry, no duplicate .btn.danger / .status.none, table standard (row tokens, numeric columns, focusable selectable rows, keyboard sorting with aria-sort, scroll cue), stateBlock with roles used for loading/error, inventory forms: no prompts, confirm dialogs, unsaved-change guard, single submit, SKU list fetched once per change', async () => {
+  const bad = [];
+  const read = (f) => fsp.readFile(new URL(`../public/${f}`, import.meta.url), 'utf8');
+  const ui = await read('ui.css'); const ord = await read('orders.css');
+  if (!/\.tag, \.xtag, \.mini-tag \{[^}]*font-size: var\(--fs-label\)/.test(ui)) bad.push('labels not consolidated');
+  if (/^\.xtag \{|^\.tag \{ font-size|^\.mini-tag \{\s*display: inline-block/m.test(ui + ord)) bad.push('old label definitions remain');
+  if (!/\.xtag\.unknown \{[^}]*border-style: dashed/.test(ui)) bad.push('unknown expiry looks like near expiry');
+  if ((ui + ord).match(/^\.btn\.danger \{/gm)?.length !== 1 || (ui + ord).match(/^\.status\.none \{/gm)?.length !== 1) bad.push('duplicate component rules');
+  for (const t of ['--h-table-row:', '--table-head:', '--selected:', '.table tbody tr[tabindex]:focus-visible', '.table th.sortable:focus-visible', 'no-repeat local']) if (!ui.includes(t)) bad.push(`table standard: ${t}`);
+  for (const f of ['index.html', 'dashboard.html']) if ((await read(f)).match(/<th class="sortable[^"]*" tabindex="0" aria-sort="none"/g)?.length !== 7) bad.push(`${f}: sortable headers not focusable`);
+  for (const f of ['app.js', 'dashboard.js']) if (!/setAttribute\('aria-sort'/.test(await read(f))) bad.push(`${f}: aria-sort not updated`);
+  const comp = await read('ui/components.js');
+  if (!/th\.sortable\[tabindex\]/.test(comp) || !/role="alert"' : kind === 'loading' \? ' role="status" aria-busy="true"'/.test(comp)) bad.push('keyboard sort / stateBlock roles');
+  for (const f of ['hr.js', 'inventory.js', 'affiliates.js']) if (!/stateBlock\('loading'/.test(await read(f))) bad.push(`${f}: hand-rolled loading`);
+  const inv = await read('inventory.js');
+  if (/window\.prompt\('(Stage|Why is the rest)/.test(inv) || !/kind === 'incoming-stage'/.test(inv) || !/kind === 'incoming-cancel'/.test(inv)) bad.push('incoming prompts remain');
+  if (/window\.confirm\(`Remove platform SKU|window\.confirm\('Remove this document/.test(inv)) bad.push('destructive actions use window.confirm');
+  if (!/if \(state\.submitting\) return;/.test(inv) || !/state\.form\.dirty = true/.test(inv) || !/if \(!force && state\.form\?\.dirty/.test(inv)) bad.push('submit/dirty guards');
+  if (!/const needSkus = !state\.skus \|\| state\.skusStale;/.test(inv)) bad.push('SKU list refetched on every filter');
+  if (bad.length) throw new Error(bad.join(' | '));
+  return 'labels: one outlined pattern at 11px on tokens (5 tones), unknown expiry dashed; duplicates removed; tables share row/head tokens, tabular numerics, focusable/selected rows, keyboard sort with aria-sort on the call board and Analytics, a scroll edge cue; stateBlock announces loading/errors and replaces hand-rolled loading in HR, Inventory, Affiliates; inventory: labelled stage/cancel forms, confirm dialogs, unsaved-change guard, one submit at a time, SKU list fetched once (5 filter changes: 10 → 5 requests)';
+});
+
 await step('inventory: month-only expiry is the last calendar day, stored as a date, never shifted', async () => {
   const id = (await createSku({ sku: `${TS}-EXPIRY`, product_name: 'Expiry dates' }, { actor: ACTOR })).id;
   const cases = [['08/2028', '2028-08-31'], ['2028-08', '2028-08-31'], ['02/2028', '2028-02-29'], ['02/2027', '2027-02-28'], ['31/12/2029', '2029-12-31'], ['2029-01-15', '2029-01-15']];
@@ -5959,7 +6047,7 @@ await step('inventory page: Add inventory and batch forms show CP, SP and MRP as
     if (/Unit cost/.test(f) || /<select[^>]*name="(price_type|price_kind)"/.test(f)) bad.push(`${kind}: old field or a dropdown`);
   }
   const recv = form('receive');
-  for (const n of ['sku_id', 'batch_number', 'quantity', 'mfg_date', 'expiry_date', 'received_date', 'supplier_name', 'po_number', 'grn_number', 'warehouse_id', 'location', 'coa', 'notes']) if (!recv.includes(`name="${n}"`)) bad.push(`receive lost ${n}`);
+  for (const n of ['sku_id', 'batch_number', 'quantity', 'mfg_date', 'expiry_date', 'received_date', 'supplier_name', 'po_number', 'grn_number', 'warehouse_id', 'location', 'coa', 'notes']) if (!recv.includes(`name="${n}"`) && !new RegExp(`(intField|dateField)\\('${n}'`).test(recv)) bad.push(`receive lost ${n}`);
   if (!/\.price-row \{[^}]*grid-template-columns: repeat\(3, minmax\(0, 1fr\)\)/.test(css) || !/@media \(max-width: 760px\) \{ \.price-row \{ grid-template-columns: 1fr; \}/.test(css)) bad.push('layout');
   if (bad.length) throw new Error(bad.join(' | '));
   return 'both forms: three labelled inputs (unit_cost/selling_price/mrp, decimal keypad) with their helper texts, no dropdown, no "Unit cost"; receipt keeps SKU, batch, quantity, dates, received date, supplier, PO, GRN, warehouse, location, COA, notes; 3 columns on desktop, 1 below 760 px';
