@@ -23,6 +23,9 @@ const api = async (url, opts = {}) => {
 };
 const note = (msg, ok = false) => {
   $('#alerts').innerHTML = msg ? `<div class="alert${ok ? ' ok' : ''}">${icon(ok ? 'circle-check' : 'circle-alert')}<span>${esc(msg)}</span></div>` : '';
+  // A failed first load never leaves the table saying "Loading…".
+  const waiting = $('#rows .empty-note[role=status]');
+  if (msg && !ok && waiting) waiting.textContent = 'Could not load. See the message above.';
   renderIcons();
 };
 const saved = (msg, failed = false) => { $('#dSaved').className = `saved${failed ? ' failed' : ''}`; $('#dSaved').textContent = msg || ''; };
@@ -312,7 +315,7 @@ function setTab(tab) {
     const openRow = (e) => { const tr = e.target.closest('tr[data-id]'); if (tr) openOutward(Number(tr.dataset.id)).catch((err) => note(err.message)); };
     for (const host of [$('#rows'), $('#report')]) {
       host.addEventListener('click', openRow);
-      host.addEventListener('keydown', (e) => { if (e.key === 'Enter') openRow(e); });
+      host.addEventListener('keydown', (e) => { if (e.key === 'Enter' || (e.key === ' ' && e.target.matches('[tabindex]'))) { if (e.key === ' ') e.preventDefault(); openRow(e); } });
     }
     $('#dActions').addEventListener('click', (e) => { const b = e.target.closest('[data-act]'); if (b) act(b.dataset.act, b); });
     $('#dClose').addEventListener('click', closeDrawer);

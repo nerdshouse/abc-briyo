@@ -448,12 +448,12 @@ function sharedBlock(o, ship) {
       ${state.detail.sharedWith ? '<p class="soft shared-note">Shared shipment: courier, AWB, status and photos apply to every order in it.</p>' : ''}` : ''}
     ${canAdd ? `<button type="button" class="btn" id="dAttachOpen">${icon('plus')}Add orders to this shipment</button>
       <div class="attach" id="dAttach" hidden>
-        <input class="input plain" id="dAttachQ" placeholder="Find an order number" autocomplete="off" />
+        <input class="input plain" id="dAttachQ" placeholder="Find an order number" aria-label="Find an order number to attach" autocomplete="off" />
         <ul class="attach-list" id="dAttachList"><li class="soft">Loading…</li></ul>
         <div class="attach-new"><span class="soft">Or a new ${esc(o.channel_label)} order:</span>
-          <input class="input plain mono" id="dNewNum" placeholder="Order number" autocomplete="off" />
+          <input class="input plain mono" id="dNewNum" placeholder="Order number" aria-label="New order number" autocomplete="off" />
           <input class="input plain" id="dNewDate" type="datetime-local" aria-label="Order date (IST)" />
-          <input class="input plain" id="dNewValue" inputmode="decimal" placeholder="Value (₹)" autocomplete="off" /></div>
+          <input class="input plain" id="dNewValue" inputmode="decimal" placeholder="Value (₹)" aria-label="New order value in rupees" autocomplete="off" /></div>
         <div class="form-actions"><button type="button" class="btn primary" id="dAttachSave">Add to shipment</button>
           <button type="button" class="btn" id="dAttachCancel">Cancel</button></div>
       </div>` : ''}
@@ -706,7 +706,7 @@ function drawerCommon(o, documents, proofDocs, events, notes) {
 
     <section class="dsec">
       <h3 class="dsec-title">Notes</h3>
-      ${canEdit() ? `<textarea class="input" id="dNote" placeholder="Add a note — it is saved to the activity and cannot be edited" maxlength="2000"></textarea>
+      ${canEdit() ? `<textarea class="input" id="dNote" placeholder="Add a note — it is saved to the activity and cannot be edited" aria-label="New note" maxlength="2000"></textarea>
       <div class="form-actions"><button class="btn" type="button" id="dNoteAdd">Add note</button></div>` : (notes.length ? '' : '<p class="muted" style="margin:0">No notes.</p>')}
       ${notes.length ? `<ul class="d-history" style="margin-top:12px">${notes.slice(0, 5).map((n) => `
         <li><span style="min-width:0;white-space:pre-wrap">${esc(n.metadata.note)}</span><span class="d-when">${esc(n.actor || 'Someone')}, ${esc(dateTime(n.at))}</span></li>`).join('')}</ul>` : ''}
@@ -890,6 +890,8 @@ dBody.addEventListener('input', (e) => {
   if (e.target.id === 'dAttachQ') { clearTimeout(attachTimer); attachTimer = setTimeout(loadAttachable, 250); }
 });
 onLeave(() => clearTimeout(attachTimer));
+// The sync status loops stop with the page (they used to fire once more after leaving).
+onLeave(() => { clearTimeout(shopifyTimer); clearTimeout(amazonTimer); });
 
 dBody.addEventListener('change', async (e) => {
   if (e.target.id === 'dPhotos') {
@@ -1931,6 +1933,7 @@ function askAmazonStart() {
   });
 }
 
+let amazonTimer = null;
 async function followAmazonSync() {
   if (amazonFollowing) return;
   amazonFollowing = true;
@@ -1941,7 +1944,7 @@ async function followAmazonSync() {
     amazonBusy(true);
     // A chain past its first run is working through a large window, run by run (Amazon allows ~1 page per 3 minutes after a burst).
     amazonNote(`<b>${s.runs > 1 ? 'Amazon sync continuing…' : 'Amazon Syncing…'}</b> <span class="soft">${count(s.fetched || 0)} fetched so far</span>`);
-    setTimeout(followAmazonSync, 2500);
+    amazonTimer = setTimeout(followAmazonSync, 2500);
     return;
   }
   amazonBusy(false);
@@ -2016,7 +2019,7 @@ function bind() {
   $('#rows').addEventListener('click', rowOpen);
   $('#clist').addEventListener('click', rowOpen);
   for (const host of [$('#rows'), $('#clist')]) {
-    host.addEventListener('keydown', (e) => { if (e.key === 'Enter') rowOpen(e); });
+    host.addEventListener('keydown', (e) => { if (e.key === 'Enter' || (e.key === ' ' && e.target.matches('[tabindex]'))) { if (e.key === ' ') e.preventDefault(); rowOpen(e); } });
   }
   $('#moreBtn').addEventListener('click', () => load({ append: true }));
   $('#refresh').addEventListener('click', () => { load(); if (state.openId) openOrder(state.openId); });

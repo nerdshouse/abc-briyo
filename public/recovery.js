@@ -18,7 +18,13 @@ const api = async (url, opts = {}) => {
   if (!res.ok || data.ok === false) throw Object.assign(new Error(data.error || `HTTP ${res.status}`), { status: res.status });
   return data;
 };
-const note = (msg) => { $('#alerts').innerHTML = msg ? `<div class="alert">${icon('circle-alert')}<span>${esc(msg)}</span></div>` : ''; renderIcons(); };
+const note = (msg) => {
+  $('#alerts').innerHTML = msg ? `<div class="alert">${icon('circle-alert')}<span>${esc(msg)}</span></div>` : '';
+  // A failed first load never leaves the table saying "Loading…".
+  const waiting = $('#rows .empty-note[role=status]');
+  if (msg && waiting) waiting.textContent = 'Could not load. See the message above.';
+  renderIcons();
+};
 const tag = (status, label) => `<span class="tag ${STATUS_TONE[status] || ''}">${esc(label)}</span>`;
 /**
  * When the order was placed relative to the cart being marked Recovered. An order placed before it cannot have been
@@ -141,7 +147,7 @@ $('#dBody').addEventListener('click', async (e) => {
     $('#statusSeg').addEventListener('click', (e) => { const b = e.target.closest('[data-status]'); if (!b) return; state.status = b.dataset.status; for (const x of $$('#statusSeg button')) x.classList.toggle('on', x === b); renderRows(); });
     const openRow = (e) => { const tr = e.target.closest('tr[data-cart]'); if (tr) openCart(Number(tr.dataset.cart)); };
     $('#rows').addEventListener('click', openRow);
-    $('#rows').addEventListener('keydown', (e) => { if (e.key === 'Enter') openRow(e); });
+    $('#rows').addEventListener('keydown', (e) => { if (e.key === 'Enter' || (e.key === ' ' && e.target.matches('tr[tabindex]'))) { if (e.key === ' ') e.preventDefault(); openRow(e); } });
     $('#dClose').addEventListener('click', closeDrawer); $('#drawerScrim').addEventListener('click', closeDrawer);
     await load();
   } catch (err) { note(err.message); }

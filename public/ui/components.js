@@ -460,8 +460,13 @@ export function initShell(me, { onSearch } = {}) {
       const k = $('.side-search kbd'); if (k) k.textContent = 'Ctrl K';
     }
     $('#signOut')?.addEventListener('click', async () => {
-      await fetch('/auth/logout', { method: 'POST' });
-      window.location.href = '/login';
+      try {
+        const res = await fetch('/auth/logout', { method: 'POST' });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        window.location.href = '/login';
+      } catch {
+        toast('Could not sign out — check your connection and try again.', { tone: 'bad' });
+      }
     });
     startRouter();
     enhanceDrawers();
@@ -734,4 +739,6 @@ export function setNavCount(id, n, { alert = false } = {}) {
   el.hidden = !n;
   el.textContent = count(n);
   el.classList.toggle('alert', alert && n > 0);
+  if (alert && n > 0) { el.setAttribute('title', `${count(n)} overdue`); el.setAttribute('aria-label', `${count(n)} overdue`); }
+  else { el.removeAttribute('title'); el.removeAttribute('aria-label'); }
 }
