@@ -270,6 +270,8 @@ async function act(name, btn) {
       // The earlier entry was saved with other quantities: show the record as it is now, and start a fresh entry.
       state.returnKey = null;
       await load(); await openOutward(o.id);
+      saved('These quantities were not recorded as a new return. The record shows what is saved.', true);
+      return;
     }
     saved(err.message, true);
     if (err.data?.field === 'requested_by_name' && $('#soOtherErr')) $('#soOtherErr').textContent = err.message;
