@@ -4,7 +4,7 @@
  * page only shows what the API returns and hides controls the API would refuse.
  * Everything a person typed is escaped (esc) before it is put into the page.
  */
-import { $, $$, esc, icon, renderIcons, initShell, pageFetch, pageSignal, onLeave } from './ui/components.js';
+import { $, $$, esc, icon, renderIcons, initShell, pageFetch, pageSignal, onLeave, confirmDialog } from './ui/components.js';
 import { istDateTime } from './ui/ist.js';
 
 const fetch = pageFetch();
@@ -202,6 +202,12 @@ async function act(name, btn) {
   if (name === 'status') return run(() => api(`${path}/status`, { method: 'PATCH', body: JSON.stringify({ status: $('#tkStatus').value, version: t.version }) }), (r) => (r.changed ? 'Status saved' : 'No change'));
   if (name === 'assign' && !$('#tkAssignee').value) { saved('Choose who the ticket goes to.', true); return; }
   if (name === 'assign') return run(() => api(`${path}/assignee`, { method: 'PATCH', body: JSON.stringify({ assignee: $('#tkAssignee').value, version: t.version }) }), (r) => (r.changed ? 'Reassigned' : 'No change'));
+  if (name === 'resend') {
+    const n = (state.detail.notifications || []).find((x) => x.kind === 'ticket_created');
+    // "Unconfirmed" or a send cut off mid-way may already have reached the owner: resending can message them twice.
+    if (n && ['unconfirmed', 'sending'].includes(n.status) && !(await confirmDialog({ title: 'Send the notice again?',
+      body: 'This notice may already have reached the ticket owner. Sending again can message them twice.', confirmLabel: 'Send again' }))) return;
+  }
   if (name === 'resend') return run(() => api(`${path}/notification/retry`, { method: 'POST', body: '{}' }), (r) => (r.status === 'submitted' ? 'Notice sent' : `Notice: ${NOTICE_TEXT[r.status] || r.status}${r.error ? ` — ${r.error}` : ''}`));
 }
 

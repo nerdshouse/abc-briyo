@@ -11171,7 +11171,7 @@ await step('affiliate commissions: one per attribution, rate and base fixed at c
 await step('tickets: any member raises one (validated, TKT- numbers unique under concurrency, idempotent per request id), assigned to the ticket owner by member record (refused when not exactly one); members see only their own (404 otherwise); owner/admins see and manage all; status, reassignment and resend refused to members; activity recorded; WhatsApp notice through the 11za client (mocked) — survives provider failure, retried safely without duplicates, never via the OTP template; no token or number in logs', async () => {
   const bad = [];
   const db = getPool();
-  const P = { owner: '919000000801', m1: '919000000802', m2: '919000000803', admin: '919000000804', dup: '919000000805' };
+  const P = { owner: '919000000801', m1: '919000000802', m2: '919000000803', admin: '919000000804', dup: '919000000805', moved: '919000000806' };
   const OWNER = 'DBCHECK-TKT Founder';
   const TOKEN = 'dbcheck-11za-token-SECRET-7731';
   const envKeys = ['TICKETS_OWNER_NAME', 'ELEVENZA_AUTH_TOKEN', 'ELEVENZA_ORIGIN_WEBSITE', 'ELEVENZA_API_URL', 'ELEVENZA_TICKET_TEMPLATE_NAME', 'ELEVENZA_TEMPLATE_NAME', 'APP_BASE_URL', 'ELEVENZA_PAYLOAD_TEMPLATE', 'ELEVENZA_AUTH_HEADER'];
@@ -11393,6 +11393,9 @@ await step('tickets: any member raises one (validated, TKT- numbers unique under
     const ren = await updateProfileForTest(P.m1, { name: `  ${OWNER.toUpperCase()} ` }, { actor: 'self', reservedName: OWNER }).then(() => null, (e) => e);
     const keep = await updateProfileForTest(P.owner, { name: OWNER }, { actor: 'self', reservedName: OWNER }).then(() => null, (e) => e);
     if (!ren || ren.status !== 400 || ren.field !== 'name' || keep) bad.push(`owner name reservation ${ren?.message} / ${keep?.message}`);
+    // ...and the owner cannot rename HERSELF away (tickets would stop, and she could not rename back): only an admin can.
+    const away = await updateProfileForTest(P.owner, { name: `${OWNER} Shah` }, { actor: 'self', reservedName: OWNER }).then(() => null, (e) => e);
+    if (!away || away.status !== 400 || (await db.query('SELECT name FROM allowed_users WHERE phone = $1', [P.owner])).rows[0].name !== OWNER) bad.push(`owner renamed herself away: ${away?.message}`);
     if ((await db.query('SELECT name FROM allowed_users WHERE phone = $1', [P.m1])).rows[0].name !== 'DBCHECK-TKT Member One') bad.push('refused rename saved');
     // (d) A pending notice is sent when its create is replayed (the first response lost), and by the startup sweep.
     const rid2 = crypto.randomUUID();
@@ -11446,6 +11449,27 @@ await step('tickets: any member raises one (validated, TKT- numbers unique under
       || gone.comments.at(-1)?.author_name !== 'DBCHECK-TKT Member Two' || 'creator_key' in gone.ticket) bad.push(`after removal ${JSON.stringify({ row, t: gone.ticket })}`);
     const metaAfter = (await call('owner', 'GET', '/meta')).body;
     if (metaAfter.creators.some((c) => c.name === 'DBCHECK-TKT Member Two')) bad.push('removed member still a creator filter');
+
+    // The notice's recipient is the member, not a number: it follows a number change, and is gone (never sent) once the
+    // member is removed — a number later given to someone else is never messaged. The trigger exists exactly once.
+    const moved = await createTicketForTest(good({ title: 'Owner changed number' }), who.m1);
+    made.add(moved.ticket.number);
+    const NEWNUM = '919000000806';
+    await db.query('UPDATE allowed_users SET phone = $2 WHERE phone = $1', [P.owner, NEWNUM]);
+    const callsM = stub.calls.length;
+    const mv = await deliverTicketNotification(moved.notificationId);
+    const toNew = stub.calls.at(-1)?.sendto;
+    await db.query('UPDATE allowed_users SET phone = $2 WHERE phone = $1', [NEWNUM, P.owner]);
+    if (mv.status !== 'submitted' || stub.calls.length !== callsM + 1 || toNew !== NEWNUM) bad.push(`number change ${mv.status} → ${toNew}`);
+    const orphan = await createTicketForTest(good({ title: 'Owner removed' }), who.m1);
+    made.add(orphan.ticket.number);
+    await db.query('DELETE FROM allowed_users WHERE phone = $1', [P.owner]);
+    await db.query(`INSERT INTO allowed_users (phone, name, active, added_by) VALUES ($1, 'DBCHECK-TKT Stranger', true, 'db-check')`, [P.owner]);   // the number, reused
+    const callsO = stub.calls.length;
+    const op = await deliverTicketNotification(orphan.notificationId);
+    if (op.sent || op.status !== 'skipped' || stub.calls.length !== callsO) bad.push(`removed owner's reused number messaged: ${JSON.stringify(op)}`);
+    const trig = (await db.query("SELECT count(*)::int n FROM pg_trigger WHERE tgname = 'ticket_events_append_only'")).rows[0].n;
+    if (trig !== 1) bad.push(`append-only trigger count ${trig}`);
 
     // 13. No token and no full owner number anywhere in what the server logged during this step.
     const logged = logs.join('\n');
