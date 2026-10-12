@@ -37,6 +37,8 @@ import { router as affiliateRouter } from './lib/affiliate-routes.js';
 import { ensureAffiliateSchema } from './lib/affiliates.js';
 import { ensureAffiliateVerificationSchema } from './lib/affiliate-verification.js';
 import { ensureHrSchema, retryPendingRemovals } from './lib/hr.js';
+import { router as ticketsRouter } from './lib/tickets-routes.js';
+import { ensureTicketsSchema, sendStrandedTicketNotifications, ownerName as ticketOwnerName } from './lib/tickets.js';
 import { overviewFor } from './lib/overview.js';
 import { recoveryReport, decideMatch, revertDecision, decisionHistory, ensureRecoverySchema } from './lib/recovery-verification.js';
 import { router as marketingRouter } from './lib/marketing-routes.js';
@@ -455,7 +457,8 @@ app.get('/api/profile', async (req, res) => {
 app.put('/api/profile', async (req, res) => {
   try {
     const { name, email } = req.body ?? {};
-    const profile = await updateProfile(req.session.phone, { name, email }, { actor: await currentUserName(req) });
+    // The ticket owner's name (lib/tickets.js) cannot be taken by renaming yourself; admins set it in Members.
+    const profile = await updateProfile(req.session.phone, { name, email }, { actor: await currentUserName(req), reservedName: ticketOwnerName() });
     invalidateMembership(req.session.phone);
     res.json({ ok: true, profile });
   } catch (err) { profileError(res, err); }
@@ -535,6 +538,11 @@ app.get(['/hr/jobs', '/hr/candidates'], requirePage('hr.view'), (_req, res) => r
 // by the opaque public id. Reading needs affiliate.view, changes affiliate.manage.
 app.use('/api/affiliates', requirePermission('affiliate.view'), affiliateRouter);
 app.get(['/affiliates', '/affiliates/:publicId([A-Za-z0-9]{6,12})'], requirePage('affiliate.view'), (_req, res) => res.sendFile(path.join(PUBLIC, 'affiliates.html')));
+
+// Tickets: every signed-in member (no module role needed) raises tickets and sees their own; the ticket owner (the
+// founder) and admins see and manage all. Who may do what is checked in lib/tickets.js on every request.
+app.use('/api/tickets', ticketsRouter);
+app.get(['/tickets', '/tickets.html'], (_req, res) => res.sendFile(path.join(PUBLIC, 'tickets.html')));
 
 app.use(express.static(PUBLIC));
 
@@ -1277,6 +1285,13 @@ app.listen(port, async () => {
       ensureRecoverySchema()
         .then(() => console.log('Recovery verification schema ready'))
         .catch((e) => console.error('Recovery verification schema setup failed (will retry on first request):', e.message));
+      ensureTicketsSchema()
+        .then(() => console.log('Tickets schema ready'))
+        // A notice whose send was cut off by a restart (still "pending") is sent now; "sending" ones are left to a manager.
+        .then(() => sendStrandedTicketNotifications()
+          .then((r) => { if (r.found) console.log(`Ticket notices: ${r.sent} of ${r.found} pending sent`); })
+          .catch((e) => console.error('Pending ticket notices not sent:', String(e.message).slice(0, 200))))
+        .catch((e) => console.error('Tickets schema setup failed (will retry on first request):', e.message));
       ensureHrSchema()
         .then(() => console.log('HR schema ready'))
         // Resume removals interrupted after the file was deleted are finished here.

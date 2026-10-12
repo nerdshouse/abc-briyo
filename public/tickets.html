@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <link rel="icon" type="image/png" href="/brand/briyo-logo-square.png" />
+  <link rel="apple-touch-icon" href="/brand/apple-touch-icon.png" />
+  <title>Tickets — Briyo OS</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/ui.css" />
+  <link rel="stylesheet" href="/orders.css" />
+  <link rel="stylesheet" href="/tickets.css" />
+  <script src="https://cdn.jsdelivr.net/npm/lucide@0.469.0/dist/umd/lucide.min.js" defer></script>
+</head>
+<body>
+<div class="app">
+
+  <aside class="sidebar" id="sidebar" aria-label="Main navigation"></aside>
+  <div class="scrim" id="scrim"></div>
+
+  <div class="main">
+    <header class="topbar">
+      <button class="icon-btn" id="navOpen" type="button" aria-label="Open navigation"><i data-lucide="menu"></i></button>
+      <span class="topbar-title" id="topTitle">Tickets</span>
+    </header>
+
+    <main class="page" data-section="tickets">
+      <div class="crumbs"><i data-lucide="ticket"></i><span class="here">Tickets</span></div>
+      <div class="page-head">
+        <div>
+          <h1 class="page-title">Tickets</h1>
+          <p class="page-sub" id="pageSub">Raise a bug, a technical or operational issue, or an access request. It goes straight to the founder.</p>
+        </div>
+        <div class="page-actions">
+          <div class="seg" role="tablist" aria-label="Which tickets" id="scopeTabs" hidden>
+            <button type="button" class="on" data-scope="all" role="tab" aria-selected="true">All tickets</button>
+            <button type="button" data-scope="assigned" role="tab" aria-selected="false">Assigned to me</button>
+            <button type="button" data-scope="mine" role="tab" aria-selected="false">Raised by me</button>
+          </div>
+          <button class="btn primary" id="newTicket" type="button"><i data-lucide="plus"></i>New ticket</button>
+        </div>
+      </div>
+      <div id="alerts"></div>
+
+      <div class="filters tk-filters">
+        <input class="input" id="fQ" type="search" placeholder="Search number, title or description" aria-label="Search tickets" maxlength="100" />
+        <select class="select" id="fStatus" aria-label="Status"><option value="">Any status</option><option value="active">Not resolved or closed</option></select>
+        <select class="select" id="fPriority" aria-label="Priority"><option value="">Any priority</option></select>
+        <select class="select" id="fCategory" aria-label="Category"><option value="">Any category</option></select>
+        <select class="select" id="fCreator" aria-label="Raised by" hidden><option value="">Anyone</option></select>
+      </div>
+      <section class="card">
+        <div class="table-wrap">
+          <table class="table tk-table">
+            <thead><tr>
+              <th>Ticket</th><th>Title</th><th>Category</th><th>Priority</th><th>Status</th>
+              <th class="tk-creator" hidden>Raised by</th><th>Assigned to</th><th>Updated</th>
+            </tr></thead>
+            <tbody id="rows"><tr><td colspan="8"><div class="empty-note" role="status">Loading…</div></td></tr></tbody>
+          </table>
+        </div>
+      </section>
+    </main>
+  </div>
+</div>
+
+<div class="drawer-scrim" id="drawerScrim" hidden></div>
+<aside class="drawer drawer-wide" id="drawer" hidden aria-label="Ticket">
+  <div class="drawer-head">
+    <div style="min-width:0"><h2 class="drawer-title" id="dTitle"></h2><div class="drawer-sub" id="dSub"></div></div>
+    <div class="drawer-nav"><button class="icon-btn" id="dClose" type="button" title="Close" aria-label="Close"><i data-lucide="x"></i></button></div>
+  </div>
+  <div class="drawer-body" id="dBody"></div>
+  <div class="drawer-foot"><span class="saved" id="dSaved" role="status" aria-live="polite"></span><div class="drawer-foot-actions" id="dActions"></div></div>
+</aside>
+<script type="module" src="/tickets.js"></script>
+</body>
+</html>

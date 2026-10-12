@@ -52,6 +52,10 @@ import path from 'node:path';
 import fsp from 'node:fs/promises';
 import crypto from 'node:crypto';
 import http from 'node:http';
+import { router as ticketsRouterForTest } from '../lib/tickets-routes.js';
+import { purgeTestTickets, deliverTicketNotification, ticketAlertText, TICKET_ALERT_MAX, createTicket as createTicketForTest, sendStrandedTicketNotifications } from '../lib/tickets.js';
+import { updateProfile as updateProfileForTest } from '../lib/profile.js';
+import { buildBody as elevenzaBodyForTest } from '../lib/whatsapp.js';
 import { ensureHrSchema, purgeTestHr, slugify, normalizePhone, removeResume, retryPendingRemovals, istDayKey, HR_TIMEZONE } from '../lib/hr.js';
 import { jobPostingLd } from '../lib/careers-pages.js';
 import nodeCrypto from 'node:crypto';
@@ -11164,6 +11168,323 @@ await step('affiliate commissions: one per attribution, rate and base fixed at c
   return 'base = subtotal ₹215.00 − recorded tax ₹41.64 = ₹173.36 (shipping ₹58 and tax excluded) × 12.5% → one ₹21.67 commission (rate 1250 kept after a new 10% rate; amounts and history immutable); negative base → none; USD kept as USD ₹→$2.50; no record / no rate / voided → none, logged; retried by the backfill only when skipped-and-logged (pre-ledger #2809-like never); cancelled order flagged, not earned, reversed with a reason; pending→approved→paid audited, illegal moves 409; admin/finance see money, viewer gets no money fields and cannot move statuses; activity shows no amounts';
 });
 
+await step('tickets: any member raises one (validated, TKT- numbers unique under concurrency, idempotent per request id), assigned to the ticket owner by member record (refused when not exactly one); members see only their own (404 otherwise); owner/admins see and manage all; status, reassignment and resend refused to members; activity recorded; WhatsApp notice through the 11za client (mocked) — survives provider failure, retried safely without duplicates, never via the OTP template; no token or number in logs', async () => {
+  const bad = [];
+  const db = getPool();
+  const P = { owner: '919000000801', m1: '919000000802', m2: '919000000803', admin: '919000000804', dup: '919000000805', moved: '919000000806' };
+  const OWNER = 'DBCHECK-TKT Founder';
+  const TOKEN = 'dbcheck-11za-token-SECRET-7731';
+  const envKeys = ['TICKETS_OWNER_NAME', 'ELEVENZA_AUTH_TOKEN', 'ELEVENZA_ORIGIN_WEBSITE', 'ELEVENZA_API_URL', 'ELEVENZA_TICKET_TEMPLATE_NAME', 'ELEVENZA_TEMPLATE_NAME', 'APP_BASE_URL', 'ELEVENZA_PAYLOAD_TEMPLATE', 'ELEVENZA_AUTH_HEADER'];
+  const savedEnv = Object.fromEntries(envKeys.map((k) => [k, process.env[k]]));
+  // A stand-in for 11za: records each request; answers per `stub.mode`.
+  const stub = { mode: 'ok', calls: [] };
+  const provider = http.createServer((req, res) => {
+    let body = ''; req.on('data', (c) => { body += c; });
+    req.on('end', () => {
+      const json = JSON.parse(body || '{}'); stub.calls.push(json);
+      if (stub.mode === 'fail') { const s = String(json.sendto); res.writeHead(500); res.end(`upstream error for ${s} (+${s.slice(0, 2)} ${s.slice(2, 7)}-${s.slice(7)}) token ${json.authToken}`); return; }
+      if (stub.mode === 'nonjson') { res.writeHead(200); res.end('OK'); return; }
+      res.writeHead(200, { 'content-type': 'application/json' }); res.end(JSON.stringify({ status: 'success', message: 'queued' }));
+    });
+  }).listen(0);
+  const logs = [];
+  const orig = { log: console.log, warn: console.warn, error: console.error };
+  for (const k of Object.keys(orig)) console[k] = (...a) => { logs.push(a.map(String).join(' ')); };
+  const app = express();
+  app.use((req, _res, next) => { req.session = JSON.parse(req.get('x-test-session') || '{}'); next(); });
+  app.use(express.json());
+  app.use('/api/tickets', ticketsRouterForTest);
+  const server = app.listen(0);
+  const who = { owner: { phone: P.owner }, m1: { phone: P.m1 }, m2: { phone: P.m2 }, admin: { phone: P.admin, isAdmin: true } };
+  const made = new Set();
+  const ticketCount = async () => (await db.query('SELECT count(*)::int n FROM tickets WHERE creator_phone = ANY($1)', [Object.values(P)])).rows[0].n;
+  const noticeOf = async (number) => (await db.query(`SELECT n.* FROM ticket_notifications n JOIN tickets t ON t.id = n.ticket_id WHERE t.number = $1`, [number])).rows[0];
+  const settle = async (number) => { for (let i = 0; i < 200; i += 1) { const n = await noticeOf(number); if (n && !['pending', 'sending'].includes(n.status)) return n; await new Promise((r) => setTimeout(r, 25)); } return noticeOf(number); };
+  try {
+    for (const k of envKeys) delete process.env[k];
+    Object.assign(process.env, { TICKETS_OWNER_NAME: OWNER, ELEVENZA_AUTH_TOKEN: TOKEN, ELEVENZA_ORIGIN_WEBSITE: 'https://origin.example.test',
+      ELEVENZA_API_URL: `http://127.0.0.1:${provider.address().port}/send`, ELEVENZA_TICKET_TEMPLATE_NAME: 'briyo_ticket_alert', APP_BASE_URL: 'https://os.example.test/' });
+    await db.query(`INSERT INTO allowed_users (phone, name, is_admin, active, added_by) VALUES
+      ($1, $5, false, true, 'db-check'), ($2, 'DBCHECK-TKT Member One', false, true, 'db-check'), ($3, 'DBCHECK-TKT Member Two', false, true, 'db-check'), ($4, 'DBCHECK-TKT Admin', true, true, 'db-check')
+      ON CONFLICT (phone) DO UPDATE SET name = EXCLUDED.name, is_admin = EXCLUDED.is_admin, active = true`, [P.owner, P.m1, P.m2, P.admin, OWNER]);
+    const base = `http://127.0.0.1:${server.address().port}/api/tickets`;
+    const call = async (as, method, path = '', body) => {
+      const r = await fetch(`${base}${path}`, { method, headers: { 'content-type': 'application/json', 'x-test-session': JSON.stringify(who[as]) }, body: body === undefined ? undefined : JSON.stringify(body) });
+      const j = await r.json(); if (j.ticket?.number) made.add(j.ticket.number); return { status: r.status, body: j };
+    };
+    const good = (extra = {}) => ({ title: 'Cannot print the dispatch label', description: 'The label printer shows an error.\nIt started this morning.', category: 'technical_issue', ...extra });
+
+    // 1, 4, 12. A member raises a ticket: number, defaults, owner assigned; the notice goes through the 11za client with the details.
+    const c1 = await call('m1', 'POST', '', good());
+    const t1 = c1.body.ticket;
+    if (c1.status !== 201 || !/^TKT-\d{5,}$/.test(t1?.number || '') || t1.status !== 'open' || t1.priority !== 'medium' || t1.assignee_name !== OWNER || t1.creator_name !== 'DBCHECK-TKT Member One') bad.push(`create ${c1.status} ${JSON.stringify(c1.body).slice(0, 200)}`);
+    if ('creator_phone' in (t1 || {}) || 'assignee_phone' in (t1 || {}) || JSON.stringify(c1.body).includes(P.owner)) bad.push('phone numbers in the API response');
+    const n1 = await settle(t1.number);
+    const sent = stub.calls.at(-1) || {};
+    if (n1.status !== 'submitted' || n1.attempts !== 1 || stub.calls.length !== 1) bad.push(`notice ${n1.status} attempts ${n1.attempts} calls ${stub.calls.length}`);
+    if (sent.templateName !== 'briyo_ticket_alert' || sent.sendto !== P.owner || sent.authToken !== TOKEN) bad.push(`provider request ${JSON.stringify({ ...sent, authToken: '…' })}`);
+    const want = [t1.number, 'Medium priority', 'Technical Issue', 'From DBCHECK-TKT Member One', 'Cannot print the dispatch label', 'The label printer shows an error. It started this morning.', `https://os.example.test/tickets?open=${t1.number}`];
+    for (const w of want) if (!String(sent.data).includes(w)) bad.push(`notice text lacks "${w}": ${sent.data}`);
+    if (/[\n\r\t]| {5}/.test(sent.data) || String(sent.data).length > TICKET_ALERT_MAX) bad.push('notice text not one clean line within the limit');
+    const long = ticketAlertText({ ...t1, title: 'T'.repeat(160), creator_name: 'C'.repeat(120), description: 'D '.repeat(3000), number: 'TKT-99999', priority: 'urgent', category: 'bug' });
+    if (long.length > TICKET_ALERT_MAX || !long.includes('TKT-99999') || !long.includes('/tickets?open=TKT-99999')) bad.push(`long notice ${long.length}`);
+
+    // 2. Required fields and invalid values: 400 with the field; nothing created.
+    const before = await ticketCount();
+    for (const [label, body, field] of [['no title', good({ title: undefined }), 'title'], ['blank title', good({ title: '   ' }), 'title'], ['no description', good({ description: '' }), 'description'],
+      ['no category', good({ category: undefined }), 'category'], ['bad category', good({ category: 'hardware' }), 'category'], ['bad priority', good({ priority: 'p1' }), 'priority'],
+      ['long title', good({ title: 'x'.repeat(161) }), 'title'], ['long description', good({ description: 'y'.repeat(5001) }), 'description'], ['title not text', good({ title: 5 }), 'title'],
+      ['bad request id', good({ request_id: 'x' }), 'request_id']]) {
+      const r = await call('m1', 'POST', '', body);
+      if (r.status !== 400 || r.body.field !== field) bad.push(`${label}: ${r.status} ${r.body.field} ${r.body.error}`);
+    }
+    if ((await ticketCount()) !== before) bad.push('a refused ticket was saved');
+    const pr = await call('m2', 'POST', '', good({ title: 'Need inventory access', category: 'access_request', priority: 'URGENT', description: '<img src=x onerror=alert(1)>' }));
+    if (pr.status !== 201 || pr.body.ticket.priority !== 'urgent' || pr.body.ticket.description !== '<img src=x onerror=alert(1)>') bad.push(`member two ${pr.status} ${pr.body.ticket?.priority}`);
+    const t2 = pr.body.ticket;
+
+    // 3. Concurrency: 16 at once → 16 distinct numbers, all assigned to the owner.
+    const many = await Promise.all(Array.from({ length: 16 }, (_, i) => call(i % 2 ? 'm1' : 'm2', 'POST', '', good({ title: `Parallel ${i}` }))));
+    const nums = many.map((r) => r.body.ticket?.number);
+    if (many.some((r) => r.status !== 201) || new Set(nums).size !== 16 || many.some((r) => r.body.ticket.assignee_name !== OWNER)) bad.push(`parallel ${many.map((r) => r.status)} ${new Set(nums).size}`);
+    for (const n of nums) await settle(n);
+
+    // 5. Another member's ticket does not exist for you (404), in every route; your list has only your own.
+    for (const [m, path, body] of [['GET', `/${t1.number}`], ['POST', `/${t1.number}/comments`, { body: 'hi' }], ['PATCH', `/${t1.number}/status`, { status: 'closed' }],
+      ['PATCH', `/${t1.number}/assignee`, { assignee: 'x' }], ['POST', `/${t1.number}/notification/retry`, {}], ['GET', '/TKT-1'], ['GET', '/abc'], ['GET', '/TKT-99999999']]) {
+      const r = await call('m2', m, path, body);
+      if (r.status !== 404) bad.push(`member two ${m} ${path}: ${r.status}`);
+    }
+    for (const scope of ['all', 'assigned', 'mine', '']) {
+      const l = await call('m2', 'GET', `?scope=${scope}`);
+      if (l.body.manager || !l.body.tickets.length || l.body.tickets.some((t) => t.creator_name !== 'DBCHECK-TKT Member Two') || l.body.tickets.some((t) => 'creator_key' in t)) bad.push(`member two list (${scope})`);
+    }
+    const mm = await call('m1', 'GET', '/meta');
+    if (mm.body.manager || mm.body.managers || mm.body.creators || mm.body.owner?.name !== OWNER) bad.push(`member meta ${JSON.stringify(mm.body).slice(0, 200)}`);
+
+    // 7. A member may comment on their own ticket, but not change status or assignee, or resend (403); nothing changes.
+    const v0 = (await call('m1', 'GET', `/${t1.number}`)).body.ticket.version;
+    const own = await call('m1', 'POST', `/${t1.number}/comments`, { body: 'Still broken after a restart.' });
+    for (const [m, path, body] of [['PATCH', `/${t1.number}/status`, { status: 'resolved', version: v0 }], ['PATCH', `/${t1.number}/assignee`, { assignee: 'x', version: v0 }], ['POST', `/${t1.number}/notification/retry`, {}]]) {
+      const r = await call('m1', m, path, body);
+      if (r.status !== 403) bad.push(`member one ${path}: ${r.status}`);
+    }
+    const after7 = (await call('m1', 'GET', `/${t1.number}`)).body;
+    if (own.status !== 201 || after7.ticket.status !== 'open' || after7.ticket.version !== v0 || after7.comments.length !== 1 || 'notifications' in after7) bad.push(`member one own ticket ${own.status} ${after7.ticket.status}`);
+
+    // 6. The owner sees and manages everything; admins too. Stale versions refused; reassignment only to a ticket manager.
+    const meta = (await call('owner', 'GET', '/meta')).body;
+    const keyOf = (name) => meta.managers.find((x) => x.name === name)?.key;
+    // A member who is not a ticket manager, by the key the owner's creator filter uses: not a valid assignee.
+    const memberKeyFor = (m, name) => (m.creators || []).find((c) => c.name === name)?.key || 'not-a-manager';
+    if (!meta.manager || !keyOf('DBCHECK-TKT Admin') || !keyOf(OWNER) || JSON.stringify(meta).includes(P.owner) || JSON.stringify(meta).includes(P.m1)) bad.push(`owner meta ${JSON.stringify(meta).slice(0, 300)}`);
+    const all = (await call('owner', 'GET', '?scope=all&limit=200')).body;
+    if (!all.tickets.some((t) => t.number === t1.number) || !all.tickets.some((t) => t.number === t2.number)) bad.push('owner does not see every ticket');
+    const m2key = meta.creators.find((c) => c.name === 'DBCHECK-TKT Member Two')?.key;
+    const byCreator = (await call('owner', 'GET', `?creator=${m2key}`)).body.tickets;
+    if (!byCreator.length || byCreator.some((t) => t.creator_name !== 'DBCHECK-TKT Member Two')) bad.push('creator filter');
+    const filt = (await call('owner', 'GET', `?category=access_request&priority=urgent&status=open&q=${encodeURIComponent('inventory access')}`)).body.tickets;
+    if (filt.length !== 1 || filt[0].number !== t2.number) bad.push(`filters ${filt.map((t) => t.number)}`);
+    const assignedToOwner = (await call('owner', 'GET', '?scope=assigned')).body.tickets;
+    if (!assignedToOwner.some((t) => t.number === t1.number)) bad.push('assigned scope');
+    const s1 = await call('owner', 'PATCH', `/${t1.number}/status`, { status: 'in_progress', version: v0 });
+    const stale = await call('owner', 'PATCH', `/${t1.number}/status`, { status: 'resolved', version: v0 });
+    const s2 = await call('owner', 'PATCH', `/${t1.number}/status`, { status: 'resolved', version: s1.body.ticket?.version });
+    if (s1.status !== 200 || stale.status !== 409 || s2.status !== 200 || !s2.body.ticket.resolved_at || s2.body.ticket.closed_at) bad.push(`status ${s1.status}/${stale.status}/${s2.status}`);
+    const s3 = await call('admin', 'PATCH', `/${t1.number}/status`, { status: 'closed', version: s2.body.ticket.version });
+    if (s3.status !== 200 || !s3.body.ticket.closed_at || !s3.body.ticket.resolved_at) bad.push(`admin close ${s3.status}`);
+    const toMember = await call('owner', 'PATCH', `/${t1.number}/assignee`, { assignee: memberKeyFor(meta, 'DBCHECK-TKT Member One'), version: s3.body.ticket.version });
+    const toAdmin = await call('owner', 'PATCH', `/${t1.number}/assignee`, { assignee: keyOf('DBCHECK-TKT Admin'), version: s3.body.ticket.version });
+    if (toMember.status !== 400 || toAdmin.status !== 200 || toAdmin.body.ticket.assignee_name !== 'DBCHECK-TKT Admin') bad.push(`reassign ${toMember.status}/${toAdmin.status}`);
+    const oc = await call('owner', 'POST', `/${t1.number}/comments`, { body: 'Replaced the cable.' });
+    const bigC = await call('owner', 'POST', `/${t1.number}/comments`, { body: 'z'.repeat(2001) });
+    if (oc.status !== 201 || bigC.status !== 400) bad.push(`owner comment ${oc.status}/${bigC.status}`);
+
+    // 8. Activity, in order, with who did it.
+    const d1 = (await call('owner', 'GET', `/${t1.number}`)).body;
+    const ev = d1.events.map((e) => `${e.type}:${e.actor_name}:${e.metadata.from ?? ''}>${e.metadata.to ?? ''}`);
+    const wantEv = ['created:DBCHECK-TKT Member One:>', `assigned:Briyo OS:>${OWNER}`, 'commented:DBCHECK-TKT Member One:>', `status_changed:${OWNER}:open>in_progress`,
+      `status_changed:${OWNER}:in_progress>resolved`, 'status_changed:DBCHECK-TKT Admin:resolved>closed', `assigned:${OWNER}:${OWNER}>DBCHECK-TKT Admin`, `commented:${OWNER}:>`];
+    if (ev.join('|') !== wantEv.join('|')) bad.push(`events ${ev.join(' | ')}`);
+    if (d1.notifications?.[0]?.status !== 'submitted') bad.push('owner does not see the notice state');
+    const append = await db.query('UPDATE ticket_events SET event_type = event_type WHERE ticket_id = (SELECT id FROM tickets WHERE number = $1)', [t1.number]).then(() => 'allowed', (e) => e.message);
+    if (!/append-only/.test(append)) bad.push(`ticket_events not append-only: ${append}`);
+
+    // 9, 10, 11. The provider fails: the ticket stands, the notice is "failed" (scrubbed); a retry sends it once; more retries send nothing.
+    stub.mode = 'fail';
+    const callsBefore = stub.calls.length;
+    const f1 = await call('m1', 'POST', '', good({ title: 'WhatsApp down test' }));
+    const nf = await settle(f1.body.ticket.number);
+    if (f1.status !== 201 || nf.status !== 'failed' || !/HTTP 500/.test(nf.last_error || '') || nf.last_error.includes(TOKEN) || nf.last_error.replace(/\D/g, '').includes(P.owner.slice(-10))) bad.push(`provider failure ${f1.status} ${nf.status} ${nf.last_error}`);
+    const countAfterFail = await ticketCount();
+    stub.mode = 'ok';
+    const r1 = await call('owner', 'POST', `/${f1.body.ticket.number}/notification/retry`, {});
+    const r2 = await call('owner', 'POST', `/${f1.body.ticket.number}/notification/retry`, {});
+    const nr = await noticeOf(f1.body.ticket.number);
+    if (r1.body.status !== 'submitted' || r2.body.status !== 'submitted' || r2.body.sent !== false || nr.attempts !== 2 || stub.calls.length !== callsBefore + 2 || (await ticketCount()) !== countAfterFail) bad.push(`retry ${r1.body.status}/${r2.body.status} attempts ${nr.attempts} calls ${stub.calls.length - callsBefore}`);
+    const again = await deliverTicketNotification(Number(nr.id));
+    if (again.sent || stub.calls.length !== callsBefore + 2) bad.push('a submitted notice was sent again');
+    // A 200 without a readable confirmation: "unconfirmed", not retried automatically.
+    stub.mode = 'nonjson';
+    const u1 = await call('m2', 'POST', '', good({ title: 'Unconfirmed test' }));
+    const nu = await settle(u1.body.ticket.number);
+    const callsU = stub.calls.length;
+    const au = await deliverTicketNotification(Number(nu.id));
+    if (nu.status !== 'unconfirmed' || au.sent || stub.calls.length !== callsU) bad.push(`unconfirmed ${nu.status} ${au.sent}`);
+    stub.mode = 'ok';
+
+    // 11. A retried submit (same request id) returns the same ticket: one ticket, one notice; a different ticket under it is 409.
+    const rid = crypto.randomUUID();
+    const cBefore = await ticketCount(); const callsI = stub.calls.length;
+    const i1 = await call('m1', 'POST', '', good({ title: 'Idempotent', request_id: rid }));
+    const i2 = await call('m1', 'POST', '', good({ title: 'Idempotent', request_id: rid }));
+    const [i3, i4] = await Promise.all([call('m1', 'POST', '', good({ title: 'Idempotent', request_id: rid })), call('m1', 'POST', '', good({ title: 'Idempotent', request_id: rid }))]);
+    const i5 = await call('m1', 'POST', '', good({ title: 'Something else', request_id: rid }));
+    await settle(i1.body.ticket.number);
+    const notes = (await db.query('SELECT count(*)::int n FROM ticket_notifications n JOIN tickets t ON t.id = n.ticket_id WHERE t.request_id = $1', [rid])).rows[0].n;
+    if (i1.status !== 201 || [i2, i3, i4].some((r) => r.status !== 200 || r.body.created !== false || r.body.ticket.number !== i1.body.ticket.number) || i5.status !== 409
+      || (await ticketCount()) !== cBefore + 1 || notes !== 1 || stub.calls.length !== callsI + 1) bad.push(`idempotent ${[i1, i2, i3, i4, i5].map((r) => r.status)} notes ${notes} calls ${stub.calls.length - callsI}`);
+    // The same request id from ANOTHER member is a separate ticket (ids are per member).
+    const other = await call('m2', 'POST', '', good({ title: 'Idempotent', request_id: rid }));
+    if (other.status !== 201 || other.body.ticket.number === i1.body.ticket.number) bad.push('request id shared across members');
+    await settle(other.body.ticket.number);
+
+    // Not configured, or pointed at the OTP template: not sent, said why, retry-able later; the provider is not called.
+    const callsC = stub.calls.length;
+    delete process.env.ELEVENZA_TICKET_TEMPLATE_NAME;
+    const nc = await call('m1', 'POST', '', good({ title: 'No template' }));
+    const ncn = await settle(nc.body.ticket.number);
+    process.env.ELEVENZA_TICKET_TEMPLATE_NAME = 'login_otp';
+    const otp = await call('m1', 'POST', '', good({ title: 'OTP template' }));
+    const otpn = await settle(otp.body.ticket.number);
+    if (ncn.status !== 'skipped' || !/ELEVENZA_TICKET_TEMPLATE_NAME/.test(ncn.last_error) || otpn.status !== 'skipped' || !/OTP/.test(otpn.last_error) || stub.calls.length !== callsC) bad.push(`not configured ${ncn.status} ${otpn.status} calls ${stub.calls.length - callsC}`);
+    process.env.ELEVENZA_TICKET_TEMPLATE_NAME = 'briyo_ticket_alert';
+    const later = await call('owner', 'POST', `/${nc.body.ticket.number}/notification/retry`, {});
+    if (later.body.status !== 'submitted') bad.push(`configured later, retry ${later.body.status}`);
+
+    // The owner cannot be identified: refused (503, code), nothing created — never assigned to someone else.
+    const cU = await ticketCount();
+    process.env.TICKETS_OWNER_NAME = 'DBCHECK-TKT Nobody';
+    const none = await call('m1', 'POST', '', good({ title: 'No owner' }));
+    process.env.TICKETS_OWNER_NAME = OWNER;
+    await db.query(`INSERT INTO allowed_users (phone, name, active, added_by) VALUES ($1, $2, true, 'db-check') ON CONFLICT (phone) DO UPDATE SET name = EXCLUDED.name, active = true`, [P.dup, ` ${OWNER.toLowerCase()} `]);
+    const two = await call('m1', 'POST', '', good({ title: 'Two owners' }));
+    const twoMeta = (await call('owner', 'GET', '/meta')).body;
+    await db.query('DELETE FROM allowed_users WHERE phone = $1', [P.dup]);
+    if (none.status !== 503 || none.body.code !== 'TICKET_OWNER_UNRESOLVED' || two.status !== 503 || !/2 active members/.test(two.body.error) || (await ticketCount()) !== cU) bad.push(`owner unresolved ${none.status}/${two.status} ${two.body.error}`);
+    if (twoMeta.manager || twoMeta.owner.resolved) bad.push('an unresolved owner still manages tickets');
+    const adminStill = (await call('admin', 'GET', '/meta')).body;
+    if (!adminStill.manager) bad.push('admin lost management');
+
+    // Review fixes. (a) Text with quotes, backslashes, `$` patterns — or a JSON payload — reaches 11za as text only:
+    //     same recipient, same template, the notice sent (not a broken request).
+    const evil = 'x","sendto":"911234567890","templateName":"login_otp","data":"123456","z":"';
+    const qt = await call('m1', 'POST', '', good({ title: 'Error "404" in C:\\temp $& $\' $1', description: `${evil} and a backslash \\ and "quotes"` }));
+    const nq = await settle(qt.body.ticket.number);
+    const sq = stub.calls.at(-1) || {};
+    if (qt.status !== 201 || nq.status !== 'submitted' || sq.sendto !== P.owner || sq.templateName !== 'briyo_ticket_alert'
+      || !String(sq.data).includes('Error "404" in C:\\temp $& $\' $1') || !String(sq.data).includes('"sendto":"911234567890"')) bad.push(`quoted text ${nq.status} ${JSON.stringify({ to: sq.sendto, tpl: sq.templateName, data: String(sq.data).slice(0, 160) })}`);
+    const otpBody = elevenzaBodyForTest(P.m1, '123456', 'Asha "A" $& D\'Souza', null);
+    if (otpBody.name !== 'Asha "A" $& D\'Souza' || otpBody.sendto !== P.m1 || otpBody.data !== '123456') bad.push(`OTP body with a quoted name ${JSON.stringify(otpBody)}`);
+    // (b) Status and assignee changes need the version they were made against.
+    const nv = await call('owner', 'PATCH', `/${t2.number}/status`, { status: 'in_progress' });
+    if (nv.status !== 400 || nv.body.field !== 'version') bad.push(`status without version ${nv.status}`);
+    // (c) A member cannot rename THEMSELF to the ticket owner's name (any case/spacing); the owner keeping hers is fine.
+    const ren = await updateProfileForTest(P.m1, { name: `  ${OWNER.toUpperCase()} ` }, { actor: 'self', reservedName: OWNER }).then(() => null, (e) => e);
+    const keep = await updateProfileForTest(P.owner, { name: OWNER }, { actor: 'self', reservedName: OWNER }).then(() => null, (e) => e);
+    if (!ren || ren.status !== 400 || ren.field !== 'name' || keep) bad.push(`owner name reservation ${ren?.message} / ${keep?.message}`);
+    // ...and the owner cannot rename HERSELF away (tickets would stop, and she could not rename back): only an admin can.
+    const away = await updateProfileForTest(P.owner, { name: `${OWNER} Shah` }, { actor: 'self', reservedName: OWNER }).then(() => null, (e) => e);
+    if (!away || away.status !== 400 || (await db.query('SELECT name FROM allowed_users WHERE phone = $1', [P.owner])).rows[0].name !== OWNER) bad.push(`owner renamed herself away: ${away?.message}`);
+    if ((await db.query('SELECT name FROM allowed_users WHERE phone = $1', [P.m1])).rows[0].name !== 'DBCHECK-TKT Member One') bad.push('refused rename saved');
+    // (d) A pending notice is sent when its create is replayed (the first response lost), and by the startup sweep.
+    const rid2 = crypto.randomUUID();
+    const lost = await createTicketForTest(good({ title: 'Response lost', request_id: rid2 }), who.m1);
+    made.add(lost.ticket.number);
+    const callsR = stub.calls.length;
+    const rp = await call('m1', 'POST', '', good({ title: 'Response lost', request_id: rid2 }));
+    const nrp = await settle(lost.ticket.number);
+    if (rp.status !== 200 || rp.body.created !== false || nrp.status !== 'submitted' || stub.calls.length !== callsR + 1) bad.push(`replay delivery ${rp.status} ${nrp.status}`);
+    const stranded = await createTicketForTest(good({ title: 'Stranded' }), who.m2);
+    made.add(stranded.ticket.number);
+    await db.query("UPDATE ticket_notifications SET created_at = now() - interval '2 minutes' WHERE id = $1", [stranded.notificationId]);
+    const sweep = await sendStrandedTicketNotifications();
+    const ns = await noticeOf(stranded.ticket.number);
+    const callsS = stub.calls.length;
+    await sendStrandedTicketNotifications();
+    if (sweep.found < 1 || ns.status !== 'submitted' || ns.attempts !== 1 || (await noticeOf(stranded.ticket.number)).attempts !== 1 || stub.calls.length !== callsS) bad.push(`stranded sweep ${JSON.stringify(sweep)} ${ns.status}`);
+    // A Unicode spelling that Postgres lowercases to the owner's name (dotted capital İ) is refused too.
+    // The check is the database's own comparison: any spelling Postgres reads as the reserved name (here, if this server's
+    // lower() maps the dotted capital İ to i) is refused; a spelling it reads differently is a different name.
+    const spelled = 'Janvİ  Patel';
+    const dotted = await updateProfileForTest(P.m1, { name: spelled }, { actor: 'self', reservedName: 'Janvi Patel' }).then(() => null, (e) => e);
+    const pgSame = (await db.query(`SELECT lower(regexp_replace(btrim($1), '\\s+', ' ', 'g')) = lower('Janvi Patel') AS same`, [spelled])).rows[0].same;
+    if (pgSame ? (!dotted || dotted.status !== 400) : Boolean(dotted)) bad.push(`dotted-İ spelling: database says same=${pgSame}, refused=${Boolean(dotted)}`);
+    if (!pgSame) await updateProfileForTest(P.m1, { name: 'DBCHECK-TKT Member One' }, { actor: 'self' });   // put the name back
+    // (e) Per-member hourly limit: refused (429), nothing created; others unaffected.
+    const mine = (await db.query("SELECT count(*)::int n FROM tickets WHERE creator_phone = $1 AND created_at > now() - interval '1 hour'", [P.m1])).rows[0].n;
+    process.env.TICKETS_PER_HOUR = String(mine);
+    const cL = await ticketCount();
+    const lim = await call('m1', 'POST', '', good({ title: 'Over the limit' }));
+    const other2 = await call('m2', 'POST', '', good({ title: 'Not limited' }));
+    delete process.env.TICKETS_PER_HOUR;
+    if (lim.status !== 429 || other2.status !== 201 || (await ticketCount()) !== cL + 1) bad.push(`hourly limit ${lim.status}/${other2.status}`);
+    await settle(other2.body.ticket.number);
+    // A notice to an owner who is no longer active is not sent (skipped), never to a stale number.
+    const inactive = await createTicketForTest(good({ title: 'Owner gone' }), who.m1);
+    made.add(inactive.ticket.number);
+    await db.query('UPDATE allowed_users SET active = false WHERE phone = $1', [P.owner]);
+    const callsG = stub.calls.length;
+    const ig = await deliverTicketNotification(inactive.notificationId);
+    await db.query('UPDATE allowed_users SET active = true WHERE phone = $1', [P.owner]);
+    if (ig.sent || ig.status !== 'skipped' || !/no longer an active member/.test(ig.error || '') || stub.calls.length !== callsG) bad.push(`inactive owner ${JSON.stringify(ig)}`);
+    // (f) Removing a member who raised, commented on and was assigned tickets works; the tickets and names stay.
+    const t2n = t2.number;
+    await db.query("UPDATE tickets SET assignee_phone = $1 WHERE number = $2", [P.m2, t2n]);   // as if they had been an assignee
+    await call('m2', 'POST', `/${t2n}/comments`, { body: 'Before I leave' });
+    if (!(await deleteMember(P.m2))) bad.push('member with tickets not removed');
+    const gone = (await call('owner', 'GET', `/${t2n}`)).body;
+    const row = (await db.query('SELECT creator_phone, assignee_phone, creator_name FROM tickets WHERE number = $1', [t2n])).rows[0];
+    if (!gone.ticket || row.creator_phone !== null || row.assignee_phone !== null || row.creator_name !== 'DBCHECK-TKT Member Two'
+      || gone.comments.at(-1)?.author_name !== 'DBCHECK-TKT Member Two' || 'creator_key' in gone.ticket) bad.push(`after removal ${JSON.stringify({ row, t: gone.ticket })}`);
+    const metaAfter = (await call('owner', 'GET', '/meta')).body;
+    if (metaAfter.creators.some((c) => c.name === 'DBCHECK-TKT Member Two')) bad.push('removed member still a creator filter');
+
+    // The notice's recipient is the member, not a number: it follows a number change, and is gone (never sent) once the
+    // member is removed — a number later given to someone else is never messaged. The trigger exists exactly once.
+    const moved = await createTicketForTest(good({ title: 'Owner changed number' }), who.m1);
+    made.add(moved.ticket.number);
+    const NEWNUM = '919000000806';
+    await db.query('UPDATE allowed_users SET phone = $2 WHERE phone = $1', [P.owner, NEWNUM]);
+    const callsM = stub.calls.length;
+    const mv = await deliverTicketNotification(moved.notificationId);
+    const toNew = stub.calls.at(-1)?.sendto;
+    await db.query('UPDATE allowed_users SET phone = $2 WHERE phone = $1', [NEWNUM, P.owner]);
+    if (mv.status !== 'submitted' || stub.calls.length !== callsM + 1 || toNew !== NEWNUM) bad.push(`number change ${mv.status} → ${toNew}`);
+    const orphan = await createTicketForTest(good({ title: 'Owner removed' }), who.m1);
+    made.add(orphan.ticket.number);
+    await db.query('DELETE FROM allowed_users WHERE phone = $1', [P.owner]);
+    await db.query(`INSERT INTO allowed_users (phone, name, active, added_by) VALUES ($1, 'DBCHECK-TKT Stranger', true, 'db-check')`, [P.owner]);   // the number, reused
+    const callsO = stub.calls.length;
+    const op = await deliverTicketNotification(orphan.notificationId);
+    if (op.sent || op.status !== 'skipped' || stub.calls.length !== callsO) bad.push(`removed owner's reused number messaged: ${JSON.stringify(op)}`);
+    const trig = (await db.query("SELECT count(*)::int n FROM pg_trigger WHERE tgname = 'ticket_events_append_only'")).rows[0].n;
+    if (trig !== 1) bad.push(`append-only trigger count ${trig}`);
+
+    // 13. No token and no full owner number anywhere in what the server logged during this step.
+    const logged = logs.join('\n');
+    if (logged.includes(TOKEN) || logged.includes(P.owner) || logged.includes(P.owner.slice(-10))) bad.push('secret or number in the logs');
+  } finally {
+    server.close(); provider.close();
+    Object.assign(console, orig);
+    for (const k of envKeys) { if (savedEnv[k] === undefined) delete process.env[k]; else process.env[k] = savedEnv[k]; }
+    const { rows: ids } = await db.query('SELECT id FROM tickets WHERE creator_phone = ANY($1) OR number = ANY($2)', [Object.values(P), [...made]]);
+    await purgeTestTickets(ids.map((r) => Number(r.id)));
+    await db.query('DELETE FROM allowed_users WHERE phone = ANY($1)', [Object.values(P)]);
+  }
+  if (bad.length) throw new Error(bad.join(' | '));
+  return 'member raises (TKT-#####, Medium default, owner assigned, no numbers in responses); 10 invalid inputs refused with their field; 16 at once → 16 distinct numbers; another member\'s ticket is 404 on every route and absent from lists; members comment on their own but status/assignee/resend → 403; owner and admins see all, filter (status, priority, category, creator, search), change status (resolved/closed stamps; stale → 409) and reassign only to a ticket manager; 8 activity events in order; events append-only; notice via the 11za client with number, priority, category, creator, title, summary and link in one line ≤ 900; provider 500 → ticket kept, notice failed (scrubbed), retry sends once, later retries none; non-JSON 200 → unconfirmed, not auto-resent; same request id → same ticket, one notice (also simultaneous); no template / OTP template → skipped, provider not called, sent once configured; owner missing or ambiguous → 503 TICKET_OWNER_UNRESOLVED, nothing created; no token or number in logs';
+});
 await step('affiliates admin cleanup', async () => {
   let n = 0;
   for (const actor of [...Object.values(AFN), 'HR admin', 'db-check-overview-commerce', 'db-check-commissions']) {
