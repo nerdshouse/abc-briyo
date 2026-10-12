@@ -55,7 +55,7 @@ import http from 'node:http';
 import { router as ticketsRouterForTest } from '../lib/tickets-routes.js';
 import { purgeTestTickets, deliverTicketNotification, ticketAlertText, TICKET_ALERT_MAX, createTicket as createTicketForTest, sendStrandedTicketNotifications } from '../lib/tickets.js';
 import { updateProfile as updateProfileForTest } from '../lib/profile.js';
-import { buildBody as elevenzaBodyForTest } from '../lib/whatsapp.js';
+import { buildBody as elevenzaBodyForTest, sendOtp as sendOtpForTest } from '../lib/whatsapp.js';
 import { ensureHrSchema, purgeTestHr, slugify, normalizePhone, removeResume, retryPendingRemovals, istDayKey, HR_TIMEZONE } from '../lib/hr.js';
 import { jobPostingLd } from '../lib/careers-pages.js';
 import nodeCrypto from 'node:crypto';
@@ -11203,7 +11203,7 @@ await step('tickets: any member raises one (validated, TKT- numbers unique under
   try {
     for (const k of envKeys) delete process.env[k];
     Object.assign(process.env, { TICKETS_OWNER_NAME: OWNER, ELEVENZA_AUTH_TOKEN: TOKEN, ELEVENZA_ORIGIN_WEBSITE: 'https://origin.example.test',
-      ELEVENZA_API_URL: `http://127.0.0.1:${provider.address().port}/send`, ELEVENZA_TICKET_TEMPLATE_NAME: 'briyo_ticket_alert', APP_BASE_URL: 'https://os.example.test/' });
+      ELEVENZA_API_URL: `http://127.0.0.1:${provider.address().port}/send`, ELEVENZA_TICKET_TEMPLATE_NAME: 'briyo_ticket_notification', APP_BASE_URL: 'https://os.example.test/' });
     await db.query(`INSERT INTO allowed_users (phone, name, is_admin, active, added_by) VALUES
       ($1, $5, false, true, 'db-check'), ($2, 'DBCHECK-TKT Member One', false, true, 'db-check'), ($3, 'DBCHECK-TKT Member Two', false, true, 'db-check'), ($4, 'DBCHECK-TKT Admin', true, true, 'db-check')
       ON CONFLICT (phone) DO UPDATE SET name = EXCLUDED.name, is_admin = EXCLUDED.is_admin, active = true`, [P.owner, P.m1, P.m2, P.admin, OWNER]);
@@ -11222,10 +11222,19 @@ await step('tickets: any member raises one (validated, TKT- numbers unique under
     const n1 = await settle(t1.number);
     const sent = stub.calls.at(-1) || {};
     if (n1.status !== 'submitted' || n1.attempts !== 1 || stub.calls.length !== 1) bad.push(`notice ${n1.status} attempts ${n1.attempts} calls ${stub.calls.length}`);
-    if (sent.templateName !== 'briyo_ticket_alert' || sent.sendto !== P.owner || sent.authToken !== TOKEN) bad.push(`provider request ${JSON.stringify({ ...sent, authToken: '…' })}`);
+    if (sent.templateName !== 'briyo_ticket_notification' || sent.sendto !== P.owner || sent.authToken !== TOKEN || sent.language !== 'en') bad.push(`provider request ${JSON.stringify({ ...sent, authToken: '…' })}`);
+    // The ticket template is a Utility template: 11za takes its body variables as a list — exactly one item, the notice.
+    if (!Array.isArray(sent.data) || sent.data.length !== 1 || typeof sent.data[0] !== 'string') bad.push(`notice variable not a one-item list: ${JSON.stringify(sent.data)}`);
     const want = [t1.number, 'Medium priority', 'Technical Issue', 'From DBCHECK-TKT Member One', 'Cannot print the dispatch label', 'The label printer shows an error. It started this morning.', `https://os.example.test/tickets?open=${t1.number}`];
-    for (const w of want) if (!String(sent.data).includes(w)) bad.push(`notice text lacks "${w}": ${sent.data}`);
-    if (/[\n\r\t]| {5}/.test(sent.data) || String(sent.data).length > TICKET_ALERT_MAX) bad.push('notice text not one clean line within the limit');
+    const noticeText = String(sent.data?.[0] ?? '');
+    for (const w of want) if (!noticeText.includes(w)) bad.push(`notice text lacks "${w}": ${noticeText}`);
+    if (/[\n\r\t]| {5}/.test(noticeText) || noticeText.length > TICKET_ALERT_MAX) bad.push('notice text not one clean line within the limit');
+    // The login OTP request is unchanged: the code as a plain string, the login template, through the same client.
+    const callsOtp = stub.calls.length;
+    const otpSent = await sendOtpForTest(P.m1, '482913', 'Member One');
+    const otpReq = stub.calls.at(-1) || {};
+    if (!otpSent.delivered || stub.calls.length !== callsOtp + 1 || otpReq.data !== '482913' || otpReq.templateName !== 'login_otp' || otpReq.sendto !== P.m1 || otpReq.language !== 'en'
+      || JSON.stringify(Object.keys(otpReq)) !== JSON.stringify(['authToken', 'name', 'sendto', 'originWebsite', 'templateName', 'language', 'data'])) bad.push(`OTP request changed: ${JSON.stringify({ ...otpReq, authToken: '…' })}`);
     const long = ticketAlertText({ ...t1, title: 'T'.repeat(160), creator_name: 'C'.repeat(120), description: 'D '.repeat(3000), number: 'TKT-99999', priority: 'urgent', category: 'bug' });
     if (long.length > TICKET_ALERT_MAX || !long.includes('TKT-99999') || !long.includes('/tickets?open=TKT-99999')) bad.push(`long notice ${long.length}`);
 
@@ -11358,7 +11367,7 @@ await step('tickets: any member raises one (validated, TKT- numbers unique under
     const otp = await call('m1', 'POST', '', good({ title: 'OTP template' }));
     const otpn = await settle(otp.body.ticket.number);
     if (ncn.status !== 'skipped' || !/ELEVENZA_TICKET_TEMPLATE_NAME/.test(ncn.last_error) || otpn.status !== 'skipped' || !/OTP/.test(otpn.last_error) || stub.calls.length !== callsC) bad.push(`not configured ${ncn.status} ${otpn.status} calls ${stub.calls.length - callsC}`);
-    process.env.ELEVENZA_TICKET_TEMPLATE_NAME = 'briyo_ticket_alert';
+    process.env.ELEVENZA_TICKET_TEMPLATE_NAME = 'briyo_ticket_notification';
     const later = await call('owner', 'POST', `/${nc.body.ticket.number}/notification/retry`, {});
     if (later.body.status !== 'submitted') bad.push(`configured later, retry ${later.body.status}`);
 
@@ -11382,8 +11391,9 @@ await step('tickets: any member raises one (validated, TKT- numbers unique under
     const qt = await call('m1', 'POST', '', good({ title: 'Error "404" in C:\\temp $& $\' $1', description: `${evil} and a backslash \\ and "quotes"` }));
     const nq = await settle(qt.body.ticket.number);
     const sq = stub.calls.at(-1) || {};
-    if (qt.status !== 201 || nq.status !== 'submitted' || sq.sendto !== P.owner || sq.templateName !== 'briyo_ticket_alert'
-      || !String(sq.data).includes('Error "404" in C:\\temp $& $\' $1') || !String(sq.data).includes('"sendto":"911234567890"')) bad.push(`quoted text ${nq.status} ${JSON.stringify({ to: sq.sendto, tpl: sq.templateName, data: String(sq.data).slice(0, 160) })}`);
+    if (qt.status !== 201 || nq.status !== 'submitted' || sq.sendto !== P.owner || sq.templateName !== 'briyo_ticket_notification'
+      || !Array.isArray(sq.data) || sq.data.length !== 1
+      || !String(sq.data[0]).includes('Error "404" in C:\\temp $& $\' $1') || !String(sq.data[0]).includes('"sendto":"911234567890"')) bad.push(`quoted text ${nq.status} ${JSON.stringify({ to: sq.sendto, tpl: sq.templateName, data: String(sq.data).slice(0, 160) })}`);
     const otpBody = elevenzaBodyForTest(P.m1, '123456', 'Asha "A" $& D\'Souza', null);
     if (otpBody.name !== 'Asha "A" $& D\'Souza' || otpBody.sendto !== P.m1 || otpBody.data !== '123456') bad.push(`OTP body with a quoted name ${JSON.stringify(otpBody)}`);
     // (b) Status and assignee changes need the version they were made against.
