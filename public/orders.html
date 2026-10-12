@@ -236,6 +236,7 @@
         <label class="fld"><span>Order Number <em>*</em></span><input class="input" name="source_order_id" required maxlength="100" autocomplete="off" placeholder="e.g. #1524" /></label>
         <label class="fld"><span>Courier Partner <em>*</em></span><select class="select" name="courier_partner_id" required></select></label>
         <label class="fld"><span>Tracking ID / AWB <em>*</em></span><input class="input mono" name="tracking_id" required maxlength="80" autocomplete="off" /></label>
+        <label class="fld"><span>Order date <em>*</em> <span class="soft tz-note"></span></span><input class="input" name="order_date" type="datetime-local" /></label>
       </div>
       <div class="banner mock website-warn" hidden style="margin-top:12px">Website orders normally come in through <b>Shopify Sync</b> (Orders → Shopify). Creating one by hand makes the sync hold the real Shopify order back as a possible duplicate, so its products are never imported. Only continue if this order is not in Shopify.</div>
     </section>
@@ -264,7 +265,6 @@
       <div class="form-grid">
         <label class="fld"><span>Shipment status</span><select class="select" name="shipment_status"></select></label>
         <label class="fld"><span>Expected delivery</span><input class="input" type="date" name="expected_delivery_date" /></label>
-        <label class="fld"><span>Order date <span class="soft tz-note"></span></span><input class="input" name="order_date" type="datetime-local" /></label>
         <label class="fld"><span>Order Value (₹)</span><input class="input" name="order_value" inputmode="decimal" autocomplete="off" placeholder="Leave blank if unknown" /></label>
         <label class="fld wide"><span>Notes</span><textarea class="input" name="note" maxlength="2000" placeholder="Saved to the shipment's activity"></textarea></label>
       </div>
