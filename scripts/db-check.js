@@ -1287,6 +1287,117 @@ await step('stale version is refused — order and shipment each guarded', async
   if ((await primary(orderId)).expected_delivery_date !== '2026-10-01') throw new Error('shipment first write lost');
   return 'both second writers got 409';
 });
+await step('edit shipment: order number, courier, AWB, link and expected delivery corrected in place — one transaction, both versions, duplicates and bad input refused, audited, no stock or outside calls; API permission', async () => {
+  const bad = [];
+  const db = getPool();
+  const { editShipment } = await import('../lib/orders.js');
+  // (expectErr is defined further down this file.)
+  const refused = async (label, fn, check) => { try { await fn(); } catch (err) { if (check(err)) return; bad.push(`${label}: wrong error ${err.message}`); return; } bad.push(`${label}: accepted`); };
+  const dl = (await listCouriers()).find((c) => c.name === 'Delhivery');
+  const other = (await listCouriers()).find((c) => c.name !== 'Delhivery' && c.active);
+  const mk = async (suffix, opts = {}) => (await createOrder({ ...R('website'), channel: 'website', source_order_id: `${TEST_ORDER}-ES-${suffix}`, order_date: NOW(), order_value: 5 }, { actor: ACTOR, ...opts }));
+  const ship = async (id) => (await db.query('SELECT *, expected_delivery_date::text AS expected_delivery_date FROM order_shipments WHERE order_id = $1 ORDER BY id LIMIT 1', [id])).rows[0];
+  const ver = async (id) => ({ orderVersion: (await getOrder(id)).version, shipmentVersion: (await ship(id)).version });
+  const counts = async () => (await db.query(`SELECT (SELECT count(*) FROM inventory_movements)::int mv, (SELECT count(*) FROM inventory_reservations)::int rs,
+    (SELECT count(*) FROM order_imports)::int im, (SELECT count(*) FROM order_shipments)::int sh`)).rows[0];
+  const a = await mk('A');
+  const b = await mk('B');
+  const before = await counts();
+  const shipA = await ship(a);
+  // Nothing outside is called (no courier booking, Shopify, notification): count outbound HTTP during the edits.
+  const realFetch = globalThis.fetch; let calls = 0;
+  globalThis.fetch = (...x) => { calls += 1; return realFetch(...x); };
+  try {
+    // 1. Correct the order number (PO / order reference), courier, AWB and expected delivery — in one go.
+    const r1 = await editShipment(a, shipA.id, { source_order_id: `  ${TEST_ORDER}-ES-A2  `, courier_partner_id: dl.id, tracking_id: ' ESAWB-0001 ', expected_delivery_date: '2026-11-20' }, { actor: 'editor', ...(await ver(a)) });
+    let o = await getOrder(a); let s = await ship(a);
+    if (!r1.changed || o.source_order_id !== `${TEST_ORDER}-ES-A2` || s.tracking_id !== 'ESAWB-0001' || Number(s.courier_partner_id) !== Number(dl.id) || s.expected_delivery_date !== '2026-11-20') bad.push(`edit ${JSON.stringify({ n: o.source_order_id, t: s.tracking_id, d: s.expected_delivery_date })}`);
+    if (Number(s.id) !== Number(shipA.id) || s.shipment_status !== shipA.shipment_status || s.dispatch_date !== shipA.dispatch_date) bad.push('id, status or dispatch date changed');
+    if (!s.tracking_url || !s.tracking_url.includes('ESAWB-0001')) bad.push('tracking link not regenerated from the courier');
+    // 2. AWB alone (courier reference) — only that field changes; the order is untouched.
+    const oVer = o.version;
+    await editShipment(a, s.id, { tracking_id: 'ESAWB-0002' }, { actor: 'editor', shipmentVersion: s.version });
+    if ((await ship(a)).tracking_id !== 'ESAWB-0002' || (await getOrder(a)).version !== oVer) bad.push('AWB-only edit');
+    // Audit: who, when, which fields, from → to; history events are added, never rewritten.
+    const ev = await orderEvents(a);
+    const num = ev.find((e) => e.event_type === 'order_edited' && e.metadata.changes?.source_order_id);
+    const awb = ev.filter((e) => e.event_type === 'tracking_changed' && e.metadata.changes?.tracking_id);
+    if (!num || num.actor !== 'editor' || num.metadata.changes.source_order_id.from !== `${TEST_ORDER}-ES-A` || num.metadata.changes.source_order_id.to !== `${TEST_ORDER}-ES-A2` || !num.at) bad.push('order number not audited');
+    const fix = awb.find((e) => e.metadata.changes.tracking_id.from === 'ESAWB-0001' && e.metadata.changes.tracking_id.to === 'ESAWB-0002');
+    if (awb.length !== 2 || !fix || fix.actor !== 'editor' || Number(fix.metadata.shipment_id) !== Number(shipA.id)) bad.push(`AWB audit ${awb.length}`);
+    const evCount = ev.length;
+    // Nothing changed → nothing written.
+    const same = await editShipment(a, s.id, { tracking_id: 'ESAWB-0002' }, { actor: 'editor', shipmentVersion: (await ship(a)).version });
+    if (same.changed || (await orderEvents(a)).length !== evCount) bad.push('no-op wrote something');
+    // 3. Duplicates: the same AWB at the same courier (any case) refused; another courier or a cancelled shipment is fine.
+    const vb = await ver(b);
+    await editShipment(b, (await ship(b)).id, { courier_partner_id: dl.id, tracking_id: 'esawb-0002' }, { actor: 'editor', ...vb }).then(() => bad.push('duplicate AWB accepted'), (e) => { if (e.status !== 409 || !e.duplicateAwb || e.field !== 'tracking_id') bad.push(`dup AWB ${e.message}`); });
+    if ((await ship(b)).tracking_id) bad.push('refused duplicate stored');
+    if (other) await editShipment(b, (await ship(b)).id, { courier_partner_id: other.id, tracking_id: 'ESAWB-0002' }, { actor: 'editor', ...(await ver(b)) });
+    await refused('duplicate order number', async () => editShipment(b, (await ship(b)).id, { source_order_id: `${TEST_ORDER}-ES-A2` }, { actor: 'editor', ...(await ver(b)) }), (e) => e.status === 409);
+    // 4. Validation as on create — and never cut short.
+    const vs = async () => ({ actor: 'editor', ...(await ver(b)) });
+    const sid = (await ship(b)).id;
+    await refused('AWB too long', async () => editShipment(b, sid, { tracking_id: 'X'.repeat(81) }, await vs()), (e) => e.status === 400 && e.field === 'tracking_id');
+    await refused('number too long', async () => editShipment(b, sid, { source_order_id: 'N'.repeat(101) }, await vs()), (e) => e.status === 400);
+    await refused('blank number', async () => editShipment(b, sid, { source_order_id: '   ' }, await vs()), (e) => e.status === 400);
+    await refused('bad link', async () => editShipment(b, sid, { tracking_url: 'ftp://x' }, await vs()), (e) => e.status === 400);
+    await refused('status not editable here', async () => editShipment(b, sid, { shipment_status: 'delivered' }, await vs()), (e) => e.status === 400);
+    await refused('dispatch date not editable here', async () => editShipment(b, sid, { dispatch_date: NOW() }, await vs()), (e) => e.status === 400);
+    await refused('order value not editable here', async () => editShipment(b, sid, { order_value: 9 }, await vs()), (e) => e.status === 400);
+    await refused('unknown courier', async () => editShipment(b, sid, { courier_partner_id: 999999 }, await vs()), (e) => e.status === 400);
+    // 5. Stale edits: either version stale → 409, and nothing of the request is applied (one transaction).
+    const v1 = await ver(b);
+    await editShipment(b, sid, { expected_delivery_date: '2026-12-01' }, { actor: 'tab-a', ...v1 });
+    await refused('stale shipment', () => editShipment(b, sid, { expected_delivery_date: '2026-12-05' }, { actor: 'tab-b', ...v1 }), (e) => e.status === 409 && e.conflict);
+    const v2 = await ver(b);
+    await refused('stale order, fresh shipment', () => editShipment(b, sid, { source_order_id: `${TEST_ORDER}-ES-B9`, tracking_id: 'ESAWB-0009' }, { actor: 'tab-b', orderVersion: v2.orderVersion - 1, shipmentVersion: v2.shipmentVersion }), (e) => e.status === 409);
+    if ((await ship(b)).expected_delivery_date !== '2026-12-01' || (await ship(b)).tracking_id === 'ESAWB-0009' || (await getOrder(b)).source_order_id !== `${TEST_ORDER}-ES-B`) bad.push('stale/partial write applied');
+    // 6. Imported orders keep their number; external (Shopify-mirrored) shipments are read-only; a dispatched one keeps courier + AWB.
+    const imp = await mk('IMP', { source: 'amazon_import' });
+    await refused('imported number', async () => editShipment(imp, (await ship(imp)).id, { source_order_id: `${TEST_ORDER}-ES-IMP2` }, { actor: 'editor', ...(await ver(imp)) }), (e) => e.status === 409 && e.field === 'source_order_id');
+    await editShipment(imp, (await ship(imp)).id, { tracking_id: 'ESAWB-IMP' }, { actor: 'editor', ...(await ver(imp)) });
+    const ext = await mk('EXT');
+    await db.query(`UPDATE order_shipments SET external_source = 'shopify', external_provider = 'bwa', external_fulfillment_id = 'gid://shopify/Fulfillment/990011' WHERE id = $1`, [(await ship(ext)).id]);
+    await refused('external', async () => editShipment(ext, (await ship(ext)).id, { tracking_id: 'ESAWB-EXT' }, { actor: 'editor', ...(await ver(ext)) }), (e) => e.status === 409);
+    await db.query(`UPDATE order_shipments SET shipment_status = 'in_transit', dispatch_date = now() WHERE id = $1`, [(await ship(imp)).id]);
+    await refused('clear AWB of a dispatched parcel', async () => editShipment(imp, (await ship(imp)).id, { tracking_id: '' }, { actor: 'editor', ...(await ver(imp)) }), (e) => e.status === 400);
+  } finally { globalThis.fetch = realFetch; }
+  if (calls) bad.push(`${calls} outbound HTTP call(s) during edits`);
+  // 7. No second shipment, no stock movement or reservation, no import or sync run.
+  const after = await counts();
+  if (after.mv !== before.mv || after.rs !== before.rs || after.im !== before.im || after.sh !== before.sh + 2) bad.push(`side effects ${JSON.stringify({ before, after })}`);
+  // 8. Through the API: logistics.edit is required (a viewer gets 403 and nothing changes); an operator saves.
+  const app = express();
+  app.use((req, _res, next) => { req.session = JSON.parse(req.get('x-test-session') || '{}'); next(); });
+  app.use(express.json());
+  app.use('/api/orders', ordersRouterForTest);
+  const server = app.listen(0);
+  try {
+    const base = `http://127.0.0.1:${server.address().port}/api/orders`;
+    const call = async (who, body) => { const r = await fetch(`${base}/${a}/shipments/${shipA.id}/details`, { method: 'PATCH', headers: { 'content-type': 'application/json', 'x-test-session': JSON.stringify(who) }, body: JSON.stringify(body) }); return { status: r.status, body: await r.json() }; };
+    const v = await ver(a);
+    const viewer = await call({ caps: ['logistics.view'] }, { tracking_id: 'ESAWB-VIEW', order_version: v.orderVersion, shipment_version: v.shipmentVersion });
+    if (viewer.status !== 403 || (await ship(a)).tracking_id === 'ESAWB-VIEW') bad.push(`viewer ${viewer.status}`);
+    const op = await call({ caps: ['logistics.view', 'logistics.edit'] }, { tracking_id: 'ESAWB-API', order_version: v.orderVersion, shipment_version: v.shipmentVersion });
+    if (op.status !== 200 || !op.body.changed || op.body.order?.id !== a || (await ship(a)).tracking_id !== 'ESAWB-API') bad.push(`operator ${op.status} ${op.body.error || ''}`);
+    const dup = await call({ caps: ['logistics.view', 'logistics.edit'] }, { tracking_id: 'ESAWB-API', courier_partner_id: dl.id, order_version: v.orderVersion, shipment_version: v.shipmentVersion });
+    if (dup.status !== 409) bad.push(`stale via API ${dup.status}`);
+    const long = await call({ caps: ['logistics.view', 'logistics.edit'] }, { tracking_id: 'Y'.repeat(81), shipment_version: (await ship(a)).version });
+    if (long.status !== 400 || long.body.field !== 'tracking_id') bad.push(`field not returned ${JSON.stringify(long.body)}`);
+  } finally { server.close(); }
+  // The page: an Edit action on list rows and in the drawer, a form of the five fields, only changed fields sent with both versions, one save at a time.
+  const js = await fsp.readFile(new URL('../public/orders.js', import.meta.url), 'utf8');
+  const html = await fsp.readFile(new URL('../public/orders.html', import.meta.url), 'utf8');
+  if (!/canEdit\(\) && o\.shipment_id \? `<button class="icon-btn bare" type="button" data-edit-ship="\$\{o\.id\}"/.test(js) || !/data-edit-ship="\$\{o\.id\}">\$\{icon\('pencil'\)\}Edit shipment<\/button>/.test(js)) bad.push('edit actions');
+  // Both entry points are wired: the list rows and the order drawer's body.
+  if (!/const edit = e\.target\.closest\('\[data-edit-ship\]'\);\s*if \(edit\) return openShipEdit/.test(js) || !/const editShip = e\.target\.closest\('\[data-edit-ship\]'\);\s*if \(editShip\) return openShipEdit/.test(js)) bad.push('edit actions not wired in list and drawer');
+  const form = html.slice(html.indexOf('id="shipEditForm"'), html.indexOf('</form>', html.indexOf('id="shipEditForm"')));
+  if ((form.match(/name="/g) || []).length !== 5 || /shipment_status|dispatch_date|order_value/.test(form)) bad.push('edit form fields');
+  if (!/if \(shipEdit\.saving \|\| !shipEdit\.ship\) return;/.test(js) || !/body: JSON\.stringify\(\{ \.\.\.changed, order_version: o\.version, shipment_version: ship\.version \}\)/.test(js)) bad.push('changed-only save / double submit guard');
+  if (bad.length) throw new Error(bad.join(' | '));
+  return 'order number + courier + AWB + expected delivery corrected in place (same shipment id, status, dispatch date; link regenerated); AWB-only edit leaves the order; audited from/to with actor; no-op writes nothing; same-courier AWB (any case) and order number duplicates 409, other courier fine; too long/blank/bad link/status/dispatch date/value/unknown courier refused; stale order or shipment 409 with nothing applied; imported number, external shipment, clearing a dispatched AWB refused; no stock, reservation, import or HTTP call; API 403 for viewers, 200 for operators, field returned';
+});
 await step('order and shipment lifecycles are independent; cancellation leaves the shipment alone', async () => {
   let s = await primary(orderId);
   await updateShipment(orderId, s.id, { shipment_status: 'packed' }, { actor: ACTOR, version: s.version });

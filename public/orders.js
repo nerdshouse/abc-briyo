@@ -6,7 +6,7 @@ import { formatDayKey } from './ui/ist.js';
  */
 import {
   $, $$, esc, money, count, icon, renderIcons, setTimezone, dateShort, dateTime, initShell, pageFetch,
-  navigate, pageSignal, onLeave, onQueryChange, ordersMeta, stateBlock, confirmDialog,
+  navigate, pageSignal, onLeave, onQueryChange, ordersMeta, stateBlock, confirmDialog, toast,
 } from './ui/components.js';
 
 // Requests belong to this page: cancelled, and never rendered, once it is left.
@@ -302,7 +302,7 @@ function renderRows() {
       <td>${proofCell(o)}</td>
       <td class="num"${o.order_date ? '' : ' title="No order date — shown by when it was entered"'}>${esc(day(o.order_date))}</td>
       <td class="r num col-amt">${o.order_value === null || o.order_value === undefined ? '<span class="muted-cell" title="No value entered">—</span>' : esc(amount(o.order_value))}${payText(o) ? `<span class="cell-sub pay-sub" title="${esc(payTitle(o))}">${esc(payText(o))}</span>` : ''}</td>
-      <td class="r"><button class="icon-btn bare" type="button" data-open="${o.id}" title="Open" aria-label="Open order ${esc(orderNo(o))}">${icon('chevron-right')}</button></td>
+      <td class="r">${canEdit() && o.shipment_id ? `<button class="icon-btn bare" type="button" data-edit-ship="${o.id}" title="Edit shipment" aria-label="Edit shipment for order ${esc(orderNo(o))}">${icon('pencil')}</button>` : ''}<button class="icon-btn bare" type="button" data-open="${o.id}" title="Open" aria-label="Open order ${esc(orderNo(o))}">${icon('chevron-right')}</button></td>
     </tr>`).join('');
   $('#clist').innerHTML = state.orders.map((o) => `
     <li class="oitem" data-id="${o.id}" tabindex="0">
@@ -585,6 +585,7 @@ function renderDrawer() {
       </dl>
       <div id="dStock" class="stock-block"></div>
       ${canEdit() ? `<div class="form-actions"><button class="btn primary" type="button" id="dShipSave">Save shipment</button>
+        ${ship.external_fulfillment_id ? '' : `<button class="btn" type="button" data-edit-ship="${o.id}">${icon('pencil')}Edit shipment</button>`}
         ${(NEXT_STEPS[ship.shipment_status] || []).map((s) => `<button class="btn" type="button" data-step="${s}">${esc(STEP_TEXT[s])}</button>`).join('')}</div>` : ''}
     </section>
 
@@ -1090,6 +1091,8 @@ dBody.addEventListener('click', async (e) => {
   if (e.target.closest('#dRetryDrop')) { state.retry = null; return renderDrawer(); }
   const tab = e.target.closest('[data-ship]');
   if (tab) { state.shipId = Number(tab.dataset.ship); $('#dSaved').textContent = ''; return renderDrawer(); }
+  const editShip = e.target.closest('[data-edit-ship]');
+  if (editShip) return openShipEdit(Number(editShip.dataset.editShip));
   if (e.target.closest('#dShipSave')) return patchOrder(shipmentFields(), 'Shipment saved', { shipment: true });
   if (e.target.closest('#dReserve')) return reserveStock();
   if (e.target.closest('#dRelease')) return releaseStock();
@@ -1257,6 +1260,92 @@ function closeForm() {
   state.editing = null;
   if ($('#drawer').hidden) $('#drawerScrim').hidden = true;
 }
+
+/*
+ * Edit shipment: corrects the order number, courier, AWB, tracking link and expected delivery of an existing
+ * shipment through PATCH …/shipments/:id/details — one transaction, both versions checked, only the fields that were
+ * actually changed are sent. Status, dates that record events, stock and money are not on this form.
+ */
+const shipEdit = { order: null, ship: null, saving: false };
+async function openShipEdit(orderId) {
+  const form = $('#shipEditForm');
+  form.reset();
+  $('#seError').hidden = true;
+  $('#seSaved').textContent = '';
+  let data;
+  try { data = await api(`/api/orders/${orderId}`); } catch (err) { return toast(err.message, { tone: 'bad' }); }
+  const o = data.order;
+  // The shipment open in the drawer for this order, else the order's own shipment, else the parcel it rides in.
+  const list = data.shipments || [];
+  const ship = (state.openId === o.id && list.find((x) => x.id === state.shipId)) || list.find((x) => Number(x.order_id) === Number(o.id)) || list[0];
+  if (!ship) return toast('This order has no shipment yet.', { tone: 'bad' });
+  if (ship.external_fulfillment_id) return toast('This shipment is mirrored from an external fulfiller; its details come from Shopify.', { tone: 'bad' });
+  Object.assign(shipEdit, { order: o, ship });
+  // The order number belongs to the shipment's own (lead) order, and only one entered by hand: imports find theirs by it.
+  const ownOrder = Number(ship.order_id) === Number(o.id);
+  const canRename = ownOrder && o.source === 'manual';
+  form.source_order_id.value = o.source_order_id || '';
+  form.source_order_id.readOnly = !canRename;
+  $('#seOrderHelp').textContent = !ownOrder ? 'This order shares another order\'s parcel; change its number from its own Order details.'
+    : !canRename ? 'Imported orders keep the number their import uses.' : 'Must be unique within the channel.';
+  form.courier_partner_id.innerHTML = opt('', 'Choose courier', !ship.courier_partner_id)
+    + state.meta.couriers.filter((c) => c.active || c.id === ship.courier_partner_id).map((c) => opt(c.id, c.name, c.id === ship.courier_partner_id)).join('');
+  form.tracking_id.value = ship.tracking_id || '';
+  form.tracking_url.value = ship.tracking_url || '';
+  form.expected_delivery_date.value = ship.expected_delivery_date || '';
+  syncShipEditLink();
+  $('#seTitle').textContent = `Edit shipment — order ${orderNo(o)}`;
+  $('#shipEditDrawer').hidden = false;
+  $('#drawerScrim').hidden = false;
+  (canRename ? form.source_order_id : form.tracking_id).focus();
+}
+/** A courier with a link pattern fills the link itself (never sent from here); otherwise it is typed. */
+function syncShipEditLink() {
+  const form = $('#shipEditForm');
+  const courier = courierById(form.courier_partner_id.value);
+  const auto = Boolean(courier?.tracking_url_template);
+  form.tracking_url.readOnly = auto;
+  form.tracking_url.placeholder = auto ? 'Filled from the courier and AWB' : 'Paste a link, if the courier gives one';
+  $('#seTrackHelp').textContent = trackHelp(courier);
+}
+function closeShipEdit() {
+  $('#shipEditDrawer').hidden = true;
+  Object.assign(shipEdit, { order: null, ship: null });
+  if ($('#drawer').hidden && $('#formDrawer').hidden) $('#drawerScrim').hidden = true;
+}
+$('#shipEditForm').addEventListener('change', (e) => { if (e.target.name === 'courier_partner_id') syncShipEditLink(); });
+$('#seClose').addEventListener('click', closeShipEdit);
+$('#seCancel').addEventListener('click', closeShipEdit);
+$('#shipEditForm').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  if (shipEdit.saving || !shipEdit.ship) return;
+  const form = e.target; const { order: o, ship } = shipEdit;
+  const err = $('#seError'); err.hidden = true;
+  for (const el of form.querySelectorAll('[aria-invalid]')) el.removeAttribute('aria-invalid');
+  const was = { source_order_id: o.source_order_id || '', courier_partner_id: ship.courier_partner_id ? String(ship.courier_partner_id) : '',
+    tracking_id: ship.tracking_id || '', tracking_url: ship.tracking_url || '', expected_delivery_date: ship.expected_delivery_date || '' };
+  const now = Object.fromEntries(Object.keys(was).map((k) => [k, String(form[k].value).trim()]));
+  const changed = Object.fromEntries(Object.keys(was).filter((k) => now[k] !== was[k]).map((k) => [k, now[k]]));
+  if (form.source_order_id.readOnly) delete changed.source_order_id;
+  if (form.tracking_url.readOnly) delete changed.tracking_url;   // generated by the server from the courier and AWB
+  if (changed.source_order_id === '') { err.textContent = 'Order number cannot be blank.'; err.hidden = false; form.source_order_id.setAttribute('aria-invalid', 'true'); return; }
+  if (!Object.keys(changed).length) { $('#seSaved').textContent = 'Nothing changed.'; return; }
+  const btn = $('#seSubmit');
+  shipEdit.saving = true; btn.disabled = true; $('#seSaved').textContent = 'Saving…';
+  try {
+    await api(`/api/orders/${ship.order_id}/shipments/${ship.id}/details`, { method: 'PATCH',
+      body: JSON.stringify({ ...changed, order_version: o.version, shipment_version: ship.version }) });
+    closeShipEdit();
+    toast('Shipment updated.');
+    load();
+    if (state.openId === o.id && !$('#drawer').hidden) openOrder(o.id);
+  } catch (ex) {
+    err.textContent = ex.message; err.hidden = false;
+    const field = ex.data?.field && form[ex.data.field];
+    if (field) { field.setAttribute('aria-invalid', 'true'); field.focus(); }
+    $('#seSaved').textContent = '';
+  } finally { shipEdit.saving = false; btn.disabled = false; }
+});
 
 $('#orderForm').addEventListener('change', (e) => {
   if (['dispatch_type', 'channel'].includes(e.target.name)) routeChanged(e.target.form, '#fDestField', e.target.name, false);
@@ -2096,6 +2185,8 @@ function bind() {
     navigate(typeUrl(b.dataset.type));
   });
   const rowOpen = (e) => {
+    const edit = e.target.closest('[data-edit-ship]');
+    if (edit) return openShipEdit(Number(edit.dataset.editShip));
     if (e.target.closest('a, .pick')) return;
     const r = e.target.closest('[data-id]');
     if (r) openOrder(Number(r.dataset.id));
