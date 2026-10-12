@@ -11174,7 +11174,9 @@ await step('tickets: any member raises one (validated, TKT- numbers unique under
   const P = { owner: '919000000801', m1: '919000000802', m2: '919000000803', admin: '919000000804', dup: '919000000805', moved: '919000000806' };
   const OWNER = 'DBCHECK-TKT Founder';
   const TOKEN = 'dbcheck-11za-token-SECRET-7731';
-  const envKeys = ['TICKETS_OWNER_NAME', 'ELEVENZA_AUTH_TOKEN', 'ELEVENZA_ORIGIN_WEBSITE', 'ELEVENZA_API_URL', 'ELEVENZA_TICKET_TEMPLATE_NAME', 'ELEVENZA_TEMPLATE_NAME', 'APP_BASE_URL', 'ELEVENZA_PAYLOAD_TEMPLATE', 'ELEVENZA_AUTH_HEADER'];
+  // Every setting the notice path reads is saved, set by this step and restored, so a developer's .env cannot change
+  // what the assertions see (ELEVENZA_LANGUAGE included: the requests are checked for 'en').
+  const envKeys = ['TICKETS_OWNER_NAME', 'ELEVENZA_AUTH_TOKEN', 'ELEVENZA_ORIGIN_WEBSITE', 'ELEVENZA_API_URL', 'ELEVENZA_TICKET_TEMPLATE_NAME', 'ELEVENZA_TEMPLATE_NAME', 'APP_BASE_URL', 'ELEVENZA_PAYLOAD_TEMPLATE', 'ELEVENZA_AUTH_HEADER', 'ELEVENZA_LANGUAGE'];
   const savedEnv = Object.fromEntries(envKeys.map((k) => [k, process.env[k]]));
   // A stand-in for 11za: records each request; answers per `stub.mode`.
   const stub = { mode: 'ok', calls: [] };
@@ -11203,7 +11205,8 @@ await step('tickets: any member raises one (validated, TKT- numbers unique under
   try {
     for (const k of envKeys) delete process.env[k];
     Object.assign(process.env, { TICKETS_OWNER_NAME: OWNER, ELEVENZA_AUTH_TOKEN: TOKEN, ELEVENZA_ORIGIN_WEBSITE: 'https://origin.example.test',
-      ELEVENZA_API_URL: `http://127.0.0.1:${provider.address().port}/send`, ELEVENZA_TICKET_TEMPLATE_NAME: 'briyo_ticket_notification', APP_BASE_URL: 'https://os.example.test/' });
+      ELEVENZA_API_URL: `http://127.0.0.1:${provider.address().port}/send`, ELEVENZA_TICKET_TEMPLATE_NAME: 'briyo_ticket_notification', APP_BASE_URL: 'https://os.example.test/',
+      ELEVENZA_LANGUAGE: 'en' });
     await db.query(`INSERT INTO allowed_users (phone, name, is_admin, active, added_by) VALUES
       ($1, $5, false, true, 'db-check'), ($2, 'DBCHECK-TKT Member One', false, true, 'db-check'), ($3, 'DBCHECK-TKT Member Two', false, true, 'db-check'), ($4, 'DBCHECK-TKT Admin', true, true, 'db-check')
       ON CONFLICT (phone) DO UPDATE SET name = EXCLUDED.name, is_admin = EXCLUDED.is_admin, active = true`, [P.owner, P.m1, P.m2, P.admin, OWNER]);
@@ -11229,6 +11232,12 @@ await step('tickets: any member raises one (validated, TKT- numbers unique under
     const noticeText = String(sent.data?.[0] ?? '');
     for (const w of want) if (!noticeText.includes(w)) bad.push(`notice text lacks "${w}": ${noticeText}`);
     if (/[\n\r\t]| {5}/.test(noticeText) || noticeText.length > TICKET_ALERT_MAX) bad.push('notice text not one clean line within the limit');
+    // The language sent is ELEVENZA_LANGUAGE (it must match the approved template's), for the notice and the OTP alike;
+    // this step sets it, so a developer's .env does not leak in. Checked with another value, then put back.
+    process.env.ELEVENZA_LANGUAGE = 'en_US';
+    const langOtp = elevenzaBodyForTest(P.m1, '000000', 'x', null).language;
+    process.env.ELEVENZA_LANGUAGE = 'en';
+    if (langOtp !== 'en_US' || elevenzaBodyForTest(P.m1, '000000', 'x', null).language !== 'en') bad.push(`ELEVENZA_LANGUAGE not used: ${langOtp}`);
     // The login OTP request is unchanged: the code as a plain string, the login template, through the same client.
     const callsOtp = stub.calls.length;
     const otpSent = await sendOtpForTest(P.m1, '482913', 'Member One');
