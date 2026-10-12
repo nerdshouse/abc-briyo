@@ -1580,6 +1580,72 @@ await step('concurrency: orders are locked before their shipments (edit, save, a
   if (bad.length) throw new Error(bad.join(' | '));
   return 'AWB race: both edits met at the courier+lower(AWB) lock, one stored it, the other 409 duplicateAwb with nothing written; a different AWB and a cancelled shipment\'s AWB are fine; edit vs cancel, attach vs cancel and edit + save + cancel on a two-shipment order all waited on the order with no shipment row held (NOWAIT proved it) and completed without deadlock; no stock, reservation or import change';
 });
+await step('concurrency: New shipment locks every existing order it involves (lead, existing extra orders, attach ids) in ascending id before any shipment — vs attaching, and two New shipments naming each other\'s orders: no deadlock', async () => {
+  const bad = [];
+  const db = getPool();
+  const { default: pgMod } = await import('pg');
+  const conn = async () => { const c = new pgMod.Client({ connectionString: process.env.DATABASE_URL }); await c.connect(); return c; };
+  const gate = await conn(); const mon = await conn();
+  const gatePid = (await gate.query('SELECT pg_backend_pid() p')).rows[0].p;
+  const lockWaits = async () => (await mon.query(
+    `SELECT count(*)::int n FROM pg_stat_activity WHERE datname = current_database() AND wait_event_type = 'Lock' AND pid NOT IN ($1, pg_backend_pid())`, [gatePid])).rows[0].n;
+  const until = async (fn, label, ms = 15000) => { const t = Date.now(); while (!(await fn())) { if (Date.now() - t > ms) throw new Error(`timed out waiting for ${label}`); await new Promise((r) => setTimeout(r, 15)); } };
+  // Is this order row free right now (nobody holds it)? Checked from the gate, inside a savepoint.
+  const orderFree = async (id) => { try { await gate.query('SAVEPOINT nw'); await gate.query('SELECT id FROM orders WHERE id = $1 FOR UPDATE NOWAIT', [id]); await gate.query('ROLLBACK TO SAVEPOINT nw'); return true; } catch (e) { await gate.query('ROLLBACK TO SAVEPOINT nw'); if (e.code === '55P03') return false; throw e; } };
+  const settle = (p) => p.then((v) => ({ ok: v }), (e) => ({ err: e }));
+  const show = (x) => (x.ok ? 'ok' : `${x.err.code || x.err.status} ${String(x.err.message).slice(0, 80)}`);
+  const deadlocked = (xs) => xs.some((x) => x.err && (x.err.code === '40P01' || !x.err.status));
+  const dl = (await listCouriers()).find((c) => c.name === 'Delhivery');
+  const mk = async (suffix) => createOrder({ ...R('website'), channel: 'website', source_order_id: `${TEST_ORDER}-CS-${suffix}`, order_date: NOW(), order_value: 5 }, { actor: ACTOR });
+  const shipOf = async (id) => (await db.query('SELECT id FROM order_shipments WHERE order_id = $1 ORDER BY id LIMIT 1', [id])).rows[0].id;
+  const links = async (id) => (await db.query('SELECT count(*)::int n FROM shipment_orders WHERE order_id = $1 AND detached_at IS NULL', [id])).rows[0].n;
+  const shipCount = async (id) => (await db.query('SELECT count(*)::int n FROM order_shipments WHERE order_id = $1', [id])).rows[0].n;
+  const counts = async () => (await db.query('SELECT (SELECT count(*) FROM inventory_movements)::int mv, (SELECT count(*) FROM inventory_reservations)::int rs, (SELECT count(*) FROM order_imports)::int im')).rows[0];
+  const before = await counts();
+  try {
+    // A. The reported regression: New shipment for existing A with existing B as an extra, vs attaching A to B's parcel.
+    const B = await mk('B'); const A = await mk('A');   // B has the lower id
+    const sA = await shipOf(A); const sB = await shipOf(B);
+    await gate.query('BEGIN');
+    await gate.query('SELECT id FROM order_shipments WHERE id = $1 FOR UPDATE', [sA]);   // pause T1 at A's shipments
+    const t1 = settle(createShipment({ ...R('website'), channel: 'website', source_order_id: `${TEST_ORDER}-CS-A`, courier_partner_id: dl.id, tracking_id: 'CS-AWB-A', shipment_status: 'packed', extra_orders: [{ source_order_id: `${TEST_ORDER}-CS-B` }] }, { actor: 'tab-1', addToExisting: true }));
+    await until(async () => (await lockWaits()) === 1, 'New shipment to reach the lead order\'s shipments');
+    // It already holds B — the existing extra order — before any shipment row (the bug: B was locked after the shipment).
+    if (await orderFree(B)) bad.push('New shipment reached a shipment row without holding its existing extra order');
+    if (await orderFree(A)) bad.push('New shipment does not hold its lead order');
+    const t2 = settle(attachToShipment(sB, { orderIds: [A] }, { actor: 'tab-2' }));
+    await until(async () => (await lockWaits()) === 2, 'attach to wait');
+    await gate.query('ROLLBACK');
+    const rA = await Promise.all([t1, t2]);
+    if (deadlocked(rA) || !rA[0].ok) bad.push(`A: ${rA.map(show).join(' / ')}`);
+    if (rA[1].err && rA[1].err.status !== 409) bad.push(`A: attach got ${show(rA[1])}`);
+    // Integrity: B is in A's parcel exactly once; A is not also inside B's parcel; no extra shipment rows.
+    if ((await links(B)) !== 1 || (await links(A)) !== (rA[1].ok ? 1 : 0) || (await shipCount(A)) !== 1 || (await shipCount(B)) !== 1) bad.push(`A integrity links B=${await links(B)} A=${await links(A)} ships A=${await shipCount(A)} B=${await shipCount(B)}`);
+    const ev = (await orderEvents(A)).filter((e) => e.event_type === 'shipment_order_attached').length;
+    if (ev !== 1) bad.push(`A: ${ev} attach events on the lead (want 1)`);
+
+    // B. Two New shipments naming each other's existing orders, in opposite roles: both wait on the LOWER id (ascending),
+    // the higher one stays free while they wait, and both finish without a deadlock (the second may get a 409).
+    const C = await mk('C'); const D = await mk('D');   // C < D
+    await gate.query('BEGIN');
+    await gate.query('SELECT id FROM orders WHERE id = $1 FOR UPDATE', [C]);
+    const u1 = settle(createShipment({ ...R('website'), channel: 'website', source_order_id: `${TEST_ORDER}-CS-D`, courier_partner_id: dl.id, tracking_id: 'CS-AWB-D', shipment_status: 'packed', extra_orders: [{ source_order_id: `${TEST_ORDER}-CS-C` }] }, { actor: 'tab-3', addToExisting: true }));
+    const u2 = settle(createShipment({ ...R('website'), channel: 'website', source_order_id: `${TEST_ORDER}-CS-C`, courier_partner_id: dl.id, tracking_id: 'CS-AWB-C', shipment_status: 'packed', extra_orders: [{ source_order_id: `${TEST_ORDER}-CS-D` }] }, { actor: 'tab-4', addToExisting: true }));
+    await until(async () => (await lockWaits()) === 2, 'both New shipments to wait on the lower order');
+    if (!(await orderFree(D))) bad.push('a New shipment took the higher-id order before the lower one');
+    await gate.query('ROLLBACK');
+    const rB = await Promise.all([u1, u2]);
+    if (deadlocked(rB) || rB.filter((x) => x.ok).length < 1 || rB.some((x) => x.err && x.err.status !== 409)) bad.push(`B: ${rB.map(show).join(' / ')}`);
+    if ((await links(C)) + (await links(D)) !== 1) bad.push(`B: links C=${await links(C)} D=${await links(D)} (want exactly one order inside the other's parcel)`);
+  } finally {
+    await gate.query('ROLLBACK').catch(() => {});
+    await gate.end().catch(() => {}); await mon.end().catch(() => {});
+  }
+  const after = await counts();
+  if (after.mv !== before.mv || after.rs !== before.rs || after.im !== before.im) bad.push(`side effects ${JSON.stringify({ before, after })}`);
+  if (bad.length) throw new Error(bad.join(' | '));
+  return 'New shipment (lead A + existing extra B) held B and A before any shipment row; attaching A to B\'s parcel waited, then got 409 — no deadlock, B attached once, one attach event; two New shipments naming each other\'s orders both waited on the lower id with the higher free, finished without deadlock (one 409), one order in the other\'s parcel; no stock, reservation or import change';
+});
 await step('order and shipment lifecycles are independent; cancellation leaves the shipment alone', async () => {
   let s = await primary(orderId);
   await updateShipment(orderId, s.id, { shipment_status: 'packed' }, { actor: ACTOR, version: s.version });
