@@ -1466,6 +1466,120 @@ await step('imported orders keep their import key: renaming or moving one is ref
   if (bad.length) throw new Error(bad.join(' | '));
   return 'amazon_import and shopify_sync orders: rename and channel move refused (409 importedOrder, field) via PATCH /api/orders/:id, Edit shipment and updateOrder, with no row, version or event change; other fields (sent with the same number and channel) still save; manual orders rename (audited), duplicates 409, stale 409, viewer 403, Edit shipment rename works';
 });
+await step('concurrency: orders are locked before their shipments (edit, save, attach, multi-shipment vs cancellation — no deadlock), and two edits giving one courier+AWB to different shipments at once: one wins, one 409', async () => {
+  const bad = [];
+  const db = getPool();
+  const { editShipment } = await import('../lib/orders.js');
+  const { default: pgMod } = await import('pg');
+  // Deterministic coordination, not timing: a separate "gate" connection holds the contested lock; the test waits until
+  // Postgres reports exactly N sessions blocked behind it (pg_blocking_pids), checks what they hold, then releases.
+  const conn = async () => { const c = new pgMod.Client({ connectionString: process.env.DATABASE_URL }); await c.connect(); return c; };
+  const gate = await conn(); const mon = await conn();
+  const gatePid = (await gate.query('SELECT pg_backend_pid() p')).rows[0].p;
+  // Sessions of this database waiting on a lock. (Several waiters for one row queue behind the first waiter's tuple
+  // lock, so only the first lists the gate in pg_blocking_pids; counting lock waits catches all of them.)
+  const blockedBehindGate = async () => (await mon.query(
+    `SELECT count(*)::int n FROM pg_stat_activity WHERE datname = current_database() AND wait_event_type = 'Lock' AND pid NOT IN ($1, pg_backend_pid())`, [gatePid])).rows[0].n;
+  const until = async (fn, label, ms = 15000) => { const t = Date.now(); while (!(await fn())) { if (Date.now() - t > ms) throw new Error(`timed out waiting for ${label}`); await new Promise((r) => setTimeout(r, 15)); } };
+  // Can the gate lock these shipment rows right now? Only if no waiting transaction already holds them (order-first).
+  const shipmentsFree = async (ids) => { try { await gate.query('SAVEPOINT nw'); await gate.query('SELECT id FROM order_shipments WHERE id = ANY($1) FOR UPDATE NOWAIT', [ids]); await gate.query('ROLLBACK TO SAVEPOINT nw'); return true; } catch (e) { await gate.query('ROLLBACK TO SAVEPOINT nw'); if (e.code === '55P03') return false; throw e; } };
+  const dl = (await listCouriers()).find((c) => c.name === 'Delhivery');
+  const mkShip = async (num, awb) => (await createShipment({ ...R('website'), channel: 'website', source_order_id: `${TEST_ORDER}-CC-${num}`, courier_partner_id: dl.id, tracking_id: awb, shipment_status: 'packed' }, { actor: ACTOR }));
+  const shipRow = async (id) => (await db.query('SELECT id, order_id, version, tracking_id, shipment_status, expected_delivery_date::text e FROM order_shipments WHERE id = $1', [id])).rows[0];
+  const evOf = async (orderId, type) => (await orderEvents(orderId)).filter((e) => e.event_type === type).length;
+  const counts = async () => (await db.query('SELECT (SELECT count(*) FROM inventory_movements)::int mv, (SELECT count(*) FROM inventory_reservations)::int rs, (SELECT count(*) FROM order_imports)::int im')).rows[0];
+  const before = await counts();
+  try {
+    // 1, 2. AWB race: both edits wait at the same courier + lower(AWB) lock (different case → same key), then one wins.
+    const a = await mkShip('A', 'CC-AWB-A'); const b = await mkShip('B', 'CC-AWB-B');
+    await gate.query('BEGIN');
+    await gate.query(`SELECT pg_advisory_xact_lock(hashtext('order_shipments:awb'), hashtext($1::text || ':' || lower($2)))`, [String(dl.id), 'CC-RACE-1']);
+    const evA = await evOf(a.orderId, 'tracking_changed'); const evB = await evOf(b.orderId, 'tracking_changed');
+    const race = [
+      editShipment(a.orderId, a.shipmentId, { tracking_id: 'CC-RACE-1' }, { actor: 'tab-a', shipmentVersion: (await shipRow(a.shipmentId)).version }),
+      editShipment(b.orderId, b.shipmentId, { tracking_id: 'cc-race-1' }, { actor: 'tab-b', shipmentVersion: (await shipRow(b.shipmentId)).version }),
+    ].map((p) => p.then((v) => ({ ok: v }), (e) => ({ err: e })));
+    await until(async () => (await blockedBehindGate()) === 2, 'both AWB edits to reach the AWB lock');
+    await gate.query('COMMIT');
+    const out = await Promise.all(race);
+    const won = out.filter((x) => x.ok); const lost = out.filter((x) => x.err);
+    if (won.length !== 1 || lost.length !== 1 || lost[0].err.status !== 409 || !lost[0].err.duplicateAwb || lost[0].err.field !== 'tracking_id') bad.push(`AWB race ${JSON.stringify(out.map((x) => x.ok ? 'ok' : `${x.err.status} ${x.err.message}`))}`);
+    const ra = await shipRow(a.shipmentId); const rb = await shipRow(b.shipmentId);
+    if ([ra.tracking_id, rb.tracking_id].filter((t) => t.toLowerCase() === 'cc-race-1').length !== 1) bad.push(`both stored the AWB: ${ra.tracking_id} / ${rb.tracking_id}`);
+    // The loser rolled back completely: its AWB, version and history are as before.
+    const loserIsA = ra.tracking_id === 'CC-AWB-A';
+    const loser = loserIsA ? { row: ra, ev: evA, id: a.orderId, old: 'CC-AWB-A' } : { row: rb, ev: evB, id: b.orderId, old: 'CC-AWB-B' };
+    if (loser.row.tracking_id !== loser.old || (await evOf(loser.id, 'tracking_changed')) !== loser.ev) bad.push('loser left a change or an event');
+    // 3, 4. A different AWB is fine; an AWB held only by a cancelled shipment is free again (existing rule).
+    const winner = loserIsA ? b : a;
+    await editShipment(loser.id, (loserIsA ? a : b).shipmentId, { tracking_id: 'CC-AWB-OTHER' }, { actor: 'tab-x', shipmentVersion: loser.row.version });
+    const w = await shipRow(winner.shipmentId);
+    await updateShipment(winner.orderId, winner.shipmentId, { shipment_status: 'cancelled' }, { actor: ACTOR, version: w.version });
+    const l2 = await shipRow((loserIsA ? a : b).shipmentId);
+    await editShipment(loser.id, l2.id, { tracking_id: 'CC-RACE-1' }, { actor: 'tab-x', shipmentVersion: l2.version });
+    if ((await shipRow(l2.id)).tracking_id !== 'CC-RACE-1') bad.push('AWB of a cancelled shipment not reusable');
+
+    // 5. Edit shipment vs cancelling its order: with the order row held, the edit waits for the ORDER and holds no shipment row.
+    const c = await mkShip('C', 'CC-AWB-C');
+    await gate.query('BEGIN');
+    await gate.query('SELECT id FROM orders WHERE id = $1 FOR UPDATE', [c.orderId]);
+    const ordC = await getOrder(c.orderId);
+    const pair = [
+      editShipment(c.orderId, c.shipmentId, { expected_delivery_date: '2026-12-24' }, { actor: 'tab-e', shipmentVersion: (await shipRow(c.shipmentId)).version }),
+      updateOrder(c.orderId, { order_status: 'cancelled' }, { actor: 'tab-c', version: ordC.version }),
+    ].map((p) => p.then((v) => ({ ok: v }), (e) => ({ err: e })));
+    await until(async () => (await blockedBehindGate()) === 2, 'edit and cancellation to wait on the order');
+    if (!(await shipmentsFree([c.shipmentId]))) bad.push('Edit shipment locked the shipment before its order');
+    await gate.query('ROLLBACK');
+    const r5 = await Promise.all(pair);
+    if (r5.some((x) => x.err)) bad.push(`edit vs cancel ${JSON.stringify(r5.map((x) => x.ok ? 'ok' : `${x.err.code || x.err.status} ${x.err.message}`))}`);
+    if ((await getOrder(c.orderId)).order_status !== 'cancelled' || (await shipRow(c.shipmentId)).e !== '2026-12-24') bad.push('edit or cancel not applied');
+
+    // 6. An order with two shipments: Edit shipment on one, Save shipment on the other and cancelling the order, together.
+    const d = await mkShip('D', 'CC-AWB-D1');
+    const d2 = await createShipment({ ...R('website'), channel: 'website', source_order_id: `${TEST_ORDER}-CC-D`, courier_partner_id: dl.id, tracking_id: 'CC-AWB-D2', shipment_status: 'packed' }, { actor: ACTOR, addToExisting: true });
+    if (d2.orderId !== d.orderId || d2.shipmentId === d.shipmentId) bad.push('second shipment not on the same order');
+    await gate.query('BEGIN');
+    await gate.query('SELECT id FROM orders WHERE id = $1 FOR UPDATE', [d.orderId]);
+    const ordD = await getOrder(d.orderId);
+    const three = [
+      editShipment(d.orderId, d.shipmentId, { tracking_id: 'CC-AWB-D1X' }, { actor: 'tab-1', shipmentVersion: (await shipRow(d.shipmentId)).version }),
+      updateShipment(d.orderId, d2.shipmentId, { expected_delivery_date: '2026-12-25' }, { actor: 'tab-2', version: (await shipRow(d2.shipmentId)).version }),
+      updateOrder(d.orderId, { order_status: 'cancelled' }, { actor: 'tab-3', version: ordD.version }),
+    ].map((p) => p.then((v) => ({ ok: v }), (e) => ({ err: e })));
+    await until(async () => (await blockedBehindGate()) === 3, 'three transactions to wait on the order');
+    if (!(await shipmentsFree([d.shipmentId, d2.shipmentId]))) bad.push('a shipment of the order was locked before the order');
+    await gate.query('ROLLBACK');
+    const r6 = await Promise.all(three);
+    if (r6.some((x) => x.err)) bad.push(`multi-shipment ${JSON.stringify(r6.map((x) => x.ok ? 'ok' : `${x.err.code || x.err.status} ${x.err.message}`))}`);
+    if ((await shipRow(d.shipmentId)).tracking_id !== 'CC-AWB-D1X' || (await shipRow(d2.shipmentId)).e !== '2026-12-25' || (await getOrder(d.orderId)).order_status !== 'cancelled') bad.push('multi-shipment results not all applied');
+
+    // Attaching an order to a parcel vs cancelling the parcel's lead order: both wait on the lead order, no shipment held.
+    const e = await mkShip('E', 'CC-AWB-E');
+    const m = await createOrder({ ...R('website'), channel: 'website', source_order_id: `${TEST_ORDER}-CC-EM`, order_date: NOW(), order_value: 5 }, { actor: ACTOR });
+    await gate.query('BEGIN');
+    await gate.query('SELECT id FROM orders WHERE id = $1 FOR UPDATE', [e.orderId]);
+    const ordE = await getOrder(e.orderId);
+    const att = [
+      attachToShipment(e.shipmentId, { orderIds: [m] }, { actor: 'tab-a' }),
+      updateOrder(e.orderId, { order_status: 'cancelled' }, { actor: 'tab-c', version: ordE.version }),
+    ].map((p) => p.then((v) => ({ ok: v }), (er) => ({ err: er })));
+    await until(async () => (await blockedBehindGate()) === 2, 'attach and cancellation to wait on the lead order');
+    if (!(await shipmentsFree([e.shipmentId]))) bad.push('attach locked the shipment before the lead order');
+    await gate.query('ROLLBACK');
+    const r7 = await Promise.all(att);
+    if (r7.some((x) => x.err && x.err.code === '40P01')) bad.push('deadlock between attach and cancellation');
+    if (r7.some((x) => x.err && !x.err.status)) bad.push(`attach vs cancel ${JSON.stringify(r7.map((x) => x.ok ? 'ok' : `${x.err.code || x.err.status} ${x.err.message}`))}`);
+  } finally {
+    await gate.query('ROLLBACK').catch(() => {});
+    await gate.end().catch(() => {}); await mon.end().catch(() => {});
+  }
+  // 9. No stock, reservation or import side effects from any of it.
+  const after = await counts();
+  if (after.mv !== before.mv || after.rs !== before.rs || after.im !== before.im) bad.push(`side effects ${JSON.stringify({ before, after })}`);
+  if (bad.length) throw new Error(bad.join(' | '));
+  return 'AWB race: both edits met at the courier+lower(AWB) lock, one stored it, the other 409 duplicateAwb with nothing written; a different AWB and a cancelled shipment\'s AWB are fine; edit vs cancel, attach vs cancel and edit + save + cancel on a two-shipment order all waited on the order with no shipment row held (NOWAIT proved it) and completed without deadlock; no stock, reservation or import change';
+});
 await step('order and shipment lifecycles are independent; cancellation leaves the shipment alone', async () => {
   let s = await primary(orderId);
   await updateShipment(orderId, s.id, { shipment_status: 'packed' }, { actor: ACTOR, version: s.version });
