@@ -1253,6 +1253,12 @@ function openForm(order) {
   form.source_order_id.readOnly = imported;
   form.channel.disabled = imported;
   form.source_order_id.title = imported ? 'Imported orders keep the number their import uses.' : '';
+  // The date box shows minutes only; remember what it showed so an untouched date is never sent back (rounded).
+  // An existing date can be corrected but not removed; an imported order's date comes from its channel.
+  form.order_date.dataset.initial = form.order_date.value;
+  form.order_date.readOnly = Boolean(imported && order.order_date);
+  form.order_date.title = imported && order.order_date ? 'Imported orders keep the order date their channel sent.'
+    : order.order_date ? 'Can be corrected, not removed.' : '';
   $('#fTitle').textContent = `Edit order ${order.source_order_id}`;
   $('#fSubmit').textContent = 'Save changes';
   $('#formDrawer').hidden = false;
@@ -1373,7 +1379,12 @@ $('#orderForm').addEventListener('submit', async (e) => {
   const missing = [['channel', 'channel'], ['source_order_id', 'order number']]
     .filter(([k]) => !String(body[k] || '').trim()).map(([, l]) => l);
   if (missing.length) { err.textContent = `Enter the ${missing.join(', ')}.`; err.hidden = false; return; }
-  // Order date is sent as wall-clock time; the server reads it in the team's timezone.
+  // Order date is sent as wall-clock time; the server reads it in the team's timezone. Only when it was changed:
+  // the box holds the stored date rounded to the minute, and the server refuses removing a date that is set.
+  if (body.order_date === form.order_date.dataset.initial) delete body.order_date;
+  else if (form.order_date.dataset.initial && !body.order_date) {
+    err.textContent = 'An order date cannot be removed once it is set. Enter the correct date instead.'; err.hidden = false; return;
+  }
   const btn = $('#fSubmit');
   btn.disabled = true;
   try {
