@@ -243,7 +243,11 @@ async function act(name, btn) {
       const batches = $$('[data-ret-batch]', f).map((i) => ({ batch_id: i.dataset.retBatch, quantity: i.value })).filter((a) => String(a.quantity).trim());
       const body = { returned_saleable: batches.length || !f.querySelector('[name=returned_saleable]') ? batches : val('returned_saleable'),
         returned_non_saleable: val('returned_non_saleable'), consumed: val('consumed'), retained: val('retained'), notes: val('ret_notes'),
-        saleable_verified: $('#retVerified').checked, request_id: state.returnKey || (state.returnKey = rid()) };
+        saleable_verified: $('#retVerified').checked,
+        // One key per record until the outcome is known. It survives edits to the quantities on purpose: after a lost
+        // response the server tells an exact retry (a repeat) from a changed one (refused, nothing recorded), so a
+        // "correction" can never become a second return. It is dropped once the server has answered.
+        request_id: state.returnKey?.id === o.id ? state.returnKey.key : (state.returnKey = { id: o.id, key: rid() }).key };
       // Empty counts as 0. Nothing entered: say so here and send nothing (the server refuses it too).
       const qty = [...batches.map((a) => a.quantity), typeof body.returned_saleable === 'string' ? body.returned_saleable : '',
         body.returned_non_saleable, body.consumed, body.retained].map((x) => String(x).trim());
@@ -253,12 +257,20 @@ async function act(name, btn) {
       }
       const r = await api(`/api/inventory/outward/${o.id}/return`, { method: 'POST', body: JSON.stringify(body) });
       state.returnKey = null;
-      await load(); await openOutward(o.id); saved(r.status === 'closed' ? 'Recorded — every unit accounted for; closed' : `Recorded — ${count(r.outstanding)} still outstanding`);
+      await load(); await openOutward(o.id);
+      // Both answers carry the real outstanding from the server; a repeat says it was already recorded.
+      const left = r.status === 'closed' ? 'every unit accounted for; closed' : `${count(r.outstanding)} still outstanding`;
+      saved(r.repeated ? `Already recorded earlier — ${left}` : `Recorded — ${left}`);
     } else if (name === 'close-out') {
       await api(`/api/inventory/outward/${o.id}/close`, { method: 'POST', body: '{}' });
       await load(); await openOutward(o.id); saved('Closed');
     }
   } catch (err) {
+    if (name === 'record' && err.data?.requestReused) {
+      // The earlier entry was saved with other quantities: show the record as it is now, and start a fresh entry.
+      state.returnKey = null;
+      await load(); await openOutward(o.id);
+    }
     saved(err.message, true);
     if (err.data?.field === 'requested_by_name' && $('#soOtherErr')) $('#soOtherErr').textContent = err.message;
   } finally { btn.disabled = false; }
