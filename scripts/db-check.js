@@ -6479,6 +6479,94 @@ await step('stock outward: issue 1 → issued 1, returned 0, outstanding 1; the 
   if (bad.length) throw new Error(bad.join(' | '));
   return 'issue 1 → issued 1 / returned 0 / outstanding 1 (list = detail), stock 10 → 9; empty and zero submissions refused with no event; saleable refused until inspected, then +1 to its batch once (retry no-op); damaged recorded, not restocked; consumed 2 + kept 1 separate, over-recording refused; history append-only; return form empty, autocomplete off, nothing sent when empty';
 });
+await step('stock outward: return retries — an exact retry is a repeat with the real outstanding; the same key with other quantities records nothing (409); concurrent duplicates record once; no extra stock movement', async () => {
+  const bad = [];
+  const db = getPool();
+  const sku = (await createSku({ sku: `${TS}-SORT`, product_name: 'Outward retry' }, { actor: ACTOR })).id;
+  const b1 = (await receiveInventory({ sku_id: sku, batch_number: 'SORT-A', expiry_date: dayOffset(300), quantity: 20, request_id: rid() }, { actor: ACTOR })).batchId;
+  const onHand = async () => (await db.query('SELECT on_hand FROM inventory_batches WHERE id = $1', [b1])).rows[0].on_hand;
+  const returnMoves = async (id) => (await soLedger(id)).filter((m) => m.movement_type === 'outward_returned').length;
+  const returnEvents = async (id) => (await getOutward(id)).events.filter((e) => e.event_type === 'returned').length;
+  const issued = async (q) => {
+    const d = await createOutward({ ...soBase(), sku_id: sku, quantity: q }, { actor: ACTOR });
+    await issueOutward(d.id, { allocations: [{ batch_id: b1, quantity: q }], request_id: rid() }, { actor: ACTOR });
+    return d.id;
+  };
+  // 1, 2. A saved return whose response was lost, then the exact same request again: a repeat, nothing added, real outstanding.
+  const a = await issued(5);
+  const stockA = await onHand();
+  const key = rid();
+  const req = { returned_saleable: '2', returned_non_saleable: '1', saleable_verified: true, request_id: key };
+  const first = await recordOutwardReturn(a, req, { actor: ACTOR });
+  const retry = await recordOutwardReturn(a, { ...req }, { actor: ACTOR });
+  const retry2 = await recordOutwardReturn(a, { ...req, returned_saleable: 2, notes: 'same, sent again' }, { actor: ACTOR });
+  let o = await getOutward(a);
+  if (first.repeated || first.outstanding !== 2) bad.push(`first ${JSON.stringify(first)}`);
+  if (!retry.repeated || retry.outstanding !== 2 || retry.status !== 'partially_returned' || retry.recorded?.returned_non_saleable !== 1 || retry.recorded?.saleable?.[String(b1)] !== 2) bad.push(`retry ${JSON.stringify(retry)}`);
+  if (!retry2.repeated) bad.push('number vs text retry not seen as the same');
+  if (o.returned_saleable !== 2 || o.returned_non_saleable !== 1 || o.outstanding !== 2 || (await returnEvents(a)) !== 1 || (await returnMoves(a)) !== 1 || (await onHand()) !== stockA + 2) bad.push('retry double-counted');
+  // 3. The same key with other quantities: refused (409), nothing recorded, and it says what was recorded.
+  for (const changed of [{ ...req, returned_saleable: '3' }, { ...req, consumed: '1' }, { ...req, returned_non_saleable: '0', consumed: '1' }]) {
+    await expectErr(`changed ${JSON.stringify(changed).slice(0, 60)}`, () => recordOutwardReturn(a, changed, { actor: ACTOR }),
+      (e) => e.status === 409 && e.requestReused && e.outstanding === 2 && e.recorded?.returned_non_saleable === 1 && !/reload/i.test(e.message));
+  }
+  // An invalid retry on a used key gets the normal validation error (400), never a match or a misleading message.
+  await expectErr('invalid reuse', () => recordOutwardReturn(a, { ...req, returned_saleable: 'x' }, { actor: ACTOR }), (e) => e.status === 400 && /whole number/.test(e.message) && !e.requestReused);
+  await expectErr('negative reuse', () => recordOutwardReturn(a, { ...req, consumed: '-1' }, { actor: ACTOR }), (e) => e.status === 400 && !e.requestReused);
+  o = await getOutward(a);
+  if (o.outstanding !== 2 || (await returnEvents(a)) !== 1 || (await returnMoves(a)) !== 1 || (await onHand()) !== stockA + 2) bad.push('a changed reuse recorded something');
+  // A genuine further return, with a new key, is recorded normally.
+  const more = await recordOutwardReturn(a, { consumed: '1', request_id: rid() }, { actor: ACTOR });
+  if (more.repeated || more.outstanding !== 1 || (await getOutward(a)).consumed !== 1) bad.push(`further return ${JSON.stringify(more)}`);
+  // Multi-batch: an ambiguous single saleable quantity on a used key is refused as it is without one (400), never a
+  // repeat; nothing is added. Valid per-batch retries still match (order and "1" vs 1 do not matter); a moved unit does not.
+  const b2 = (await receiveInventory({ sku_id: sku, batch_number: 'SORT-B', expiry_date: dayOffset(400), quantity: 10, request_id: rid() }, { actor: ACTOR })).batchId;
+  const mDraft = await createOutward({ ...soBase(), sku_id: sku, quantity: 6 }, { actor: ACTOR });
+  await issueOutward(mDraft.id, { allocations: [{ batch_id: b1, quantity: 3 }, { batch_id: b2, quantity: 3 }], request_id: rid() }, { actor: ACTOR });
+  const m = mDraft.id;
+  const stock2 = async () => [await onHand(), (await db.query('SELECT on_hand FROM inventory_batches WHERE id = $1', [b2])).rows[0].on_hand];
+  const mk = rid();
+  await recordOutwardReturn(m, { consumed: '1', request_id: mk }, { actor: ACTOR });
+  const snapM = async () => { const x = await getOutward(m); return JSON.stringify([x.returned_saleable, x.returned_non_saleable, x.consumed, x.retained, x.outstanding, await returnEvents(m), await returnMoves(m), await stock2()]); };
+  const m0 = await snapM();
+  await expectErr('multi-batch ambiguous reuse', () => recordOutwardReturn(m, { consumed: '1', returned_saleable: '2', saleable_verified: true, request_id: mk }, { actor: ACTOR }),
+    (e) => e.status === 400 && /more than one batch/.test(e.message) && !e.requestReused);
+  await expectErr('multi-batch ambiguous, no key', () => recordOutwardReturn(m, { consumed: '1', returned_saleable: '2', saleable_verified: true, request_id: rid() }, { actor: ACTOR }), (e) => e.status === 400 && /more than one batch/.test(e.message));
+  if ((await snapM()) !== m0) bad.push(`multi-batch ambiguous reuse changed something ${m0} → ${await snapM()}`);
+  const pk = rid();
+  const per = { returned_saleable: [{ batch_id: b1, quantity: 1 }, { batch_id: b2, quantity: 1 }], saleable_verified: true, request_id: pk };
+  const pFirst = await recordOutwardReturn(m, per, { actor: ACTOR });
+  const p1 = await snapM();
+  const pRetry = await recordOutwardReturn(m, { ...per, returned_saleable: [{ batch_id: String(b2), quantity: '1' }, { batch_id: String(b1), quantity: 1 }] }, { actor: ACTOR });
+  if (pFirst.repeated || !pRetry.repeated || pRetry.outstanding !== 3 || (await snapM()) !== p1) bad.push(`per-batch retry ${JSON.stringify(pRetry)}`);
+  await expectErr('per-batch moved', () => recordOutwardReturn(m, { ...per, returned_saleable: [{ batch_id: b1, quantity: 2 }] }, { actor: ACTOR }), (e) => e.status === 409 && e.requestReused);
+  await expectErr('per-batch foreign batch', () => recordOutwardReturn(m, { ...per, returned_saleable: [{ batch_id: 999999999, quantity: 1 }, { batch_id: b2, quantity: 1 }] }, { actor: ACTOR }), (e) => e.status === 400 && !e.requestReused);
+  if ((await snapM()) !== p1) bad.push('a refused per-batch reuse changed something');
+  // 4, 5. Concurrent duplicates: identical requests record once; a different one with the same key is refused.
+  const c = await issued(4);
+  const stockC = await onHand();
+  const k2 = rid();
+  const same = { returned_saleable: '1', retained: '1', saleable_verified: true, request_id: k2 };
+  const both = await Promise.allSettled([recordOutwardReturn(c, same, { actor: ACTOR }), recordOutwardReturn(c, { ...same }, { actor: ACTOR }), recordOutwardReturn(c, { ...same }, { actor: ACTOR })]);
+  const ok = both.filter((x) => x.status === 'fulfilled').map((x) => x.value);
+  if (ok.length !== 3 || ok.filter((v) => !v.repeated).length !== 1 || ok.some((v) => v.outstanding !== 2)) bad.push(`concurrent ${JSON.stringify(both.map((x) => x.value || x.reason?.message))}`);
+  const k3 = rid();
+  const race = await Promise.allSettled([recordOutwardReturn(c, { consumed: '1', request_id: k3 }, { actor: ACTOR }), recordOutwardReturn(c, { consumed: '2', request_id: k3 }, { actor: ACTOR })]);
+  if (race.filter((x) => x.status === 'fulfilled').length !== 1 || !race.some((x) => x.status === 'rejected' && x.reason.requestReused)) bad.push(`concurrent different ${JSON.stringify(race.map((x) => x.value || x.reason?.message))}`);
+  o = await getOutward(c);
+  if (o.returned_saleable !== 1 || o.retained !== 1 || (await returnEvents(c)) !== 2 || (await returnMoves(c)) !== 1 || (await onHand()) !== stockC + 1
+    || o.quantity !== o.returned_saleable + o.returned_non_saleable + o.consumed + o.retained + o.outstanding) bad.push(`concurrent totals ${JSON.stringify({ rs: o.returned_saleable, k: o.retained, c: o.consumed, out: o.outstanding })}`);
+  // 6. The page: one key per record, kept until the server answers; a repeat says "Already recorded" with the server's
+  // outstanding (never a made-up 0); a changed reuse reloads the record and shows the server's message.
+  const js = await fsp.readFile(new URL('../public/stock-outward.js', import.meta.url), 'utf8');
+  if (!/request_id: state\.returnKey\?\.id === o\.id \? state\.returnKey\.key : \(state\.returnKey = \{ id: o\.id, key: rid\(\) \}\)\.key/.test(js)) bad.push('key not per record');
+  if (!/saved\(r\.repeated \? `Already recorded earlier — \$\{left\}` : `Recorded — \$\{left\}`\)/.test(js) || !/\$\{count\(r\.outstanding\)\} still outstanding/.test(js)) bad.push('repeat feedback');
+  const routes = await fsp.readFile(new URL('../lib/inventory-routes.js', import.meta.url), 'utf8');
+  if (!/requestReused: err\.requestReused, recorded: err\.recorded/.test(routes)) bad.push('API does not pass requestReused to the page');
+  if (!/if \(name === 'record' && err\.data\?\.requestReused\) \{\s*[^}]*state\.returnKey = null;\s*await load\(\); await openOutward\(o\.id\);\s*saved\('These quantities were not recorded as a new return\. The record shows what is saved\.', true\);\s*return;/.test(js)) bad.push('changed-reuse handling / message');
+  if (bad.length) throw new Error(bad.join(' | '));
+  return 'saved then retried (lost response) → repeat with real outstanding 2, 1 event, 1 movement, stock +2 once; same key with other quantities → 409 requestReused, invalid ones → the normal 400, nothing recorded; multi-batch: an ambiguous single saleable quantity on a used key is a 400 not a repeat, per-batch retries match regardless of order, a moved unit is a 409; new key records; 3 concurrent identical → 1 recorded + 2 repeats; concurrent different with one key → 1 recorded, 1 refused; totals reconcile; page keeps one key per record and shows the server\'s outcome';
+});
 await step('retailer orders without Briyo SKUs (e.g. Medkart): retailer name/code kept beside the Briyo product, code optional; an unmatched line is flagged and blocks stock until a person matches it; then deducted exactly once', async () => {
   const bad = [];
   const db = getPool();
