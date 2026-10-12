@@ -6128,13 +6128,81 @@ await step('order date integrity: saving other fields keeps the stored date exac
     await commitAmazonImport(amzCsv([amzRow({ 'order-id': AZ('ODI-HAND'), 'order-item-id': 'ODIH', 'purchase-date': '2026-09-18T06:30:11+00:00' })]), 'odi3.csv', { actor: IMPORTER });
     const hs = await snap(handAz);
     if (hs.u !== '2026-09-18 06:30:11' || hs.source !== 'manual') bad.push(`hand-entered amazon filled ${JSON.stringify(hs)}`);
+
+    // 8. Imported orders with no date (the Amazon API sends none when createdTime is missing): the Amazon file fills one
+    //    from its purchase-date; the other is given one by hand. Once a date exists, it is the source's: a change is 409,
+    //    removing it 400, and neither writes anything or logs anything.
+    az.pages[''] = { orders: [92, 93].map((n) => ({ ...azOrder(n, [azItem('I1')], { updated: '2026-10-09T11:00:00Z' }), createdTime: undefined })) };
+    await runAmazonSync({ client: azc, actor: AZ_ACTOR });
+    const [fileFilled, handFilled] = [Number((await azRow(92))?.id), Number((await azRow(93))?.id)];
+    if (!fileFilled || !handFilled || (await snap(fileFilled)).d !== null || (await snap(handFilled)).d !== null) bad.push('setup: undated Amazon API orders');
+    await commitAmazonImport(amzCsv([amzRow({ 'order-id': AZS(92), 'order-item-id': 'I1', 'purchase-date': '2026-09-17T05:04:03+00:00' })]), 'odi4.csv', { actor: IMPORTER });
+    const ff = await snap(fileFilled);
+    if (ff.u !== '2026-09-17 05:04:03' || ff.source !== 'amazon_spapi') bad.push(`file did not fill the imported order's date ${JSON.stringify(ff)}`);
+
+    // 9. The Edit form's own date code (public/orders.js), run as written against a stand-in form, and its request sent to
+    //    the route — so what the page decides (send the date or not, stop or not) is checked together with what it causes.
+    const ui = await fsp.readFile(new URL('../public/orders.js', import.meta.url), 'utf8');
+    const cut = (from, to) => { const i = ui.indexOf(from); const j = ui.indexOf(to, i); if (i < 0 || j < 0) throw new Error(`orders.js: "${from}" not found`); return ui.slice(i, j); };
+    const toTeamInput = new Function('state', `${cut('const toTeamInput = ', 'const bytes = ')}; return toTeamInput;`)({ meta: { timezone: 'Asia/Kolkata' } });
+    const openDate = new Function('form', 'order', cut("const imported = order.source && order.source !== 'manual';", "$('#fTitle')"));
+    const submitDate = new Function('form', 'body', 'err', `${cut('// Order date is sent as wall-clock time', "const btn = $('#fSubmit');")}\nreturn 'sent';`);
+    // Open the form for the order (as openForm does), optionally type in the date box, save with the name changed.
+    const formSave = async (id, { typed, badInput = false } = {}) => {
+      const order = await getOrder(id);
+      const form = { source_order_id: {}, channel: {}, order_date: { value: toTeamInput(order.order_date), dataset: {}, validity: { badInput: false } } };
+      openDate(form, order);
+      const opened = { readOnly: form.order_date.readOnly, title: form.order_date.title };
+      if (typed !== undefined) form.order_date.value = typed;
+      form.order_date.validity.badInput = badInput;
+      const body = { order_date: form.order_date.value, customer_name: `Form save ${Date.now()}` };
+      const err = {};
+      const sent = submitDate(form, body, err) === 'sent';
+      const res = sent ? await patch(id, body) : null;
+      return { opened, body, err, sent, res };
+    };
+    // Untouched date box, another field saved: the date is not sent, the stored value (with seconds) is kept, only the name is logged.
+    for (const [src, id] of [['manual', manual], ['amazon_import', amzFile], ['shopify_sync', shop], ['amazon_spapi', amzApi]]) {
+      const before = await snap(id);
+      const r = await formSave(id);
+      if (!r.sent || 'order_date' in r.body || r.res.status !== 200 || (await snap(id)).d !== before.d || JSON.stringify(Object.keys(await lastEdit(id) || {})) !== '["customer_name"]') bad.push(`form, untouched date (${src}): sent=${r.sent} ${JSON.stringify(r.body)} ${r.res?.status}`);
+      // The date box: read-only for an imported order with a date; editable (correctable) for a hand-entered one.
+      if (r.opened.readOnly !== (src !== 'manual') || (src !== 'manual' && !/channel sent/.test(r.opened.title)) || (src === 'manual' && !/corrected, not removed/.test(r.opened.title))) bad.push(`form, date box (${src}) ${JSON.stringify(r.opened)}`);
+    }
+    // A half-typed date (the browser reports badInput and an empty value) stops the save with its own message; nothing is sent.
+    for (const id of [manual, und2]) {   // dated, and still undated
+      const before = await snap(id);
+      const r = await formSave(id, { typed: '', badInput: true });
+      if (r.sent || !/complete order date/.test(r.err.textContent || '') || JSON.stringify(await snap(id)) !== JSON.stringify(before)) bad.push(`form, half-typed date: sent=${r.sent} "${r.err.textContent}"`);
+    }
+    // Emptying a set date stops the save in the page (the server refuses it too — step 2); nothing is sent.
+    const emptied = await formSave(manual, { typed: '' });
+    if (emptied.sent || !/cannot be removed/.test(emptied.err.textContent || '')) bad.push(`form, emptied date: sent=${emptied.sent}`);
+    // A changed date is sent and saved (hand-entered order).
+    const changed = await formSave(manual, { typed: '2026-09-22T18:05' });
+    if (!changed.sent || changed.body.order_date !== '2026-09-22T18:05' || changed.res.status !== 200 || (await snap(manual)).u !== '2026-09-22 12:35:00') bad.push(`form, changed date ${changed.res?.status} ${(await snap(manual)).u}`);
+    // The undated imported order: its box is editable, the typed date is sent and saved, and logged from no date.
+    const given = await formSave(handFilled, { typed: '2026-10-02T11:20' });
+    if (given.opened.readOnly || !given.sent || given.res.status !== 200 || (await snap(handFilled)).u !== '2026-10-02 05:50:00' || (await lastEdit(handFilled))?.order_date?.from !== null) bad.push(`form, undated imported order given a date ${given.res?.status} ${(await snap(handFilled)).u}`);
+    if (!(await formSave(handFilled)).opened.readOnly) bad.push('form, date box not read-only once the imported order has a date');
+    // Both now-dated imported orders: a change → 409 order_date (importedOrder), removing → 400 order_date; nothing written, nothing logged.
+    for (const [label, id] of [['filled by the file', fileFilled], ['given by hand', handFilled]]) {
+      const before = await snap(id);
+      const ch = await patch(id, { order_date: '2026-10-05T09:00', customer_name: 'Should not save' });
+      if (ch.status !== 409 || ch.body.field !== 'order_date' || !ch.body.importedOrder) bad.push(`${label}: change ${ch.status} ${ch.body.field}`);
+      for (const v of ['', '   ', null]) {
+        const cl = await patch(id, { order_date: v, customer_name: 'Should not save' });
+        if (cl.status !== 400 || cl.body.field !== 'order_date') bad.push(`${label}: clear ${JSON.stringify(v)} ${cl.status}`);
+      }
+      if (JSON.stringify(await snap(id)) !== JSON.stringify(before)) bad.push(`${label}: a refused request wrote ${JSON.stringify([before, await snap(id)])}`);
+    }
   } finally {
     server.close();
     if (savedCk === null) await db.query('DELETE FROM system_state WHERE key = $1', [CK]);
     else await db.query('UPDATE system_state SET value = $2 WHERE key = $1', [CK, savedCk]);
   }
   if (bad.length) throw new Error(bad.join(' | '));
-  return 'hand-entered, Amazon file, Shopify and Amazon API orders: saving other fields with the form\'s rounded date or none keeps order_date byte for byte and logs only the field changed; "", spaces, tab, null → 400 order_date with nothing written; invalid dates still 400; a hand-entered date corrects (logged); imported dates → 409 order_date (even a 1-second change), channel/number still 409; an undated order takes a date, an empty box on one is fine; Shopify, Amazon file and Amazon API each still apply a changed source date; the Amazon file fills a hand-entered undated Amazon order';
+  return 'hand-entered, Amazon file, Shopify and Amazon API orders: saving other fields with the form\'s rounded date or none keeps order_date byte for byte and logs only the field changed; "", spaces, tab, null → 400 order_date with nothing written; invalid dates still 400; a hand-entered date corrects (logged); imported dates → 409 order_date (even a 1-second change), channel/number still 409; an undated order takes a date, an empty box on one is fine; Shopify, Amazon file and Amazon API each still apply a changed source date; the Amazon file fills a hand-entered undated Amazon order and an undated Amazon API order; an undated imported order takes a date by hand, then (like the file-filled one) refuses a change (409) or removal (400) with nothing written; the Edit form\'s own code: untouched box → date not sent and kept exactly (4 sources), box read-only only for dated imported orders, half-typed date stops with its own message, emptying a set date stops, a changed date is sent and saved';
 });
 await step('amazon sp-api pacing: burst of 20 then one request per refill, remembered rate, 429 without a header waits a refill (not ~30 s)', async () => {
   const bad = [];
