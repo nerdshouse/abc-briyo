@@ -138,6 +138,33 @@
 </aside>
 
 <!-- Edit order details -->
+<aside class="drawer" id="shipEditDrawer" hidden aria-label="Edit shipment">
+  <div class="drawer-head">
+    <div><h2 class="drawer-title" id="seTitle">Edit shipment</h2><div class="drawer-sub" id="seSub">Corrects details only: status, stock and history stay as they are. Every change is recorded in the activity.</div></div>
+    <div class="drawer-nav"><button class="icon-btn" id="seClose" type="button" title="Close" aria-label="Close"><i data-lucide="x"></i></button></div>
+  </div>
+  <form class="drawer-body" id="shipEditForm" novalidate>
+    <div class="form-error" id="seError" role="alert" hidden></div>
+    <section class="dsec">
+      <div class="form-grid">
+        <label class="fld wide"><span>Order Number <em>*</em></span><input class="input mono" name="source_order_id" maxlength="100" autocomplete="off" />
+          <span class="help" id="seOrderHelp"></span></label>
+        <label class="fld"><span>Courier</span><select class="select" name="courier_partner_id"></select></label>
+        <label class="fld"><span>AWB / Tracking ID</span><input class="input mono" name="tracking_id" maxlength="80" autocomplete="off" /></label>
+        <label class="fld wide"><span>Tracking link</span><input class="input" name="tracking_url" maxlength="500" autocomplete="off" />
+          <span class="help" id="seTrackHelp"></span></label>
+        <label class="fld"><span>Expected delivery</span><input class="input" type="date" name="expected_delivery_date" /></label>
+      </div>
+    </section>
+  </form>
+  <div class="drawer-foot">
+    <span class="saved" id="seSaved"></span>
+    <div style="display:flex;gap:8px">
+      <button class="btn" type="button" id="seCancel">Cancel</button>
+      <button class="btn primary" type="submit" form="shipEditForm" id="seSubmit">Save changes</button>
+    </div>
+  </div>
+</aside>
 <aside class="drawer drawer-wide" id="formDrawer" hidden aria-label="Order form">
   <div class="drawer-head">
     <div><h2 class="drawer-title" id="fTitle">Edit order</h2><div class="drawer-sub" id="fSub">Every change is recorded in the activity.</div></div>

@@ -11,7 +11,7 @@
 .ord-table col.c-inv { width: 84px; }
 .ord-table col.c-date { width: 112px; }
 .ord-table col.c-amt { width: 112px; }
-.ord-table col.c-act { width: 44px; }
+.ord-table col.c-act { width: 76px; }   /* edit shipment + open */
 .ord-table th .th-sub { font-weight: 400; color: var(--text-3); margin-left: 4px; }
 .ord-table .ship-sub { margin-top: 3px; }
 .ord-table .ship-sub .track-link, .ord-table .ship-sub .mono { font-size: 11.5px; }
