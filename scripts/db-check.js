@@ -2914,8 +2914,14 @@ await step('inventory: batch expiry is edited on its own — set when unknown, c
   if (!/data-act="expiry" data-batch="\$\{b\.id\}">Edit expiry<\/button>/.test(js)) bad.push('no Edit expiry action');
   if (!/dateField\('expiry_date', 'Expiry', \{ value: batch\.expiry_date \|\| '', monthOption: true/.test(form) || /name="(status|location|unit_cost|quantity)"/.test(form)) bad.push('expiry form fields');
   if (!/body: JSON\.stringify\(\{ expiry_date: v\.expiry_date \|\| '', version: batch\.version \}\)/.test(js)) bad.push('expiry save sends more than the expiry');
+  // Clearing a recorded expiry asks first; only then is anything sent. "Keep date" restores it and sends nothing.
+  const sub = js.slice(js.indexOf('async function submitForm'), js.indexOf("} else if (kind === 'expiry') {\n      const batch", js.indexOf('async function submitForm')));
+  const guard = sub.slice(sub.indexOf("if (kind === 'expiry') {"), sub.indexOf("$('#fSaved').textContent = 'Saving…';"));
+  if (!/if \(batch\?\.expiry_date && !v\.expiry_date\) \{/.test(guard) || !/title: "Clear this batch's expiry date\?"/.test(guard) || !/cancelLabel: 'Keep date'/.test(guard)) bad.push('clearing a recorded expiry is not confirmed');
+  if (!/if \(!ok\) \{[\s\S]*?input\.value = batch\.expiry_date;\s*return;\s*\}/.test(guard) || /api\(/.test(guard)) bad.push('cancelling clear still sends or loses the date');
+  if (sub.indexOf("if (kind === 'expiry') {") > sub.indexOf('try {')) bad.push('confirmation after the save starts');
   if (bad.length) throw new Error(bad.join(' | '));
-  return 'unknown → +30 d (FEFO and near-expiry follow; quantity, prices, location, status, supplier, warehouse unchanged; no movement or batch), 02/2029 → 2029-02-28, stale version 409, cleared → unknown; invalid dates and expiry before mfg refused; other batch untouched; audited; page action and expiry-only PATCH';
+  return 'unknown → +30 d (FEFO and near-expiry follow; quantity, prices, location, status, supplier, warehouse unchanged; no movement or batch), 02/2029 → 2029-02-28, stale version 409, cleared → unknown (the page confirms clearing a recorded date; Keep date sends nothing); invalid dates and expiry before mfg refused; other batch untouched; audited; page action and expiry-only PATCH';
 });
 await step('inventory: only inventory-tracked SKUs need stock at dispatch', async () => {
   const svc = (await createSku({ sku: `${TS}-GIFTCARD`, product_name: 'Gift card (not stock)', track_inventory: false }, { actor: ACTOR })).id;

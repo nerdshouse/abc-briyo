@@ -970,6 +970,28 @@ async function submitForm(e) {
   if (problem) return;
   const v = Object.fromEntries(new FormData(f).entries());
   delete v.coa;
+  // Clearing a recorded expiry is confirmed first (the form stays locked meanwhile). Keeping it puts the date back
+  // and sends nothing; setting or correcting a date is never asked about.
+  if (kind === 'expiry') {
+    const batch = state.detail.batches.find((b) => b.id === ctx.batchId);
+    if (batch?.expiry_date && !v.expiry_date) {
+      $('#fSubmit').disabled = true;
+      state.submitting = true;
+      const ok = await confirmDialog({ title: "Clear this batch's expiry date?",
+        body: `<p>Batch ${esc(batch.batch_number)} is recorded as expiring on ${esc(day(batch.expiry_date))}. Cleared, it shows as Unknown expiry.</p>`,
+        confirmLabel: 'Clear expiry', cancelLabel: 'Keep date', danger: true });
+      state.submitting = false;
+      $('#fSubmit').disabled = false;
+      if (!ok) {
+        const input = f.querySelector('[name=expiry_date]');
+        const month = f.querySelector('[data-month-for=expiry_date]');
+        if (month) month.checked = false;
+        input.type = 'date';
+        input.value = batch.expiry_date;
+        return;
+      }
+    }
+  }
   $('#fSubmit').disabled = true;
   state.submitting = true;
   $('#fSaved').textContent = 'Saving…';
