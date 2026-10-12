@@ -1248,6 +1248,11 @@ function openForm(order) {
   // Editing opens the extra fields when any are filled; a new order starts folded.
   $('#moreDetails').open = ['customer_name', 'customer_phone', 'customer_email', 'payment_method',
     'payment_status', 'fulfillment_type'].some((k) => order[k]);
+  // An imported order keeps the channel and number its import finds it by (the server refuses a change too).
+  const imported = order.source && order.source !== 'manual';
+  form.source_order_id.readOnly = imported;
+  form.channel.disabled = imported;
+  form.source_order_id.title = imported ? 'Imported orders keep the number their import uses.' : '';
   $('#fTitle').textContent = `Edit order ${order.source_order_id}`;
   $('#fSubmit').textContent = 'Save changes';
   $('#formDrawer').hidden = false;
@@ -1357,6 +1362,7 @@ $('#orderForm').addEventListener('submit', async (e) => {
   const err = $('#formError');
   err.hidden = true;
   const body = Object.fromEntries(new FormData(form));
+  if (form.channel.disabled) body.channel = state.editing.channel;   // an imported order's channel, shown but not editable
   // Only send the route when it is set or being changed, so editing an older
   // order without a dispatch type does not demand one.
   if (!body.dispatch_type && !state.editing.dispatch_type) { delete body.dispatch_type; delete body.destination_id; }

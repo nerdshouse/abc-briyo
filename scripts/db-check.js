@@ -1398,6 +1398,74 @@ await step('edit shipment: order number, courier, AWB, link and expected deliver
   if (bad.length) throw new Error(bad.join(' | '));
   return 'order number + courier + AWB + expected delivery corrected in place (same shipment id, status, dispatch date; link regenerated); AWB-only edit leaves the order; audited from/to with actor; no-op writes nothing; same-courier AWB (any case) and order number duplicates 409, other courier fine; too long/blank/bad link/status/dispatch date/value/unknown courier refused; stale order or shipment 409 with nothing applied; imported number, external shipment, clearing a dispatched AWB refused; no stock, reservation, import or HTTP call; API 403 for viewers, 200 for operators, field returned';
 });
+await step('imported orders keep their import key: renaming or moving one is refused (409) through Edit order details and Edit shipment, under the row lock, with nothing written; other fields stay editable; manual orders still rename', async () => {
+  const bad = [];
+  const db = getPool();
+  const mk = async (suffix, source) => createOrder({ ...R('website'), channel: 'website', source_order_id: `${TEST_ORDER}-IR-${suffix}`, order_date: NOW(), order_value: 5 }, { actor: ACTOR, source });
+  const row = async (id) => (await db.query('SELECT source_order_id, channel, customer_name, version, updated_at FROM orders WHERE id = $1', [id])).rows[0];
+  const evCount = async (id) => (await orderEvents(id)).length;
+  const ship = async (id) => (await db.query('SELECT id, version FROM order_shipments WHERE order_id = $1 ORDER BY id LIMIT 1', [id])).rows[0];
+  const app = express();
+  app.use((req, _res, next) => { req.session = JSON.parse(req.get('x-test-session') || '{}'); next(); });
+  app.use(express.json());
+  app.use('/api/orders', ordersRouterForTest);
+  const server = app.listen(0);
+  const OP = { caps: ['logistics.view', 'logistics.edit'] };
+  try {
+    const base = `http://127.0.0.1:${server.address().port}/api/orders`;
+    const patch = async (path, body, who = OP) => { const r = await fetch(`${base}${path}`, { method: 'PATCH', headers: { 'content-type': 'application/json', 'x-test-session': JSON.stringify(who) }, body: JSON.stringify(body) }); return { status: r.status, body: await r.json() }; };
+    for (const source of ['amazon_import', 'shopify_sync']) {
+      const id = await mk(source === 'amazon_import' ? 'AZ' : 'SH', source);
+      const r0 = await row(id); const e0 = await evCount(id);
+      // Edit order details: a new number, or another channel, is refused; the order and its history do not change.
+      const rn = await patch(`/${id}`, { source_order_id: `${r0.source_order_id}-X`, version: r0.version });
+      if (rn.status !== 409 || !rn.body.importedOrder || rn.body.field !== 'source_order_id') bad.push(`${source} rename ${rn.status} ${JSON.stringify(rn.body).slice(0, 120)}`);
+      const otherChannel = (await db.query(`SELECT key FROM sales_channels WHERE key <> 'website' AND active ORDER BY key LIMIT 1`).catch(() => ({ rows: [] }))).rows[0]?.key || 'amazon';
+      const mv = await patch(`/${id}`, { channel: otherChannel, version: r0.version });
+      if (mv.status !== 409 || !mv.body.importedOrder || mv.body.field !== 'channel') bad.push(`${source} move ${mv.status} ${mv.body.error || ''}`);
+      // The same number and channel with other edits (what the form sends): accepted, the number untouched.
+      const ok = await patch(`/${id}`, { source_order_id: r0.source_order_id, channel: 'website', customer_name: 'Imported Edit', version: r0.version });
+      const r1 = await row(id);
+      if (ok.status !== 200 || r1.customer_name !== 'Imported Edit' || r1.source_order_id !== r0.source_order_id || r1.channel !== 'website') bad.push(`${source} other fields ${ok.status} ${ok.body.error || ''}`);
+      if ((await evCount(id)) !== e0 + 1) bad.push(`${source} events after refusals ${(await evCount(id)) - e0} (want 1, the accepted edit)`);
+      // A refusal leaves nothing behind: same number, same version as after the accepted edit.
+      const e1 = await evCount(id);
+      const again = await patch(`/${id}`, { source_order_id: `${r0.source_order_id}-Y`, customer_name: 'Should not save', version: r1.version });
+      const r2 = await row(id);
+      if (again.status !== 409 || r2.version !== r1.version || r2.customer_name !== 'Imported Edit' || r2.source_order_id !== r0.source_order_id || (await evCount(id)) !== e1) bad.push(`${source} refused rename wrote something`);
+      // Edit shipment: refused the same way (same rule, same place).
+      const s = await ship(id);
+      const es = await patch(`/${id}/shipments/${s.id}/details`, { source_order_id: `${r0.source_order_id}-Z`, order_version: r2.version, shipment_version: s.version });
+      if (es.status !== 409 || !es.body.importedOrder || (await row(id)).source_order_id !== r0.source_order_id || (await evCount(id)) !== e1) bad.push(`${source} edit shipment rename ${es.status}`);
+      // The library path enforces it too (not just the route).
+      try { await updateOrder(id, { source_order_id: `${r0.source_order_id}-L` }, { actor: ACTOR, version: r2.version }); bad.push(`${source} updateOrder accepted a rename`); }
+      catch (err) { if (err.status !== 409 || !err.importedOrder) bad.push(`${source} updateOrder ${err.message}`); }
+    }
+    // Manual orders still rename (audited); uniqueness, stale versions and permissions are unchanged.
+    const m = await mk('M', 'manual');
+    const other = await mk('M2', 'manual');
+    let r = await row(m);
+    const rn = await patch(`/${m}`, { source_order_id: `${TEST_ORDER}-IR-M9`, version: r.version });
+    const ev = (await orderEvents(m)).find((e) => e.event_type === 'order_edited' && e.metadata.changes?.source_order_id);
+    if (rn.status !== 200 || (await row(m)).source_order_id !== `${TEST_ORDER}-IR-M9` || ev?.metadata.changes.source_order_id.from !== `${TEST_ORDER}-IR-M`) bad.push(`manual rename ${rn.status} ${rn.body.error || ''}`);
+    r = await row(m);
+    const dup = await patch(`/${m}`, { source_order_id: `${TEST_ORDER}-IR-M2`, version: r.version });
+    if (dup.status !== 409 || dup.body.importedOrder || !/already has that channel and order number/.test(dup.body.error)) bad.push(`manual duplicate ${dup.status} ${dup.body.error}`);
+    const stale = await patch(`/${m}`, { source_order_id: `${TEST_ORDER}-IR-M8`, version: r.version - 1 });
+    if (stale.status !== 409 || !stale.body.conflict) bad.push(`stale ${stale.status}`);
+    const viewer = await patch(`/${m}`, { source_order_id: `${TEST_ORDER}-IR-M7`, version: r.version }, { caps: ['logistics.view'] });
+    if (viewer.status !== 403 || (await row(m)).source_order_id !== `${TEST_ORDER}-IR-M9`) bad.push(`viewer ${viewer.status}`);
+    const sm = await ship(m);
+    const esm = await patch(`/${m}/shipments/${sm.id}/details`, { source_order_id: `${TEST_ORDER}-IR-M6`, order_version: r.version, shipment_version: sm.version });
+    if (esm.status !== 200 || (await row(m)).source_order_id !== `${TEST_ORDER}-IR-M6`) bad.push(`manual edit-shipment rename ${esm.status} ${esm.body.error || ''}`);
+    void other;
+  } finally { server.close(); }
+  // The page: an imported order's number is read-only and its channel fixed in Edit order details (the server refuses regardless).
+  const js = await fsp.readFile(new URL('../public/orders.js', import.meta.url), 'utf8');
+  if (!/const imported = order\.source && order\.source !== 'manual';\s*form\.source_order_id\.readOnly = imported;\s*form\.channel\.disabled = imported;/.test(js) || !/if \(form\.channel\.disabled\) body\.channel = state\.editing\.channel;/.test(js)) bad.push('page does not lock an imported order\'s number and channel');
+  if (bad.length) throw new Error(bad.join(' | '));
+  return 'amazon_import and shopify_sync orders: rename and channel move refused (409 importedOrder, field) via PATCH /api/orders/:id, Edit shipment and updateOrder, with no row, version or event change; other fields (sent with the same number and channel) still save; manual orders rename (audited), duplicates 409, stale 409, viewer 403, Edit shipment rename works';
+});
 await step('order and shipment lifecycles are independent; cancellation leaves the shipment alone', async () => {
   let s = await primary(orderId);
   await updateShipment(orderId, s.id, { shipment_status: 'packed' }, { actor: ACTOR, version: s.version });
