@@ -1533,6 +1533,117 @@ await step('order date: a hand-entered order needs its order date (New shipment,
   if (bad.length) throw new Error(bad.join(' | '));
   return 'New shipment without a date (blank or absent) → 400 on order_date, nothing created; with one → list row order_date 05-10-2026 (IST); an undated extra order refuses the whole parcel, naming it; an existing undated order still gets "already exists", takes a shipment and an Edit shipment, and stays "—" (no date substituted); Add new order to a shipment and POST /api/orders enforce the same; library callers unchanged; null/blank/invalid dates show "—"';
 });
+await step('order date validation: impossible or malformed dates are refused (never rolled over), blank/whitespace means missing, one error shape (400, field order_date); every order in a request is checked before anything is written — no partial orders, no shipment change, no ORD- number used', async () => {
+  const bad = [];
+  const db = getPool();
+  const N = (s) => `${TEST_ORDER}-DV-${s}`;
+  const row = async (num) => (await db.query('SELECT id, order_date FROM orders WHERE source_order_id = $1', [num])).rows[0];
+  const seqName = (await db.query(`SELECT pg_get_serial_sequence('orders', 'id') AS s`)).rows[0].s;
+  const seq = async () => Number((await db.query(`SELECT last_value FROM ${seqName}`)).rows[0].last_value);
+  const dl = (await listCouriers()).find((c) => c.name === 'Delhivery');
+  const ship = (num, extra = {}) => ({ ...R('website'), channel: 'website', source_order_id: num, courier_partner_id: dl.id, tracking_id: `AWB-${num}`, shipment_status: 'packed', ...extra });
+  const app = express();
+  app.use((req, _res, next) => { req.session = JSON.parse(req.get('x-test-session') || '{}'); next(); });
+  app.use(express.json());
+  app.use('/api/orders', ordersRouterForTest);
+  const server = app.listen(0);
+  const OP = { caps: ['logistics.view', 'logistics.edit'] };
+  const MISSING = (num) => `Enter the order date for order ${num}.`;
+  const INVALID = /^The order date( for order \S+)? is not a valid date and time/;
+  try {
+    const base = `http://127.0.0.1:${server.address().port}/api/orders`;
+    const call = async (method, path, body) => { const r = await fetch(`${base}${path}`, { method, headers: { 'content-type': 'application/json', 'x-test-session': JSON.stringify(OP) }, body: JSON.stringify(body) }); return { status: r.status, body: await r.json() }; };
+    // A refusal: 400, field order_date, the expected message, no order row, and the id sequence (ORD- numbers) untouched.
+    const refused = async (label, r, num, msg, s0) => {
+      const okMsg = typeof msg === 'string' ? r.body.error === msg : msg.test(r.body.error || '');
+      if (r.status !== 400 || r.body.field !== 'order_date' || !okMsg) bad.push(`${label}: ${r.status} ${r.body.field} "${r.body.error}"`);
+      if (num && (await row(num))) bad.push(`${label}: order ${num} was created`);
+      if ((await seq()) !== s0) bad.push(`${label}: used ${(await seq()) - s0} order number(s)`);
+    };
+
+    // 1. Accepted: IST wall clock (with and without seconds, T or space), UTC Z, an explicit offset, fractions with an offset, 29-02 in a leap year.
+    const accepted = [['ist', '2026-10-05T14:30', '2026-10-05T09:00:00.000Z'], ['ist-sec', '2026-10-05T14:30:15', '2026-10-05T09:00:15.000Z'],
+      ['ist-space', '2026-10-05 14:30', '2026-10-05T09:00:00.000Z'], ['utc', '2026-10-05T09:00:00Z', '2026-10-05T09:00:00.000Z'],
+      ['offset', '2026-10-05T14:30:00+05:30', '2026-10-05T09:00:00.000Z'], ['offset-nocolon', '2026-10-05T14:30+0530', '2026-10-05T09:00:00.000Z'],
+      ['frac', '2026-10-05T09:00:00.250Z', '2026-10-05T09:00:00.250Z'], ['leap', '2028-02-29T10:00', '2028-02-29T04:30:00.000Z'],
+      ['leap-400', '2000-02-29T10:00', '2000-02-29T04:30:00.000Z'], ['end-of-day', '2026-12-31T23:59', '2026-12-31T18:29:00.000Z']];
+    for (const [k, v, want] of accepted) {
+      const r = await call('POST', '/shipments', ship(N(`OK-${k}`), { order_date: v }));
+      const got = (await row(N(`OK-${k}`)))?.order_date?.toISOString();
+      if (r.status !== 201 || got !== want) bad.push(`accept ${k} ${JSON.stringify(v)}: ${r.status} ${got} (want ${want}) ${r.body.error || ''}`);
+    }
+    // 2. Missing: absent, null, empty, whitespace-only → the same "Enter the order date" message.
+    for (const [k, extra] of [['absent', {}], ['null', { order_date: null }], ['empty', { order_date: '' }], ['spaces', { order_date: '   ' }], ['tab', { order_date: '\t' }]]) {
+      const s0 = await seq();
+      await refused(`missing ${k}`, await call('POST', '/shipments', ship(N(`MS-${k}`), extra)), N(`MS-${k}`), MISSING(N(`MS-${k}`)), s0);
+    }
+    // 3. Malformed and impossible → "not a valid date and time", never rolled over to another day.
+    const invalid = [['abc', 'abc'], ['dd-mm-yyyy', '05-10-2026 14:30'], ['date-only', '2026-10-05'], ['no-minutes', '2026-10-05T14'],
+      ['feb29-2026', '2026-02-29T10:00'], ['feb29-1900', '1900-02-29T10:00'], ['feb30', '2026-02-30T10:00'], ['feb31', '2026-02-31T10:00'],
+      ['apr31', '2026-04-31T10:00'], ['month13', '2026-13-05T10:00'], ['month00', '2026-00-05T10:00'], ['day00', '2026-10-00T10:00'],
+      ['hour24', '2026-10-05T24:00'], ['hour25', '2026-10-05T25:00'], ['minute60', '2026-10-05T10:60'], ['second60', '2026-10-05T10:00:60'],
+      ['utc-feb31', '2026-02-31T10:00:00Z'], ['utc-hour24', '2026-10-05T24:00:00Z'], ['offset+15', '2026-10-05T10:00:00+15:00'],
+      ['frac-no-offset', '2026-10-05T10:00:00.5'], ['year-0099', '0099-10-05T10:00'], ['number', 20261005]];
+    for (const [k, v] of invalid) {
+      const s0 = await seq();
+      const r = await call('POST', '/shipments', ship(N(`BAD-${k}`), { order_date: v }));
+      await refused(`invalid ${k}`, r, N(`BAD-${k}`), INVALID, s0);
+      if (r.body.error && !r.body.error.includes(N(`BAD-${k}`))) bad.push(`invalid ${k}: message does not name the order`);
+    }
+
+    // 4. Several orders in one parcel: a bad or missing date on ANY new order refuses the whole request before anything is
+    //    written — no lead, no extra, no ORD- number.
+    for (const [k, e2, msg] of [['invalid', { order_date: '2026-02-30T10:00' }, INVALID], ['missing', {}, MISSING(N('MX-missing-E2'))]]) {
+      const s0 = await seq();
+      const r = await call('POST', '/shipments', ship(N(`MX-${k}-L`), { order_date: '2026-10-05T10:00', extra_orders: [{ source_order_id: N(`MX-${k}-E1`), order_date: '2026-10-04T10:00' }, { source_order_id: N(`MX-${k}-E2`), ...e2 }] }));
+      await refused(`parcel, extra ${k}`, r, N(`MX-${k}-L`), msg, s0);
+      if (!String(r.body.error).includes(N(`MX-${k}-E2`)) || (await row(N(`MX-${k}-E1`))) || (await row(N(`MX-${k}-E2`)))) bad.push(`parcel, extra ${k}: ${r.body.error}`);
+    }
+    // 5. An existing undated order (blank shipment) + a new undated extra: refused; the existing order's shipment and history unchanged.
+    const oldId = await createOrder({ ...R('website'), channel: 'website', source_order_id: N('OLD') }, { actor: ACTOR });
+    const shipState = async () => JSON.stringify((await db.query('SELECT id, courier_partner_id, tracking_id, shipment_status, version FROM order_shipments WHERE order_id = $1 ORDER BY id', [oldId])).rows);
+    const evN = async () => (await orderEvents(oldId)).length;
+    const [st0, ev0, s0] = [await shipState(), await evN(), await seq()];
+    const r5 = await call('POST', '/shipments', { ...ship(N('OLD'), { extra_orders: [{ source_order_id: N('OLD-X') }] }), addToExisting: true });
+    await refused('existing lead + undated new extra', r5, N('OLD-X'), MISSING(N('OLD-X')), s0);
+    if ((await shipState()) !== st0 || (await evN()) !== ev0) bad.push('existing lead changed by a refused request');
+    // ...and without the bad extra, the existing undated order takes its shipment (no date asked for, none invented).
+    const r5b = await call('POST', '/shipments', { ...ship(N('OLD')), addToExisting: true });
+    if (r5b.status !== 201 || (await row(N('OLD'))).order_date !== null) bad.push(`existing undated order: ${r5b.status} ${r5b.body.error || ''}`);
+
+    // 6. Add new orders to a shipment: one good + one bad → refused before any insert; an existing undated number needs no date.
+    const sid = r5b.body.shipmentId;
+    const s6 = await seq();
+    const r6 = await call('POST', `/shipments/${sid}/orders`, { new_orders: [{ source_order_id: N('AT-1'), order_date: '2026-10-06T09:15' }, { source_order_id: N('AT-2'), order_date: '2026-10-06T25:00' }] });
+    await refused('attach good + bad', r6, N('AT-1'), INVALID, s6);
+    const s6b = await seq();
+    await refused('attach whitespace', await call('POST', `/shipments/${sid}/orders`, { new_orders: [{ source_order_id: N('AT-3'), order_date: '  ' }] }), N('AT-3'), MISSING(N('AT-3')), s6b);
+    await createOrder({ ...R('website'), channel: 'website', source_order_id: N('OLD2') }, { actor: ACTOR });
+    const r6c = await call('POST', `/shipments/${sid}/orders`, { new_orders: [{ source_order_id: N('OLD2') }] });
+    if (r6c.status >= 300) bad.push(`attach existing undated number ${r6c.status} ${r6c.body.error || ''}`);
+
+    // 7. POST /api/orders and Edit order details use the same rule and error shape; a refused edit changes nothing.
+    const s7 = await seq();
+    await refused('POST /api/orders feb31', await call('POST', '', { ...R('website'), channel: 'website', source_order_id: N('PO'), order_date: '2026-02-31T10:00' }), N('PO'), INVALID, s7);
+    const o7 = await getOrder(oldId);
+    const e7 = await call('PATCH', `/${oldId}`, { order_date: '2026-13-01T10:00', version: o7.version });
+    const o7b = await getOrder(oldId);
+    if (e7.status !== 400 || e7.body.field !== 'order_date' || !INVALID.test(e7.body.error) || o7b.version !== o7.version || o7b.order_date !== null) bad.push(`edit invalid ${e7.status} ${e7.body.error}`);
+    const e7b = await call('PATCH', `/${oldId}`, { order_date: '2026-10-01T08:00', version: o7.version });
+    if (e7b.status !== 200 || new Date((await getOrder(oldId)).order_date).toISOString() !== '2026-10-01T02:30:00.000Z') bad.push(`edit valid ${e7b.status} ${e7b.body.error || ''}`);
+
+    // 8. Library callers: strict parsing applies (a bad date is never stored), the date requirement does not.
+    if (!(await createOrder({ ...R('website'), channel: 'website', source_order_id: N('LIB') }, { actor: ACTOR }))) bad.push('library undated createOrder refused');
+    const lib2 = await createOrder({ ...R('website'), channel: 'website', source_order_id: N('LIB2'), order_date: '2026-02-31T10:00' }, { actor: ACTOR }).then(() => null, (e) => e);
+    if (!lib2 || lib2.status !== 400 || lib2.field !== 'order_date' || (await row(N('LIB2')))) bad.push(`library feb31: ${lib2?.status} ${lib2?.message}`);
+    // 9. Shipment timestamps keep their own parser (unchanged by this rule); IST conversion unchanged.
+    if (zonedToUtc('2026-09-24T11:30', 'Asia/Kolkata') !== '2026-09-24T06:00:00.000Z') bad.push('zonedToUtc changed');
+  } finally {
+    server.close();
+  }
+  if (bad.length) throw new Error(bad.join(' | '));
+  return 'accepted: IST wall clock (T or space, ±seconds), Z, ±HH:MM offsets, fractions with an offset, 29-02 in leap years; refused (400, field order_date, names the order, no row, no ORD- number used): 29-02-2026/1900, 30/31-02, 31-04, month 00/13, day 00, hour 24/25, minute 60, second 60, offsets beyond ±14 h, DD-MM-YYYY, date-only, garbage; absent/null/blank/whitespace → "Enter the order date"; a bad or missing date on any order in a parcel or attach request refuses it whole before any insert; existing undated orders unchanged and still take shipments; Edit order and POST /api/orders use the same rule; library callers parse strictly without the requirement';
+});
 await step('concurrency: orders are locked before their shipments (edit, save, attach, multi-shipment vs cancellation — no deadlock), and two edits giving one courier+AWB to different shipments at once: one wins, one 409', async () => {
   const bad = [];
   const db = getPool();

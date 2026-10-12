@@ -502,9 +502,9 @@ function sharedBlock(o, ship) {
       <div class="attach" id="dAttach" hidden>
         <input class="input plain" id="dAttachQ" placeholder="Find an order number" aria-label="Find an order number to attach" autocomplete="off" />
         <ul class="attach-list" id="dAttachList"><li class="soft">Loading…</li></ul>
-        <div class="attach-new"><span class="soft">Or a new ${esc(o.channel_label)} order:</span>
+        <div class="attach-new"><span class="soft">Or a new ${esc(o.channel_label)} order — number and order date <em>*</em> (IST) required:</span>
           <input class="input plain mono" id="dNewNum" placeholder="Order number" aria-label="New order number" autocomplete="off" />
-          <input class="input plain" id="dNewDate" type="datetime-local" aria-label="Order date (IST)" />
+          <input class="input plain" id="dNewDate" type="datetime-local" required aria-required="true" aria-label="Order date (IST), required" title="Order date (IST) — required" />
           <input class="input plain" id="dNewValue" inputmode="decimal" placeholder="Value (₹)" aria-label="New order value in rupees" autocomplete="off" /></div>
         <div class="form-actions"><button type="button" class="btn primary" id="dAttachSave">Add to shipment</button>
           <button type="button" class="btn" id="dAttachCancel">Cancel</button></div>
@@ -1499,7 +1499,7 @@ function syncExtras() {
 function addExtraRow() {
   $('#cExtras').insertAdjacentHTML('beforeend', `<div class="extra-row">
     <input class="input plain mono x-num" placeholder="Amazon order number" aria-label="Amazon order number" autocomplete="off" />
-    <input class="input plain x-date" type="datetime-local" aria-label="Order date (IST)" />
+    <input class="input plain x-date" type="datetime-local" required aria-required="true" aria-label="Order date (IST), required for a new order" title="Order date (IST) — required for a new order" />
     <input class="input plain x-value" inputmode="decimal" placeholder="Value (₹)" aria-label="Order value" autocomplete="off" />
     <button type="button" class="icon-btn bare x-remove" title="Remove" aria-label="Remove this order">${icon('x')}</button></div>`);
   renderIcons();
