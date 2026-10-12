@@ -1,0 +1,19 @@
+/* Tickets — only what ui.css / orders.css do not already provide. */
+.tk-filters { margin-bottom: 12px; }
+.tk-filters .input, .tk-filters .select { width: auto; min-width: 0; flex: 1 1 150px; }
+.tk-filters #fQ { flex: 2 1 260px; }
+.tk-table .tk-title .cell-main { max-width: 320px; }
+.tk-facts { display: grid; grid-template-columns: max-content 1fr; gap: 6px 16px; margin: 0; font-size: 13px; }
+.tk-facts dt { color: var(--muted); }
+.tk-facts dd { margin: 0; }
+/* What people typed: kept as typed (line breaks), never interpreted as HTML (escaped in tickets.js). */
+.tk-text { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 13px; line-height: 1.5; }
+.tk-desc { min-height: 140px; }
+.tk-row { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+.tk-notice { margin-top: 12px; }
+.tk-comments { list-style: none; margin: 0 0 12px; padding: 0; display: flex; flex-direction: column; gap: 10px; }
+.tk-comments li { border: 1px solid var(--border-soft); border-radius: 8px; padding: 8px 10px; background: var(--surface-2); }
+.tk-who { display: flex; gap: 8px; align-items: baseline; font-size: 12.5px; margin-bottom: 4px; flex-wrap: wrap; }
+@media (max-width: 760px) {
+  .tk-table .tk-title .cell-main { max-width: 180px; }
+}

@@ -356,7 +356,7 @@ export const initials = (name) => String(name || '?').split(/\s+/).filter(Boolea
  * still checks every page and API. Department counts arrive afterwards.
  *
  * Briyo OS
- *   Overview
+ *   Overview · Tickets (every member)
  *   OPERATIONS  Logistics · Inventory
  *   CUSTOMER    Support (cart recovery)
  *   GROWTH      Marketing (Meta Ads; admins in V1) · Affiliates
@@ -384,7 +384,8 @@ function sidebarHtml(me) {
       <kbd>⌘ K</kbd>
     </form>` : ''}
     <nav aria-label="Departments">
-      <div class="nav-group nav-top">${navLink('/overview', 'Overview', 'layout-dashboard', { module: 'overview' })}</div>
+      <div class="nav-group nav-top">${navLink('/overview', 'Overview', 'layout-dashboard', { module: 'overview' })}
+        ${me?.authenticated !== false ? navLink('/tickets', 'Tickets', 'ticket') : ''}</div>
       ${navSection('Operations', '<div id="opsNav"></div>')}
       ${navSection('Customer', support ? navDept('Support', 'headset', '/?mode=tocall',
         navLink('/?mode=tocall', 'To call', '', { id: 'countToCall', view: 'tocall' })
