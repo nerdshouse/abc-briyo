@@ -171,7 +171,7 @@ async function openOutward(id) {
     body += `<section class="dsec"><h3 class="dsec-title">Issue stock <span class="dsec-meta soft">${count(st.available)} available · ${count(o.quantity)} needed</span></h3>
       ${st.batches.length ? `<p class="muted" style="margin:0 0 8px">Choose the batches (earliest expiry suggested). They must add up to ${count(o.quantity)}.</p>
       <div class="so-alloc">${st.batches.map((b) => `<label class="fld"><span><span class="mono">${esc(b.batch_number)}</span> · ${esc(b.warehouse_name)}${b.expiry_date ? ` · exp ${esc(day(b.expiry_date))}` : ''} · ${count(b.available)} free</span>
-        <input class="input" inputmode="numeric" data-alloc="${b.id}" value="${pre.get(b.id) || ''}" /></label>`).join('')}</div>`
+        <input class="input" inputmode="numeric" autocomplete="off" data-alloc="${b.id}" value="${pre.get(b.id) || ''}" /></label>`).join('')}</div>`
         : '<p class="warn-text" style="margin:0">No sellable stock of this product to issue.</p>'}
       ${st.available < o.quantity ? `<p class="warn-text">Only ${count(st.available)} available — reduce the quantity or receive stock first.</p>` : ''}
     </section>
@@ -181,12 +181,12 @@ async function openOutward(id) {
     const multi = o.batches.length > 1;
     body += `<section class="dsec"><h3 class="dsec-title">Record what came back or was used <span class="dsec-meta soft">${count(o.outstanding)} outstanding</span></h3>
       <div class="form-grid" id="retForm">
-        ${multi ? o.batches.map((b) => `<label class="fld"><span>Returned saleable to batch <span class="mono">${esc(b.batch_number)}</span></span><input class="input" inputmode="numeric" data-ret-batch="${b.batch_id}" /></label>`).join('')
-          : '<label class="fld"><span>Returned — saleable</span><input class="input" inputmode="numeric" name="returned_saleable" /></label>'}
-        <label class="fld"><span>Returned — damaged / non-saleable</span><input class="input" inputmode="numeric" name="returned_non_saleable" />
+        ${multi ? o.batches.map((b) => `<label class="fld"><span>Returned saleable to batch <span class="mono">${esc(b.batch_number)}</span></span><input class="input" inputmode="numeric" autocomplete="off" data-ret-batch="${b.batch_id}" /></label>`).join('')
+          : '<label class="fld"><span>Returned — saleable</span><input class="input" inputmode="numeric" autocomplete="off" name="returned_saleable" /></label>'}
+        <label class="fld"><span>Returned — damaged / non-saleable</span><input class="input" inputmode="numeric" autocomplete="off" name="returned_non_saleable" />
           <span class="help">Recorded only; it does not go back into stock.</span></label>
-        <label class="fld"><span>Consumed / used</span><input class="input" inputmode="numeric" name="consumed" /></label>
-        <label class="fld"><span>Kept by the recipient</span><input class="input" inputmode="numeric" name="retained" /></label>
+        <label class="fld"><span>Consumed / used</span><input class="input" inputmode="numeric" autocomplete="off" name="consumed" /></label>
+        <label class="fld"><span>Kept by the recipient</span><input class="input" inputmode="numeric" autocomplete="off" name="retained" /></label>
         <label class="fld wide"><span class="check"><input type="checkbox" id="retVerified" /> The saleable units were inspected and are fit to sell again</span>
           <span class="help">Only these go back into stock.</span></label>
         <label class="fld wide"><span>Notes</span><input class="input" name="ret_notes" maxlength="1000" /></label>
@@ -244,6 +244,13 @@ async function act(name, btn) {
       const body = { returned_saleable: batches.length || !f.querySelector('[name=returned_saleable]') ? batches : val('returned_saleable'),
         returned_non_saleable: val('returned_non_saleable'), consumed: val('consumed'), retained: val('retained'), notes: val('ret_notes'),
         saleable_verified: $('#retVerified').checked, request_id: state.returnKey || (state.returnKey = rid()) };
+      // Empty counts as 0. Nothing entered: say so here and send nothing (the server refuses it too).
+      const qty = [...batches.map((a) => a.quantity), typeof body.returned_saleable === 'string' ? body.returned_saleable : '',
+        body.returned_non_saleable, body.consumed, body.retained].map((x) => String(x).trim());
+      if (qty.every((x) => x === '' || /^0+$/.test(x))) {
+        saved('Enter at least one quantity: returned saleable, damaged / non-saleable, consumed or kept by the recipient.', true);
+        return;
+      }
       const r = await api(`/api/inventory/outward/${o.id}/return`, { method: 'POST', body: JSON.stringify(body) });
       state.returnKey = null;
       await load(); await openOutward(o.id); saved(r.status === 'closed' ? 'Recorded — every unit accounted for; closed' : `Recorded — ${count(r.outstanding)} still outstanding`);

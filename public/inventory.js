@@ -328,6 +328,7 @@ function renderSku() {
           <select class="select mini-select" data-upload-type="${b.id}" aria-label="Document type">${state.meta.documentTypes.map((t) => opt(t, t === 'coa' ? 'COA' : t.replaceAll('_', ' '))).join('')}</select>` : ''}
       </div>
       ${canMove() ? `<div class="batch-actions">
+        <button type="button" class="linkish" data-act="expiry" data-batch="${b.id}">Edit expiry</button>
         <button type="button" class="linkish" data-act="adjust" data-batch="${b.id}">Adjust / write off</button>
         <button type="button" class="linkish" data-act="stock-return" data-batch="${b.id}">Return stock</button>
         <button type="button" class="linkish" data-act="transfer" data-batch="${b.id}">Transfer</button>
@@ -630,6 +631,15 @@ function openForm(kind, ctx = {}) {
       ${intField('quantity', 'Quantity')}
       <label class="fld"><span>Location / rack there</span><input class="input" name="location" maxlength="80" /></label>
       <label class="fld wide"><span>Notes</span><textarea class="input" name="notes" maxlength="1000"></textarea></label>
+    </div></section>`;
+  } else if (kind === 'expiry') {
+    // Only the expiry date changes: quantity, warehouse, supplier, prices and status are never sent from here.
+    title = `Expiry — batch ${batch.batch_number}`;
+    sub = `${batch.expiry_date ? `Recorded as ${day(batch.expiry_date)}.` : 'No expiry date is recorded (Unknown expiry).'} Quantities and other batch details do not change.`;
+    submit = 'Save expiry';
+    body = `<section class="dsec"><div class="form-grid">
+      ${dateField('expiry_date', 'Expiry', { value: batch.expiry_date || '', monthOption: true, wide: true,
+        help: 'Leave empty to record the expiry as unknown. Earliest-expiry-first picking and the expiry views use the new date straight away.' })}
     </div></section>`;
   } else if (kind === 'batch') {
     title = `Batch ${batch.batch_number}`;
@@ -960,6 +970,28 @@ async function submitForm(e) {
   if (problem) return;
   const v = Object.fromEntries(new FormData(f).entries());
   delete v.coa;
+  // Clearing a recorded expiry is confirmed first (the form stays locked meanwhile). Keeping it puts the date back
+  // and sends nothing; setting or correcting a date is never asked about.
+  if (kind === 'expiry') {
+    const batch = state.detail.batches.find((b) => b.id === ctx.batchId);
+    if (batch?.expiry_date && !v.expiry_date) {
+      $('#fSubmit').disabled = true;
+      state.submitting = true;
+      const ok = await confirmDialog({ title: "Clear this batch's expiry date?",
+        body: `<p>Batch ${esc(batch.batch_number)} is recorded as expiring on ${esc(day(batch.expiry_date))}. Cleared, it shows as Unknown expiry.</p>`,
+        confirmLabel: 'Clear expiry', cancelLabel: 'Keep date', danger: true });
+      state.submitting = false;
+      $('#fSubmit').disabled = false;
+      if (!ok) {
+        const input = f.querySelector('[name=expiry_date]');
+        const month = f.querySelector('[data-month-for=expiry_date]');
+        if (month) month.checked = false;
+        input.type = 'date';
+        input.value = batch.expiry_date;
+        return;
+      }
+    }
+  }
   $('#fSubmit').disabled = true;
   state.submitting = true;
   $('#fSaved').textContent = 'Saving…';
@@ -1043,6 +1075,12 @@ async function submitForm(e) {
       openAfter = ctx.skuId;
     } else if (kind === 'transfer') {
       await api('/api/inventory/transfer', { method: 'POST', body: JSON.stringify({ ...v, batch_id: ctx.batchId, request_id: state.form.requestId }) });
+      openAfter = state.detail.sku.id;
+    } else if (kind === 'expiry') {
+      const batch = state.detail.batches.find((b) => b.id === ctx.batchId);
+      // Empty clears it (Unknown expiry); a month is stored as its last day by the server.
+      const r = await api(`/api/inventory/batches/${ctx.batchId}`, { method: 'PATCH', body: JSON.stringify({ expiry_date: v.expiry_date || '', version: batch.version }) });
+      state.notice = r.changed ? `Expiry for batch ${batch.batch_number} saved.` : 'Nothing changed.';
       openAfter = state.detail.sku.id;
     } else if (kind === 'batch') {
       const batch = state.detail.batches.find((b) => b.id === ctx.batchId);
