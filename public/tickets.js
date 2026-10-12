@@ -4,7 +4,7 @@
  * page only shows what the API returns and hides controls the API would refuse.
  * Everything a person typed is escaped (esc) before it is put into the page.
  */
-import { $, $$, esc, icon, renderIcons, initShell, pageFetch, pageSignal } from './ui/components.js';
+import { $, $$, esc, icon, renderIcons, initShell, pageFetch, pageSignal, onLeave } from './ui/components.js';
 import { istDateTime } from './ui/ist.js';
 
 const fetch = pageFetch();
@@ -24,6 +24,7 @@ const api = async (url, opts = {}) => {
   return data;
 };
 const note = (msg, ok = false) => {
+  if (!$('#alerts')) return;   // the page was left meanwhile
   // Success uses the neutral success style (orders.css .alert.hr-ok); a plain .alert reads as an error.
   $('#alerts').innerHTML = msg ? `<div class="alert${ok ? ' hr-ok' : ''}" role="${ok ? 'status' : 'alert'}">${icon(ok ? 'circle-check' : 'circle-alert')}<span>${esc(msg)}</span></div>` : '';
   const waiting = $('#rows .empty-note[role=status]');
@@ -129,6 +130,14 @@ const EVENT_TEXT = {
   status_changed: (e) => `${e.actor_name} changed the status from ${label(state.meta.statuses, e.metadata?.from)} to ${label(state.meta.statuses, e.metadata?.to)}`,
   commented: (e) => `${e.actor_name} commented`,
 };
+/** The current assignee is preselected; if they are not a manager any more they stay shown, so "Reassign" never moves the ticket by accident. */
+function assigneeOptions(t, managers) {
+  const current = managers.find((x) => x.name === t.assignee_name);
+  return (current ? '' : `<option value="" selected disabled>${esc(t.assignee_name || 'Nobody')} (current)</option>`)
+    + managers.map((x) => opt(x.key, `${x.name}${x.owner ? ' (ticket owner)' : ''}`, x === current)).join('');
+}
+// The server lets a manager resend anything not yet submitted, and a notice left "sending" for 10 minutes (a cut-off send).
+const canResend = (n) => n.status !== 'submitted' && (n.status !== 'sending' || Date.now() - new Date(n.last_attempt_at).getTime() > 10 * 60000);
 const NOTICE_TEXT = { pending: 'Waiting to be sent', sending: 'Sending…', submitted: 'Sent to WhatsApp', unconfirmed: 'Sent, but 11za did not confirm', failed: 'Not sent — failed', skipped: 'Not sent' };
 
 async function openTicket(number) {
@@ -154,11 +163,11 @@ async function openTicket(number) {
     <section class="dsec"><h3 class="dsec-title">Description</h3><div class="tk-text">${esc(t.description)}</div></section>
     ${d.manager ? `<section class="dsec"><h3 class="dsec-title">Manage</h3><div class="form-grid">
       <label class="fld"><span>Status</span><select class="select" id="tkStatus">${m.statuses.map((s) => opt(s.key, s.label, s.key === t.status)).join('')}</select></label>
-      <label class="fld"><span>Assigned to</span><select class="select" id="tkAssignee">${(m.managers || []).map((x) => opt(x.key, `${x.name}${x.owner ? ' (ticket owner)' : ''}`, x.name === t.assignee_name)).join('')}</select></label>
+      <label class="fld"><span>Assigned to</span><select class="select" id="tkAssignee">${assigneeOptions(t, m.managers || [])}</select></label>
     </div>
     <div class="tk-row"><button class="btn" type="button" data-act="status">Save status</button><button class="btn" type="button" data-act="assign">Reassign</button></div>
     ${notice ? `<p class="help tk-notice">WhatsApp notice to the ticket owner: <b>${esc(NOTICE_TEXT[notice.status] || notice.status)}</b>${notice.attempts ? ` · ${notice.attempts} attempt${notice.attempts === 1 ? '' : 's'}` : ''}${notice.last_error ? ` — ${esc(notice.last_error)}` : ''}
-      ${notice.status !== 'submitted' && notice.status !== 'sending' ? ' <button class="btn bare" type="button" data-act="resend">Send again</button>' : ''}</p>` : ''}
+      ${canResend(notice) ? ' <button class="btn bare" type="button" data-act="resend">Send again</button>' : ''}</p>` : ''}
     </section>` : ''}
     <section class="dsec"><h3 class="dsec-title">Comments <span class="dsec-meta soft">${d.comments.length}</span></h3>
       ${d.comments.length ? `<ul class="tk-comments">${d.comments.map((c) => `<li><div class="tk-who"><b>${esc(c.author_name)}</b><span class="soft">${esc(when(c.created_at))}</span></div><div class="tk-text">${esc(c.body)}</div></li>`).join('')}</ul>` : '<p class="soft">No comments yet.</p>'}
@@ -191,6 +200,7 @@ async function act(name, btn) {
     return run(() => api(`${path}/comments`, { method: 'POST', body: JSON.stringify({ body }) }), 'Comment added');
   }
   if (name === 'status') return run(() => api(`${path}/status`, { method: 'PATCH', body: JSON.stringify({ status: $('#tkStatus').value, version: t.version }) }), (r) => (r.changed ? 'Status saved' : 'No change'));
+  if (name === 'assign' && !$('#tkAssignee').value) { saved('Choose who the ticket goes to.', true); return; }
   if (name === 'assign') return run(() => api(`${path}/assignee`, { method: 'PATCH', body: JSON.stringify({ assignee: $('#tkAssignee').value, version: t.version }) }), (r) => (r.changed ? 'Reassigned' : 'No change'));
   if (name === 'resend') return run(() => api(`${path}/notification/retry`, { method: 'POST', body: '{}' }), (r) => (r.status === 'submitted' ? 'Notice sent' : `Notice: ${NOTICE_TEXT[r.status] || r.status}${r.error ? ` — ${r.error}` : ''}`));
 }
@@ -227,6 +237,7 @@ function setScope(scope) {
     for (const b of $$('[data-scope]')) b.addEventListener('click', () => setScope(b.dataset.scope));
     for (const id of ['fStatus', 'fPriority', 'fCategory', 'fCreator']) $(`#${id}`).addEventListener('change', reload);
     let tmr; $('#fQ').addEventListener('input', () => { clearTimeout(tmr); tmr = setTimeout(reload, 250); });
+    onLeave(() => clearTimeout(tmr));
     const openRow = (e) => { const tr = e.target.closest('tr[data-number]'); if (tr) openTicket(tr.dataset.number).catch((err) => note(err.message)); };
     $('#rows').addEventListener('click', openRow);
     $('#rows').addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') { if (e.key === ' ') e.preventDefault(); openRow(e); } });

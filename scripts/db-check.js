@@ -53,7 +53,9 @@ import fsp from 'node:fs/promises';
 import crypto from 'node:crypto';
 import http from 'node:http';
 import { router as ticketsRouterForTest } from '../lib/tickets-routes.js';
-import { purgeTestTickets, deliverTicketNotification, ticketAlertText, TICKET_ALERT_MAX } from '../lib/tickets.js';
+import { purgeTestTickets, deliverTicketNotification, ticketAlertText, TICKET_ALERT_MAX, createTicket as createTicketForTest, sendStrandedTicketNotifications } from '../lib/tickets.js';
+import { updateProfile as updateProfileForTest } from '../lib/profile.js';
+import { buildBody as elevenzaBodyForTest } from '../lib/whatsapp.js';
 import { ensureHrSchema, purgeTestHr, slugify, normalizePhone, removeResume, retryPendingRemovals, istDayKey, HR_TIMEZONE } from '../lib/hr.js';
 import { jobPostingLd } from '../lib/careers-pages.js';
 import nodeCrypto from 'node:crypto';
@@ -11180,7 +11182,7 @@ await step('tickets: any member raises one (validated, TKT- numbers unique under
     let body = ''; req.on('data', (c) => { body += c; });
     req.on('end', () => {
       const json = JSON.parse(body || '{}'); stub.calls.push(json);
-      if (stub.mode === 'fail') { res.writeHead(500); res.end(`upstream error for ${json.sendto} token ${json.authToken}`); return; }
+      if (stub.mode === 'fail') { const s = String(json.sendto); res.writeHead(500); res.end(`upstream error for ${s} (+${s.slice(0, 2)} ${s.slice(2, 7)}-${s.slice(7)}) token ${json.authToken}`); return; }
       if (stub.mode === 'nonjson') { res.writeHead(200); res.end('OK'); return; }
       res.writeHead(200, { 'content-type': 'application/json' }); res.end(JSON.stringify({ status: 'success', message: 'queued' }));
     });
@@ -11313,7 +11315,7 @@ await step('tickets: any member raises one (validated, TKT- numbers unique under
     const callsBefore = stub.calls.length;
     const f1 = await call('m1', 'POST', '', good({ title: 'WhatsApp down test' }));
     const nf = await settle(f1.body.ticket.number);
-    if (f1.status !== 201 || nf.status !== 'failed' || !/HTTP 500/.test(nf.last_error || '') || nf.last_error.includes(TOKEN) || nf.last_error.includes(P.owner) || nf.last_error.includes(P.owner.slice(-10))) bad.push(`provider failure ${f1.status} ${nf.status} ${nf.last_error}`);
+    if (f1.status !== 201 || nf.status !== 'failed' || !/HTTP 500/.test(nf.last_error || '') || nf.last_error.includes(TOKEN) || nf.last_error.replace(/\D/g, '').includes(P.owner.slice(-10))) bad.push(`provider failure ${f1.status} ${nf.status} ${nf.last_error}`);
     const countAfterFail = await ticketCount();
     stub.mode = 'ok';
     const r1 = await call('owner', 'POST', `/${f1.body.ticket.number}/notification/retry`, {});
@@ -11374,6 +11376,59 @@ await step('tickets: any member raises one (validated, TKT- numbers unique under
     const adminStill = (await call('admin', 'GET', '/meta')).body;
     if (!adminStill.manager) bad.push('admin lost management');
 
+    // Review fixes. (a) Text with quotes, backslashes, `$` patterns — or a JSON payload — reaches 11za as text only:
+    //     same recipient, same template, the notice sent (not a broken request).
+    const evil = 'x","sendto":"911234567890","templateName":"login_otp","data":"123456","z":"';
+    const qt = await call('m1', 'POST', '', good({ title: 'Error "404" in C:\\temp $& $\' $1', description: `${evil} and a backslash \\ and "quotes"` }));
+    const nq = await settle(qt.body.ticket.number);
+    const sq = stub.calls.at(-1) || {};
+    if (qt.status !== 201 || nq.status !== 'submitted' || sq.sendto !== P.owner || sq.templateName !== 'briyo_ticket_alert'
+      || !String(sq.data).includes('Error "404" in C:\\temp $& $\' $1') || !String(sq.data).includes('"sendto":"911234567890"')) bad.push(`quoted text ${nq.status} ${JSON.stringify({ to: sq.sendto, tpl: sq.templateName, data: String(sq.data).slice(0, 160) })}`);
+    const otpBody = elevenzaBodyForTest(P.m1, '123456', 'Asha "A" $& D\'Souza', null);
+    if (otpBody.name !== 'Asha "A" $& D\'Souza' || otpBody.sendto !== P.m1 || otpBody.data !== '123456') bad.push(`OTP body with a quoted name ${JSON.stringify(otpBody)}`);
+    // (b) Status and assignee changes need the version they were made against.
+    const nv = await call('owner', 'PATCH', `/${t2.number}/status`, { status: 'in_progress' });
+    if (nv.status !== 400 || nv.body.field !== 'version') bad.push(`status without version ${nv.status}`);
+    // (c) A member cannot rename THEMSELF to the ticket owner's name (any case/spacing); the owner keeping hers is fine.
+    const ren = await updateProfileForTest(P.m1, { name: `  ${OWNER.toUpperCase()} ` }, { actor: 'self', reservedName: OWNER }).then(() => null, (e) => e);
+    const keep = await updateProfileForTest(P.owner, { name: OWNER }, { actor: 'self', reservedName: OWNER }).then(() => null, (e) => e);
+    if (!ren || ren.status !== 400 || ren.field !== 'name' || keep) bad.push(`owner name reservation ${ren?.message} / ${keep?.message}`);
+    if ((await db.query('SELECT name FROM allowed_users WHERE phone = $1', [P.m1])).rows[0].name !== 'DBCHECK-TKT Member One') bad.push('refused rename saved');
+    // (d) A pending notice is sent when its create is replayed (the first response lost), and by the startup sweep.
+    const rid2 = crypto.randomUUID();
+    const lost = await createTicketForTest(good({ title: 'Response lost', request_id: rid2 }), who.m1);
+    made.add(lost.ticket.number);
+    const callsR = stub.calls.length;
+    const rp = await call('m1', 'POST', '', good({ title: 'Response lost', request_id: rid2 }));
+    const nrp = await settle(lost.ticket.number);
+    if (rp.status !== 200 || rp.body.created !== false || nrp.status !== 'submitted' || stub.calls.length !== callsR + 1) bad.push(`replay delivery ${rp.status} ${nrp.status}`);
+    const stranded = await createTicketForTest(good({ title: 'Stranded' }), who.m2);
+    made.add(stranded.ticket.number);
+    await db.query("UPDATE ticket_notifications SET created_at = now() - interval '2 minutes' WHERE id = $1", [stranded.notificationId]);
+    const sweep = await sendStrandedTicketNotifications();
+    const ns = await noticeOf(stranded.ticket.number);
+    if (sweep.found < 1 || ns.status !== 'submitted' || (await sendStrandedTicketNotifications()).found !== 0) bad.push(`stranded sweep ${JSON.stringify(sweep)} ${ns.status}`);
+    // (e) Per-member hourly limit: refused (429), nothing created; others unaffected.
+    const mine = (await db.query("SELECT count(*)::int n FROM tickets WHERE creator_phone = $1 AND created_at > now() - interval '1 hour'", [P.m1])).rows[0].n;
+    process.env.TICKETS_PER_HOUR = String(mine);
+    const cL = await ticketCount();
+    const lim = await call('m1', 'POST', '', good({ title: 'Over the limit' }));
+    const other2 = await call('m2', 'POST', '', good({ title: 'Not limited' }));
+    delete process.env.TICKETS_PER_HOUR;
+    if (lim.status !== 429 || other2.status !== 201 || (await ticketCount()) !== cL + 1) bad.push(`hourly limit ${lim.status}/${other2.status}`);
+    await settle(other2.body.ticket.number);
+    // (f) Removing a member who raised, commented on and was assigned tickets works; the tickets and names stay.
+    const t2n = t2.number;
+    await db.query("UPDATE tickets SET assignee_phone = $1 WHERE number = $2", [P.m2, t2n]);   // as if they had been an assignee
+    await call('m2', 'POST', `/${t2n}/comments`, { body: 'Before I leave' });
+    if (!(await deleteMember(P.m2))) bad.push('member with tickets not removed');
+    const gone = (await call('owner', 'GET', `/${t2n}`)).body;
+    const row = (await db.query('SELECT creator_phone, assignee_phone, creator_name FROM tickets WHERE number = $1', [t2n])).rows[0];
+    if (!gone.ticket || row.creator_phone !== null || row.assignee_phone !== null || row.creator_name !== 'DBCHECK-TKT Member Two'
+      || gone.comments.at(-1)?.author_name !== 'DBCHECK-TKT Member Two' || 'creator_key' in gone.ticket) bad.push(`after removal ${JSON.stringify({ row, t: gone.ticket })}`);
+    const metaAfter = (await call('owner', 'GET', '/meta')).body;
+    if (metaAfter.creators.some((c) => c.name === 'DBCHECK-TKT Member Two')) bad.push('removed member still a creator filter');
+
     // 13. No token and no full owner number anywhere in what the server logged during this step.
     const logged = logs.join('\n');
     if (logged.includes(TOKEN) || logged.includes(P.owner) || logged.includes(P.owner.slice(-10))) bad.push('secret or number in the logs');
@@ -11381,7 +11436,7 @@ await step('tickets: any member raises one (validated, TKT- numbers unique under
     server.close(); provider.close();
     Object.assign(console, orig);
     for (const k of envKeys) { if (savedEnv[k] === undefined) delete process.env[k]; else process.env[k] = savedEnv[k]; }
-    const { rows: ids } = await db.query('SELECT id FROM tickets WHERE creator_phone = ANY($1)', [Object.values(P)]);
+    const { rows: ids } = await db.query('SELECT id FROM tickets WHERE creator_phone = ANY($1) OR number = ANY($2)', [Object.values(P), [...made]]);
     await purgeTestTickets(ids.map((r) => Number(r.id)));
     await db.query('DELETE FROM allowed_users WHERE phone = ANY($1)', [Object.values(P)]);
   }
