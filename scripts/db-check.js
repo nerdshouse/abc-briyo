@@ -11407,7 +11407,17 @@ await step('tickets: any member raises one (validated, TKT- numbers unique under
     await db.query("UPDATE ticket_notifications SET created_at = now() - interval '2 minutes' WHERE id = $1", [stranded.notificationId]);
     const sweep = await sendStrandedTicketNotifications();
     const ns = await noticeOf(stranded.ticket.number);
-    if (sweep.found < 1 || ns.status !== 'submitted' || (await sendStrandedTicketNotifications()).found !== 0) bad.push(`stranded sweep ${JSON.stringify(sweep)} ${ns.status}`);
+    const callsS = stub.calls.length;
+    await sendStrandedTicketNotifications();
+    if (sweep.found < 1 || ns.status !== 'submitted' || ns.attempts !== 1 || (await noticeOf(stranded.ticket.number)).attempts !== 1 || stub.calls.length !== callsS) bad.push(`stranded sweep ${JSON.stringify(sweep)} ${ns.status}`);
+    // A Unicode spelling that Postgres lowercases to the owner's name (dotted capital İ) is refused too.
+    // The check is the database's own comparison: any spelling Postgres reads as the reserved name (here, if this server's
+    // lower() maps the dotted capital İ to i) is refused; a spelling it reads differently is a different name.
+    const spelled = 'Janvİ  Patel';
+    const dotted = await updateProfileForTest(P.m1, { name: spelled }, { actor: 'self', reservedName: 'Janvi Patel' }).then(() => null, (e) => e);
+    const pgSame = (await db.query(`SELECT lower(regexp_replace(btrim($1), '\\s+', ' ', 'g')) = lower('Janvi Patel') AS same`, [spelled])).rows[0].same;
+    if (pgSame ? (!dotted || dotted.status !== 400) : Boolean(dotted)) bad.push(`dotted-İ spelling: database says same=${pgSame}, refused=${Boolean(dotted)}`);
+    if (!pgSame) await updateProfileForTest(P.m1, { name: 'DBCHECK-TKT Member One' }, { actor: 'self' });   // put the name back
     // (e) Per-member hourly limit: refused (429), nothing created; others unaffected.
     const mine = (await db.query("SELECT count(*)::int n FROM tickets WHERE creator_phone = $1 AND created_at > now() - interval '1 hour'", [P.m1])).rows[0].n;
     process.env.TICKETS_PER_HOUR = String(mine);
@@ -11417,6 +11427,14 @@ await step('tickets: any member raises one (validated, TKT- numbers unique under
     delete process.env.TICKETS_PER_HOUR;
     if (lim.status !== 429 || other2.status !== 201 || (await ticketCount()) !== cL + 1) bad.push(`hourly limit ${lim.status}/${other2.status}`);
     await settle(other2.body.ticket.number);
+    // A notice to an owner who is no longer active is not sent (skipped), never to a stale number.
+    const inactive = await createTicketForTest(good({ title: 'Owner gone' }), who.m1);
+    made.add(inactive.ticket.number);
+    await db.query('UPDATE allowed_users SET active = false WHERE phone = $1', [P.owner]);
+    const callsG = stub.calls.length;
+    const ig = await deliverTicketNotification(inactive.notificationId);
+    await db.query('UPDATE allowed_users SET active = true WHERE phone = $1', [P.owner]);
+    if (ig.sent || ig.status !== 'skipped' || !/no longer an active member/.test(ig.error || '') || stub.calls.length !== callsG) bad.push(`inactive owner ${JSON.stringify(ig)}`);
     // (f) Removing a member who raised, commented on and was assigned tickets works; the tickets and names stay.
     const t2n = t2.number;
     await db.query("UPDATE tickets SET assignee_phone = $1 WHERE number = $2", [P.m2, t2n]);   // as if they had been an assignee
