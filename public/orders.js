@@ -1381,6 +1381,7 @@ $('#orderForm').addEventListener('submit', async (e) => {
   if (missing.length) { err.textContent = `Enter the ${missing.join(', ')}.`; err.hidden = false; return; }
   // Order date is sent as wall-clock time; the server reads it in the team's timezone. Only when it was changed:
   // the box holds the stored date rounded to the minute, and the server refuses removing a date that is set.
+  if (form.order_date.validity.badInput) { err.textContent = 'Enter the complete order date and time.'; err.hidden = false; return; }
   if (body.order_date === form.order_date.dataset.initial) delete body.order_date;
   else if (form.order_date.dataset.initial && !body.order_date) {
     err.textContent = 'An order date cannot be removed once it is set. Enter the correct date instead.'; err.hidden = false; return;
