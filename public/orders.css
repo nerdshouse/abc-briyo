@@ -205,6 +205,8 @@
 .attach-list .num { margin-left: auto; }
 .attach-new { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; font-size: 12px; }
 .attach-new > span { grid-column: 1 / -1; }
+/* The required-field asterisk, as on form labels (ui.css .fld em). */
+#cExtraSec .help em, .attach-new em { font-style: normal; color: var(--error-text); }
 .attach-new .input:first-of-type { grid-column: 1 / -1; }
 .extras { display: flex; flex-direction: column; gap: 6px; margin-bottom: 8px; }
 .extra-row { display: grid; grid-template-columns: minmax(0, 1.3fr) minmax(0, 1fr) minmax(0, .7fr) auto; gap: 6px; align-items: center; }
