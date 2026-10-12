@@ -2863,6 +2863,60 @@ await step('inventory: month-only expiry is the last calendar day, stored as a d
   }
   return `${cases.length} spellings stored as exact DATEs (08/2028 → 2028-08-31, 02/2028 → 2028-02-29), read back as text in TZ=${process.env.TZ || 'system'}; bad months refused`;
 });
+await step('inventory: batch expiry is edited on its own — set when unknown, corrected, cleared; invalid refused; quantity and other fields untouched; FEFO, expiry views and the page action follow', async () => {
+  const bad = [];
+  const db = getPool();
+  const id = (await createSku({ sku: `${TS}-EXPEDIT`, product_name: 'Expiry edit' }, { actor: ACTOR })).id;
+  const unknown = (await receiveInventory({ sku_id: id, batch_number: 'EXPEDIT-U', quantity: 91, unit_cost: '120', selling_price: '249', mrp: '299', location: 'R1', request_id: rid() }, { actor: ACTOR })).batchId;
+  const dated = (await receiveInventory({ sku_id: id, batch_number: 'EXPEDIT-D', expiry_date: dayOffset(400), quantity: 10, request_id: rid() }, { actor: ACTOR })).batchId;
+  const snap = async (b) => (await db.query(`SELECT on_hand, quantity_received, sku_id, warehouse_id, supplier_id, unit_cost::text, selling_price::text, mrp::text, status, location, version, expiry_date::text AS expiry_date FROM inventory_batches WHERE id = $1`, [b])).rows[0];
+  const moves = async () => (await db.query('SELECT count(*)::int n FROM inventory_movements WHERE batch_id = ANY($1)', [[unknown, dated]])).rows[0].n;
+  const batches = async () => (await db.query('SELECT count(*)::int n FROM inventory_batches WHERE sku_id = $1', [id])).rows[0].n;
+  const before = await snap(unknown); const m0 = await moves(); const n0 = await batches();
+  // FEFO before: the unknown-expiry batch comes last, so the dated one is suggested.
+  if ((await outwardStockOptions(id, 1)).suggestion[0]?.batch_id !== dated) bad.push('FEFO before');
+  if (!(await inventoryOverview({ expiring: 'unknown', q: `${TS}-EXPEDIT` })).rows.some((r) => r.id === unknown)) bad.push('not listed as unknown expiry');
+  // 1. Unknown → a date (sooner than the other batch): only the expiry and the version change.
+  const r1 = await updateBatch(unknown, { expiry_date: dayOffset(30) }, { actor: ACTOR, version: before.version });
+  const after1 = await snap(unknown);
+  if (!r1.changed || after1.expiry_date !== dayOffset(30)) bad.push(`set ${JSON.stringify(after1)}`);
+  for (const k of ['on_hand', 'quantity_received', 'sku_id', 'warehouse_id', 'supplier_id', 'unit_cost', 'selling_price', 'mrp', 'status', 'location']) if (String(after1[k]) !== String(before[k])) bad.push(`${k} changed`);
+  if (after1.version !== before.version + 1) bad.push('version');
+  if ((await moves()) !== m0 || (await batches()) !== n0) bad.push('a movement or batch was created');
+  // 6. FEFO and the expiry views use the new date straight away.
+  if ((await outwardStockOptions(id, 1)).suggestion[0]?.batch_id !== unknown) bad.push('FEFO did not move to the newly dated batch');
+  const detail = (await skuDetail(id)).batches;
+  if (detail[0].id !== unknown || detail[0].expiry_state !== 'near_expiry') bad.push(`detail order/state ${detail.map((b) => `${b.batch_number}:${b.expiry_state}`)}`);
+  if ((await inventoryOverview({ expiring: 'unknown', q: `${TS}-EXPEDIT` })).rows.some((r) => r.id === unknown)) bad.push('still listed as unknown');
+  if (!(await inventoryOverview({ expiring: 'near', q: `${TS}-EXPEDIT` })).rows.some((r) => r.id === unknown)) bad.push('not listed as near expiry');
+  // 2. Correct an existing date (month-only label → its last day); a stale version is refused.
+  await expectErr('stale version', () => updateBatch(unknown, { expiry_date: '2029-03-31' }, { actor: ACTOR, version: before.version }), (e) => e.status === 409);
+  await updateBatch(unknown, { expiry_date: '02/2029' }, { actor: ACTOR, version: after1.version });
+  if ((await snap(unknown)).expiry_date !== '2029-02-28') bad.push('correct (month-only)');
+  // 3. Clear: back to unknown expiry (NULL), listed as unknown again.
+  const v2 = (await snap(unknown)).version;
+  await updateBatch(unknown, { expiry_date: '' }, { actor: ACTOR, version: v2 });
+  if ((await snap(unknown)).expiry_date !== null) bad.push('clear');
+  if (!(await inventoryOverview({ expiring: 'unknown', q: `${TS}-EXPEDIT` })).rows.some((r) => r.id === unknown)) bad.push('cleared not unknown');
+  // 4. Invalid dates refused, nothing stored.
+  for (const v of ['31/02/2029', '13/2029', 'soon', '2029-13-01']) await expectErr(`invalid ${v}`, () => updateBatch(unknown, { expiry_date: v }, { actor: ACTOR }), (e) => e.status === 400);
+  await updateBatch(unknown, { mfg_date: '2028-01-01' }, { actor: ACTOR });
+  await expectErr('before mfg', () => updateBatch(unknown, { expiry_date: '2027-12-31' }, { actor: ACTOR }), (e) => e.status === 400 && /manufacturing/.test(e.message));
+  const last = await snap(unknown);
+  if (last.expiry_date !== null || last.on_hand !== before.on_hand || (await moves()) !== m0) bad.push('a refused edit changed something');
+  if ((await snap(dated)).expiry_date !== dayOffset(400)) bad.push('the other batch changed');
+  // Every edit is audited with what changed.
+  const aud = (await db.query(`SELECT metadata FROM inventory_audit WHERE batch_id = $1 AND action = 'batch_updated' ORDER BY id`, [unknown])).rows;
+  if (aud.length < 3 || !aud.every((a) => a.metadata.changes && (a.metadata.changes.expiry_date || a.metadata.changes.mfg_date))) bad.push(`audit ${aud.length}`);
+  // The page: an "Edit expiry" action per batch, a form with only the expiry field, and a PATCH of expiry_date + version only.
+  const js = await fsp.readFile(new URL('../public/inventory.js', import.meta.url), 'utf8');
+  const form = js.slice(js.indexOf("} else if (kind === 'expiry') {"), js.indexOf("} else if (kind === 'batch') {"));
+  if (!/data-act="expiry" data-batch="\$\{b\.id\}">Edit expiry<\/button>/.test(js)) bad.push('no Edit expiry action');
+  if (!/dateField\('expiry_date', 'Expiry', \{ value: batch\.expiry_date \|\| '', monthOption: true/.test(form) || /name="(status|location|unit_cost|quantity)"/.test(form)) bad.push('expiry form fields');
+  if (!/body: JSON\.stringify\(\{ expiry_date: v\.expiry_date \|\| '', version: batch\.version \}\)/.test(js)) bad.push('expiry save sends more than the expiry');
+  if (bad.length) throw new Error(bad.join(' | '));
+  return 'unknown → +30 d (FEFO and near-expiry follow; quantity, prices, location, status, supplier, warehouse unchanged; no movement or batch), 02/2029 → 2029-02-28, stale version 409, cleared → unknown; invalid dates and expiry before mfg refused; other batch untouched; audited; page action and expiry-only PATCH';
+});
 await step('inventory: only inventory-tracked SKUs need stock at dispatch', async () => {
   const svc = (await createSku({ sku: `${TS}-GIFTCARD`, product_name: 'Gift card (not stock)', track_inventory: false }, { actor: ACTOR })).id;
   await invOrders([amzRow({ 'order-id': AZ(61), 'order-item-id': 'I61', sku: `${TS}-GIFTCARD`, 'quantity-purchased': '1' })]);
@@ -6364,6 +6418,61 @@ await step('stock outward page: "Other" in Requested by reveals "Enter Requester
   return 'Other option after the team; name box between Requested by and Issued by, hidden until Other, required only then, cleared when switching back; trimmed, empty refused with an inline message (server message shown too); detail and report say "not a team member"';
 });
 
+await step('stock outward: issue 1 → issued 1, returned 0, outstanding 1; the return form starts empty; empty or zero records nothing; saleable only after inspection, damaged never restocked; consumed and kept independent; over-recording refused; retries never double-count', async () => {
+  const bad = [];
+  const db = getPool();
+  const sku = (await createSku({ sku: `${TS}-SO1`, product_name: 'Outward single unit', variant_name: 'Carton Pack' }, { actor: ACTOR })).id;
+  const batch = (await receiveInventory({ sku_id: sku, batch_number: 'SO1-A', expiry_date: dayOffset(300), quantity: 10, request_id: rid() }, { actor: ACTOR })).batchId;
+  const onHand = async () => (await db.query('SELECT on_hand FROM inventory_batches WHERE id = $1', [batch])).rows[0].on_hand;
+  const eventsOf = async (id) => (await getOutward(id)).events.map((e) => e.event_type).join();
+  const one = async () => {
+    const d = await createOutward({ ...soBase(), sku_id: sku, quantity: 1 }, { actor: ACTOR });
+    await issueOutward(d.id, { allocations: [{ batch_id: batch, quantity: 1 }], request_id: rid() }, { actor: ACTOR });
+    return d.id;
+  };
+  // 1, 2. Issue 1: only "issued" moves.
+  const a = await one();
+  let o = await getOutward(a);
+  if (o.quantity !== 1 || o.returned_saleable !== 0 || o.returned_non_saleable !== 0 || o.consumed !== 0 || o.retained !== 0 || o.outstanding !== 1 || o.status !== 'issued') bad.push(`after issue ${JSON.stringify({ q: o.quantity, rs: o.returned_saleable, out: o.outstanding, st: o.status })}`);
+  const listed = (await listOutwards({ q: `${TS}-SO1` })).find((x) => x.id === a);
+  if (!listed || listed.outstanding !== 1 || listed.returned_saleable !== 0) bad.push('list disagrees with detail');
+  if ((await onHand()) !== 9) bad.push('issue did not take 1 out');
+  // 4. Empty strings and zeros record nothing (no event, no change).
+  const ev0 = await eventsOf(a);
+  await expectErr('all empty', () => recordOutwardReturn(a, { returned_saleable: '', returned_non_saleable: '', consumed: '', retained: '', request_id: rid() }, { actor: ACTOR }), (e) => e.status === 400 && /at least one/.test(e.message));
+  await expectErr('all zero', () => recordOutwardReturn(a, { returned_saleable: '0', returned_non_saleable: 0, consumed: '0', retained: '0', saleable_verified: true, request_id: rid() }, { actor: ACTOR }), (e) => e.status === 400);
+  if ((await eventsOf(a)) !== ev0 || (await getOutward(a)).outstanding !== 1) bad.push('an empty submission recorded something');
+  // 5. One saleable unit: refused until inspected, then back in its batch exactly once (retry with the same key is a no-op).
+  await expectErr('uninspected', () => recordOutwardReturn(a, { returned_saleable: '1' }, { actor: ACTOR }), (e) => e.confirmRequired);
+  if ((await onHand()) !== 9) bad.push('uninspected unit restocked');
+  const key = rid();
+  const r = await recordOutwardReturn(a, { returned_saleable: '1', saleable_verified: true, request_id: key }, { actor: ACTOR });
+  const again = await recordOutwardReturn(a, { returned_saleable: '1', saleable_verified: true, request_id: key }, { actor: ACTOR });
+  o = await getOutward(a);
+  if (r.status !== 'closed' || !again.repeated || o.returned_saleable !== 1 || o.outstanding !== 0 || (await onHand()) !== 10) bad.push(`saleable ${JSON.stringify({ r, again, rs: o.returned_saleable, on: await onHand() })}`);
+  // 6. Damaged: recorded, never restocked.
+  const b = await one();
+  await recordOutwardReturn(b, { returned_non_saleable: '1', request_id: rid() }, { actor: ACTOR });
+  if ((await getOutward(b)).returned_non_saleable !== 1 || (await onHand()) !== 9) bad.push('damaged restocked or not recorded');
+  // 7, 8. Consumed and kept are separate counts; anything beyond what is outstanding is refused.
+  const c = await createOutward({ ...soBase(), sku_id: sku, quantity: 3 }, { actor: ACTOR });
+  await issueOutward(c.id, { allocations: [{ batch_id: batch, quantity: 3 }], request_id: rid() }, { actor: ACTOR });
+  await expectErr('over', () => recordOutwardReturn(c.id, { consumed: '2', retained: '2', request_id: rid() }, { actor: ACTOR }), (e) => e.status === 409);
+  await recordOutwardReturn(c.id, { consumed: '2', request_id: rid() }, { actor: ACTOR });
+  await recordOutwardReturn(c.id, { retained: '1', request_id: rid() }, { actor: ACTOR });
+  o = await getOutward(c.id);
+  if (o.consumed !== 2 || o.retained !== 1 || o.returned_saleable !== 0 || o.returned_non_saleable !== 0 || o.status !== 'closed' || (await onHand()) !== 6) bad.push(`consumed/kept ${JSON.stringify({ c: o.consumed, k: o.retained, st: o.status, on: await onHand() })}`);
+  // 10. History: append-only and in order; earlier records unchanged by later ones.
+  if ((await eventsOf(a)) !== 'created,issued,returned,closed' || (await getOutward(a)).returned_saleable !== 1) bad.push(`history ${await eventsOf(a)}`);
+  // 3. The page: return quantities start empty, never prefilled, with browser autocomplete off; nothing is sent when every quantity is empty or 0.
+  const js = await fsp.readFile(new URL('../public/stock-outward.js', import.meta.url), 'utf8');
+  const ret = js.slice(js.indexOf('id="retForm"'), js.indexOf('id="retVerified"'));
+  const qtyInputs = ret.match(/<input class="input" inputmode="numeric"[^>]*>/g) || [];
+  if (qtyInputs.length !== 5 || qtyInputs.some((i) => /value=/.test(i) || !/autocomplete="off"/.test(i))) bad.push(`return inputs ${qtyInputs.length}`);
+  if (!/if \(qty\.every\(\(x\) => x === '' \|\| \/\^0\+\$\/\.test\(x\)\)\) \{\s*saved\('Enter at least one quantity/.test(js)) bad.push('no empty check before sending');
+  if (bad.length) throw new Error(bad.join(' | '));
+  return 'issue 1 → issued 1 / returned 0 / outstanding 1 (list = detail), stock 10 → 9; empty and zero submissions refused with no event; saleable refused until inspected, then +1 to its batch once (retry no-op); damaged recorded, not restocked; consumed 2 + kept 1 separate, over-recording refused; history append-only; return form empty, autocomplete off, nothing sent when empty';
+});
 await step('retailer orders without Briyo SKUs (e.g. Medkart): retailer name/code kept beside the Briyo product, code optional; an unmatched line is flagged and blocks stock until a person matches it; then deducted exactly once', async () => {
   const bad = [];
   const db = getPool();
