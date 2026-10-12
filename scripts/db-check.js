@@ -1466,6 +1466,73 @@ await step('imported orders keep their import key: renaming or moving one is ref
   if (bad.length) throw new Error(bad.join(' | '));
   return 'amazon_import and shopify_sync orders: rename and channel move refused (409 importedOrder, field) via PATCH /api/orders/:id, Edit shipment and updateOrder, with no row, version or event change; other fields (sent with the same number and channel) still save; manual orders rename (audited), duplicates 409, stale 409, viewer 403, Edit shipment rename works';
 });
+await step('order date: a hand-entered order needs its order date (New shipment, its extra orders, Add new order to a shipment, POST /api/orders) — refused with nothing created; existing orders, imports and library callers unchanged; the list returns order_date and a missing date shows "—"', async () => {
+  const bad = [];
+  const db = getPool();
+  const N = (s) => `${TEST_ORDER}-OD-${s}`;
+  const exists = async (num) => (await db.query('SELECT count(*)::int n FROM orders WHERE source_order_id = $1', [num])).rows[0].n;
+  const listed = async (num) => (await listOrders({ q: num })).orders.find((o) => o.source_order_id === num);
+  const dl = (await listCouriers()).find((c) => c.name === 'Delhivery');
+  const ship = (num, extra = {}) => ({ ...R('website'), channel: 'website', source_order_id: num, courier_partner_id: dl.id, tracking_id: `AWB-${num}`, shipment_status: 'packed', ...extra });
+  const app = express();
+  app.use((req, _res, next) => { req.session = JSON.parse(req.get('x-test-session') || '{}'); next(); });
+  app.use(express.json());
+  app.use('/api/orders', ordersRouterForTest);
+  const server = app.listen(0);
+  const OP = { caps: ['logistics.view', 'logistics.edit'] };
+  try {
+    const base = `http://127.0.0.1:${server.address().port}/api/orders`;
+    const call = async (method, path, body) => { const r = await fetch(`${base}${path}`, { method, headers: { 'content-type': 'application/json', 'x-test-session': JSON.stringify(OP) }, body: JSON.stringify(body) }); return { status: r.status, body: await r.json() }; };
+
+    // 1. New shipment for a new order without a date (blank, as the form sends it, or left out): refused, nothing created.
+    for (const [label, extra] of [['blank', { order_date: '' }], ['absent', {}]]) {
+      const r = await call('POST', '/shipments', ship(N(`NS-${label}`), extra));
+      if (r.status !== 400 || r.body.field !== 'order_date' || !/order date/i.test(r.body.error) || (await exists(N(`NS-${label}`)))) bad.push(`New shipment, date ${label}: ${r.status} ${r.body.error}`);
+    }
+    // 2. With the date (IST wall clock, as the form sends it): created; the list row has order_date; the column shows its IST day.
+    const ok = await call('POST', '/shipments', ship(N('NS-dated'), { order_date: '2026-10-05T14:30' }));
+    const row = await listed(N('NS-dated'));
+    if (ok.status !== 201 || !row || new Date(row.order_date).toISOString() !== '2026-10-05T09:00:00.000Z' || istDate(row.order_date) !== '05-10-2026') bad.push(`dated New shipment ${ok.status} ${row?.order_date}`);
+    // 3. An extra order in the same parcel without a date: the whole request is refused, naming it; neither order is created.
+    const ex = await call('POST', '/shipments', ship(N('NS-lead'), { order_date: '2026-10-05T10:00', extra_orders: [{ source_order_id: N('NS-extra') }] }));
+    if (ex.status !== 400 || ex.body.field !== 'order_date' || !ex.body.error.includes(N('NS-extra')) || (await exists(N('NS-lead'))) || (await exists(N('NS-extra')))) bad.push(`undated extra ${ex.status} ${ex.body.error}`);
+    // 4. An order that already exists without a date (entered before this rule): the screen still gets "already exists",
+    //    and adding a shipment to it works — it is not re-dated, and no shipment or dispatch date is put in its place.
+    const oldId = await createOrder({ ...R('website'), channel: 'website', source_order_id: N('OLD') }, { actor: ACTOR });
+    const ask = await call('POST', '/shipments', ship(N('OLD')));
+    if (ask.status !== 409 || !ask.body.orderExists) bad.push(`existing undated order: ${ask.status} ${ask.body.error}`);
+    const add = await call('POST', '/shipments', { ...ship(N('OLD')), addToExisting: true });
+    const oldRow = await listed(N('OLD'));
+    if (add.status !== 201 || oldRow.order_date !== null || istDate(oldRow.order_date) !== '—') bad.push(`add to existing undated ${add.status} ${oldRow?.order_date}`);
+    // 5. Edit shipment on that undated order still works (no date demanded by shipment editing).
+    const s0 = (await db.query('SELECT id, version FROM order_shipments WHERE order_id = $1 ORDER BY id LIMIT 1', [oldId])).rows[0];
+    const ed = await call('PATCH', `/${oldId}/shipments/${s0.id}/details`, { tracking_id: `AWB-${N('OLD')}-2`, order_version: (await getOrder(oldId)).version, shipment_version: s0.version });
+    if (ed.status !== 200 || (await listed(N('OLD'))).order_date !== null) bad.push(`edit shipment on undated order ${ed.status} ${ed.body.error || ''}`);
+    // 6. Add a new order to an existing shipment: refused without a date, accepted with one; an existing number needs none.
+    const sid = ok.body.shipmentId;
+    const an = await call('POST', `/shipments/${sid}/orders`, { new_orders: [{ source_order_id: N('AT-new') }] });
+    if (an.status !== 400 || an.body.field !== 'order_date' || (await exists(N('AT-new')))) bad.push(`attach undated new ${an.status} ${an.body.error}`);
+    const ad = await call('POST', `/shipments/${sid}/orders`, { new_orders: [{ source_order_id: N('AT-new'), order_date: '2026-10-06T09:15' }] });
+    if (ad.status >= 300 || istDate((await listed(N('AT-new')))?.order_date) !== '06-10-2026') bad.push(`attach dated new ${ad.status} ${ad.body.error || ''}`);
+    await createOrder({ ...R('website'), channel: 'website', source_order_id: N('OLD2') }, { actor: ACTOR });   // undated, blank shipment
+    const ae = await call('POST', `/shipments/${sid}/orders`, { new_orders: [{ source_order_id: N('OLD2') }] });
+    if (ae.status >= 300) bad.push(`attach existing number without date ${ae.status} ${ae.body.error || ''}`);
+    // 7. POST /api/orders: same rule.
+    const po = await call('POST', '', { ...R('website'), channel: 'website', source_order_id: N('PO') });
+    const po2 = await call('POST', '', { ...R('website'), channel: 'website', source_order_id: N('PO'), order_date: '2026-10-07T18:45' });
+    if (po.status !== 400 || po.body.field !== 'order_date' || po2.status !== 201 || istDate(po2.body.order.order_date) !== '07-10-2026') bad.push(`POST /api/orders ${po.status} / ${po2.status}`);
+    // 8. Library callers (imports, seed, scripts) are unchanged: no flag, no requirement.
+    const lib = await createOrder({ ...R('website'), channel: 'website', source_order_id: N('LIB') }, { actor: ACTOR, source: 'amazon_import' });
+    if (!lib) bad.push('library createOrder without a date refused');
+    // 9. Display fallback: missing or invalid dates are "—", never a made-up date; a real one is DD-MM-YYYY in IST.
+    for (const v of [null, undefined, '', 'not a date']) if (istDate(v) !== '—') bad.push(`istDate(${JSON.stringify(v)}) = ${istDate(v)}`);
+    if (istDate('2026-10-11T19:00:00Z') !== '12-10-2026') bad.push('IST day boundary');
+  } finally {
+    server.close();
+  }
+  if (bad.length) throw new Error(bad.join(' | '));
+  return 'New shipment without a date (blank or absent) → 400 on order_date, nothing created; with one → list row order_date 05-10-2026 (IST); an undated extra order refuses the whole parcel, naming it; an existing undated order still gets "already exists", takes a shipment and an Edit shipment, and stays "—" (no date substituted); Add new order to a shipment and POST /api/orders enforce the same; library callers unchanged; null/blank/invalid dates show "—"';
+});
 await step('concurrency: orders are locked before their shipments (edit, save, attach, multi-shipment vs cancellation — no deadlock), and two edits giving one courier+AWB to different shipments at once: one wins, one 409', async () => {
   const bad = [];
   const db = getPool();
@@ -2249,13 +2316,15 @@ await step('amazon import: one order, one item', async () => {
   const o = await amzOrder(1);
   const items = await orderItems(o.id);
   if (o.dispatch_type !== 'easy_ship' || o.order_value !== 499 || o.source !== 'amazon_import') throw new Error(JSON.stringify(o));
+  // The Orders list row (what the Order date column reads) carries Amazon's purchase-date, shown as its IST day.
+  if (!o.order_date || new Date(o.order_date).getTime() !== Date.parse('2026-09-20T10:15:00+00:00') || istDate(o.order_date) !== '20-09-2026') throw new Error(`order_date ${o.order_date}`);
   if (o.shipment_id !== null || o.shipment_status !== null || (await orderShipments(o.id)).length) throw new Error('import created a shipment');
   if (items.length !== 1 || items[0].source_line_item_id !== 'I1' || items[0].item_tax !== 76.12) throw new Error(JSON.stringify(items));
   // The list leaves out the raw payload; the full order (as the drawer reads it) has it.
   const full = await getOrder(o.id);
   if (!full.source_payload?.amazon || 'gift-wrap-price' in full.source_payload.amazon || JSON.stringify(full.source_payload).includes('gift')) throw new Error('ignored column stored');
   if ('source_payload' in o) throw new Error('list rows still carry the raw payload');
-  return 'preview wrote nothing; import made 1 order (Easy Ship, ₹499) + 1 item and no shipment; ignored columns not stored';
+  return 'preview wrote nothing; import made 1 order (Easy Ship, ₹499, order date = purchase-date, 20-09-2026 in the list) + 1 item and no shipment; ignored columns not stored';
 });
 await step('amazon import: one order with two items; several orders in one file', async () => {
   const file = amzCsv([
@@ -4424,6 +4493,9 @@ await step('shopify orders: window, pagination, dry run writes nothing; import i
   const o = byGid(orders, 7);
   if (o.channel !== 'website' || o.source !== 'shopify_sync' || o.fulfillment_type !== 'merchant' || o.dispatch_type !== 'easy_ship' || o.order_status !== 'new'
     || o.payment_method !== 'prepaid' || o.payment_status !== 'paid' || o.source_payload.shopify.name !== shOrder(7).name) bad.push(`order ${JSON.stringify(o).slice(0, 300)}`);
+  // The Orders list row carries Shopify's createdAt as the order date (the field the Order date column reads).
+  const listed = (await listOrders({ q: o.source_order_id })).orders.find((x) => x.id === Number(o.id));
+  if (!listed?.order_date || new Date(listed.order_date).getTime() !== new Date(store[6].createdAt).getTime() || istDate(listed.order_date) !== istDate(store[6].createdAt)) bad.push(`list order_date ${listed?.order_date} vs ${store[6].createdAt}`);
   if (bad.length) throw new Error(bad.join(' | '));
   return '90-day window refused (read_orders = 60); 30-day preview: 122 found, 120 new, 1 test skipped, 1 oversized (51 lines) held back after 50 fetched, 13 pages of 10, 0 writes; import in bounded runs (50 + resume 73); re-run creates 0 orders and 0 lines';
 });
