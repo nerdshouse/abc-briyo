@@ -1,0 +1,74 @@
+# Runs the test suite (npm run db:check) against a throwaway PostgreSQL that
+# exists only for this job. No repository secrets are used and none are needed:
+# every value below is a test-only placeholder, and the only database the job can
+# reach is the service container. db-check itself refuses to run against a
+# database labelled production, or an unlabelled one holding data.
+name: db-check
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: db-check-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  db-check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: briyo
+          POSTGRES_PASSWORD: ci-only-not-a-secret
+          POSTGRES_DB: briyo_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U briyo -d briyo_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      # The service container above, and nothing else. DATABASE_URL is left unset
+      # on purpose: db-check points the app at TEST_DATABASE_URL itself.
+      TEST_DATABASE_URL: postgres://briyo:ci-only-not-a-secret@127.0.0.1:5432/briyo_test?sslmode=disable
+      SESSION_SECRET: ci-only-session-secret-not-used-anywhere-else
+      # Production runs in UTC; so do these tests.
+      TZ: UTC
+      BOARD_TIMEZONE: Asia/Kolkata
+      DOCUMENT_STORAGE: local
+      ELEVENZA_AUTH_TOKEN: ''
+      SHOPIFY_POLL_ENABLED: 'false'
+      SHOPIFY_ORDERS_POLL_ENABLED: 'false'
+      SLA_ALERTS_ENABLED: 'false'
+      KEEPALIVE_ENABLED: 'false'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      # First run on a brand-new database: every check must pass, as a new
+      # environment would see it.
+      - name: db-check (fresh database)
+        timeout-minutes: 8
+        run: npm run db:check
+      # Second run on the same database: tests clean up after themselves and can
+      # be run again.
+      - name: db-check (re-run)
+        timeout-minutes: 8
+        run: npm run db:check
+      - name: No test leftovers
+        timeout-minutes: 2
+        run: node scripts/ci/assert-no-test-leftovers.js

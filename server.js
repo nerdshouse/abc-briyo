@@ -22,8 +22,9 @@ import {
   mockReasonSummary, mockStatsByCaller, mockStaleCarts, mockSearchCarts,
 } from './lib/mock.js';
 import {
-  normalizePayload, normalizeOrderPayload, parseLineItems, redactPayload,
+  normalizePayload, normalizeOrderPayload, parseLineItems, redactPayload, orderWebhookDiagnostic, orderLogRef,
 } from './lib/normalize.js';
+import { redactForLog } from './lib/log-redact.js';
 import {
   router as authRouter, requireAuth, requireAdmin, currentUserName, invalidateMembership,
   requirePermission, requirePage, requireCompleteProfile,
@@ -390,16 +391,19 @@ app.post('/api/webhook/gokwik/order-completed', async (req, res) => {
   }
 
   const order = normalizeOrderPayload(payload);
+  // Logs never carry the payload or a value from it (customer data can sit under
+  // any key): field names, the event type and the order id, tied together by an
+  // id for this delivery. The payload itself is kept in webhook_failures on error.
+  const delivery = crypto.randomUUID().slice(0, 8);
+  const diagnostic = () => orderWebhookDiagnostic(payload, order);
 
   // Warn, never throw — an unmatched or unparseable order must not 500.
   const missing = ['orderId', 'phone', 'email'].filter((k) => !order[k]);
   if (missing.length) {
-    console.warn(
-      `Order webhook: missing ${missing.join(', ')}. Payload keys: [${Object.keys(payload).join(', ')}]`);
+    console.warn(`Order webhook ${delivery}: missing ${missing.join(', ')}. ${diagnostic()}`);
   }
   if (!order.phone && !order.email) {
-    console.warn('Order webhook: no phone or email, cannot match any cart. Full payload:',
-      JSON.stringify(payload).slice(0, 600));
+    console.warn(`Order webhook ${delivery}: no phone or email, cannot match any cart.`);
     return res.status(200).json({ ok: true, matched: 0, reason: 'no phone or email in payload' });
   }
 
@@ -413,16 +417,17 @@ app.post('/api/webhook/gokwik/order-completed', async (req, res) => {
       updatedBy: 'Auto (GoKwik order match)',
     });
     if (matched.length) {
-      console.log(`Order ${order.orderName || order.orderId}: auto-recovered ${matched.length} cart(s) — ` +
+      console.log(`Order ${orderLogRef(payload)}: auto-recovered ${matched.length} cart(s) — ` +
         matched.map((m) => `${m.cart_id} via ${m.matched_on}`).join(', '));
     } else {
-      console.log(`Order ${order.orderName || order.orderId}: no open cart matched`);
+      console.log(`Order ${orderLogRef(payload)}: no open cart matched`);
     }
     return res.status(200).json({ ok: true, matched: matched.length });
   } catch (err) {
-    console.error('Order webhook failed:', err.message, JSON.stringify(payload).slice(0, 600));
+    // A database error can quote the row it failed on: redacted, then cut.
+    console.error(`Order webhook ${delivery} failed: ${redactForLog(err.message)}. ${diagnostic()}`);
     await db.noteFailure({ kind: 'order-completed', error: err.message, body: req.body })
-      .catch((e) => console.error('Could not even record the failure:', e.message));
+      .catch((e) => console.error(`Order webhook ${delivery}: could not even record the failure: ${redactForLog(e.message)}`));
     return res.status(200).json({ ok: true, matched: 0, stored: false });
   }
 });
