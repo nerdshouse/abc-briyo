@@ -176,6 +176,28 @@ await step('database TLS: sslmode prefer/require/verify-ca is spelled verify-ful
   if (childPg(withVerifiedSslMode(`${base}?sslmode=disable`)).ssl !== 'false') bad.push('disable changed');
   if (childPg(withVerifiedSslMode(`${base}?sslmode=no-verify`)).ssl !== '{"rejectUnauthorized":false}') bad.push('no-verify changed');
   if (childPg(withVerifiedSslMode(base)).ssl !== '{"rejectUnauthorized":true}') bad.push('explicit ssl not used without sslmode');
+  // The production path itself: getPool() in a fresh process whose only DATABASE_URL is a fictional one with
+  // sslmode=require (nothing inherited from this process, so no real URL can reach it). Creating a pool opens no
+  // connection. Its connection string must be the rewritten one, with the encoded password and other parameters
+  // intact, and pg must parse it to the verified TLS options without warning.
+  const prodUrl = `${base}?application_name=dbcheck&sslmode=require&channel_binding=require`;
+  const pooled = spawnSync(process.execPath, ['--input-type=module', '-e', `
+    const { getPool } = await import(${JSON.stringify(new URL('../lib/db.js', import.meta.url).href)});
+    const pool = getPool();
+    const { createRequire } = await import('node:module');
+    const CP = createRequire(import.meta.url)('pg/lib/connection-parameters.js');
+    process.stdout.write(JSON.stringify({ cs: pool.options.connectionString, ssl: new CP(pool.options).ssl, total: pool.totalCount }));
+    await pool.end();`],
+  { cwd: new URL('..', import.meta.url).pathname, encoding: 'utf8', timeout: 10_000, env: { PATH: process.env.PATH, DATABASE_URL: prodUrl } });
+  let got = null;
+  try { got = JSON.parse(pooled.stdout); } catch { bad.push(`getPool() child failed: ${String(pooled.stderr).split('\n').find((l) => /Error/.test(l)) || pooled.status}`); }
+  if (got) {
+    if (got.cs !== `${base}?application_name=dbcheck&sslmode=verify-full&channel_binding=require`) bad.push(`getPool() connection string not rewritten: …${String(got.cs).slice(base.length)}`);
+    if (!String(got.cs).startsWith(base)) bad.push('getPool() changed the credentials or host');
+    if (JSON.stringify(got.ssl) !== '{}') bad.push(`getPool() TLS options ${JSON.stringify(got.ssl)}`);
+    if (got.total !== 0) bad.push(`getPool() opened ${got.total} connection(s)`);
+  }
+  if (/SECURITY WARNING: The SSL modes/.test(pooled.stderr)) bad.push('pg warned on getPool()\'s options');
   if (bad.length) throw new Error(bad.join('; '));
   return 'prefer/require/verify-ca → verify-full: pg warned before, not after; TLS options identical ({} = chain + hostname verified); disable, no-verify, verify-full, uselibpqcompat and no sslmode untouched; password encoding and other params byte for byte';
 });
