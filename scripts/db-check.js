@@ -11,7 +11,7 @@ import {
   actionQueue, cartsForBucket, ACTION_BUCKETS, dailySnapshot,
   cartEvents, recentEvents, callbackAtOf,
 } from '../lib/db.js';
-import { createOtp, verifyOtp, checkRateLimit, normalisePhone } from '../lib/otp.js';
+import { createOtp, verifyOtp, checkRateLimit, normalisePhone, maskPhone, redactPhones } from '../lib/otp.js';
 import { normalizePayload, redactPayload, REDACTED_KEYS } from '../lib/normalize.js';
 import { GOKWIK_REAL_PAYLOAD } from './fixtures/gokwik-real.js';
 import { mapShopifyCsv } from '../lib/shopify-csv.js';
@@ -7889,6 +7889,122 @@ await step('rbac: a failed membership lookup denies access (fail closed)', async
     if (ok.status !== 200) throw new Error(`after recovery ${ok.status}`);
   } finally { _setMembershipLookup(null); server.close(); }
   return 'lookup error → 503 on API, page and /auth/me (was: allowed as caller); next good lookup → 200';
+});
+await step('auth logs: login, refusal and 11za failure log a masked number (last 4 digits) — never the whole number; maskPhone/redactPhones handle normal, short, malformed and missing values; login behaviour unchanged', async () => {
+  // Fictional numbers only. M1 signs in (console driver), M2 and M3 hit a failing / odd 11za, OUT is not a member.
+  const LM = { m1: '919000000851', m2: '919000000852', m3: '919000000853', out: '919000000859' };
+  const all = Object.values(LM);
+  const bad = [];
+  // 1. The helpers.
+  for (const [input, want] of [['919000000851', '...0851'], ['+91 90000 00851', '...0851'], ['09000000851', '...0851'], [919000000851, '...0851'],
+    ['12345', '(short number)'], ['+91', '(short number)'], ['abc', '(no number)'], ['', '(no number)'], [null, '(no number)'], [undefined, '(no number)'], [{}, '(no number)']]) {
+    const got = maskPhone(input);
+    if (got !== want) bad.push(`maskPhone(${JSON.stringify(input)}) = ${got}, want ${want}`);
+  }
+  for (const [input, want] of [
+    ['11za returned HTTP 500: {"sendto":"919000000851"}', '11za returned HTTP 500: {"sendto":"...0851"}'],
+    ['to +91 90000-00852 and 9000000853.', 'to ...0852 and ...0853.'],
+    ['on 2026-10-13, order 1234567, code 482913', 'on 2026-10-13, order 1234567, code 482913'],   // dates and short ids untouched
+    [null, ''], [undefined, ''],
+  ]) {
+    const got = redactPhones(input);
+    if (got !== want) bad.push(`redactPhones(${JSON.stringify(input)}) = ${got}`);
+  }
+
+  // 2. The real auth router, with every console line captured.
+  const envKeys = ['ELEVENZA_AUTH_TOKEN', 'ELEVENZA_ORIGIN_WEBSITE', 'ELEVENZA_API_URL', 'ELEVENZA_PAYLOAD_TEMPLATE', 'ELEVENZA_AUTH_HEADER', 'ELEVENZA_TEMPLATE_NAME'];
+  const savedEnv = Object.fromEntries(envKeys.map((k) => [k, process.env[k]]));
+  const clean = async () => {
+    await getPool().query('DELETE FROM otp_state WHERE phone = ANY($1)', [all]);
+    await getPool().query('DELETE FROM login_log WHERE phone = ANY($1)', [all]);
+    await getPool().query('DELETE FROM allowed_users WHERE phone = ANY($1)', [all]);
+  };
+  await clean();
+  await getPool().query(`INSERT INTO allowed_users (phone, name, added_by) VALUES ($1, 'DBCHECK-LM One', 'db-check'), ($2, 'DBCHECK-LM Two', 'db-check'), ($3, 'DBCHECK-LM Three', 'db-check')`, [LM.m1, LM.m2, LM.m3]);
+  // A stand-in 11za: /fail answers 500 and /odd a non-JSON 200, both echoing the number back as a provider might.
+  const provider = http.createServer((req, res) => {
+    let b = ''; req.on('data', (c) => { b += c; });
+    req.on('end', () => {
+      const sendto = (() => { try { return JSON.parse(b).sendto; } catch { return '?'; } })();
+      if (req.url === '/fail') { res.writeHead(500); res.end(`{"error":"template rejected for ${sendto}"}`); }
+      else { res.writeHead(200); res.end(`queued for +${sendto}`); }
+    });
+  }).listen(0);
+  const app = express();
+  app.use(express.json());
+  app.use(cookieParser());
+  app.use('/auth', authRouterForTest);
+  const server = app.listen(0);
+  const base = `http://127.0.0.1:${server.address().port}`;
+  const post = (path, body, headers = {}) => fetch(`${base}/auth${path}`, { method: 'POST', headers: { 'content-type': 'application/json', ...headers }, body: JSON.stringify(body) });
+  const lines = [];
+  const real = { log: console.log, warn: console.warn, error: console.error, info: console.info, debug: console.debug };
+  const capture = (...a) => { lines.push(a.map((x) => (x instanceof Error ? x.stack : typeof x === 'string' ? x : JSON.stringify(x))).join(' ')); };
+  let summary = '';
+  try {
+    for (const k of ['ELEVENZA_AUTH_TOKEN', 'ELEVENZA_PAYLOAD_TEMPLATE', 'ELEVENZA_AUTH_HEADER', 'ELEVENZA_TEMPLATE_NAME']) delete process.env[k];
+    Object.assign(console, { log: capture, warn: capture, error: capture, info: capture, debug: capture });
+
+    // Successful login, console driver: the code is printed (local testing needs it), the number masked.
+    const r1 = await post('/request-otp', { phone: '9000000851' });
+    const j1 = await r1.json();
+    if (r1.status !== 200 || j1.ok !== true || j1.consoleMode !== true) bad.push(`request-otp ${r1.status} ${JSON.stringify(j1)}`);
+    const code = lines.map((l) => /\[console driver\] OTP for \.\.\.0851 is (\d{6})/.exec(l)?.[1]).find(Boolean);
+    if (!code) bad.push('console driver line with the masked number and the code not found');
+    const wrong = await post('/verify-otp', { phone: '9000000851', code: code === '000000' ? '111111' : '000000' });
+    if (wrong.status !== 401 || (wrong.headers.get('set-cookie') || '').includes(`${SESSION_COOKIE}=`)) bad.push(`wrong code → ${wrong.status}`);
+    const good = await post('/verify-otp', { phone: '9000000851', code });
+    const cookie = (good.headers.get('set-cookie') || '').split(';')[0];
+    if (good.status !== 200 || (await good.json()).ok !== true || !cookie.startsWith(`${SESSION_COOKIE}=`)) bad.push(`verify-otp ${good.status} cookie ${Boolean(cookie)}`);
+    const me = await (await fetch(`${base}/auth/me`, { headers: { cookie } })).json();
+    if (me.authenticated !== true || me.phone !== LM.m1) bad.push(`session not usable: authenticated ${me.authenticated}`);
+    const again = await post('/verify-otp', { phone: '9000000851', code });
+    if (again.status !== 401) bad.push(`code reused → ${again.status}`);
+    if (!lines.some((l) => l.includes('Login succeeded for ...0851'))) bad.push('masked success line missing');
+
+    // Not a member: the same generic answer, no code issued, a masked warning.
+    const r2 = await post('/request-otp', { phone: '+91 90000 00859' });
+    const j2 = await r2.json();
+    if (r2.status !== 200 || j2.ok !== true) bad.push(`non-member ${r2.status}`);
+    if ((await getPool().query('SELECT 1 FROM otp_state WHERE phone = $1', [LM.out])).rowCount) bad.push('non-member got a code');
+    if (!lines.some((l) => l.includes('non-allowlisted number: ...0859'))) bad.push('masked non-member line missing');
+
+    // 11za configured but failing: 502 as before; the provider echo is masked in the log.
+    Object.assign(process.env, { ELEVENZA_AUTH_TOKEN: 'dbcheck-not-a-token', ELEVENZA_ORIGIN_WEBSITE: 'https://origin.example.test', ELEVENZA_API_URL: `http://127.0.0.1:${provider.address().port}/fail` });
+    const r3 = await post('/request-otp', { phone: '9000000852' });
+    if (r3.status !== 502) bad.push(`11za failure → ${r3.status}`);
+    if (!lines.some((l) => l.includes('OTP send failed for ...0852') && l.includes('template rejected for ...0852'))) bad.push('masked send-failure line missing');
+    // A non-JSON 200 is still a send; its echo is masked too.
+    process.env.ELEVENZA_API_URL = `http://127.0.0.1:${provider.address().port}/odd`;
+    const r4 = await post('/request-otp', { phone: '9000000853' });
+    if (r4.status !== 200) bad.push(`non-JSON 200 → ${r4.status}`);
+    if (!lines.some((l) => l.includes('non-JSON 200') && l.includes('...0853'))) bad.push('masked non-JSON line missing');
+
+    // The login audit table is unchanged: it still records the number, with the outcome. (Written without awaiting.)
+    let audit = [];
+    for (let i = 0; i < 20 && audit.length < 4; i += 1) {
+      ({ rows: audit } = await getPool().query('SELECT phone, ok FROM login_log WHERE phone = ANY($1) ORDER BY id', [all]));
+      if (audit.length < 4) await new Promise((r) => setTimeout(r, 100));
+    }
+    const okRows = audit.filter((r) => r.ok && r.phone === LM.m1).length;
+    if (okRows !== 1 || !audit.some((r) => !r.ok && r.phone === LM.out) || !audit.some((r) => !r.ok && r.phone === LM.m1)) bad.push(`login_log ${audit.length} rows, ${okRows} success`);
+
+    summary = `${lines.length} log lines captured`;
+  } finally {
+    Object.assign(console, real);
+    for (const k of envKeys) { if (savedEnv[k] === undefined) delete process.env[k]; else process.env[k] = savedEnv[k]; }
+    server.close(); provider.close();
+    await clean();
+  }
+  // No captured line may hold any of the numbers, in any common spelling.
+  for (const p of all) {
+    const ten = p.slice(2);
+    const spellings = [p, ten, `${ten.slice(0, 5)} ${ten.slice(5)}`, `${ten.slice(0, 5)}-${ten.slice(5)}`];
+    const leaks = lines.filter((l) => spellings.some((s) => l.includes(s)));
+    if (leaks.length) bad.push(`${leaks.length} log line(s) contain ${maskPhone(p)} in full`);
+  }
+  if (bad.length) throw new Error(bad.join('; '));
+  return `${summary}; console-mode login (wrong code 401, right code 200 + working session, reuse 401), non-member generic 200, 11za 500 → 502 and non-JSON 200 all log only ...NNNN`;
 });
 
 // The real server, on the test database, with signed sessions for each member.

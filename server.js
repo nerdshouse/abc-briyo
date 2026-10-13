@@ -46,7 +46,7 @@ import { router as ordersRouter, courierRouter, destinationRouter } from './lib/
 import { router as inventoryRouter } from './lib/inventory-routes.js';
 import { ensureInventorySchema } from './lib/inventory.js';
 import { ensureOrderFinancialSnapshotSchema } from './lib/order-financial-snapshots.js';
-import { activeUsers, seedAllowedUsers, normalisePhone, bootstrapAdmins, nameFor } from './lib/otp.js';
+import { activeUsers, seedAllowedUsers, normalisePhone, bootstrapAdmins, nameFor, maskPhone } from './lib/otp.js';
 import { mapShopifyCsv } from './lib/shopify-csv.js';
 import { toCsv } from './lib/csv.js';
 import { driver } from './lib/whatsapp.js';
@@ -1091,7 +1091,7 @@ app.post('/api/members', requireAdmin, async (req, res) => {
       actor, action: 'add', targetPhone: phone,
       detail: `${name}${isAdmin ? ' (admin)' : ''}${Object.keys(changes).length ? ` · ${describeModules(changes)}` : ''}`,
     });
-    console.log(`Member added by ${actor}: +${phone} (${name})${isAdmin ? ' [admin]' : ''}`);
+    console.log(`Member added by ${actor}: ${maskPhone(phone)} (${name})${isAdmin ? ' [admin]' : ''}`);
     return res.json({ ok: true, member });
   } catch (err) { return fail(res, err); }
 });
@@ -1159,7 +1159,7 @@ app.patch('/api/members/:phone', requireAdmin, async (req, res) => {
           actor, action: 'change-number', targetPhone: newPhone,
           detail: `moved from +${phone}`,
         });
-        console.log(`Member number changed by ${actor}: +${phone} -> +${newPhone}`);
+        console.log(`Member number changed by ${actor}: ${maskPhone(phone)} -> ${maskPhone(newPhone)}`);
         return res.json({ ok: true, member: moved.member });
       }
     }
@@ -1181,7 +1181,7 @@ app.patch('/api/members/:phone', requireAdmin, async (req, res) => {
       Object.keys(changes).length ? describeModules(changes) : null,
     ].filter(Boolean).join(', ');
     await recordMemberChange({ actor, action: 'update', targetPhone: phone, detail: what });
-    console.log(`Member updated by ${actor}: +${phone} — ${what}`);
+    console.log(`Member updated by ${actor}: ${maskPhone(phone)} — ${what}`);
     return res.json({ ok: true, member });
   } catch (err) { return fail(res, err); }
 });
@@ -1211,7 +1211,7 @@ app.delete('/api/members/:phone', requireAdmin, async (req, res) => {
 
     invalidateMembership(phone);
     await recordMemberChange({ actor, action: 'remove', targetPhone: phone, detail: null });
-    console.log(`Member removed by ${actor}: +${phone}`);
+    console.log(`Member removed by ${actor}: ${maskPhone(phone)}`);
     return res.json({ ok: true });
   } catch (err) { return fail(res, err); }
 });
@@ -1321,7 +1321,7 @@ app.listen(port, async () => {
         "  Add someone:  INSERT INTO allowed_users (phone, name) VALUES ('91XXXXXXXXXX', 'Name');\n");
     } else {
       const masked = [...allowed.entries()]
-        .map(([phone, name]) => `${name}:...${phone.slice(-4)}`).join(', ');
+        .map(([phone, name]) => `${name}:${maskPhone(phone)}`).join(', ');
       console.log(`Allowed logins (${seed.source}): ${allowed.size} — ${masked}`);
     }
   } catch (err) {
