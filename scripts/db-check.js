@@ -3716,6 +3716,90 @@ await step('platform SKUs: a new platform is a row, not a migration', async () =
   for (const k of ['amazon', 'blinkit', 'zepto', 'tata_1mg', 'netmeds', 'clinikally']) if (!seeded.includes(k)) throw new Error(`missing platform ${k}`);
   return `added "${p.label}" (${p.key}) and mapped to it with no schema change; the 6 standard platforms are seeded`;
 });
+await step('platform SKUs: Flipkart, PharmEasy, HyugaLife, BigBasket, Nykaa and SastaSundar are seeded platforms — mappings, units per listing and duplicate rules as for Amazon; marketplace order lines resolve through them; no stock moves; existing platforms unchanged; logistics partners are not platforms', async () => {
+  const bad = [];
+  const db = getPool();
+  const NEW = { flipkart: 'Flipkart', pharmeasy: 'PharmEasy', hyugalife: 'HyugaLife', bigbasket: 'BigBasket', nykaa: 'Nykaa', sastasundar: 'SastaSundar' };
+  const OLD = { amazon: 'Amazon', blinkit: 'Blinkit', zepto: 'Zepto', tata_1mg: 'Tata 1mg', netmeds: 'Netmeds', clinikally: 'Clinikally', website: 'Website · Shopify' };
+  const all = await listPlatforms();
+  const byKey = new Map(all.map((p) => [p.key, p]));
+  for (const [k, label] of Object.entries(NEW)) if (byKey.get(k)?.label !== label || !byKey.get(k)?.active) bad.push(`platform ${k}: ${JSON.stringify(byKey.get(k))}`);
+  for (const [k, label] of Object.entries(OLD)) if (byKey.get(k)?.label !== label) bad.push(`existing platform ${k} changed: ${JSON.stringify(byKey.get(k))}`);
+  // Logistics partners stay couriers; nothing named Scootsy became a platform.
+  if (all.some((p) => /scootsy/i.test(`${p.key} ${p.label}`))) bad.push('a logistics partner was added as a platform');
+  // Five share their order-channel key (their order lines find the mappings); SastaSundar has no order channel.
+  const chans = new Set((await db.query('SELECT key FROM sales_channels')).rows.map((r) => r.key));
+  for (const k of ['flipkart', 'pharmeasy', 'hyugalife', 'bigbasket', 'nykaa']) if (!chans.has(k)) bad.push(`no order channel ${k}`);
+  if (chans.has('sastasundar')) bad.push('sastasundar is an order channel');
+
+  const stockState = async () => (await db.query(`SELECT
+      (SELECT count(*) FROM inventory_movements)::int mv, (SELECT count(*) FROM inventory_reservations)::int rs,
+      (SELECT coalesce(sum(on_hand), 0) FROM inventory_batches)::int qty, (SELECT count(*) FROM skus)::int skus,
+      (SELECT count(*) FROM order_shipments)::int ships`)).rows[0];
+  const before = await stockState();
+  const dests = await listDestinations();
+  const routeFor = (ch) => { const d = dests.find((x) => x.channel === ch && x.active); return d ? { dispatch_type: d.dispatch_type, destination_id: d.id } : { dispatch_type: 'easy_ship' }; };
+  for (const ch of ['flipkart', 'pharmeasy', 'hyugalife', 'bigbasket', 'nykaa']) {
+    const code = `${TS}-MP-${ch.toUpperCase()}`;
+    // An order line on this marketplace with its own platform SKU: unmapped, and now mappable from the worklist.
+    const id = await createOrder({ ...routeFor(ch), channel: ch, source_order_id: `${TEST_ORDER}-MP-${ch}`, order_date: NOW(), order_value: 100 }, { actor: ACTOR });
+    await db.query(`INSERT INTO order_items (order_id, source_line_item_id, sku, title, quantity, item_price) VALUES ($1, 'L1', $2, 'Marketplace line', 3, 100)`, [id, code]);
+    const listed = (await unmappedSkus()).find((u) => u.code === code);
+    if (!listed || listed.channel !== ch || !listed.mappable || listed.platform_label !== NEW[ch]) bad.push(`${ch} worklist ${JSON.stringify(listed)}`);
+    // Mapped with 2 units per listing (not assumed 1): the line resolves; the code means nothing on another platform.
+    const r = await addPlatformMappings(INV.m2, ch, [code], { actor: ACTOR, fromOrder: true, unitsPerListing: 2 });
+    const line = (await db.query('SELECT sku_id, sku FROM order_items WHERE order_id = $1', [id])).rows[0];
+    const map = (await db.query('SELECT units_per_listing FROM sku_platform_mappings WHERE platform = $1 AND lower(platform_sku) = lower($2)', [ch, code])).rows[0];
+    if (r.added[0] !== code || r.orderItemsMapped !== 1 || line.sku_id !== INV.m2 || line.sku !== code || map?.units_per_listing !== 2) bad.push(`${ch} mapping ${JSON.stringify({ r, line, map })}`);
+    const c = await db.connect();
+    try {
+      const here = await resolveSkuIds(c, ch, [code]);
+      const other = await resolveSkuIds(c, ch === 'flipkart' ? 'pharmeasy' : 'flipkart', [code]);
+      if (here.get(code.toLowerCase()) !== INV.m2 || other.has(code.toLowerCase())) bad.push(`${ch} platform-scoped resolution`);
+    } finally { c.release(); }
+  }
+  // SastaSundar (a product-code list): mapped like any platform, units validated the same way.
+  const ss = await addPlatformMappings(INV.m2, 'sastasundar', [`${TS}-SS-001`], { actor: ACTOR, unitsPerListing: 3 });
+  if (ss.added[0] !== `${TS}-SS-001`) bad.push(`sastasundar mapping ${JSON.stringify(ss)}`);
+  for (const u of ['0', '-1', '1.5', 'x']) {
+    const e = await addPlatformMappings(INV.m2, 'sastasundar', [`${TS}-SS-BAD`], { actor: ACTOR, unitsPerListing: u }).then(() => null, (x) => x);
+    if (!e || e.status !== 400) bad.push(`units per listing ${u} accepted`);
+  }
+  // SastaSundar can also serve as the product-code list of the existing "Sastasundar Healthbuddy Limited" retailer
+  // destination with no schema change (it is not an order-channel key); a marketplace channel key cannot. Put back after.
+  const ssDest = dests.find((d) => d.channel === 'retailers' && /^sastasundar/i.test(d.name));
+  if (!ssDest) bad.push('no Sastasundar retailer destination');
+  else {
+    const was = ssDest.sku_platform ?? '';
+    try {
+      const linked = await saveDestination({ id: ssDest.id, sku_platform: 'sastasundar' });
+      if (linked?.sku_platform !== 'sastasundar') bad.push(`sastasundar link ${JSON.stringify(linked)}`);
+      const asChannel = await saveDestination({ id: ssDest.id, sku_platform: 'pharmeasy' }).then(() => null, (e) => e);
+      if (!asChannel || asChannel.status !== 400) bad.push(`a marketplace channel key was accepted as a retailer list: ${asChannel?.message}`);
+    } finally {
+      await saveDestination({ id: ssDest.id, sku_platform: was });
+    }
+    if (((await listDestinations()).find((d) => d.id === ssDest.id)?.sku_platform ?? '') !== was) bad.push('retailer link not restored');
+  }
+  // Duplicate rule as on Amazon: the same PharmEasy code on another master needs confirmation and a reason.
+  const dup = await addPlatformMappings(INV.m, 'pharmeasy', [`${TS}-MP-PHARMEASY`], { actor: ACTOR }).then(() => null, (x) => x);
+  if (!dup || dup.status !== 409) bad.push(`pharmeasy duplicate ${dup?.status} ${dup?.message}`);
+  // Adding platforms and mappings moved no stock and made no SKU. (Each of the 5 test orders has its own empty
+  // shipment, made by createOrder — that is all that changed among shipments.)
+  const after = await stockState();
+  for (const k of ['mv', 'rs', 'qty', 'skus']) if (after[k] !== before[k]) bad.push(`${k} changed: ${before[k]} → ${after[k]}`);
+  if (after.ships !== before.ships + 5) bad.push(`shipments ${before.ships} → ${after.ships} (want +5, one empty shipment per test order)`);
+  // Amazon works as before alongside them: an Amazon code maps and resolves, and only on Amazon.
+  const amz = await addPlatformMappings(INV.m, 'amazon', [`${TS}-MP-AMZ`], { actor: ACTOR });
+  const c = await db.connect();
+  try {
+    const key = `${TS}-MP-AMZ`.toLowerCase();
+    if (amz.added[0] !== `${TS}-MP-AMZ` || (await resolveSkuIds(c, 'amazon', [`${TS}-MP-AMZ`])).get(key) !== INV.m
+      || (await resolveSkuIds(c, 'flipkart', [`${TS}-MP-AMZ`])).has(key)) bad.push('amazon mapping or resolution changed');
+  } finally { c.release(); }
+  if (bad.length) throw new Error(bad.join(' | '));
+  return '6 marketplaces seeded (labels, active), 7 existing platforms unchanged, no Scootsy platform; Flipkart/PharmEasy/HyugaLife/BigBasket/Nykaa lines listed as mappable, mapped with 2 units/listing, resolved, scoped to their platform; SastaSundar maps with the same unit validation and can be linked as the Sastasundar retailer code list (a channel key cannot); duplicate code needs confirmation (409); no stock, SKU or shipment change; Amazon unchanged';
+});
 await step('platform SKUs: historical Amazon orders keep their master SKU through the move off the old column', async () => {
   // A master set up the old way (code in skus.amazon_seller_sku) with an order line already resolved through it.
   const legacy = (await createSku({ sku: `${TS}-LEGACY`, product_name: 'Legacy mapped' }, { actor: ACTOR })).id;
