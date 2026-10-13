@@ -12,7 +12,7 @@ import {
   cartEvents, recentEvents, callbackAtOf,
 } from '../lib/db.js';
 import { createOtp, verifyOtp, checkRateLimit, normalisePhone, maskPhone, redactPhones } from '../lib/otp.js';
-import { normalizePayload, normalizeOrderPayload, redactPayload, REDACTED_KEYS, orderLogRef, orderWebhookDiagnostic } from '../lib/normalize.js';
+import { normalizePayload, normalizeOrderPayload, redactPayload, REDACTED_KEYS, orderLogRef, orderWebhookDiagnostic, eventLabel, KNOWN_ORDER_EVENTS } from '../lib/normalize.js';
 import { maskPhone as maskPhoneFromLogRedact, redactPhones as redactPhonesFromLogRedact, redactEmails, redactForLog } from '../lib/log-redact.js';
 import { GOKWIK_REAL_PAYLOAD } from './fixtures/gokwik-real.js';
 import { mapShopifyCsv } from '../lib/shopify-csv.js';
@@ -1161,6 +1161,9 @@ const primary = async (id) => (await orderShipments(id))[0];
 await step('orders schema, shipment table migration, sequence untouched', async () => {
   const before = (await getPool().query(`SELECT last_value FROM orders_id_seq`).catch(() => ({ rows: [{}] }))).rows[0].last_value;
   await ensureOrdersSchema();
+  // The order steps below read dispatch_destinations.sku_platform, which ensureInventorySchema adds. Without this a
+  // brand-new database failed ~54 order checks on its first run only (server.js runs it at boot).
+  await ensureInventorySchema();
   await purgeTestOrders(TEST_ORDER); // leftovers from an interrupted run
   const cols = (await getPool().query(`SELECT column_name FROM information_schema.columns WHERE table_name = 'orders'`)).rows.map((r) => r.column_name);
   for (const gone of ['shipment_status', 'courier_partner_id', 'tracking_id', 'dispatch_date']) {
@@ -5572,6 +5575,8 @@ await step('shopify orders: one-click full history — needs read_all_orders as 
   const CK = 'shopify_orders_checkpoint';
   const savedCk = (await getPool().query('SELECT value FROM system_state WHERE key = $1', [CK])).rows[0]?.value ?? null;
   const keepEnv = process.env.SHOPIFY_READ_ALL_ORDERS; delete process.env.SHOPIFY_READ_ALL_ORDERS;
+  // #2823's landing URL is on the store's myshopify domain: set here (as the referral step does), not inherited from a .env.
+  const keepShopDomain = process.env.SHOPIFY_STORE_DOMAIN; process.env.SHOPIFY_STORE_DOMAIN = 'briyo-supp.myshopify.com';
   const gidOf = (n) => `${SH_PREFIX}${String(n).padStart(4, '0')}`;
   const ATS = 'Amazon Transportation Services';
   // 130 orders back to 2023 (3 pages of 50 at most; runs of 50 so the chain resumes), one BWA, one #2823 pattern.
@@ -5652,6 +5657,7 @@ await step('shopify orders: one-click full history — needs read_all_orders as 
     if (a?.n !== 0 || a.r?.conflict !== true || a.r.commission !== false) bad.push(`#2823 pattern ${JSON.stringify(a)}`);
   } finally {
     if (keepEnv === undefined) delete process.env.SHOPIFY_READ_ALL_ORDERS; else process.env.SHOPIFY_READ_ALL_ORDERS = keepEnv;
+    if (keepShopDomain === undefined) delete process.env.SHOPIFY_STORE_DOMAIN; else process.env.SHOPIFY_STORE_DOMAIN = keepShopDomain;
     _resetScopeCache();
     if (savedCk === null) await getPool().query('DELETE FROM system_state WHERE key = $1', [CK]);
     else await getPool().query(`UPDATE system_state SET value = $2 WHERE key = $1`, [CK, savedCk]);
@@ -11767,6 +11773,16 @@ await step('log redaction: redactPhones masks Indian mobiles under any common se
     if (got.length > 300 || /\d{5,}/.test(got) || /dbcheck\.cu/.test(got)) bad.push(`redactForLog(${label} at the cut) = …${got.slice(-24)}`);
   }
   if (redactForLog('a\nERROR forged line\r\nb') !== 'a ERROR forged line b') bad.push('redactForLog kept a line break');
+  // No character that can start a log line or restyle / reorder one survives: CR, LF, VT, FF, ESC (ANSI colour), NEL, the
+  // 8-bit CSI, DEL, the Unicode line and paragraph separators, bidi overrides and isolates. Each run becomes one space.
+  for (const [name, ch] of [['CR', '\r'], ['LF', '\n'], ['VT', '\u000b'], ['FF', '\f'], ['ESC', '\u001b'], ['NUL', '\u0000'], ['DEL', '\u007f'], ['NEL', '\u0085'],
+    ['CSI', '\u009b'], ['LS', '\u2028'], ['PS', '\u2029'], ['RLO', '\u202e'], ['RLI', '\u2067'], ['tab', '\t']]) {
+    const got = redactForLog(`a${ch}${ch}[31mERROR forged${ch}b`);
+    if (got !== 'a [31mERROR forged b') bad.push(`redactForLog kept ${name}: ${JSON.stringify(got)}`);
+  }
+  // A number split by a control character is joined, then masked; redaction still comes before the cut.
+  if (redactForLog('98765\u001b43210 and 90000\u202800861') !== '...3210 and ...0861') bad.push('number split by a control character not masked');
+  if (redactForLog(`${'z'.repeat(285)}\u001b[2K919000000861 end`, 300) !== `${'z'.repeat(285)} [2K...0861 end`) bad.push('control characters + phone at the cut');
   if (redactForLog('9000000861 dbcheck.e@example.test') !== '...0861 (email)') bad.push('redactForLog missed a phone or an email');
   // One implementation: lib/otp.js re-exports lib/log-redact.js.
   if (maskPhone !== maskPhoneFromLogRedact || redactPhones !== redactPhonesFromLogRedact) bad.push('two masking implementations');
@@ -11781,6 +11797,11 @@ await step('order webhook diagnostics: the order reference comes only from expli
     ['customer.id', { customer: { id: 'CUST-48812' }, phone: '9000000851' }], ['session.id', { session: { id: 'sess_abc123' } }],
     ['customer.name', { customer: { name: 'Rao2' } }], ['address.name', { address: { name: 'Flat-12/B-Wing' } }], ['top-level name', { name: 'asha.rao1' }],
     ['contact/shipping ids', { contact: { order_id: 'CT-1' }, shipping: { order_id: 'SH-1' }, shipping_address: { order_id: 'SA-1' } }],
+    // Explicit order-id keys inside customer, session, address or user blocks are still not order references.
+    ['customer.order_id', { customer: { order_id: 'CUST-ORD-1' } }], ['customer.order_number', { customer: { order_number: '#77' } }],
+    ['session/address/user order ids', { session: { order_id: 'S-1' }, address: { order_id: 'A-1' }, user: { order_name: 'U-1' }, billing_address: { moid: 'B-1' } }],
+    // An order reference has a digit: a word in an order field may be a name.
+    ['name in order_name', { order_name: 'Rao' }], ['name in order_id', { order_id: 'asha.rao' }], ['word in moid', { data: { moid: 'pending' } }],
     ['phone with an extra digit', { order_id: '90000008511' }], ['glued numbers', { order_id: '919000000851919000000852' }], ['spaced phone', { order_id: '90000-00851' }],
     ['email', { order_id: 'a1@example.test' }], ['spaces', { order_number: 'Order 12 for Rao' }], ['line break', { order_id: 'GK-1\nERROR forged' }],
     ['too long', { order_id: `GK-${'1'.repeat(70)}` }], ['13-digit id', { order_id: '6123456789012' }], ['object', { order_id: { id: 'GK-1' } }],
@@ -11793,10 +11814,20 @@ await step('order webhook diagnostics: the order reference comes only from expli
     if (orderLogRef(payload) !== want) bad.push(`${JSON.stringify(payload)} → ${orderLogRef(payload)}, want ${want}`);
   }
   // Event type: kept when shaped like one, withheld when it could be a name, a number or an address.
-  const ev = (event) => /event=(\S+)/.exec(orderWebhookDiagnostic({ event }, {}))[1];
-  for (const e of ['order.completed', 'PAYMENT_CONFIRMED', 'paid', 'order:created-v2']) if (ev(e) !== e) bad.push(`event ${e} → ${ev(e)}`);
-  for (const e of ['DbcheckRao', 'Asha', 'order.9000000851', 'a@b.test', 'two words', 'x\nERROR forged', 'e'.repeat(49), 'evt_123456']) if (ev(e) !== '(withheld)') bad.push(`event ${JSON.stringify(e)} → ${ev(e)}`);
-  if (ev(undefined) !== '(none)' || /event=\(none\)/.test(orderWebhookDiagnostic({ event: { name: 'Rao' } }, {})) === false) bad.push('missing / object event not "(none)"');
+  // Event type: the GoKwik order webhook has never delivered, so no event name is known and every value is withheld
+  // (naming the field). Only an exact allowlist entry is shown — never a value that merely looks like an event type.
+  if (KNOWN_ORDER_EVENTS.length !== 0 || !Object.isFrozen(KNOWN_ORDER_EVENTS)) bad.push(`event allowlist not empty and frozen: ${KNOWN_ORDER_EVENTS.length}`);
+  const ev = (event, key = 'event') => /event=(\S+)/.exec(orderWebhookDiagnostic({ [key]: event }, {}))[1];
+  for (const e of ['asha', 'Asha_Rao', 'priya_sharma', 'Asha-Rao', 'ASHA', 'asha.rao', 'rao2', 'DbcheckRao', 'order.completed', 'PAYMENT_CONFIRMED', 'paid',
+    'order.9000000851', 'a@b.test', 'two words', 'x\nERROR forged', 'e'.repeat(49), 'evt_123456', 42]) {
+    if (ev(e) !== '(withheld:event)') bad.push(`event ${JSON.stringify(e)} → ${ev(e)}`);
+  }
+  for (const key of ['event_type', 'event_name', 'type', 'topic']) if (ev('asha', key) !== `(withheld:${key})`) bad.push(`${key}: asha → ${ev('asha', key)}`);
+  if (ev(undefined) !== '(none)' || ev(null) !== '(none)' || ev({ name: 'Rao' }) !== '(none)') bad.push('missing / object event not "(none)"');
+  // The allowlist mechanism: an exact entry is shown; a near miss (case, separator) is not.
+  const allow = ['order.completed'];
+  if (eventLabel({ event: 'order.completed' }, allow) !== 'order.completed' || eventLabel({ type: 'order.completed' }, allow) !== 'order.completed') bad.push('allowlisted event not shown');
+  for (const e of ['Order.Completed', 'order_completed', 'order.completed ', 'asha']) if (eventLabel({ event: e }, allow) !== '(withheld:event)') bad.push(`near miss ${JSON.stringify(e)} shown`);
   // Field names: a phone, a PIN or an email in a name is not shown, only counted.
   const keys = /keys=\[([^\]]*)\]/.exec(orderWebhookDiagnostic({ customer_9000000876: 1, 'pin_560099': 1, 'a@b.test': 1, 'x y': 1, order_id: 'GK-1', [`k${'e'.repeat(45)}`]: 1 }, {}))[1];
   if (keys !== 'order_id, +5 not shown') bad.push(`keys [${keys}]`);
@@ -11804,7 +11835,7 @@ await step('order webhook diagnostics: the order reference comes only from expli
   if (!many.includes('+20 not shown') || many.length > 1200) bad.push(`50 fields: ${many.length} chars`);
   if (/[\r\n]/.test(orderWebhookDiagnostic({ event: 'a\nb', order_id: 'GK-1\nb', 'a\nb': 1 }, {}))) bad.push('line break in a diagnostic');
   if (bad.length) throw new Error(bad.join('; '));
-  return 'customer/session/address/name values, phone-ish and email-ish refs rejected; GK-88812, #1001, BWA1001 kept; names in event and phone/PIN/email in field names withheld; one bounded line';
+  return 'customer/session/address/name values, phone-ish and email-ish refs rejected; GK-88812, #1001, BWA1001 kept; every event value withheld (empty allowlist; exact-match mechanism checked); phone/PIN/email in field names withheld; one bounded line';
 });
 
 await step('auth: an 11za send failure answers 502 with one fixed message — no provider text, configuration detail or echoed number reaches the client; details stay in the log, masked; non-members unchanged', async () => {
@@ -11875,20 +11906,23 @@ await step('ops alerts and member photos: the SLA startup line, the unsent ops a
     });
     // 2. The scheduler: startup line masked; a stale backlog is sent through 11za, which fails echoing the number.
     let sends = 0;
-    await withEnv({ OPS_PHONE: '9000000866', SLA_ALERTS_ENABLED: undefined, SLA_ALERT_MINUTES: '0.002', SLA_ALERT_THRESHOLD: '1', DAILY_SUMMARY_ENABLED: 'false',
+    await withEnv({ OPS_PHONE: '9000000866', SLA_ALERTS_ENABLED: undefined, SLA_ALERT_MINUTES: '0.002', SLA_ALERT_THRESHOLD: '1', DAILY_SUMMARY_ENABLED: undefined, DAILY_SUMMARY_HOUR: '0',
       ELEVENZA_AUTH_TOKEN: 'dbcheck-not-a-token', ELEVENZA_OPS_TEMPLATE_NAME: 'dbcheck_ops', ELEVENZA_ORIGIN_WEBSITE: 'https://origin.example.test',
       ELEVENZA_API_URL: `http://127.0.0.1:${provider.address().port}/fail`, ELEVENZA_PAYLOAD_TEMPLATE: undefined, ELEVENZA_AUTH_HEADER: undefined }, async () => {
       // The ingest lookup fails with an error quoting a number and an address (as a database error can).
       timer = startSlaAlerts({ getStale: async () => { sends += 1; return { count: 2, value: 999 }; }, slaHours: 6,
-        getLastIngest: async () => { throw new Error('ingest lookup failed for 919000000866 / dbcheck.ops@example.test'); } });
+        getLastIngest: async () => { throw new Error('ingest lookup failed for 919000000866 / dbcheck.ops@example.test'); },
+        // The evening summary is due (hour 0) and its stats lookup fails the same way.
+        getDailyStats: async () => { throw new Error('summary stats failed for 919000000866 / dbcheck.sum@example.test'); } });
       if (!timer) bad.push('scheduler did not start');
       if (!cap.lines.some((l) => /SLA alerts: every [\d.]+ min to \.\.\.0866 when >= 1/.test(l))) bad.push('startup line not masked');
-      for (let i = 0; i < 50 && !cap.lines.some((l) => l.startsWith('SLA alert check failed')); i += 1) await new Promise((r) => setTimeout(r, 50));
+      for (let i = 0; i < 50 && !(cap.lines.some((l) => l.startsWith('SLA alert check failed')) && cap.lines.some((l) => l.startsWith('Daily summary failed'))); i += 1) await new Promise((r) => setTimeout(r, 50));
       clearInterval(timer); timer = null;
       const failed = cap.lines.find((l) => l.startsWith('SLA alert check failed'));
       if (!sends || !failed) bad.push(`scheduled check ran ${sends} time(s), failure line ${Boolean(failed)}`);
       else if (!failed.includes('template rejected for ...0866')) bad.push('failure line lost the provider detail');
       if (!cap.lines.some((l) => l === 'Ingest-silence check failed: ingest lookup failed for ...0866 / (email)')) bad.push('ingest-silence error not redacted (phone and email)');
+      if (!cap.lines.some((l) => l === 'Daily summary failed: summary stats failed for ...0866 / (email)')) bad.push('daily-summary error not redacted (phone and email)');
     });
     // 3. Photo cleanup failing: the member keeps the new photo / loses the old one as before; the log line is masked.
     await getPool().query(`INSERT INTO allowed_users (phone, name, added_by) VALUES ($1, 'DBCHECK-PV Photo', 'db-check')`, [MEM]);
@@ -11903,7 +11937,7 @@ await step('ops alerts and member photos: the SLA startup line, the unsent ops a
     if (cleared.hasPhoto) bad.push('photo not cleared');
     if (!cap.lines.some((l) => l === 'Member photo for ...0867 not removed from storage')) bad.push('clear cleanup line not masked');
   } finally { if (timer) clearInterval(timer); cap.stop(); provider.close(); await clean(); }
-  const leaks = leaksOf(cap.lines, [OPS, MEM], ['dbcheck.ops@example.test']);
+  const leaks = leaksOf(cap.lines, [OPS, MEM], ['dbcheck.ops@example.test', 'dbcheck.sum@example.test']);
   if (leaks.length) bad.push(`full number in logs: ${leaks.join(', ')}`);
   if (bad.length) throw new Error(bad.join('; '));
   return `${cap.lines.length} lines captured: unsent alert, startup line, failed scheduled send (provider echo masked), two photo-cleanup failures — all ...NNNN`;
@@ -11913,7 +11947,7 @@ await step('order webhook: logs carry field names, the event type, the order id 
   const PII = {
     phones: ['919000000871', '919000000872', '919000000873', '919000000874', '919000000875', '919000000876', '919000000877', '919000000878', '919000000879'],
     text: ['dbcheck.buyer@example.test', 'dbcheck.ship@example.test', 'dbcheck.err@example.test', 'dbcheck.g@example.test', 'DBCHECK Person', 'Fictional Lane', 'Testnagar', '560099', 'DBCHECK-WH',
-      'CUST-48812', 'sess_abc123', 'Rao2', 'Flat-12/B-Wing', 'asha.rao1', '90000008511', 'DbcheckRao'],
+      'CUST-48812', 'sess_abc123', 'Rao2', 'Flat-12/B-Wing', 'asha.rao1', '90000008511', 'Asha_Rao', 'priya_sharma'],
   };
   const SECRET = 'dbcheck-webhook-secret';
   const bad = [];
@@ -11925,47 +11959,55 @@ await step('order webhook: logs carry field names, the event type, the order id 
   const B = 'not json: DBCHECK Person 9000000873 dbcheck.buyer@example.test DBCHECK-WH';
   const C = { type: 'payment_confirmed', order_number: '#1001', phone: '9000000874', name: 'DBCHECK Person', shipping_address: { address1: '12 Fictional Lane', city: 'Testnagar', zip: '560099' }, tag: 'DBCHECK-WH' };
   const D = { order_id: 'GK-DBCHECK-4', email: 'dbcheck.ship\u0000@example.test', alt_phone: '9000000875', customer_name: 'DBCHECK Person', tag: 'DBCHECK-WH' };
-  const E = { event: 'DbcheckRao', order_id: '90000008511', customer: { id: 'CUST-48812', name: 'Rao2' }, session: { id: 'sess_abc123' }, address: { name: 'Flat-12/B-Wing' },
+  const E = { event: 'Asha_Rao', order_id: '90000008511', customer: { id: 'CUST-48812', name: 'Rao2' }, session: { id: 'sess_abc123' }, address: { name: 'Flat-12/B-Wing' },
     name: 'asha.rao1', customer_9000000876: 'x', phone: '9000000878', tag: 'DBCHECK-WH' };
-  const F = { topic: 'paid', order: { order_id: 'BWA1001' }, phone: '9000000879', tag: 'DBCHECK-WH' };
+  const F = { topic: 'priya_sharma', order: { order_id: 'BWA1001' }, phone: '9000000879', tag: 'DBCHECK-WH' };
   const G = { order_id: 'GK-88812', email: 'dbcheck.g@example.test', tag: 'DBCHECK-WH' };
   const H = { order_id: 'GK-DBCHECK-8', phone: '9000000877', tag: 'DBCHECK-WH' };
   const HCART = 'DBCHECK-HC-1';
-  const dropFault = async () => {
+  // Everything this step creates — the fault trigger and its function, the cart, any recovery or failure rows — is
+  // removed in finally whether the step passes, fails or throws part-way (setup included), and once first, in case
+  // an earlier run was killed.
+  const cleanUp = async () => {
     await getPool().query('DROP TRIGGER IF EXISTS dbcheck_wh_fail ON abandoned_carts');
     await getPool().query('DROP FUNCTION IF EXISTS dbcheck_wh_fail()');
+    await getPool().query(`DELETE FROM auto_recovery_log WHERE cart_id LIKE 'DBCHECK-HC-%' OR order_id LIKE 'GK-DBCHECK-%'`);
     await getPool().query(`DELETE FROM abandoned_carts WHERE cart_id LIKE 'DBCHECK-HC-%'`);
+    await getPool().query(`DELETE FROM webhook_failures WHERE kind = 'order-completed' AND body LIKE '%DBCHECK-WH%'`);
   };
-  await dropFault();
-  const hCart = { request_id: HCART, customer: { first_name: 'DBCHECK', last_name: 'Person', phone: '9000000877', email: 'dbcheck.err@example.test' }, totals: { total: 10 }, currency: 'INR' };
-  await insertCart(normalizePayload(hCart), hCart);
-  const hRow = (await getPool().query('SELECT phone, email, status FROM abandoned_carts WHERE cart_id = $1', [HCART])).rows[0];
-  // The error puts the stored phone 9 characters before the 300-character cut (the email earlier): cut first, and 9 of its characters would survive unmasked.
-  const prefix = `dbcheck simulated failure: contact ${hRow.email}; `;
-  const dashes = 291 - prefix.length - ' phone '.length;
-  await getPool().query(`CREATE FUNCTION dbcheck_wh_fail() RETURNS trigger LANGUAGE plpgsql AS $f$
-    BEGIN RAISE EXCEPTION '%', format('dbcheck simulated failure: contact %s; %s phone %s end', NEW.email, repeat('-', ${Number(dashes)}), NEW.phone); END $f$`);
-  await getPool().query(`CREATE TRIGGER dbcheck_wh_fail BEFORE UPDATE ON abandoned_carts FOR EACH ROW WHEN (OLD.cart_id LIKE 'DBCHECK-HC-%') EXECUTE FUNCTION dbcheck_wh_fail()`);
-  const parsedA = normalizeOrderPayload(A);
-  if (parsedA.phone || parsedA.email) bad.push(`fixture A is recognised (${parsedA.phone ? 'phone' : 'email'}): pick other keys`);
-  const port = await freePort();
+  let srv = null;
+  let closed = null;
   let log = '';
-  const srv = spawn(process.execPath, ['server.js'], {
-    cwd: new URL('..', import.meta.url).pathname,
-    env: { ...process.env, PORT: String(port), APP_ENV: 'test', WEBHOOK_SECRET: SECRET, ADMIN_PHONES: '', ELEVENZA_AUTH_TOKEN: '', SHOPIFY_ACCESS_TOKEN: '',
-      SHOPIFY_POLL_ENABLED: 'false', SHOPIFY_POLL_MINUTES: '0', SHOPIFY_ORDERS_POLL_ENABLED: '', SLA_ALERTS_ENABLED: 'false', DAILY_SUMMARY_ENABLED: 'false', KEEPALIVE_URL: '', RENDER_EXTERNAL_URL: '' },
-    stdio: ['ignore', 'pipe', 'pipe'],
-  });
-  srv.stdout.on('data', (d) => { log += d; }); srv.stderr.on('data', (d) => { log += d; });
-  // Registered now, so a server that dies early still resolves it; awaited (bounded) before the log is read.
-  const closed = new Promise((r) => srv.once('close', r));
-  const base = `http://127.0.0.1:${port}`;
-  const send = async (body) => { const r = await fetch(`${base}/api/webhook/gokwik/order-completed`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-webhook-secret': SECRET }, body: typeof body === 'string' ? body : JSON.stringify(body) }); return { status: r.status, body: await r.json() }; };
-  const waitFor = async (re, what) => {
-    for (let i = 0; i < 60 && !re.test(log); i += 1) await new Promise((r) => setTimeout(r, 50));
-    if (!re.test(log)) bad.push(`log line missing: ${what}`);
-  };
+  await cleanUp();
   try {
+    const hCart = { request_id: HCART, customer: { first_name: 'DBCHECK', last_name: 'Person', phone: '9000000877', email: 'dbcheck.err@example.test' }, totals: { total: 10 }, currency: 'INR' };
+    await insertCart(normalizePayload(hCart), hCart);
+    const hRow = (await getPool().query('SELECT phone, email, status FROM abandoned_carts WHERE cart_id = $1', [HCART])).rows[0];
+    // The error puts the stored phone 9 characters before the 300-character cut (the email earlier): cut first, and 9 of its characters would survive unmasked.
+    const prefix = `dbcheck simulated failure: contact ${hRow.email}; `;
+    const dashes = 291 - prefix.length - ' phone '.length;
+    if (dashes < 1) throw new Error(`fixture: the phone cannot sit at the cut (${dashes})`);
+    await getPool().query(`CREATE FUNCTION dbcheck_wh_fail() RETURNS trigger LANGUAGE plpgsql AS $f$
+      BEGIN RAISE EXCEPTION '%', format('dbcheck simulated failure: contact %s; %s phone %s end', NEW.email, repeat('-', ${Number(dashes)}), NEW.phone); END $f$`);
+    await getPool().query(`CREATE TRIGGER dbcheck_wh_fail BEFORE UPDATE ON abandoned_carts FOR EACH ROW WHEN (OLD.cart_id LIKE 'DBCHECK-HC-%') EXECUTE FUNCTION dbcheck_wh_fail()`);
+    const parsedA = normalizeOrderPayload(A);
+    if (parsedA.phone || parsedA.email) bad.push(`fixture A is recognised (${parsedA.phone ? 'phone' : 'email'}): pick other keys`);
+    const port = await freePort();
+    srv = spawn(process.execPath, ['server.js'], {
+      cwd: new URL('..', import.meta.url).pathname,
+      env: { ...process.env, PORT: String(port), APP_ENV: 'test', WEBHOOK_SECRET: SECRET, ADMIN_PHONES: '', ELEVENZA_AUTH_TOKEN: '', SHOPIFY_ACCESS_TOKEN: '',
+        SHOPIFY_POLL_ENABLED: 'false', SHOPIFY_POLL_MINUTES: '0', SHOPIFY_ORDERS_POLL_ENABLED: '', SLA_ALERTS_ENABLED: 'false', DAILY_SUMMARY_ENABLED: 'false', KEEPALIVE_URL: '', RENDER_EXTERNAL_URL: '' },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    srv.stdout.on('data', (d) => { log += d; }); srv.stderr.on('data', (d) => { log += d; });
+    // Registered now, so a server that dies early still resolves it; awaited (bounded) before the log is read.
+    closed = new Promise((r) => srv.once('close', r));
+    const base = `http://127.0.0.1:${port}`;
+    const send = async (body) => { const r = await fetch(`${base}/api/webhook/gokwik/order-completed`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-webhook-secret': SECRET }, body: typeof body === 'string' ? body : JSON.stringify(body) }); return { status: r.status, body: await r.json() }; };
+    const waitFor = async (re, what) => {
+      for (let i = 0; i < 60 && !re.test(log); i += 1) await new Promise((r) => setTimeout(r, 50));
+      if (!re.test(log)) bad.push(`log line missing: ${what}`);
+    };
     for (let i = 0; i < 100; i++) {
       try { if ((await fetch(`${base}/healthz`)).ok) break; } catch { /* starting */ }
       await new Promise((r) => setTimeout(r, 150));
@@ -11974,7 +12016,7 @@ await step('order webhook: logs carry field names, the event type, the order id 
     const before = log.length;
     const a = await send(A);
     if (a.status !== 200 || JSON.stringify(a.body) !== JSON.stringify({ ok: true, matched: 0, reason: 'no phone or email in payload' })) bad.push(`A → ${a.status} ${JSON.stringify(a.body)}`);
-    await waitFor(/Order webhook ([0-9a-f]{8}): missing phone, email\. event=order\.completed order=GK-DBCHECK-1 recognised=\[orderId, orderName\] keys=\[event, order_id, customer_phone, delivery, buyer_mail_id, note\][\s\S]*Order webhook \1: no phone or email, cannot match any cart\./, 'A diagnostic and no-contact lines');
+    await waitFor(/Order webhook ([0-9a-f]{8}): missing phone, email\. event=\(withheld:event\) order=GK-DBCHECK-1 recognised=\[orderId, orderName\] keys=\[event, order_id, customer_phone, delivery, buyer_mail_id, note\][\s\S]*Order webhook \1: no phone or email, cannot match any cart\./, 'A diagnostic and no-contact lines');
     const b = await send(B);
     if (b.status !== 200 || b.body.reason !== 'no phone or email in payload') bad.push(`B → ${b.status} ${JSON.stringify(b.body)}`);
     await waitFor(/Order webhook [0-9a-f]{8}: missing orderId, phone, email\. event=\(none\) order=\(no order id\) recognised=\[\] keys=\[_unparsed_body\]/, 'B diagnostic');
@@ -11986,7 +12028,7 @@ await step('order webhook: logs carry field names, the event type, the order id 
     await waitFor(/Order webhook [0-9a-f]{8} failed: .+\. event=\(none\) order=GK-DBCHECK-4 recognised=\[orderId, orderName, email\] keys=\[order_id, email, alt_phone, customer_name, tag\]/, 'D failure line');
     const e = await send(E);
     if (e.status !== 200 || JSON.stringify(e.body) !== JSON.stringify({ ok: true, matched: 0 })) bad.push(`E → ${e.status} ${JSON.stringify(e.body)}`);
-    await waitFor(/Order webhook [0-9a-f]{8}: missing email\. event=\(withheld\) order=\(no order id\) recognised=\[orderId, orderName, phone\] keys=\[event, order_id, customer, session, address, name, phone, tag, \+1 not shown\]/, 'E diagnostic');
+    await waitFor(/Order webhook [0-9a-f]{8}: missing email\. event=\(withheld:event\) order=\(no order id\) recognised=\[orderId, orderName, phone\] keys=\[event, order_id, customer, session, address, name, phone, tag, \+1 not shown\]/, 'E diagnostic');
     await waitFor(/Order \(no order id\): no open cart matched/, 'E unmatched line');
     for (const [body, ref] of [[F, 'BWA1001'], [G, 'GK-88812']]) {
       const r = await send(body);
@@ -12008,15 +12050,16 @@ await step('order webhook: logs carry field names, the event type, the order id 
     if (hStored.rows.length !== 1 || !hStored.rows[0].error.startsWith('dbcheck simulated failure')) bad.push(`H failure recorded ${hStored.rows.length} time(s)`);
     if (log.length === before) bad.push('nothing logged');
   } finally {
-    // Wait for 'close' (all output read), bounded: SIGTERM, then SIGKILL; never hang.
-    const within = (ms) => Promise.race([closed.then(() => true), new Promise((r) => setTimeout(() => r(false), ms))]);
-    srv.kill();
-    if (!(await within(5000))) {
-      srv.kill('SIGKILL');
-      if (!(await within(2000))) bad.push('server output did not close');
+    // Wait for 'close' (all output read), bounded: SIGTERM, then SIGKILL; never hang. No server if setup failed first.
+    if (srv) {
+      const within = (ms) => Promise.race([closed.then(() => true), new Promise((r) => setTimeout(() => r(false), ms))]);
+      srv.kill();
+      if (!(await within(5000))) {
+        srv.kill('SIGKILL');
+        if (!(await within(2000))) bad.push('server output did not close');
+      }
     }
-    await dropFault();
-    await getPool().query(`DELETE FROM webhook_failures WHERE kind = 'order-completed' AND body LIKE '%DBCHECK-WH%'`);
+    await cleanUp();
   }
   const lines = log.split('\n');
   const leaks = leaksOf(lines, PII.phones, PII.text);
