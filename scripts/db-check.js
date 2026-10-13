@@ -12,7 +12,8 @@ import {
   cartEvents, recentEvents, callbackAtOf,
 } from '../lib/db.js';
 import { createOtp, verifyOtp, checkRateLimit, normalisePhone, maskPhone, redactPhones } from '../lib/otp.js';
-import { normalizePayload, redactPayload, REDACTED_KEYS } from '../lib/normalize.js';
+import { normalizePayload, normalizeOrderPayload, redactPayload, REDACTED_KEYS } from '../lib/normalize.js';
+import { maskPhone as maskPhoneFromLogRedact, redactPhones as redactPhonesFromLogRedact, redactEmails } from '../lib/log-redact.js';
 import { GOKWIK_REAL_PAYLOAD } from './fixtures/gokwik-real.js';
 import { mapShopifyCsv } from '../lib/shopify-csv.js';
 import { csvCell, toCsv } from '../lib/csv.js';
@@ -54,8 +55,8 @@ import crypto from 'node:crypto';
 import http from 'node:http';
 import { router as ticketsRouterForTest } from '../lib/tickets-routes.js';
 import { purgeTestTickets, deliverTicketNotification, ticketAlertText, TICKET_ALERT_MAX, createTicket as createTicketForTest, sendStrandedTicketNotifications } from '../lib/tickets.js';
-import { updateProfile as updateProfileForTest } from '../lib/profile.js';
-import { buildBody as elevenzaBodyForTest, sendOtp as sendOtpForTest } from '../lib/whatsapp.js';
+import { updateProfile as updateProfileForTest, savePhoto as savePhotoForTest, clearPhoto as clearPhotoForTest } from '../lib/profile.js';
+import { buildBody as elevenzaBodyForTest, sendOtp as sendOtpForTest, sendOpsAlert as sendOpsAlertForTest } from '../lib/whatsapp.js';
 import { ensureHrSchema, purgeTestHr, slugify, normalizePhone, removeResume, retryPendingRemovals, istDayKey, HR_TIMEZONE } from '../lib/hr.js';
 import { jobPostingLd } from '../lib/careers-pages.js';
 import nodeCrypto from 'node:crypto';
@@ -74,7 +75,7 @@ import { istDateTime, istDate, istTime, istDayKey as uiIstDayKey } from '../publ
 import { issueFormToken, verifyTurnstile, normalizeHost, isCareersRequest } from '../lib/careers.js';
 import net from 'node:net';
 import {
-  isIngestSilent, buildDailySummary, shouldSendSummary, boardDay,
+  isIngestSilent, buildDailySummary, shouldSendSummary, boardDay, startSlaAlerts,
 } from '../lib/sla-alert.js';
 import { issueSession, verifySession, COOKIE as SESSION_COOKIE } from '../lib/session.js';
 import { rateLimit, _reset as resetRateLimit } from '../lib/rate-limit.js';
@@ -11704,6 +11705,224 @@ await step('tickets: any member raises one (validated, TKT- numbers unique under
   if (bad.length) throw new Error(bad.join(' | '));
   return 'member raises (TKT-#####, Medium default, owner assigned, no numbers in responses); 10 invalid inputs refused with their field; 16 at once → 16 distinct numbers; another member\'s ticket is 404 on every route and absent from lists; members comment on their own but status/assignee/resend → 403; owner and admins see all, filter (status, priority, category, creator, search), change status (resolved/closed stamps; stale → 409) and reassign only to a ticket manager; 8 activity events in order; events append-only; notice via the 11za client with number, priority, category, creator, title, summary and link in one line ≤ 900; provider 500 → ticket kept, notice failed (scrubbed), retry sends once, later retries none; non-JSON 200 → unconfirmed, not auto-resent; same request id → same ticket, one notice (also simultaneous); no template / OTP template → skipped, provider not called, sent once configured; owner missing or ambiguous → 503 TICKET_OWNER_UNRESOLVED, nothing created; no token or number in logs';
 });
+// ---------------------------------------------------------------------------
+// Privacy: no customer or member contact data in logs or client errors. Fictional data only.
+// ---------------------------------------------------------------------------
+/** Captures every console line until the returned stop() is called (always call it in finally). */
+const captureConsole = () => {
+  const lines = [];
+  const real = { log: console.log, warn: console.warn, error: console.error, info: console.info, debug: console.debug };
+  const capture = (...a) => { lines.push(a.map((x) => (x instanceof Error ? x.stack : typeof x === 'string' ? x : JSON.stringify(x))).join(' ')); };
+  Object.assign(console, { log: capture, warn: capture, error: capture, info: capture, debug: capture });
+  return { lines, stop: () => Object.assign(console, real) };
+};
+/** Every common way a 12-digit 91… number is written. */
+const phoneSpellings = (p) => { const t = p.slice(-10); return [p, t, `${t.slice(0, 5)} ${t.slice(5)}`, `${t.slice(0, 5)}-${t.slice(5)}`]; };
+const leaksOf = (lines, phones, others = []) => phones.filter((p) => phoneSpellings(p).some((s) => lines.some((l) => l.includes(s)))).map(maskPhone)
+  .concat(others.filter((s) => lines.some((l) => l.includes(s))));
+const withEnv = async (vars, fn) => {
+  const saved = Object.fromEntries(Object.keys(vars).map((k) => [k, process.env[k]]));
+  for (const [k, v] of Object.entries(vars)) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }
+  try { return await fn(); } finally { for (const [k, v] of Object.entries(saved)) { if (v === undefined) delete process.env[k]; else process.env[k] = v; } }
+};
+/** A stand-in 11za: /fail answers 500 echoing the number; anything else 200 JSON. */
+const echoingProvider = () => http.createServer((req, res) => {
+  let b = ''; req.on('data', (c) => { b += c; });
+  req.on('end', () => {
+    const sendto = (() => { try { return JSON.parse(b).sendto; } catch { return '?'; } })();
+    if (req.url === '/fail') { res.writeHead(500); res.end(`{"error":"template rejected for ${sendto}","account":"dbcheck-acct-7781"}`); }
+    else { res.writeHead(200, { 'content-type': 'application/json' }); res.end('{"status":"submitted"}'); }
+  });
+}).listen(0);
+
+await step('log redaction: redactPhones masks Indian mobiles under any common separator and keeps dates, times, timestamps, amounts and ids readable; redactEmails', async () => {
+  const bad = [];
+  for (const [input, want] of [
+    ['919000000861', '...0861'], ['+91 90000 00861', '...0861'], ['(+91) 90000 00861', '(...0861'], ['0091 90000 00861', '...0861'], ['09000000861', '...0861'],
+    ['90000/00861', '...0861'], ['90000_00861', '...0861'], ['90000,00861', '...0861'], ['90000–00861', '...0861'], ['+91.90000.00861', '...0861'],
+    ['phone=9000000861&x=1', 'phone=...0861&x=1'], ['{"sendto":"919000000861"}', '{"sendto":"...0861"}'], ['order 1234 9000000861', 'order 1234 ...0861'],
+    ['9000000861,9000000862', '...0861,...0862'], ['tel: 90000 00861.', 'tel: ...0861.'],
+    // Must stay readable.
+    ['2026-10-13 10:00:00', '2026-10-13 10:00:00'], ['2026-10-13T10:00:00.123Z', '2026-10-13T10:00:00.123Z'], ['13/10/2026 10:00', '13/10/2026 10:00'],
+    ['ts 1760000000000', 'ts 1760000000000'], ['id 12345678901', 'id 12345678901'], ['₹1,23,45,678', '₹1,23,45,678'], ['order #1001 qty 2', 'order #1001 qty 2'],
+    ['cart 5123456789012', 'cart 5123456789012'], ['HTTP 502 after 15000 ms', 'HTTP 502 after 15000 ms'], ['code 482913', 'code 482913'],
+    ['uuid 0b8e7c1e-1234-5678-9012-345678901234', 'uuid 0b8e7c1e-1234-5678-9012-345678901234'], [null, ''], [undefined, ''],
+  ]) {
+    const got = redactPhones(input);
+    if (got !== want) bad.push(`redactPhones(${JSON.stringify(input)}) = ${JSON.stringify(got)}, want ${JSON.stringify(want)}`);
+  }
+  for (const [input, want] of [['to dbcheck.person+x@example.test, ok', 'to (email), ok'], ['<a@b.test>', '<(email)>'], ['no address @ here', 'no address @ here'], [null, '']]) {
+    if (redactEmails(input) !== want) bad.push(`redactEmails(${JSON.stringify(input)}) = ${redactEmails(input)}`);
+  }
+  // One implementation: lib/otp.js re-exports lib/log-redact.js.
+  if (maskPhone !== maskPhoneFromLogRedact || redactPhones !== redactPhonesFromLogRedact) bad.push('two masking implementations');
+  if (bad.length) throw new Error(bad.join('; '));
+  return '15 phone spellings masked (slash, underscore, comma, en dash included); dates, times, timestamps, amounts, ids and uuids unchanged; emails → (email)';
+});
+
+await step('auth: an 11za send failure answers 502 with one fixed message — no provider text, configuration detail or echoed number reaches the client; details stay in the log, masked; non-members unchanged', async () => {
+  const P = { m: '919000000864', m2: '919000000865', out: '919000000869' };
+  const all = Object.values(P);
+  const bad = [];
+  const clean = async () => {
+    await getPool().query('DELETE FROM otp_state WHERE phone = ANY($1)', [all]);
+    await getPool().query('DELETE FROM login_log WHERE phone = ANY($1)', [all]);
+    await getPool().query('DELETE FROM allowed_users WHERE phone = ANY($1)', [all]);
+  };
+  await clean();
+  await getPool().query(`INSERT INTO allowed_users (phone, name, added_by) VALUES ($1, 'DBCHECK-PV One', 'db-check'), ($2, 'DBCHECK-PV Two', 'db-check')`, [P.m, P.m2]);
+  const provider = echoingProvider();
+  const app = express();
+  app.use(express.json());
+  app.use(cookieParser());
+  app.use('/auth', authRouterForTest);
+  const server = app.listen(0);
+  const base = `http://127.0.0.1:${server.address().port}`;
+  const post = async (phone) => { const r = await fetch(`${base}/auth/request-otp`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ phone }) }); return { status: r.status, text: await r.text(), cookie: r.headers.get('set-cookie') }; };
+  const cap = captureConsole();
+  const want = JSON.stringify({ ok: false, error: 'Could not send the code right now. Try again in a few minutes.' });
+  try {
+    await withEnv({ ELEVENZA_AUTH_TOKEN: 'dbcheck-not-a-token', ELEVENZA_ORIGIN_WEBSITE: 'https://origin.example.test', ELEVENZA_API_URL: `http://127.0.0.1:${provider.address().port}/fail`,
+      ELEVENZA_PAYLOAD_TEMPLATE: undefined, ELEVENZA_AUTH_HEADER: undefined, ELEVENZA_TEMPLATE_NAME: undefined }, async () => {
+      // 1. The provider refuses, echoing the number and an account detail.
+      const r1 = await post('9000000864');
+      if (r1.status !== 502 || r1.text !== want || r1.cookie) bad.push(`provider failure → ${r1.status} ${r1.text}`);
+      if (!cap.lines.some((l) => l.includes('OTP send failed for ...0864') && l.includes('template rejected for ...0864') && l.includes('dbcheck-acct-7781'))) bad.push('provider detail not kept in the log (masked)');
+      // 2. A configuration error (no origin website) is not described to the client either.
+      await withEnv({ ELEVENZA_ORIGIN_WEBSITE: undefined }, async () => {
+        const r2 = await post('9000000865');
+        if (r2.status !== 502 || r2.text !== want) bad.push(`config failure → ${r2.status} ${r2.text}`);
+        if (/ELEVENZA|origin/i.test(r2.text)) bad.push('configuration named to the client');
+        if (!cap.lines.some((l) => l.includes('OTP send failed for ...0865') && l.includes('ELEVENZA_ORIGIN_WEBSITE'))) bad.push('config detail not kept in the log');
+      });
+      // 3. Non-members: the generic answer, as before (no send attempted).
+      const r3 = await post('9000000869');
+      const j3 = JSON.parse(r3.text);
+      if (r3.status !== 200 || j3.ok !== true || typeof j3.message !== 'string' || j3.consoleMode !== false) bad.push(`non-member → ${r3.status} ${r3.text}`);
+    });
+  } finally { cap.stop(); server.close(); provider.close(); await clean(); }
+  const leaks = leaksOf(cap.lines, all);
+  if (leaks.length) bad.push(`full number in logs: ${leaks.join(', ')}`);
+  if (bad.length) throw new Error(bad.join('; '));
+  return `provider 500 and missing config → 502 "${JSON.parse(want).error}"; provider text, account id and number logged masked only; non-member generic 200 unchanged`;
+});
+
+await step('ops alerts and member photos: the SLA startup line, the unsent ops alert, a failed ops send and photo-cleanup failures log ...NNNN only; delivery, scheduling and cleanup unchanged', async () => {
+  const OPS = '919000000866';
+  const MEM = '919000000867';
+  const bad = [];
+  const provider = echoingProvider();
+  const cap = captureConsole();
+  let timer = null;
+  const clean = async () => {
+    await getPool().query('DELETE FROM member_log WHERE target_phone = $1', [MEM]);
+    await getPool().query('DELETE FROM allowed_users WHERE phone = $1', [MEM]);
+  };
+  await clean();
+  try {
+    // 1. Ops alert without WhatsApp: logged instead of sent, the alert text intact, the number masked.
+    await withEnv({ ELEVENZA_AUTH_TOKEN: undefined, ELEVENZA_OPS_TEMPLATE_NAME: undefined }, async () => {
+      const r = await sendOpsAlertForTest(OPS, 'DBCHECK ops text: 3 carts stale');
+      if (r.delivered !== false || r.reason !== 'no ops template configured') bad.push(`unsent alert ${JSON.stringify(r)}`);
+      if (!cap.lines.some((l) => l.includes('to ...0866: DBCHECK ops text: 3 carts stale'))) bad.push('unsent alert line changed');
+    });
+    // 2. The scheduler: startup line masked; a stale backlog is sent through 11za, which fails echoing the number.
+    let sends = 0;
+    await withEnv({ OPS_PHONE: '9000000866', SLA_ALERTS_ENABLED: undefined, SLA_ALERT_MINUTES: '0.002', SLA_ALERT_THRESHOLD: '1', DAILY_SUMMARY_ENABLED: 'false',
+      ELEVENZA_AUTH_TOKEN: 'dbcheck-not-a-token', ELEVENZA_OPS_TEMPLATE_NAME: 'dbcheck_ops', ELEVENZA_ORIGIN_WEBSITE: 'https://origin.example.test',
+      ELEVENZA_API_URL: `http://127.0.0.1:${provider.address().port}/fail`, ELEVENZA_PAYLOAD_TEMPLATE: undefined, ELEVENZA_AUTH_HEADER: undefined }, async () => {
+      timer = startSlaAlerts({ getStale: async () => { sends += 1; return { count: 2, value: 999 }; }, slaHours: 6, getLastIngest: async () => new Date().toISOString() });
+      if (!timer) bad.push('scheduler did not start');
+      if (!cap.lines.some((l) => /SLA alerts: every [\d.]+ min to \.\.\.0866 when >= 1/.test(l))) bad.push('startup line not masked');
+      for (let i = 0; i < 50 && !cap.lines.some((l) => l.startsWith('SLA alert check failed')); i += 1) await new Promise((r) => setTimeout(r, 50));
+      clearInterval(timer); timer = null;
+      const failed = cap.lines.find((l) => l.startsWith('SLA alert check failed'));
+      if (!sends || !failed) bad.push(`scheduled check ran ${sends} time(s), failure line ${Boolean(failed)}`);
+      else if (!failed.includes('template rejected for ...0866')) bad.push('failure line lost the provider detail');
+    });
+    // 3. Photo cleanup failing: the member keeps the new photo / loses the old one as before; the log line is masked.
+    await getPool().query(`INSERT INTO allowed_users (phone, name, added_by) VALUES ($1, 'DBCHECK-PV Photo', 'db-check')`, [MEM]);
+    const objects = new Map();
+    const store = { put: async (key, buf) => { objects.set(key, buf); }, remove: async () => { throw new Error(`storage refused for ${MEM}`); } };
+    const png = Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), Buffer.alloc(300, 5)]);
+    await savePhotoForTest(MEM, { filename: 'a.png', buffer: png }, { actor: 'db-check', store });
+    const replaced = await savePhotoForTest(MEM, { filename: 'b.png', buffer: png }, { actor: 'db-check', store });
+    if (!replaced.hasPhoto || objects.size !== 2) bad.push(`replace with a failing cleanup: hasPhoto ${replaced.hasPhoto}, ${objects.size} objects`);
+    if (!cap.lines.some((l) => l === 'Old member photo for ...0867 not removed')) bad.push('replace cleanup line not masked');
+    const cleared = await clearPhotoForTest(MEM, { actor: 'db-check', store });
+    if (cleared.hasPhoto) bad.push('photo not cleared');
+    if (!cap.lines.some((l) => l === 'Member photo for ...0867 not removed from storage')) bad.push('clear cleanup line not masked');
+  } finally { if (timer) clearInterval(timer); cap.stop(); provider.close(); await clean(); }
+  const leaks = leaksOf(cap.lines, [OPS, MEM]);
+  if (leaks.length) bad.push(`full number in logs: ${leaks.join(', ')}`);
+  if (bad.length) throw new Error(bad.join('; '));
+  return `${cap.lines.length} lines captured: unsent alert, startup line, failed scheduled send (provider echo masked), two photo-cleanup failures — all ...NNNN`;
+});
+
+await step('order webhook: logs carry field names, the event type, the order id and a delivery id — never the payload, names, numbers, emails or addresses, on the no-contact, unparseable, unmatched and failure paths; responses unchanged', async () => {
+  const PII = {
+    phones: ['919000000871', '919000000872', '919000000873', '919000000874', '919000000875'],
+    text: ['dbcheck.buyer@example.test', 'dbcheck.ship@example.test', 'DBCHECK Person', 'Fictional Lane', 'Testnagar', '560099', 'DBCHECK-WH'],
+  };
+  const SECRET = 'dbcheck-webhook-secret';
+  const bad = [];
+  // Payloads. A: contact data only under keys the parser does not recognise. B: a body that is not JSON.
+  // C: a recognised phone that matches no cart; its "name" is the customer's, which the parser takes for the order name. D: a recognised email the database rejects (NUL byte) → the failure path.
+  const A = { event: 'order.completed', order_id: 'GK-DBCHECK-1', customer_phone: '9000000871', delivery: { contact_mobile: '+91 90000 00872', consignee: 'DBCHECK Person', line1: '12 Fictional Lane', city: 'Testnagar', pin: '560099' }, buyer_mail_id: 'dbcheck.buyer@example.test', note: 'DBCHECK-WH' };
+  const B = 'not json: DBCHECK Person 9000000873 dbcheck.buyer@example.test DBCHECK-WH';
+  const C = { type: 'payment_confirmed', id: 'GK-DBCHECK-3', phone: '9000000874', name: 'DBCHECK Person', shipping_address: { address1: '12 Fictional Lane', city: 'Testnagar', zip: '560099' }, tag: 'DBCHECK-WH' };
+  const D = { order_id: 'GK-DBCHECK-4', email: 'dbcheck.ship\u0000@example.test', alt_phone: '9000000875', customer_name: 'DBCHECK Person', tag: 'DBCHECK-WH' };
+  const parsedA = normalizeOrderPayload(A);
+  if (parsedA.phone || parsedA.email) bad.push(`fixture A is recognised (${parsedA.phone ? 'phone' : 'email'}): pick other keys`);
+  const port = await freePort();
+  let log = '';
+  const srv = spawn(process.execPath, ['server.js'], {
+    cwd: new URL('..', import.meta.url).pathname,
+    env: { ...process.env, PORT: String(port), APP_ENV: 'test', WEBHOOK_SECRET: SECRET, ADMIN_PHONES: '', ELEVENZA_AUTH_TOKEN: '', SHOPIFY_ACCESS_TOKEN: '',
+      SHOPIFY_POLL_ENABLED: 'false', SHOPIFY_POLL_MINUTES: '0', SHOPIFY_ORDERS_POLL_ENABLED: '', SLA_ALERTS_ENABLED: 'false', DAILY_SUMMARY_ENABLED: 'false', KEEPALIVE_URL: '', RENDER_EXTERNAL_URL: '' },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  srv.stdout.on('data', (d) => { log += d; }); srv.stderr.on('data', (d) => { log += d; });
+  const base = `http://127.0.0.1:${port}`;
+  const send = async (body) => { const r = await fetch(`${base}/api/webhook/gokwik/order-completed`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-webhook-secret': SECRET }, body: typeof body === 'string' ? body : JSON.stringify(body) }); return { status: r.status, body: await r.json() }; };
+  const waitFor = async (re, what) => {
+    for (let i = 0; i < 60 && !re.test(log); i += 1) await new Promise((r) => setTimeout(r, 50));
+    if (!re.test(log)) bad.push(`log line missing: ${what}`);
+  };
+  try {
+    for (let i = 0; i < 100; i++) {
+      try { if ((await fetch(`${base}/healthz`)).ok) break; } catch { /* starting */ }
+      await new Promise((r) => setTimeout(r, 150));
+      if (i === 99) throw new Error(`server did not start: ${redactPhones(log.slice(-300))}`);
+    }
+    const before = log.length;
+    const a = await send(A);
+    if (a.status !== 200 || JSON.stringify(a.body) !== JSON.stringify({ ok: true, matched: 0, reason: 'no phone or email in payload' })) bad.push(`A → ${a.status} ${JSON.stringify(a.body)}`);
+    await waitFor(/Order webhook ([0-9a-f]{8}): missing phone, email\. event=order\.completed order=GK-DBCHECK-1 recognised=\[orderId, orderName\] keys=\[event, order_id, customer_phone, delivery, buyer_mail_id, note\][\s\S]*Order webhook \1: no phone or email, cannot match any cart\./, 'A diagnostic and no-contact lines');
+    const b = await send(B);
+    if (b.status !== 200 || b.body.reason !== 'no phone or email in payload') bad.push(`B → ${b.status} ${JSON.stringify(b.body)}`);
+    await waitFor(/Order webhook [0-9a-f]{8}: missing orderId, phone, email\. event=\(none\) order=\(no order id\) recognised=\[\] keys=\[_unparsed_body\]/, 'B diagnostic');
+    const c = await send(C);
+    if (c.status !== 200 || JSON.stringify(c.body) !== JSON.stringify({ ok: true, matched: 0 })) bad.push(`C → ${c.status} ${JSON.stringify(c.body)}`);
+    await waitFor(/Order GK-DBCHECK-3: no open cart matched/, 'C unmatched line');
+    const d = await send(D);
+    if (d.status !== 200 || JSON.stringify(d.body) !== JSON.stringify({ ok: true, matched: 0, stored: false })) bad.push(`D → ${d.status} ${JSON.stringify(d.body)}`);
+    await waitFor(/Order webhook [0-9a-f]{8} failed: .+\. event=\(none\) order=GK-DBCHECK-4 recognised=\[orderId, orderName, email\] keys=\[order_id, email, alt_phone, customer_name, tag\]/, 'D failure line');
+    // The failure is still recorded for replay, body and all (the database, not the log).
+    const { rows } = await getPool().query(`SELECT body FROM webhook_failures WHERE kind = 'order-completed' AND body LIKE '%GK-DBCHECK-4%'`);
+    if (rows.length !== 1) bad.push(`failure recorded ${rows.length} time(s)`);
+    if (log.length === before) bad.push('nothing logged');
+  } finally {
+    srv.kill(); await new Promise((r) => srv.once('exit', r));
+    await getPool().query(`DELETE FROM webhook_failures WHERE kind = 'order-completed' AND body LIKE '%DBCHECK-WH%'`);
+  }
+  const lines = log.split('\n');
+  const leaks = leaksOf(lines, PII.phones, PII.text);
+  if (leaks.length) bad.push(`customer data in the server log: ${leaks.join(', ')}`);
+  if (bad.length) throw new Error(bad.join('; '));
+  return 'no-contact, unparseable, unmatched and database-failure deliveries: field names, event, order id and delivery id only; responses as before; failure still stored for replay';
+});
+
 await step('affiliates admin cleanup', async () => {
   let n = 0;
   for (const actor of [...Object.values(AFN), 'HR admin', 'db-check-overview-commerce', 'db-check-commissions']) {
