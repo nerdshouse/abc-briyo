@@ -1,6 +1,6 @@
 import dotenv from 'dotenv';
 import {
-  ensureSchema, getPool, isMockMode, insertCart, listCarts, updateStatus, ping,
+  ensureSchema, getPool, isMockMode, insertCart, listCarts, updateStatus, ping, poolOptions, withVerifiedSslMode,
   matchOrderToCarts, reasonSummary, statsByCaller, staleCarts,
   renormalizeRow, DERIVED_COLUMNS,
   recordSystemEvent, getSystemState, recordWebhookFailure, webhookFailureCount,
@@ -47,7 +47,7 @@ import { backfillModuleRoles, setModuleRole, moduleRolesOf } from '../lib/db.js'
 import { requireAuth, requirePermission, _setMembershipLookup, router as authRouterForTest } from '../lib/auth-routes.js';
 import express from 'express';
 import cookieParser from 'cookie-parser';
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import os from 'node:os';
 import path from 'node:path';
 import fsp from 'node:fs/promises';
@@ -137,6 +137,48 @@ await step('connect', async () => {
 });
 
 await step('create schema (carts + otp_state)', () => ensureSchema());
+
+await step('database TLS: sslmode prefer/require/verify-ca is spelled verify-full (same certificate and hostname checks, no pg warning, safe under pg 9); everything else in the URL untouched', async () => {
+  const bad = [];
+  // Fictional hosts and credentials only; nothing here connects.
+  const base = 'postgres://dbcheck_user:p%40ss%2Fw0rd@db.example.test:5432/app';
+  for (const [q, want] of [
+    ['?sslmode=require&channel_binding=require', '?sslmode=verify-full&channel_binding=require'],
+    ['?channel_binding=require&sslmode=require', '?channel_binding=require&sslmode=verify-full'],
+    ['?sslmode=prefer', '?sslmode=verify-full'], ['?sslmode=verify-ca', '?sslmode=verify-full'],
+    ['?sslmode=verify-full', '?sslmode=verify-full'], ['?sslmode=disable', '?sslmode=disable'], ['?sslmode=no-verify', '?sslmode=no-verify'],
+    ['', ''], ['?uselibpqcompat=true&sslmode=require', '?uselibpqcompat=true&sslmode=require'], ['?application_name=sslmode=require', '?application_name=sslmode=require'],
+    ['?sslmode=requireX', '?sslmode=requireX'],
+  ]) {
+    const got = withVerifiedSslMode(base + q);
+    if (got !== base + want) bad.push(`${q || '(none)'} → ${got.slice(base.length)}`);
+  }
+  for (const v of [undefined, null, '']) if (withVerifiedSslMode(v) !== v) bad.push(`${JSON.stringify(v)} changed`);
+  const opts = poolOptions(`${base}?sslmode=require`);
+  if (opts.connectionString !== `${base}?sslmode=verify-full` || opts.ssl?.rejectUnauthorized !== true || opts.max !== 5) bad.push(`poolOptions ${JSON.stringify({ ...opts, connectionString: '…' })}`);
+  // pg's own view, in a fresh process each time (it warns once per process): the TLS options it would hand to Node, and
+  // whether it warned. {} means Node's defaults: certificate chain and hostname both verified.
+  const childPg = (url) => {
+    const r = spawnSync(process.execPath, ['-e', `
+      const CP = require('pg/lib/connection-parameters.js');
+      process.stdout.write(JSON.stringify(new CP({ connectionString: process.argv[1], ssl: { rejectUnauthorized: true } }).ssl));`, url],
+    { cwd: new URL('..', import.meta.url).pathname, encoding: 'utf8', timeout: 10_000 });
+    return { ssl: r.stdout, warned: /SECURITY WARNING: The SSL modes/.test(r.stderr) };
+  };
+  for (const mode of ['require', 'prefer', 'verify-ca']) {
+    const before = childPg(`${base}?sslmode=${mode}&channel_binding=require`);
+    const after = childPg(withVerifiedSslMode(`${base}?sslmode=${mode}&channel_binding=require`));
+    if (!before.warned) bad.push(`${mode}: pg did not warn before (the test no longer reproduces the cause)`);
+    if (after.warned) bad.push(`${mode}: pg still warns after`);
+    if (before.ssl !== after.ssl || after.ssl !== '{}') bad.push(`${mode}: TLS options changed ${before.ssl} → ${after.ssl}`);
+  }
+  // Untouched modes keep their meaning, including the ones that switch verification off (left to the URL, as before).
+  if (childPg(withVerifiedSslMode(`${base}?sslmode=disable`)).ssl !== 'false') bad.push('disable changed');
+  if (childPg(withVerifiedSslMode(`${base}?sslmode=no-verify`)).ssl !== '{"rejectUnauthorized":false}') bad.push('no-verify changed');
+  if (childPg(withVerifiedSslMode(base)).ssl !== '{"rejectUnauthorized":true}') bad.push('explicit ssl not used without sslmode');
+  if (bad.length) throw new Error(bad.join('; '));
+  return 'prefer/require/verify-ca → verify-full: pg warned before, not after; TLS options identical ({} = chain + hostname verified); disable, no-verify, verify-full, uselibpqcompat and no sslmode untouched; password encoding and other params byte for byte';
+});
 
 await step('insert cart', async () => {
   const payload = {
