@@ -3765,6 +3765,22 @@ await step('platform SKUs: Flipkart, PharmEasy, HyugaLife, BigBasket, Nykaa and 
     const e = await addPlatformMappings(INV.m2, 'sastasundar', [`${TS}-SS-BAD`], { actor: ACTOR, unitsPerListing: u }).then(() => null, (x) => x);
     if (!e || e.status !== 400) bad.push(`units per listing ${u} accepted`);
   }
+  // SastaSundar can also serve as the product-code list of the existing "Sastasundar Healthbuddy Limited" retailer
+  // destination with no schema change (it is not an order-channel key); a marketplace channel key cannot. Put back after.
+  const ssDest = dests.find((d) => d.channel === 'retailers' && /^sastasundar/i.test(d.name));
+  if (!ssDest) bad.push('no Sastasundar retailer destination');
+  else {
+    const was = ssDest.sku_platform ?? '';
+    try {
+      const linked = await saveDestination({ id: ssDest.id, sku_platform: 'sastasundar' });
+      if (linked?.sku_platform !== 'sastasundar') bad.push(`sastasundar link ${JSON.stringify(linked)}`);
+      const asChannel = await saveDestination({ id: ssDest.id, sku_platform: 'pharmeasy' }).then(() => null, (e) => e);
+      if (!asChannel || asChannel.status !== 400) bad.push(`a marketplace channel key was accepted as a retailer list: ${asChannel?.message}`);
+    } finally {
+      await saveDestination({ id: ssDest.id, sku_platform: was });
+    }
+    if (((await listDestinations()).find((d) => d.id === ssDest.id)?.sku_platform ?? '') !== was) bad.push('retailer link not restored');
+  }
   // Duplicate rule as on Amazon: the same PharmEasy code on another master needs confirmation and a reason.
   const dup = await addPlatformMappings(INV.m, 'pharmeasy', [`${TS}-MP-PHARMEASY`], { actor: ACTOR }).then(() => null, (x) => x);
   if (!dup || dup.status !== 409) bad.push(`pharmeasy duplicate ${dup?.status} ${dup?.message}`);
@@ -3782,7 +3798,7 @@ await step('platform SKUs: Flipkart, PharmEasy, HyugaLife, BigBasket, Nykaa and 
       || (await resolveSkuIds(c, 'flipkart', [`${TS}-MP-AMZ`])).has(key)) bad.push('amazon mapping or resolution changed');
   } finally { c.release(); }
   if (bad.length) throw new Error(bad.join(' | '));
-  return '6 marketplaces seeded (labels, active), 7 existing platforms unchanged, no Scootsy platform; Flipkart/PharmEasy/HyugaLife/BigBasket/Nykaa lines listed as mappable, mapped with 2 units/listing, resolved, scoped to their platform; SastaSundar maps with the same unit validation; duplicate code needs confirmation (409); no stock, SKU or shipment change; Amazon unchanged';
+  return '6 marketplaces seeded (labels, active), 7 existing platforms unchanged, no Scootsy platform; Flipkart/PharmEasy/HyugaLife/BigBasket/Nykaa lines listed as mappable, mapped with 2 units/listing, resolved, scoped to their platform; SastaSundar maps with the same unit validation and can be linked as the Sastasundar retailer code list (a channel key cannot); duplicate code needs confirmation (409); no stock, SKU or shipment change; Amazon unchanged';
 });
 await step('platform SKUs: historical Amazon orders keep their master SKU through the move off the old column', async () => {
   // A master set up the old way (code in skus.amazon_seller_sku) with an order line already resolved through it.
