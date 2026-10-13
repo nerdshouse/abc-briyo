@@ -24,7 +24,7 @@ import {
 import {
   normalizePayload, normalizeOrderPayload, parseLineItems, redactPayload, orderWebhookDiagnostic, orderLogRef,
 } from './lib/normalize.js';
-import { redactPhones, redactEmails } from './lib/log-redact.js';
+import { redactForLog } from './lib/log-redact.js';
 import {
   router as authRouter, requireAuth, requireAdmin, currentUserName, invalidateMembership,
   requirePermission, requirePage, requireCompleteProfile,
@@ -417,17 +417,17 @@ app.post('/api/webhook/gokwik/order-completed', async (req, res) => {
       updatedBy: 'Auto (GoKwik order match)',
     });
     if (matched.length) {
-      console.log(`Order ${orderLogRef(order)}: auto-recovered ${matched.length} cart(s) — ` +
+      console.log(`Order ${orderLogRef(payload)}: auto-recovered ${matched.length} cart(s) — ` +
         matched.map((m) => `${m.cart_id} via ${m.matched_on}`).join(', '));
     } else {
-      console.log(`Order ${orderLogRef(order)}: no open cart matched`);
+      console.log(`Order ${orderLogRef(payload)}: no open cart matched`);
     }
     return res.status(200).json({ ok: true, matched: matched.length });
   } catch (err) {
-    const why = (m) => redactEmails(redactPhones(String(m).slice(0, 300)));
-    console.error(`Order webhook ${delivery} failed: ${why(err.message)}. ${diagnostic()}`);
+    // A database error can quote the row it failed on: redacted, then cut.
+    console.error(`Order webhook ${delivery} failed: ${redactForLog(err.message)}. ${diagnostic()}`);
     await db.noteFailure({ kind: 'order-completed', error: err.message, body: req.body })
-      .catch((e) => console.error(`Order webhook ${delivery}: could not even record the failure: ${why(e.message)}`));
+      .catch((e) => console.error(`Order webhook ${delivery}: could not even record the failure: ${redactForLog(e.message)}`));
     return res.status(200).json({ ok: true, matched: 0, stored: false });
   }
 });
