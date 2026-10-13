@@ -129,6 +129,12 @@ async function step(label, fn) {
   catch (err) { bad(label, err); }
 }
 
+// pg 8 warns (once per process) when a query is queued on a client that is still busy — removed in pg 9, so every
+// such call site would break on upgrade. Recorded from here on; the last step fails if any code path in the suite did it.
+const PG_BUSY_CLIENT = /Calling client\.query\(\) when the client is already executing a query/;
+const pgBusyClientWarnings = [];
+process.on('warning', (w) => { if (PG_BUSY_CLIENT.test(w.message)) pgBusyClientWarnings.push(String(w.stack || w.message)); });
+
 console.log('\nChecking database…\n');
 
 await step('connect', async () => {
@@ -12162,6 +12168,23 @@ await step('hr cleanup', async () => {
   const left = (await getPool().query(`SELECT (SELECT count(*) FROM hr_jobs WHERE title LIKE $1)::int + (SELECT count(*) FROM hr_candidates WHERE email LIKE 'dbcheck-hr-%')::int n`, [`${HRT}%`])).rows[0].n;
   if (left) throw new Error('HR test rows left');
   return `server stopped; ${jobs} test jobs and their candidates, applications, history, notes, events and files removed`;
+});
+
+await step('pg: no query was queued on a busy client anywhere in this run (deprecated in pg 8, removed in pg 9) — e.g. Promise.all over one transaction client', async () => {
+  // The detector is not blind: pg still warns with this text when a second query is queued on a busy client. Checked in a
+  // fresh process (the warning is once per process) on a client that is never connected — nothing reaches a database.
+  const probe = spawnSync(process.execPath, ['-e', `
+    const pg = require('pg');
+    const c = new pg.Client({ host: '127.0.0.1', port: 1, user: 'x', password: 'x', database: 'x' });
+    c.query('SELECT 1').catch(() => {}); c.query('SELECT 2').catch(() => {});`],
+  { cwd: new URL('..', import.meta.url).pathname, encoding: 'utf8', timeout: 10_000, env: { PATH: process.env.PATH } });
+  if (!PG_BUSY_CLIENT.test(probe.stderr)) throw new Error('pg no longer emits the busy-client warning this check listens for — update PG_BUSY_CLIENT');
+  if (process.noDeprecation) throw new Error('deprecation warnings are silenced (--no-deprecation): this run cannot be checked');
+  if (pgBusyClientWarnings.length) {
+    const at = pgBusyClientWarnings[0].split('\n').filter((l) => /file:\/\/.*\/(lib|server)/.test(l)).slice(0, 4).map((l) => l.trim().replace(/file:\/\/.*?\/(lib|server)/, '$1')).join(' ← ');
+    throw new Error(`a query was queued on a busy pg client: ${at || pgBusyClientWarnings[0].split('\n').slice(0, 3).join(' | ')}`);
+  }
+  return 'detector verified in a fresh process; no busy-client query in the whole run';
 });
 
 console.log(failures === 0
