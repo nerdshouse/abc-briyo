@@ -739,6 +739,15 @@ Production data is never copied into development or test.
    "Sample Customer", 90000 00xxx phones, `.invalid` emails, `DEV-` numbers).
 5. `npm run db:check` — labels `briyo_test` "test" on first run, then tests.
 
+**CI.** `.github/workflows/db-check.yml` runs `npm run db:check` on every pull
+request and push to `main`, against a PostgreSQL 17 container that exists only
+for the job: once on the brand-new database (every check must pass), once more on
+the same database (tests must clean up and re-run), then
+`scripts/ci/assert-no-test-leftovers.js`. It uses no repository secrets and can
+reach no other database; all its settings are test-only placeholders, with
+`TZ=UTC` as on Render. There are no known baseline failures: the suite passes on
+a fresh database without a `.env`.
+
 With `DATABASE_URL` unset the app runs in **mock mode** on in-memory sample
 data, and none of the above applies.
 
