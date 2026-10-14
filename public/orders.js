@@ -651,10 +651,18 @@ const canMapSkus = () => Boolean(state.me?.caps?.includes('inventory.catalog'));
 function itemLines(o, { max = 2 } = {}) {
   const lines = o.line_skus || [];
   if (!lines.length) return '<span class="muted-cell" title="No products on this order yet">No items</span>';
-  const qty = (l) => (l.quantity > 1 ? ` <span class="it-qty">×${esc(l.quantity)}</span>` : '');
+  // Physical units of the product: a pack listing (units_per_listing > 1, as stock reservation counts it) says both
+  // how many listings and how many units — "×6 (2 × pack of 3)" — never just the listing count.
+  const per = (l) => Math.max(1, Number(l.units_per_listing) || 1);
+  const units = (l) => l.quantity * per(l);
+  const qty = (l) => (per(l) > 1 ? ` <span class="it-qty">×${esc(units(l))} (${esc(l.quantity)} × pack of ${esc(per(l))})</span>`
+    : l.quantity > 1 ? ` <span class="it-qty">×${esc(l.quantity)}</span>` : '');
   const nameOf = (l) => [l.product, l.variant].filter(Boolean).join(' — ') || l.briyo_sku;
   const one = (l) => {
-    if (l.sku_id) return `<span class="it" title="${esc(`${nameOf(l)} · Briyo SKU ${l.briyo_sku}`)}">${esc(nameOf(l))}${qty(l)}</span>`;
+    if (l.sku_id) {
+      const packs = per(l) > 1 ? ` · ${units(l)} units: ${l.quantity} × pack of ${per(l)}` : '';
+      return `<span class="it" title="${esc(`${nameOf(l)} · Briyo SKU ${l.briyo_sku}${packs}`)}">${esc(nameOf(l))}${qty(l)}</span>`;
+    }
     if (l.review) {
       return `<span class="it" title="${esc(`Not matched to a Briyo product yet: ${l.title || 'no name'}. Open the order and use Match product.`)}">`
         + `<span class="warn-text">Not matched</span> · ${esc(l.title || '—')}${qty(l)}</span>`;
@@ -686,7 +694,8 @@ function itemsSection(o, items) {
   const manual = takesManualLines(o);
   if (!items.length && !manual) return '';
   const open = manualLinesOpen(o);
-  const units = items.reduce((n, it) => n + it.quantity, 0);
+  // Physical units: a pack listing counts its units_per_listing (as stock reservation does), not 1.
+  const units = items.reduce((n, it) => n + it.quantity * Math.max(1, Number(it.units_per_listing) || 1), 0);
   const skus = state.lineSkus || [];
   const skuOptions = skus.map((k) => `<option value="${k.id}">${esc(k.sku)} — ${esc([k.product_name, k.variant_name].filter(Boolean).join(' '))}</option>`).join('');
   const row = (it) => {

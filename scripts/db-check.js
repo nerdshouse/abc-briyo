@@ -4377,16 +4377,24 @@ await step('orders list, Item column: every line carries its Briyo product, read
   await lineOn('website', 'IC-WEB', `${TS}-ML-A`, 2);
   const [w] = await linesOf('IC-WEB');
   if (!w || w.code !== `${TS}-ML-A` || w.briyo_sku !== `${TS}-ML-A` || w.sku_id !== ML.a || w.quantity !== 2
-    || w.product !== A.product || w.variant !== A.variant || w.title !== null || w.review !== false) bad.push(`website ${JSON.stringify(w)}`);
+    || w.product !== A.product || w.variant !== A.variant || w.title !== null || w.review !== false || w.units_per_listing !== 1) bad.push(`website ${JSON.stringify(w)}`);
   // 2. A platform SKU already mapped (Blinkit ×3 pack of ML-A, from the step above): the Briyo product.
+  // It is a pack: one listing of a ×3 mapping is 3 units of the product, as stock reservation counts it — and two are 6.
   await lineOn('blinkit', 'IC-MAP', `${TS}-ML-A-PACK3`, 1);
   const [m] = await linesOf('IC-MAP');
-  if (!m || m.code !== `${TS}-ML-A-PACK3` || m.sku_id !== ML.a || m.product !== A.product || m.title !== null) bad.push(`mapped ${JSON.stringify(m)}`);
+  if (!m || m.code !== `${TS}-ML-A-PACK3` || m.sku_id !== ML.a || m.product !== A.product || m.title !== null
+    || m.quantity !== 1 || m.units_per_listing !== 3 || m.quantity * m.units_per_listing !== 3) bad.push(`mapped pack ${JSON.stringify(m)}`);
+  const map2 = await lineOn('blinkit', 'IC-MAP2', `${TS}-ML-A-PACK3`, 2);
+  const [m2] = await linesOf('IC-MAP2');
+  if (!m2 || m2.quantity !== 2 || m2.units_per_listing !== 3 || m2.quantity * m2.units_per_listing !== 6) bad.push(`two packs ${JSON.stringify(m2)}`);
+  // The order drawer gets the same pack size per line (its "N units" total is quantity × units per listing).
+  const drawer = await orderItems(map2);
+  if (drawer.length !== 1 || drawer[0].units_per_listing !== 3 || drawer.reduce((n, it) => n + it.quantity * it.units_per_listing, 0) !== 6) bad.push(`drawer ${JSON.stringify(drawer.map((it) => [it.quantity, it.units_per_listing]))}`);
   // 3. A platform SKU nobody mapped: no product, never guessed; the channel's own name for it instead.
   const code = `${TS}-IC-UNMAPPED`;
   await lineOn('zepto', 'IC-UNM', code, 3);
   const [u] = await linesOf('IC-UNM');
-  if (!u || u.sku_id !== null || u.product !== null || u.briyo_sku !== null || u.title !== 'Test line' || u.review !== false || u.quantity !== 3 || u.mappable !== true) bad.push(`unmapped ${JSON.stringify(u)}`);
+  if (!u || u.sku_id !== null || u.product !== null || u.briyo_sku !== null || u.title !== 'Test line' || u.review !== false || u.quantity !== 3 || u.mappable !== true || u.units_per_listing !== 1) bad.push(`unmapped ${JSON.stringify(u)}`);
   // A channel with no product-code list in Inventory (Instamart today) says so: its SKU cannot be mapped there.
   await lineOn('instamart', 'IC-NOLIST', `${TS}-IC-NOLIST`, 1);
   const [nl] = await linesOf('IC-NOLIST');
@@ -4396,7 +4404,7 @@ await step('orders list, Item column: every line carries its Briyo product, read
   await addPlatformMappings(ML.b, PF.zepto, [code], { actor: ACTOR });
   const [u2] = await linesOf('IC-UNM');
   const lineAfter = (await getPool().query(`SELECT i.id FROM order_items i JOIN orders o ON o.id = i.order_id WHERE o.source_order_id = $1`, [`${TEST_ORDER}-IC-UNM`])).rows;
-  if (!u2 || u2.sku_id !== ML.b || u2.product !== 'Manual line B' || u2.title !== null || u2.code !== code) bad.push(`after mapping ${JSON.stringify(u2)}`);
+  if (!u2 || u2.sku_id !== ML.b || u2.product !== 'Manual line B' || u2.title !== null || u2.code !== code || u2.units_per_listing !== 1) bad.push(`after mapping ${JSON.stringify(u2)}`);
   if (JSON.stringify(lineBefore) !== JSON.stringify(lineAfter) || lineAfter.length !== 1) bad.push('mapping replaced the order line instead of linking it');
   // 5. Several lines, in the order they were added: two products and one "not matched yet" retailer line.
   const multi = await mlOrder('IC-MULTI', { channel: 'instamart' });
@@ -4405,7 +4413,8 @@ await step('orders list, Item column: every line carries its Briyo product, read
   await addManualOrderLine(multi, { unmatched: true, retailer_product_name: 'DBCHECK shelf pack', quantity: 4 }, { actor: ACTOR });
   const ml = await linesOf('ML-IC-MULTI');
   if (ml.length !== 3 || ml[0].product !== A.product || ml[0].quantity !== 2 || ml[1].product !== 'Manual line B'
-    || ml[2].sku_id !== null || ml[2].review !== true || ml[2].title !== 'DBCHECK shelf pack' || ml[2].quantity !== 4) bad.push(`multi ${JSON.stringify(ml)}`);
+    || ml[2].sku_id !== null || ml[2].review !== true || ml[2].title !== 'DBCHECK shelf pack' || ml[2].quantity !== 4
+    || ml.some((l) => l.units_per_listing !== 1)) bad.push(`multi ${JSON.stringify(ml)}`);   // hand-entered: master units, never a pack
   // 6. Every active non-website channel, the same way: a hand-entered order's product (Amazon: an imported line).
   const { rows: chans } = await getPool().query(`SELECT key FROM sales_channels WHERE active AND key <> 'website' ORDER BY sort`);
   // A route each channel accepts: the suite's own where it has one, else easy ship, else its first type and destination.
@@ -4425,11 +4434,11 @@ await step('orders list, Item column: every line carries its Briyo product, read
       await addManualOrderLine(id, { sku_id: ML.a, quantity: 1 }, { actor: ACTOR });
       lines = await linesOf(`ML-IC-CH-${key}`);
     }
-    if (lines.length !== 1 || lines[0].sku_id !== ML.a || lines[0].product !== A.product || lines[0].variant !== A.variant) bad.push(`${key}: ${JSON.stringify(lines)}`);
+    if (lines.length !== 1 || lines[0].sku_id !== ML.a || lines[0].product !== A.product || lines[0].variant !== A.variant || lines[0].units_per_listing !== 1) bad.push(`${key}: ${JSON.stringify(lines)}`);
   }
   if (chans.length < 10) bad.push(`only ${chans.length} non-website channels`);
   if (bad.length) throw new Error(bad.join('; '));
-  return `website row unchanged (+product); mapped → product, unmapped → none + channel's name; mapping later → product on the same line; 3 lines in order incl. "not matched yet"; ${chans.length} non-website channels alike`;
+  return `website row unchanged (+product); mapped pack → 1 × 3 = 3 units, 2 × 3 = 6 (list and drawer); unmapped → none + channel's name; mapping later → product on the same line; 3 lines in order incl. "not matched yet"; ${chans.length} non-website channels alike`;
 });
 await step('master SKU import: parser — Briyo SKU + Product Name only; platform columns ignored with a warning', async () => {
   const two = planSkuSheet([['Briyo SKU', 'Product Name'], ['A1', 'Alpha'], ['', ''], ['A2', '  Beta   capsules ']]);
