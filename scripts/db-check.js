@@ -3421,7 +3421,7 @@ await step('shared UI patterns: one outlined label (tag / xtag / mini-tag) on to
   return 'labels: one outlined pattern at 11px on tokens (5 tones), unknown expiry dashed; duplicates removed; tables share row/head tokens, tabular numerics, focusable/selected rows, keyboard sort with aria-sort on the call board and Analytics, a scroll edge cue; stateBlock announces loading/errors and replaces hand-rolled loading in HR, Inventory, Affiliates; inventory: labelled stage/cancel forms, confirm dialogs, unsaved-change guard, one submit at a time, SKU list fetched once (5 filter changes: 10 → 5 requests)';
 });
 
-await step('orders & logistics UI: eight-column table (shipment = status + courier · AWB, Amount kept on screen to tablet width), grouped filters with a counted "More filters", drawer facts first and items/details before proof, one save at a time, cancel confirmed, loading/error never shown as "no orders", stale answers ignored, couriers stacked on phones', async () => {
+await step('orders & logistics UI: nine-column table (Item after Order; shipment = status + courier · AWB, Amount kept on screen to tablet width), grouped filters with a counted "More filters", drawer facts first and items/details before proof, one save at a time, cancel confirmed, loading/error never shown as "no orders", stale answers ignored, couriers stacked on phones', async () => {
   const bad = [];
   const read = (f) => fsp.readFile(new URL(`../public/${f}`, import.meta.url), 'utf8');
   const html = await read('orders.html'); const js = await read('orders.js'); const css = await read('orders.css');
@@ -3429,7 +3429,7 @@ await step('orders & logistics UI: eight-column table (shipment = status + couri
   for (const id of ['q', 'fchannel', 'fdest', 'fstatus', 'fshipment', 'fcourier', 'finvoice', 'ftracking', 'ffrom', 'fto', 'fclear', 'refresh', 'shopifyOrders', 'amazonOrders', 'importOrders', 'newShipment', 'selBar', 'rows', 'clist', 'more'])
     if (!html.includes(`id="${id}"`)) bad.push(`#${id} missing`);
   const thead = html.slice(html.indexOf('<thead>'), html.indexOf('</thead>'));
-  if ((thead.match(/<th[\s>]/g) || []).length !== 8 || !/<th class="r col-amt">Amount<\/th>/.test(thead) || !/Shipment <span class="th-sub">courier · AWB<\/span>/.test(thead)) bad.push('table head');
+  if ((thead.match(/<th[\s>]/g) || []).length !== 9 || !/<th>Order<\/th><th class="col-item" title="[^"]*">Item<\/th>/.test(thead) || !/<th class="r col-amt">Amount<\/th>/.test(thead) || !/Shipment <span class="th-sub">courier · AWB<\/span>/.test(thead)) bad.push('table head');
   if (/@media \(max-width: 1360px\)[^}]*col-amt/.test(css) || /\.col-amt[^{]*\{[^}]*display: none/.test(css)) bad.push('Amount hidden on laptops again');
   if (!/<td class="r num col-amt">\$\{o\.order_value === null \|\| o\.order_value === undefined \? '<span class="muted-cell" title="No value entered">—<\/span>' : esc\(amount\(o\.order_value\)\)\}/.test(js)) bad.push('amount cell (shared money formatter, no value never ₹0)');
   if (!/const payText = \(o\) => \[o\.payment_method && label\(o\.payment_method\), o\.payment_status && label\(o\.payment_status\)\]/.test(js) || !/pay-sub/.test(js)) bad.push('payment not shown under the amount');
@@ -4367,6 +4367,69 @@ await step('manual order lines: a hand-entered Amazon order (no manual products 
 await step('manual order lines: test cutover cleared', async () => {
   await getPool().query('UPDATE inventory_settings SET cutover_at = NULL WHERE id');
   return 'cutover NULL for the rest of the suite';
+});
+await step('orders list, Item column: every line carries its Briyo product, read live from the SKU master — website unchanged; mapped and unmapped platform SKUs; a later mapping shows without re-import; several lines; every non-website channel alike', async () => {
+  const bad = [];
+  const rowOf = async (num) => (await listOrders({ q: `${TEST_ORDER}-${num}` })).orders.find((o) => o.source_order_id === `${TEST_ORDER}-${num}`);
+  const linesOf = async (num) => (await rowOf(num))?.line_skus || [];
+  const A = { product: 'Manual line A', variant: '60 caps' };
+  // 1. Website: the same SKU fields as before (its lines carry the master code), plus the product.
+  await lineOn('website', 'IC-WEB', `${TS}-ML-A`, 2);
+  const [w] = await linesOf('IC-WEB');
+  if (!w || w.code !== `${TS}-ML-A` || w.briyo_sku !== `${TS}-ML-A` || w.sku_id !== ML.a || w.quantity !== 2
+    || w.product !== A.product || w.variant !== A.variant || w.title !== null || w.review !== false) bad.push(`website ${JSON.stringify(w)}`);
+  // 2. A platform SKU already mapped (Blinkit ×3 pack of ML-A, from the step above): the Briyo product.
+  await lineOn('blinkit', 'IC-MAP', `${TS}-ML-A-PACK3`, 1);
+  const [m] = await linesOf('IC-MAP');
+  if (!m || m.code !== `${TS}-ML-A-PACK3` || m.sku_id !== ML.a || m.product !== A.product || m.title !== null) bad.push(`mapped ${JSON.stringify(m)}`);
+  // 3. A platform SKU nobody mapped: no product, never guessed; the channel's own name for it instead.
+  const code = `${TS}-IC-UNMAPPED`;
+  await lineOn('zepto', 'IC-UNM', code, 3);
+  const [u] = await linesOf('IC-UNM');
+  if (!u || u.sku_id !== null || u.product !== null || u.briyo_sku !== null || u.title !== 'Test line' || u.review !== false || u.quantity !== 3 || u.mappable !== true) bad.push(`unmapped ${JSON.stringify(u)}`);
+  // A channel with no product-code list in Inventory (Instamart today) says so: its SKU cannot be mapped there.
+  await lineOn('instamart', 'IC-NOLIST', `${TS}-IC-NOLIST`, 1);
+  const [nl] = await linesOf('IC-NOLIST');
+  if (!nl || nl.sku_id !== null || nl.mappable !== false) bad.push(`no product-code list ${JSON.stringify(nl)}`);
+  // 4. Mapped later in Inventory: the same order line (no re-import) now shows the product.
+  const lineBefore = (await getPool().query(`SELECT i.id FROM order_items i JOIN orders o ON o.id = i.order_id WHERE o.source_order_id = $1`, [`${TEST_ORDER}-IC-UNM`])).rows;
+  await addPlatformMappings(ML.b, PF.zepto, [code], { actor: ACTOR });
+  const [u2] = await linesOf('IC-UNM');
+  const lineAfter = (await getPool().query(`SELECT i.id FROM order_items i JOIN orders o ON o.id = i.order_id WHERE o.source_order_id = $1`, [`${TEST_ORDER}-IC-UNM`])).rows;
+  if (!u2 || u2.sku_id !== ML.b || u2.product !== 'Manual line B' || u2.title !== null || u2.code !== code) bad.push(`after mapping ${JSON.stringify(u2)}`);
+  if (JSON.stringify(lineBefore) !== JSON.stringify(lineAfter) || lineAfter.length !== 1) bad.push('mapping replaced the order line instead of linking it');
+  // 5. Several lines, in the order they were added: two products and one "not matched yet" retailer line.
+  const multi = await mlOrder('IC-MULTI', { channel: 'instamart' });
+  await addManualOrderLine(multi, { sku_id: ML.a, quantity: 2 }, { actor: ACTOR });
+  await addManualOrderLine(multi, { sku_id: ML.b, quantity: 1 }, { actor: ACTOR });
+  await addManualOrderLine(multi, { unmatched: true, retailer_product_name: 'DBCHECK shelf pack', quantity: 4 }, { actor: ACTOR });
+  const ml = await linesOf('ML-IC-MULTI');
+  if (ml.length !== 3 || ml[0].product !== A.product || ml[0].quantity !== 2 || ml[1].product !== 'Manual line B'
+    || ml[2].sku_id !== null || ml[2].review !== true || ml[2].title !== 'DBCHECK shelf pack' || ml[2].quantity !== 4) bad.push(`multi ${JSON.stringify(ml)}`);
+  // 6. Every active non-website channel, the same way: a hand-entered order's product (Amazon: an imported line).
+  const { rows: chans } = await getPool().query(`SELECT key FROM sales_channels WHERE active AND key <> 'website' ORDER BY sort`);
+  // A route each channel accepts: the suite's own where it has one, else easy ship, else its first type and destination.
+  const routeFor = async (key) => {
+    if (ROUTES[key]) return ROUTES[key];
+    const { rows: [c] } = await getPool().query('SELECT dispatch_types FROM sales_channels WHERE key = $1', [key]);
+    const type = (c.dispatch_types || []).includes('easy_ship') ? 'easy_ship' : (c.dispatch_types || [])[0];
+    if (!type || type === 'easy_ship') return type ? { dispatch_type: type, destination_id: null } : {};
+    const { rows: [d] } = await getPool().query('SELECT id FROM dispatch_destinations WHERE channel = $1 AND dispatch_type = $2 AND active ORDER BY id LIMIT 1', [key, type]);
+    return { dispatch_type: type, destination_id: d?.id ?? null };
+  };
+  for (const { key } of chans) {
+    let lines;
+    if (key === 'amazon') { await lineOn('amazon', `IC-CH-${key}`, `${TS}-ML-A`, 1); lines = await linesOf(`IC-CH-${key}`); }
+    else {
+      const id = await createOrder({ ...(await routeFor(key)), channel: key, source_order_id: `${TEST_ORDER}-ML-IC-CH-${key}`, order_value: 100 }, { actor: ACTOR });
+      await addManualOrderLine(id, { sku_id: ML.a, quantity: 1 }, { actor: ACTOR });
+      lines = await linesOf(`ML-IC-CH-${key}`);
+    }
+    if (lines.length !== 1 || lines[0].sku_id !== ML.a || lines[0].product !== A.product || lines[0].variant !== A.variant) bad.push(`${key}: ${JSON.stringify(lines)}`);
+  }
+  if (chans.length < 10) bad.push(`only ${chans.length} non-website channels`);
+  if (bad.length) throw new Error(bad.join('; '));
+  return `website row unchanged (+product); mapped → product, unmapped → none + channel's name; mapping later → product on the same line; 3 lines in order incl. "not matched yet"; ${chans.length} non-website channels alike`;
 });
 await step('master SKU import: parser — Briyo SKU + Product Name only; platform columns ignored with a warning', async () => {
   const two = planSkuSheet([['Briyo SKU', 'Product Name'], ['A1', 'Alpha'], ['', ''], ['A2', '  Beta   capsules ']]);
