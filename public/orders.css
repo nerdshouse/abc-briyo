@@ -4,10 +4,12 @@
 /* Eight columns: Order · Customer · Channel · Shipment (status, courier · AWB) · Proof · Date · Amount · open.
    Amount and the logistics facts stay visible down to tablet width; Customer folds under the order number first. */
 .ord-table { table-layout: fixed; min-width: 860px; }
-.ord-table col.c-order { width: 22%; }   /* room for the SKU lines under the number */
-.ord-table col.c-cust { width: 15%; }
-.ord-table col.c-chan { width: 15%; }
-.ord-table col.c-ship { width: 21%; }
+.ord-table col.c-order { width: 18%; }   /* room for the SKU lines under the number */
+.ord-table col.c-item { width: 18%; }    /* the Briyo product on each line */
+.ord-table col.c-cust { width: 11%; }
+.ord-table col.c-chan { width: 14%; }
+.ord-table col.c-ship { width: 17%; }
+.ord-table th { overflow: hidden; text-overflow: ellipsis; }   /* a narrow header never runs into the next one */
 .ord-table col.c-inv { width: 84px; }
 .ord-table col.c-date { width: 112px; }
 .ord-table col.c-amt { width: 112px; }
@@ -21,6 +23,7 @@
 .ord-table .cell-main, .ord-table .cell-sub { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 /* After the cell rule above, which they override (same specificity, so order decides). */
 .ord-table .cust-inline { display: none; }
+.ord-table .item-inline { display: none; }   /* the Item column folded under the order number (tablet) */
 .ord-table .pay-sub { margin-top: 3px; white-space: normal; overflow: visible; }   /* wraps rather than cut off in the narrower tablet column */
 /* The "Cancelled" tag is never cut off: it moves under a long order number, which is shortened only if it alone is
    too wide. The gap spaces items on one line only, so a wrapped tag sits flush left. */
@@ -109,8 +112,14 @@
   /* the Customer column folds under the order number; Amount and the logistics columns stay */
   .ord-table .col-cust, .ord-table col.c-cust { display: none; }
   .ord-table .cust-inline { display: block; }
+  /* the Item column folds under the order number too, so Amount stays on screen */
+  .ord-table .col-item, .ord-table col.c-item { display: none; }
+  .ord-table .item-inline { display: block; margin-top: 2px; }
   /* tablet: every remaining column fits without a sideways scroll (Amount included) */
   .ord-table { min-width: 680px; }
+  .ord-table col.c-order { width: 26%; }
+  .ord-table col.c-chan { width: 17%; }
+  .ord-table col.c-ship { width: 23%; }
   .ord-table col.c-inv { width: 64px; }
   .ord-table col.c-date { width: 112px; }
   .ord-table col.c-amt { width: 100px; }
@@ -334,6 +343,11 @@
 .line-skus .ls { display: block; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .line-skus b { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-weight: 500; color: var(--text-2); }
 .oi-sub .line-skus .ls { display: inline; margin-right: 10px; }
+/* Item column: one product per line, wrapped to at most two lines (full name on hover); "Map in Inventory" under unmapped ones. */
+.item-lines .it { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; line-clamp: 2; overflow: hidden; white-space: normal; overflow-wrap: anywhere; }
+.item-lines .it-qty { color: var(--text-2); font-variant-numeric: tabular-nums; }
+.item-lines .it-act { display: inline-block; margin-top: 2px; font-size: 12px; }
+.oi-items .item-lines .it { -webkit-line-clamp: 3; line-clamp: 3; }
 
 /* Platform SKUs on a master SKU */
 .pf-list { list-style: none; margin: 0; padding: 0; border: 1px solid var(--border); border-radius: var(--r-sm); }

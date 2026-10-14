@@ -286,14 +286,15 @@ function renderRows() {
       : '<b>No orders yet.</b>Add a shipment with New Shipment, or Import orders.')
     : '';
   if (empty) {
-    $('#rows').innerHTML = `<tr><td colspan="8"><div class="empty-note">${empty}</div></td></tr>`;
+    $('#rows').innerHTML = `<tr><td colspan="9"><div class="empty-note">${empty}</div></td></tr>`;
     $('#clist').innerHTML = `<li class="oitem"><div class="empty-note">${empty}</div></li>`;
     return;
   }
   $('#rows').innerHTML = state.orders.map((o) => `
     <tr class="orow${o.id === state.openId ? ' open' : ''}" data-id="${o.id}" tabindex="0">
-      <td><span class="cell-main mono ord-no" title="${esc(orderNo(o))}">${pickBox(o)}<span class="ord-num">${esc(orderNo(o))}</span>${cancelledTag(o)}</span>${lineSkus(o)}
+      <td><span class="cell-main mono ord-no" title="${esc(orderNo(o))}">${pickBox(o)}<span class="ord-num">${esc(orderNo(o))}</span>${cancelledTag(o)}</span>${lineSkus(o)}${isMarketplace(o.channel) ? `<span class="cell-sub item-inline">${itemLines(o)}</span>` : ''}
         ${o.customer_name ? `<span class="cell-sub cust-inline" title="${esc(o.customer_name)}">${esc(o.customer_name)}</span>` : ''}</td>
+      <td class="col-item">${itemCell(o)}</td>
       <td class="col-cust">${o.customer_name ? `<span class="cell-main cust" title="${esc(o.customer_name)}">${esc(o.customer_name)}</span>` : '<span class="muted-cell">—</span>'}</td>
       <td><span class="cell-main chan">${esc(channelOf(o))}</span>${o.destination_name
         ? `<span class="cell-sub muted" title="${esc(o.destination_name)}">${esc(o.destination_name)}</span>`
@@ -309,6 +310,7 @@ function renderRows() {
       <div class="oi-top">${pickBox(o)}<span class="oi-id mono">${esc(orderNo(o))}</span><span class="chan">${esc(channelOf(o))}</span>${cancelledTag(o)}
         <span class="oi-val">${shipIndicator(o)}</span></div>
       ${o.line_skus?.length ? `<div class="oi-sub">${lineSkus(o)}</div>` : ''}
+      ${isMarketplace(o.channel) ? `<div class="oi-sub oi-items">${itemLines(o, { max: 3 })}</div>` : ''}
       ${o.destination_name ? `<div class="oi-sub">${icon('map-pin')} ${esc(o.destination_name)}</div>` : ''}
       <div class="oi-sub">${o.tracking_id ? `${esc(o.courier_name || '')} · <span class="mono">${esc(o.tracking_id)}</span>` : o.shipment_id ? 'No courier / AWB yet' : 'Not in a shipment yet'}</div>
       <div class="oi-stat"><span class="soft" style="font-size:12.5px">${esc(day(o.order_date))}</span>
@@ -638,6 +640,48 @@ function lineSkus(o) {
   return `<span class="cell-sub line-skus">${rows.join('')}${lines.length > 2 ? `<span class="ls">+${lines.length - 2} more</span>` : ''}</span>`;
 }
 
+const canMapSkus = () => Boolean(state.me?.caps?.includes('inventory.catalog'));
+
+/**
+ * Orders list, Item column: which Briyo product each line is, for every channel except the website (its lines carry
+ * Briyo's own SKUs, shown under the order number as before). The product comes from the SKU master through the line's
+ * link, so a platform SKU mapped later in Inventory shows here at once — the order is never re-imported. A line not
+ * linked yet says so and shows what the channel called it; the product is never guessed.
+ */
+function itemLines(o, { max = 2 } = {}) {
+  const lines = o.line_skus || [];
+  if (!lines.length) return '<span class="muted-cell" title="No products on this order yet">No items</span>';
+  // Physical units of the product: a pack listing (units_per_listing > 1, as stock reservation counts it) says both
+  // how many listings and how many units — "×6 (2 × pack of 3)" — never just the listing count.
+  const per = (l) => Math.max(1, Number(l.units_per_listing) || 1);
+  const units = (l) => l.quantity * per(l);
+  const qty = (l) => (per(l) > 1 ? ` <span class="it-qty">×${esc(units(l))} (${esc(l.quantity)} × pack of ${esc(per(l))})</span>`
+    : l.quantity > 1 ? ` <span class="it-qty">×${esc(l.quantity)}</span>` : '');
+  const nameOf = (l) => [l.product, l.variant].filter(Boolean).join(' — ') || l.briyo_sku;
+  const one = (l) => {
+    if (l.sku_id) {
+      const packs = per(l) > 1 ? ` · ${units(l)} units: ${l.quantity} × pack of ${per(l)}` : '';
+      return `<span class="it" title="${esc(`${nameOf(l)} · Briyo SKU ${l.briyo_sku}${packs}`)}">${esc(nameOf(l))}${qty(l)}</span>`;
+    }
+    if (l.review) {
+      return `<span class="it" title="${esc(`Not matched to a Briyo product yet: ${l.title || 'no name'}. Open the order and use Match product.`)}">`
+        + `<span class="warn-text">Not matched</span> · ${esc(l.title || '—')}${qty(l)}</span>`;
+    }
+    const why = l.mappable ? 'Once it is mapped in Inventory, this order shows the product.'
+      : `${o.channel_label || 'This channel'} has no product-code list in Inventory yet, so its SKUs cannot be mapped there.`;
+    return `<span class="it" title="${esc(`${o.channel_label || 'Platform'} SKU ${l.code || '(none)'}${l.title ? ` — ${l.title}` : ''} is not mapped to a Briyo product. ${why}`)}">`
+      + `<span class="warn-text">Not mapped</span> · <span class="mono">${esc(l.code || '—')}</span>${qty(l)}</span>`;
+  };
+  const more = lines.length > max
+    ? `<span class="it soft" title="${esc(lines.slice(max).map((l) => (l.sku_id ? nameOf(l) : l.title || l.code || '—')).join('\n'))}">+${lines.length - max} more</span>` : '';
+  // Platform SKUs are mapped in Inventory (Unmapped SKUs); a "not matched yet" line is matched in the order itself.
+  const mapLink = canMapSkus() && lines.some((l) => !l.sku_id && !l.review && l.code && l.mappable)
+    ? '<a class="it-act" href="/inventory?view=unmapped">Map in Inventory</a>' : '';
+  return `<span class="item-lines">${lines.slice(0, max).map(one).join('')}${more}${mapLink}</span>`;
+}
+const itemCell = (o) => (isMarketplace(o.channel) ? itemLines(o)
+  : '<span class="muted-cell" title="Website orders carry Briyo SKUs directly — see the SKU under the order number">—</span>');
+
 /** Line items, as the marketplace listed them. Manual orders have none. */
 const PARCEL_LEFT = new Set(['dispatched', 'in_transit', 'out_for_delivery', 'delivered', 'delivery_failed', 'rto']);
 /** Hand-entered orders take products here (not Amazon: its report import adds them). lib/orders.js decides again. */
@@ -650,7 +694,8 @@ function itemsSection(o, items) {
   const manual = takesManualLines(o);
   if (!items.length && !manual) return '';
   const open = manualLinesOpen(o);
-  const units = items.reduce((n, it) => n + it.quantity, 0);
+  // Physical units: a pack listing counts its units_per_listing (as stock reservation does), not 1.
+  const units = items.reduce((n, it) => n + it.quantity * Math.max(1, Number(it.units_per_listing) || 1), 0);
   const skus = state.lineSkus || [];
   const skuOptions = skus.map((k) => `<option value="${k.id}">${esc(k.sku)} — ${esc([k.product_name, k.variant_name].filter(Boolean).join(' '))}</option>`).join('');
   const row = (it) => {
