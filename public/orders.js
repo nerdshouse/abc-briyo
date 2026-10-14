@@ -1,4 +1,5 @@
 import { formatDayKey } from './ui/ist.js';
+import { unitSummary, unitSummaryText, UNMAPPED_UNITS_NOTE } from './ui/units.js';
 /**
  * Orders & Logistics — All orders, channel tabs, the logistics queues, the
  * order drawer and manual create/edit. Everything reads /api/orders; channels,
@@ -694,8 +695,8 @@ function itemsSection(o, items) {
   const manual = takesManualLines(o);
   if (!items.length && !manual) return '';
   const open = manualLinesOpen(o);
-  // Physical units: a pack listing counts its units_per_listing (as stock reservation does), not 1.
-  const units = items.reduce((n, it) => n + it.quantity * Math.max(1, Number(it.units_per_listing) || 1), 0);
+  // Physical units (packs counted as their units); a line not mapped yet is counted apart, never as units.
+  const unitsPartial = unitSummary(items).unmapped > 0;
   const skus = state.lineSkus || [];
   const skuOptions = skus.map((k) => `<option value="${k.id}">${esc(k.sku)} — ${esc([k.product_name, k.variant_name].filter(Boolean).join(' '))}</option>`).join('');
   const row = (it) => {
@@ -721,7 +722,7 @@ function itemsSection(o, items) {
         </div>`;
   };
   return `<section class="dsec" id="dItems">
-      <h3 class="dsec-title">${manual ? 'Products' : 'Items'} <span class="dsec-meta soft">${count(items.length)} line${items.length === 1 ? '' : 's'} · ${count(units)} unit${units === 1 ? '' : 's'}</span></h3>
+      <h3 class="dsec-title">${manual ? 'Products' : 'Items'} <span class="dsec-meta soft"${unitsPartial ? ` title="${esc(UNMAPPED_UNITS_NOTE)}"` : ''}>${esc(unitSummaryText(items))}</span></h3>
       ${items.length ? `<div class="item-list">${items.map(row).join('')}</div>` : ''}
       ${manual && !items.length && !open ? '<p class="muted" style="margin:0">No products recorded on this order.</p>' : ''}
       ${open ? `<div class="ml-add">

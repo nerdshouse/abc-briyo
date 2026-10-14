@@ -72,6 +72,7 @@ import { runShopifySync, mapShopifyOrder, shopifyPaymentMethod, shopifyPaymentSt
 import { ensureOrderFinancialSnapshotSchema, financialSnapshotFrom, recordFinancialSnapshot, addAmounts, FINANCIAL_TABLES } from '../lib/order-financial-snapshots.js';
 import { SHOPIFY_MAX_QUERY_COST, SHOPIFY_ORDER_QUERIES, LIMITS as SHOPIFY_LIMITS, shopifyOrderQuery, estimateShopifyOrderQueryCost } from '../lib/shopify-order-queries.js';
 import { istDateTime, istDate, istTime, istDayKey as uiIstDayKey } from '../public/ui/ist.js';
+import { unitSummary, unitSummaryText } from '../public/ui/units.js';
 import { issueFormToken, verifyTurnstile, normalizeHost, isCareersRequest } from '../lib/careers.js';
 import net from 'node:net';
 import {
@@ -4439,6 +4440,45 @@ await step('orders list, Item column: every line carries its Briyo product, read
   if (chans.length < 10) bad.push(`only ${chans.length} non-website channels`);
   if (bad.length) throw new Error(bad.join('; '));
   return `website row unchanged (+product); mapped pack → 1 × 3 = 3 units, 2 × 3 = 6 (list and drawer); unmapped → none + channel's name; mapping later → product on the same line; 3 lines in order incl. "not matched yet"; ${chans.length} non-website channels alike`;
+});
+await step('order drawer unit total: packs counted as units; a platform line not mapped yet is counted apart, never as units — mapped, unmapped, mixed, hand-entered, and mapped later', async () => {
+  const bad = [];
+  // A second imported-style line on an order, resolved as the importers do (lineOn makes the first, 'L1').
+  const addLine = async (orderId, channel, code, qty, n) => {
+    const c = await getPool().connect();
+    let skuId;
+    try { skuId = (await resolveSkuIds(c, channel, [code])).get(code.toLowerCase()) ?? null; } finally { c.release(); }
+    await getPool().query(`INSERT INTO order_items (order_id, source_line_item_id, sku, title, quantity, item_price, sku_id)
+      VALUES ($1, $2, $3, 'Test line', $4, 100, $5)`, [orderId, `L${n}`, code, qty, skuId]);
+  };
+  const check = async (label, orderId, want, wantText) => {
+    const items = await orderItems(orderId);
+    const got = unitSummary(items);
+    if (JSON.stringify(got) !== JSON.stringify(want) || unitSummaryText(items) !== wantText) bad.push(`${label}: ${JSON.stringify(got)} "${unitSummaryText(items)}"`);
+  };
+  const UNM = `${TS}-UT-UNMAPPED`;
+  // Fully mapped: 2 × pack of 3 + 1 single of the same product = 7 units.
+  const mapped = await lineOn('blinkit', 'UT-MAPPED', `${TS}-ML-A-PACK3`, 2);
+  await addLine(mapped, 'blinkit', `${TS}-ML-A`, 1, 2);
+  await check('mapped', mapped, { lines: 2, known: 7, unmapped: 0 }, '2 lines · 7 units');
+  // Only an unmapped platform line: its units are unknown, and no number is shown for them.
+  const only = await lineOn('blinkit', 'UT-UNMAPPED', UNM, 3);
+  await check('unmapped only', only, { lines: 1, known: 0, unmapped: 1 }, '1 line · units unknown (1 unmapped line)');
+  // Mixed: the 6 known units, and the unmapped line apart.
+  const mixed = await lineOn('blinkit', 'UT-MIXED', `${TS}-ML-A-PACK3`, 2);
+  await addLine(mixed, 'blinkit', UNM, 1, 2);
+  await check('mixed', mixed, { lines: 2, known: 6, unmapped: 1 }, '2 lines · 6 known units · 1 unmapped line');
+  // Hand-entered lines are already in units, the "not matched yet" one included.
+  const hand = await mlOrder('UT-HAND', { channel: 'zepto' });
+  await addManualOrderLine(hand, { sku_id: ML.a, quantity: 2 }, { actor: ACTOR });
+  await addManualOrderLine(hand, { unmatched: true, retailer_product_name: 'DBCHECK unit pack', quantity: 4 }, { actor: ACTOR });
+  await check('hand-entered', hand, { lines: 2, known: 6, unmapped: 0 }, '2 lines · 6 units');
+  // Mapped later (one unit per listing): the same lines now total 6 + 1 = 7, with nothing unmapped.
+  await addPlatformMappings(ML.b, PF.blinkit, [UNM], { actor: ACTOR });
+  await check('mixed, mapped later', mixed, { lines: 2, known: 7, unmapped: 0 }, '2 lines · 7 units');
+  await check('unmapped only, mapped later', only, { lines: 1, known: 3, unmapped: 0 }, '1 line · 3 units');
+  if (bad.length) throw new Error(bad.join('; '));
+  return '2×3 + 1 = "2 lines · 7 units"; unmapped only "units unknown"; mixed "6 known units · 1 unmapped line"; hand-entered in units; mapping later completes the totals';
 });
 await step('master SKU import: parser — Briyo SKU + Product Name only; platform columns ignored with a warning', async () => {
   const two = planSkuSheet([['Briyo SKU', 'Product Name'], ['A1', 'Alpha'], ['', ''], ['A2', '  Beta   capsules ']]);
