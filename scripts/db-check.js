@@ -7514,6 +7514,64 @@ await step('code-less website lines: two matches at once — one wins, one event
   return `two matches at once → 1 won (409 for the other), 1 event; gated: ${gated.join('; ')}; unmatch/reserve ×4, alternating who starts → ${outcomes.join(' ')} (unmatch then reserve; f=won, r=refused), never both, never stock reserved for an unlinked line`;
 });
 
+await step('code-less website lines: no deadlock with a Shopify sync page — the sync holds the line (and, case B, the order) and then locks a cancelled Buy with Amazon shipment of the same order while a match runs', async () => {
+  // A sync page locks an order's lines (its upsert locks every existing line, changed or not) and later the order's
+  // external shipments (mirrorExternalFulfillments). A match must lock in the same order — order, line, shipments —
+  // or the two wait on each other (40P01). Case A is the deadlock that the earlier lock order (shipments before the
+  // line) produced; case B (the sync also holds the order) never could, and is kept as a guard.
+  const bad = [];
+  const { default: pgMod } = await import('pg');
+  const conn = async () => { const c = new pgMod.Client({ connectionString: process.env.DATABASE_URL }); await c.connect(); return c; };
+  const sync = await conn(); const mon = await conn();
+  const syncPid = (await sync.query('SELECT pg_backend_pid() p')).rows[0].p;
+  const waiting = async () => (await mon.query(`SELECT count(*)::int n FROM pg_stat_activity WHERE datname = current_database() AND wait_event_type = 'Lock' AND pid NOT IN ($1, pg_backend_pid())`, [syncPid])).rows[0].n;
+  const until = async (fn, label) => { const t = Date.now(); while (!(await fn())) { if (Date.now() - t > 15000) throw new Error(`timed out waiting for ${label}`); await new Promise((r) => setTimeout(r, 15)); } };
+  const settle = (p) => p.then((v) => ({ ok: v }), (e) => ({ err: e }));
+  const results = [];
+  try {
+    for (const [n, holdOrder] of [[9110, false], [9111, true]]) {
+      clStore.push(shOrder(n, { lines: [{ sku: null, qty: 1, title: 'Sample sachet' }] }));
+      await clSync();
+      const oid = await clOrder(n);
+      const lineId = (await clLines(oid))[0].id;
+      // A Buy with Amazon fulfilment Shopify later cancelled: a live (not shipped) external shipment of the order.
+      const { rows: [ext] } = await getPool().query(
+        `INSERT INTO order_shipments (order_id, shipment_status, external_source, external_provider, external_fulfillment_id, created_by, updated_by)
+         VALUES ($1, 'cancelled', 'shopify', 'bwa', $2, $3, $3) RETURNING id, version`, [oid, `gid://shopify/Fulfillment/${SH_NUM}${n}`, ACTOR]);
+      // 1. The sync page: (B: the order,) then the line, as the upsert does.
+      await sync.query('BEGIN');
+      await sync.query(`SET LOCAL lock_timeout = '10s'`);
+      if (holdOrder) await sync.query('SELECT id FROM orders WHERE id = $1 FOR UPDATE', [oid]);
+      await sync.query('SELECT id FROM order_items WHERE id = $1 FOR UPDATE', [lineId]);
+      // 2. A person matches the line; it queues behind the sync (on the line, or on the order in case B).
+      const match = settle(clMatch(lineId, CL.a, 1, `Deadlock regression ${holdOrder ? 'B' : 'A'}`));
+      await until(async () => (await waiting()) === 1, 'the match to wait for the sync');
+      // 3. The sync now locks the external shipment (mirrorExternalFulfillments). It must get it: the match holds no
+      //    shipment yet. With shipments locked before the line, the match would hold it and this would deadlock.
+      const step3 = await settle(sync.query('SELECT id FROM order_shipments WHERE id = $1 FOR UPDATE', [ext.id]));
+      await sync.query(step3.err ? 'ROLLBACK' : 'COMMIT').catch(() => sync.query('ROLLBACK'));
+      const m = await match;
+      const line = (await clLines(oid))[0];
+      const evs = (await orderEvents(oid)).filter((e) => e.event_type === 'item_matched_manually' && e.metadata?.reason === `Deadlock regression ${holdOrder ? 'B' : 'A'}`);
+      const extAfter = (await getPool().query('SELECT shipment_status, version FROM order_shipments WHERE id = $1', [ext.id])).rows[0];
+      const tag = holdOrder ? 'B (sync holds order + line)' : 'A (sync holds line)';
+      if (step3.err) bad.push(`${tag}: sync shipment step failed ${step3.err.code} ${step3.err.message}`);
+      if (m.err) bad.push(`${tag}: match failed ${m.err.code || m.err.status} ${m.err.message}`);
+      if ([step3.err, m.err].some((e) => e?.code === '40P01')) bad.push(`${tag}: deadlock`);
+      if (line.sku_id !== CL.a || line.matched_units_per_listing !== 1) bad.push(`${tag}: line ${JSON.stringify(line)}`);
+      if (evs.length !== 1) bad.push(`${tag}: ${evs.length} match events`);
+      if (extAfter.shipment_status !== 'cancelled' || extAfter.version !== ext.version) bad.push(`${tag}: external shipment changed`);
+      results.push(`${tag}: sync got the shipment, match ${m.ok ? 'done after the sync' : 'failed'}`);
+      if (line.matched_units_per_listing !== null) await unmatchImportedLine(lineId, { reason: 'reset after deadlock test' }, { actor: ACTOR });
+    }
+  } finally {
+    await sync.query('ROLLBACK').catch(() => {});
+    await sync.end().catch(() => {}); await mon.end().catch(() => {});
+  }
+  if (bad.length) throw new Error(bad.join(' | '));
+  return `${results.join('; ')}; no deadlock error, one match and one event each, external shipment untouched`;
+});
+
 await step('amazon sp-api cleanup', async () => {
   await purgeTestOrders(`${TEST_ORDER}-AZSP`);
   await getPool().query(`DELETE FROM order_imports WHERE kind = 'amazon_sync' AND imported_by = $1`, [AZ_ACTOR]);
