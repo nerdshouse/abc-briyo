@@ -589,6 +589,8 @@ html.scroll-locked .drawer-scrim { touch-action: none; }
 .ml-amt { width: 110px; }
 .item-row.needs-review { border-left: 3px solid var(--warn, #F79009); padding-left: 8px; }
 .ml-match { margin-top: 6px; }
+/* Code-less website line, matched by hand: a percentage width keeps a long product name from widening the row on a phone. */
+.cl-match .select, .cl-match .input:not(.ml-qty) { width: 100%; }
 @media (max-width: 760px) { .ml-row { flex-wrap: wrap; } .ml-row .select, .ml-row .input:not(.ml-qty):not(.ml-amt) { flex: 1 1 100%; } }
 .ml-row .input:not(.ml-qty):not(.ml-amt) { flex: 1 1 180px; min-width: 0; }
 
