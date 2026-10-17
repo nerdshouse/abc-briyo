@@ -1,5 +1,5 @@
 import { formatDayKey } from './ui/ist.js';
-import { unitSummary, unitSummaryText, UNMAPPED_UNITS_NOTE } from './ui/units.js';
+import { unitSummaryText, unmappedUnitsNote } from './ui/units.js';
 /**
  * Orders & Logistics — All orders, channel tabs, the logistics queues, the
  * order drawer and manual create/edit. Everything reads /api/orders; channels,
@@ -670,9 +670,12 @@ function itemLines(o, { max = 2 } = {}) {
       return `<span class="it" title="${esc(`Not matched to a Briyo product yet: ${l.title || 'no name'}. Open the order and use Match product.`)}">`
         + `<span class="it-name"><span class="warn-text">Not matched</span> · ${esc(l.title || '—')}</span>${qty(l)}</span>`;
     }
-    const why = l.mappable ? 'Once it is mapped in Inventory, this order shows the product.'
+    // Inventory maps by code: a line with no code is never sent there.
+    const why = !l.code ? 'It has no product code, so it cannot be mapped in Inventory, which works by code.'
+      : l.mappable ? 'Once it is mapped in Inventory, this order shows the product.'
       : `${o.channel_label || 'This channel'} has no product-code list in Inventory yet, so its SKUs cannot be mapped there.`;
-    return `<span class="it" title="${esc(`${o.channel_label || 'Platform'} SKU ${l.code || '(none)'}${l.title ? ` — ${l.title}` : ''} is not mapped to a Briyo product. ${why}`)}">`
+    const what = l.code ? `${o.channel_label || 'Platform'} SKU ${l.code}` : `${o.channel_label || 'Platform'} line with no SKU`;
+    return `<span class="it" title="${esc(`${what}${l.title ? ` — ${l.title}` : ''} is not mapped to a Briyo product. ${why}`)}">`
       + `<span class="it-name"><span class="warn-text">Not mapped</span> · <span class="mono">${esc(l.code || '—')}</span></span>${qty(l)}</span>`;
   };
   const more = lines.length > max
@@ -719,7 +722,7 @@ function itemsSection(o, items) {
   if (!items.length && !manual) return '';
   const open = manualLinesOpen(o);
   // Physical units (packs counted as their units); a line not mapped yet is counted apart, never as units.
-  const unitsPartial = unitSummary(items).unmapped > 0;
+  const unitsNote = unmappedUnitsNote(items);
   const skus = state.lineSkus || [];
   const skuOptions = skus.map((k) => `<option value="${k.id}">${esc(k.sku)} — ${esc([k.product_name, k.variant_name].filter(Boolean).join(' '))}</option>`).join('');
   const row = (it) => {
@@ -746,7 +749,7 @@ function itemsSection(o, items) {
         </div>`;
   };
   return `<section class="dsec" id="dItems">
-      <h3 class="dsec-title">${manual ? 'Products' : 'Items'} <span class="dsec-meta soft"${unitsPartial ? ` title="${esc(UNMAPPED_UNITS_NOTE)}"` : ''}>${esc(unitSummaryText(items))}</span></h3>
+      <h3 class="dsec-title">${manual ? 'Products' : 'Items'} <span class="dsec-meta soft"${unitsNote ? ` title="${esc(unitsNote)}"` : ''}>${esc(unitSummaryText(items))}</span></h3>
       ${items.length ? `<div class="item-list">${items.map(row).join('')}</div>` : ''}
       ${manual && !items.length && !open ? '<p class="muted" style="margin:0">No products recorded on this order.</p>' : ''}
       ${open ? `<div class="ml-add">

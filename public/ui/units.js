@@ -32,6 +32,23 @@ export function unitSummaryText(items) {
   return `${plural(lines, 'line')} · ${plural(known, 'known unit')} · ${plural(unmapped, 'unmapped line')}`;
 }
 
-/** Why the total is partial, for a tooltip; empty when every unit is known. */
+/** Why the total is partial, for a line with a platform code (mapped in Inventory by that code). */
 export const UNMAPPED_UNITS_NOTE = 'A platform SKU that is not mapped to a Briyo product has no known pack size yet, so its '
   + 'units are not counted. Map it in Inventory → Unmapped SKUs.';
+/** For an imported website line with no product code: Inventory maps by code, so it is matched in the order instead. */
+export const CODELESS_UNITS_NOTE = 'A line with no product code has no known pack size yet, so its units are not counted. '
+  + 'It cannot be mapped in Inventory, which works by code: an Inventory manager uses Match product on the line in this order.';
+/** For any other line with no code: there is nothing to map by, and no matching on this order. */
+export const NO_CODE_UNITS_NOTE = 'A line with no product code has no known pack size yet, so its units are not counted. '
+  + 'It cannot be mapped in Inventory, which works by code.';
+
+/** Why the total is partial, for a tooltip — one sentence per kind of line not counted; empty when every unit is known. */
+export function unmappedUnitsNote(items) {
+  const open = (items || []).filter((it) => !it.sku_id && !String(it.source_line_item_id || '').startsWith('manual:'));
+  const coded = (it) => String(it.sku ?? it.code ?? '').trim() !== '';
+  return [
+    open.some(coded) ? UNMAPPED_UNITS_NOTE : '',
+    open.some((it) => !coded(it) && it.codeless_import) ? CODELESS_UNITS_NOTE : '',
+    open.some((it) => !coded(it) && !it.codeless_import) ? NO_CODE_UNITS_NOTE : '',
+  ].filter(Boolean).join(' ');
+}
