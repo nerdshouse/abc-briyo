@@ -340,7 +340,8 @@ async function openOrder(id, { shipmentId = null } = {}) {
   }
   try {
     state.detail = await api(`/api/orders/${id}`);
-    if (!state.lineSkus && manualLinesOpen(state.detail.order)) {
+    const codeless = canMapSkus() && (state.detail.items || []).some((it) => it.codeless_import && (it.sku_id === null || it.matched_units_per_listing !== null));
+    if (!state.lineSkus && (manualLinesOpen(state.detail.order) || codeless)) {
       state.lineSkus = (await api('/api/orders/line-skus').catch(() => ({ skus: [] }))).skus || [];
     }
     renderDrawer();
@@ -690,6 +691,27 @@ const manualLinesOpen = (o) => takesManualLines(o) && canEdit() && o.order_statu
   && !(state.detail?.shipments || []).some((x) => PARCEL_LEFT.has(x.shipment_status));
 
 /** Line items, as the marketplace listed them — or, on a hand-entered order, the products staff added. */
+/**
+ * A website line Shopify sent with no product code: until a person matches it to a Briyo product it holds back
+ * stock reservation and dispatch. Inventory managers match it here (product, units per listing, reason), and can
+ * undo that before stock is reserved; everyone else sees what it is.
+ */
+function codelessHtml(it, skuOptions) {
+  if (!it.codeless_import) return '';
+  if (it.matched_units_per_listing !== null && it.matched_units_per_listing !== undefined) {
+    const by = [it.matched_by, it.matched_at ? dateShort(it.matched_at) : ''].filter(Boolean).join(', ');
+    return `<div style="font-size:12px" class="soft">Matched by hand · ${esc(it.matched_units_per_listing)} unit${it.matched_units_per_listing === 1 ? '' : 's'} per listing${by ? ` · ${esc(by)}` : ''}${it.match_reason ? ` — ${esc(it.match_reason)}` : ''}</div>
+      ${canMapSkus() ? `<div class="ml-row ml-match"><input class="input" data-cl-unreason="${it.id}" maxlength="300" placeholder="Why remove this match" aria-label="Reason for removing the match" />
+        <button class="btn" type="button" data-cl-unmatch="${it.id}">Unmatch</button></div>` : ''}`;
+  }
+  if (it.sku_id !== null) return '';
+  return `<div style="font-size:12px"><span class="warn-text">No product code from Shopify — no stock can be reserved for this order until the line is matched.</span></div>
+    ${canMapSkus() ? `<div class="ml-row ml-match cl-match"><select class="select" data-cl-sku="${it.id}" aria-label="Briyo product for ${esc(it.title || 'this line')}"><option value="">Choose the Briyo product</option>${skuOptions}</select>
+      <input class="input ml-qty cl-units" type="number" min="1" max="1000" step="1" inputmode="numeric" value="1" data-cl-units="${it.id}" aria-label="Units per listing" title="Master units in one listing (a pack of 3 is 3)" />
+      <input class="input" data-cl-reason="${it.id}" maxlength="300" placeholder="Why this product (e.g. label checked)" aria-label="Reason for the match" />
+      <button class="btn" type="button" data-cl-match="${it.id}">Match product</button></div>` : '<div class="soft" style="font-size:12px">An Inventory manager can match it to a Briyo product.</div>'}`;
+}
+
 function itemsSection(o, items) {
   const manual = takesManualLines(o);
   if (!items.length && !manual) return '';
@@ -711,6 +733,7 @@ function itemsSection(o, items) {
               it.promotion_discount ? `Discount ${esc(money(it.promotion_discount))}` : '',
               it.shipping_price ? `Shipping ${esc(money(it.shipping_price))}` : ''].filter(Boolean).join(' · ')}</div>
             ${label ? `<div style="font-size:12px">${label}</div>` : ''}
+            ${codelessHtml(it, skuOptions)}
             ${it.needs_review && open ? `<div class="ml-row ml-match"><select class="select" data-line-match-sku="${it.id}" aria-label="Briyo product for ${esc(it.retailer_product_name || 'this line')}"><option value="">Choose the Briyo product</option>${skuOptions}</select>
               <button class="btn" type="button" data-line-match="${it.id}">Match product</button>
               <label class="soft ml-remember"><input type="checkbox" data-line-remember="${it.id}" /> Remember for this retailer's next orders</label></div>` : ''}</div>
@@ -960,6 +983,9 @@ function describeEvent(e) {
     case 'item_matched': return ['link', 'info', `Retailer line matched · ${esc(md.retailer_product)}${md.retailer_code ? ` (${esc(md.retailer_code)})` : ''} → <b>${esc(md.sku)}</b>${md.remembered ? ' · saved for next orders' : ''}`];
     case 'item_updated': return ['pencil', '', `Line changed · ${esc(md.sku || md.retailer_product || '')}: ${esc(Object.keys(md.changes || {}).join(', '))}`];
     case 'item_quantity_changed': return ['pencil', '', `Product quantity · ${esc(md.sku)}: ${esc(md.from)} → <b>${esc(md.to)}</b>`];
+    case 'item_matched_manually': return ['link', 'info', `Line matched by hand · ${esc(md.title || 'line')} → <b>${esc(md.sku)}</b>, ${esc(md.units_per_listing)} per listing — ${esc(md.reason)}`];
+    case 'item_unmatched_manually': return ['unlink', 'warn', `Hand match removed · ${esc(md.title || 'line')} (was ${esc(md.sku || '—')}) — ${esc(md.reason)}`];
+    case 'item_match_superseded': return ['link', 'warn', `Shopify now sends code ${esc(md.code)} for a line matched by hand (was ${esc(md.from?.sku || '—')}, ${esc(md.from?.units_per_listing)} per listing) → ${md.to?.resolved ? `<b>${esc(md.to.sku)}</b>` : 'not mapped yet'}`];
     case 'item_removed': return ['package-minus', 'warn', `Product removed · ${esc(md.sku || md.retailer_product || 'line')} × ${esc(md.quantity)}`];
     case 'stock_released': return ['package-open', 'warn', `Reserved stock released${md.reason === 'order cancelled' ? ' — order cancelled' : ''}`];
     case 'amazon_import_lines_locked': return ['lock', 'warn', `Amazon import did not change ${md.lines} item${md.lines > 1 ? 's' : ''}: stock for this order has already been dispatched`];
@@ -1178,6 +1204,37 @@ dBody.addEventListener('click', async (e) => {
     return closeDrawer();
   }
   // Products on a hand-entered order: nothing is saved until a product and quantity are chosen and added.
+  const clAct = e.target.closest('[data-cl-match], [data-cl-unmatch]');
+  if (clAct) {
+    const oid = state.detail.order.id;
+    const fail = (msg) => { $('#dSaved').className = 'saved failed'; $('#dSaved').textContent = msg; };
+    let url; let body; let done;
+    if (clAct.dataset.clMatch) {
+      const id = clAct.dataset.clMatch;
+      const sku = $(`[data-cl-sku="${id}"]`).value;
+      const units = $(`[data-cl-units="${id}"]`).value.trim();
+      const reason = $(`[data-cl-reason="${id}"]`).value.trim();
+      if (!sku) return fail('Choose the Briyo product first.');
+      if (!/^\d+$/.test(units) || Number(units) < 1 || Number(units) > 1000) return fail('Units per listing must be a whole number from 1 to 1000.');
+      if (reason.length < 3) return fail('Say why this line is this product.');
+      const name = $(`[data-cl-sku="${id}"]`).selectedOptions[0]?.textContent || 'this product';
+      if (!confirm(`Match this line to ${name}, ${units} unit${units === '1' ? '' : 's'} per listing? Stock is taken from it when the parcel is dispatched.`)) return null;
+      url = `/api/inventory/order-lines/${id}/match`; body = { sku_id: sku, units_per_listing: units, reason }; done = 'Line matched';
+    } else {
+      const id = clAct.dataset.clUnmatch;
+      const reason = $(`[data-cl-unreason="${id}"]`).value.trim();
+      if (reason.length < 3) return fail('Say why the match is being removed.');
+      url = `/api/inventory/order-lines/${id}/unmatch`; body = { reason }; done = 'Match removed';
+    }
+    clAct.disabled = true;
+    try {
+      await api(url, { method: 'POST', body: JSON.stringify(body) });
+      await openOrder(oid);
+      $('#dSaved').className = 'saved'; $('#dSaved').textContent = done;
+      load();
+    } catch (err) { clAct.disabled = false; fail(err.message); }
+    return null;
+  }
   const lineAct = e.target.closest('#mlAdd, [data-line-save], [data-line-remove], [data-line-match]');
   if (lineAct) {
     const oid = state.detail.order.id;

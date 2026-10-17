@@ -23,6 +23,7 @@ import {
   trackingUrlFor, purgeTestOrders, zonedToUtc, listDestinations, saveDestination, DISPATCH_TYPES,
   shipmentMembers, sharedShipmentOf, attachToShipment, detachFromShipment, attachableOrders, createShipmentForOrders,
   addManualOrderLine, updateManualOrderLine, removeManualOrderLine, manualLineSkuOptions, matchManualOrderLine,
+  matchImportedLine, unmatchImportedLine,
 } from '../lib/orders.js';
 import { saveUploadedDocument, router as ordersRouterForTest, destinationRouter as destinationRouterForTest } from '../lib/orders-routes.js';
 import { planAmazon, readTable, previewAmazonImport, commitAmazonImport } from '../lib/amazon-import.js';
@@ -7245,6 +7246,272 @@ await step('orders page: Shopify button turns into a red "Stop Shopify Sync" whi
   if (/amazon/i.test(stop + busy)) bad.push('touches Amazon');
   if (bad.length) throw new Error(bad.join(' | '));
   return 'idle "Shopify"; running → red .btn.danger "Stop Shopify Sync" (logo hidden); one click → exactly one POST /shopify/sync/cancel, then disabled "Stopping…"; polling shows "Stopping…" then "Shopify sync stopped · N fetched · N new · N updated · Click Shopify to continue."; next click starts normally; wraps on mobile; Amazon button untouched';
+});
+
+// ---- Code-less website lines matched by hand (orders.js matchImportedLine / unmatchImportedLine) --------------
+// Orders come in through the real Shopify sync (fake Shopify), so they are imported website orders exactly as in
+// production; their numbers start with SH_PREFIX, so "shopify orders cleanup" removes them, and the SKUs with TS.
+const CL = {};
+const clStore = [];
+const clSync = async () => runShopifySync({ window: { days: 60 }, dryRun: false, gql: shFake(() => clStore), actor: SH_ACTOR });
+const clOrder = async (n) => (await getPool().query('SELECT id FROM orders WHERE source_order_id = $1', [`${SH_PREFIX}${String(n).padStart(4, '0')}`])).rows[0]?.id;
+const clLines = async (orderId) => (await getPool().query(
+  `SELECT id, sku, sku_id, quantity, title, matched_units_per_listing, matched_by, match_reason FROM order_items WHERE order_id = $1 ORDER BY source_line_item_id`, [orderId])).rows;
+const clUnits = async (orderId) => Object.fromEntries((await orderItems(orderId)).map((l) => [l.id, l.units_per_listing]));
+const clShip = async (n, awb) => {
+  const dl = (await listCouriers()).find((x) => x.name === 'Delhivery');
+  return createShipment({ ...R('website'), channel: 'website', source_order_id: `${SH_PREFIX}${String(n).padStart(4, '0')}`, courier_partner_id: dl.id, tracking_id: awb, shipment_status: 'packed' },
+    { actor: ACTOR, addToExisting: true });
+};
+const clMatch = (itemId, sku, units, reason = 'Label checked against the parcel', actor = ACTOR) => matchImportedLine(itemId, { sku_id: sku, units_per_listing: units, reason }, { actor });
+
+await step('code-less website lines: only an imported, live website line with no code and no product can be matched — active stock-tracked product, units 1–1000, a reason; Inventory catalogue permission enforced by the API', async () => {
+  const bad = [];
+  CL.a = (await createSku({ sku: `${TS}-CL-A`, product_name: 'Code-less match target' }, { actor: ACTOR })).id;
+  CL.b = (await createSku({ sku: `${TS}-CL-B`, product_name: 'Code-less other product' }, { actor: ACTOR })).id;
+  CL.off = (await createSku({ sku: `${TS}-CL-OFF`, product_name: 'Inactive' }, { actor: ACTOR })).id;
+  await updateSku(CL.off, { active: false }, { actor: ACTOR, version: (await getSku(CL.off)).version });
+  CL.nt = (await createSku({ sku: `${TS}-CL-NT`, product_name: 'Not tracked', track_inventory: false }, { actor: ACTOR })).id;
+  CL.bA = (await receiveInventory({ sku_id: CL.a, batch_number: 'CL-A1', expiry_date: dayOffset(400), quantity: 60, request_id: rid() }, { actor: ACTOR })).batchId;
+  CL.bB = (await receiveInventory({ sku_id: CL.b, batch_number: 'CL-B1', expiry_date: dayOffset(400), quantity: 10, request_id: rid() }, { actor: ACTOR })).batchId;
+  // 9101: two code-less lines (1 and 3 listings) and a coded one; 9102 cancelled; 9103 code-less, for the API checks.
+  clStore.push(shOrder(9101, { lines: [{ sku: null, qty: 1, title: 'Sample sachet' }, { sku: null, qty: 3, title: 'Promo pack' }, { sku: `${TS}-CL-B`, qty: 1 }] }));
+  clStore.push(shOrder(9102, { lines: [{ sku: null, qty: 1, title: 'Sample sachet' }] }));
+  clStore.push(shOrder(9103, { lines: [{ sku: null, qty: 1, title: 'Sample sachet' }] }));
+  await clSync();
+  CL.o1 = await clOrder(9101); CL.o2 = await clOrder(9102); CL.o3 = await clOrder(9103);
+  const l1 = await clLines(CL.o1);
+  [CL.sample, CL.promo, CL.coded] = [l1.find((l) => String(l.title).startsWith('Sample sachet'))?.id, l1.find((l) => String(l.title).startsWith('Promo pack'))?.id, l1.find((l) => l.sku === `${TS}-CL-B`)?.id];
+  if (!CL.o1 || l1.length !== 3 || l1.filter((l) => l.sku === null && l.sku_id === null).length !== 2) bad.push(`fixture ${JSON.stringify(l1)}`);
+  await getPool().query(`UPDATE orders SET order_status = 'cancelled' WHERE id = $1`, [CL.o2]);
+  // A hand-entered website order whose line has no code, and an Amazon order line with no code: not this feature.
+  const manual = await createOrder({ ...R('website'), channel: 'website', source_order_id: `${SH_PREFIX}9150`, order_value: 100 }, { actor: ACTOR });
+  const { rows: [ml] } = await getPool().query(`INSERT INTO order_items (order_id, source_line_item_id, sku, title, quantity) VALUES ($1, 'CL-MANUAL', NULL, 'x', 1) RETURNING id`, [manual]);
+  const amz = await createOrder({ ...R('amazon'), channel: 'amazon', source_order_id: `${SH_PREFIX}9151`, order_value: 100 }, { actor: ACTOR });
+  await getPool().query(`UPDATE orders SET source = 'amazon_import' WHERE id = $1`, [amz]);
+  const { rows: [al] } = await getPool().query(`INSERT INTO order_items (order_id, source_line_item_id, sku, title, quantity) VALUES ($1, 'CL-AMZ', NULL, 'x', 1) RETURNING id`, [amz]);
+  const cancelledLine = (await clLines(CL.o2))[0].id;
+  const refusals = [
+    ['no product', () => matchImportedLine(CL.sample, { units_per_listing: 1, reason: 'x x x' }, { actor: ACTOR }), (e) => e.status === 400 && e.field === 'sku_id'],
+    ['units 0', () => clMatch(CL.sample, CL.a, 0), (e) => e.status === 400 && e.field === 'units_per_listing'],
+    ['units 1001', () => clMatch(CL.sample, CL.a, 1001), (e) => e.status === 400],
+    ['units 1.5', () => clMatch(CL.sample, CL.a, '1.5'), (e) => e.status === 400],
+    ['units text', () => clMatch(CL.sample, CL.a, 'two'), (e) => e.status === 400],
+    ['no reason', () => clMatch(CL.sample, CL.a, 1, '  '), (e) => e.status === 400 && e.field === 'reason'],
+    ['short reason', () => clMatch(CL.sample, CL.a, 1, 'ok'), (e) => e.status === 400],
+    ['long reason', () => clMatch(CL.sample, CL.a, 1, 'x'.repeat(301)), (e) => e.status === 400],
+    ['unknown product', () => clMatch(CL.sample, 999999999, 1), (e) => e.status === 404],
+    ['inactive product', () => clMatch(CL.sample, CL.off, 1), (e) => e.status === 400 && /inactive/.test(e.message)],
+    ['not stock-tracked', () => clMatch(CL.sample, CL.nt, 1), (e) => e.status === 400 && /stock-tracked/.test(e.message)],
+    ['no such line', () => clMatch(999999999, CL.a, 1), (e) => e.status === 404],
+    ['line with a code', () => clMatch(CL.coded, CL.a, 1), (e) => e.status === 409 && /Map that code/.test(e.message)],
+    ['cancelled order', () => clMatch(cancelledLine, CL.a, 1), (e) => e.status === 409 && /cancelled/.test(e.message)],
+    ['hand-entered order', () => clMatch(ml.id, CL.a, 1), (e) => e.status === 409 && /imported website/.test(e.message)],
+    ['amazon order', () => clMatch(al.id, CL.a, 1), (e) => e.status === 409 && /imported website/.test(e.message)],
+    ['unmatch a line never matched', () => unmatchImportedLine(CL.sample, { reason: 'not matched' }, { actor: ACTOR }), (e) => e.status === 409],
+    ['unmatch without a reason', () => unmatchImportedLine(CL.sample, { reason: '' }, { actor: ACTOR }), (e) => e.status === 400],
+  ];
+  for (const [label, fn, check] of refusals) await expectErr(label, fn, check);
+  if ((await clLines(CL.o1)).some((l) => l.matched_units_per_listing !== null || (l.sku === null && l.sku_id !== null))) bad.push('a refused request changed a line');
+  // API: logistics or inventory viewers/operators are refused; an Inventory manager matches.
+  const app = express();
+  app.use((req, _res, next) => { req.session = JSON.parse(req.get('x-test-session') || '{}'); next(); });
+  app.use(express.json());
+  app.use('/api/inventory', inventoryRouterForTest);
+  const server = app.listen(0);
+  const base = `http://127.0.0.1:${server.address().port}/api/inventory/order-lines`;
+  const call = (path, caps, body) => fetch(`${base}${path}`, { method: 'POST', headers: { 'x-test-session': JSON.stringify({ caps }), 'content-type': 'application/json' }, body: JSON.stringify(body) }).then((r) => r.status);
+  const line3 = (await clLines(CL.o3))[0].id;
+  try {
+    const body = { sku_id: CL.a, units_per_listing: 1, reason: 'Label checked against the parcel' };
+    for (const caps of [['logistics.view'], ['inventory.view'], ['inventory.view', 'inventory.move']]) {
+      if (await call(`/${line3}/match`, caps, body) !== 403) bad.push(`match allowed for ${caps}`);
+      if (await call(`/${line3}/unmatch`, caps, { reason: 'test' }) !== 403) bad.push(`unmatch allowed for ${caps}`);
+    }
+    if ((await clLines(CL.o3))[0].sku_id !== null) bad.push('a refused API call matched the line');
+    if (await call(`/${line3}/match`, ['inventory.view', 'inventory.catalog'], body) !== 200) bad.push('Inventory manager could not match');
+    if (await call(`/${line3}/unmatch`, ['inventory.view', 'inventory.catalog'], { reason: 'API test' }) !== 200) bad.push('Inventory manager could not unmatch');
+  } finally { server.close(); }
+  if ((await clLines(CL.o3))[0].sku_id !== null) bad.push('unmatch through the API left a link');
+  if (bad.length) throw new Error(bad.join(' | '));
+  return `${refusals.length} refusals (product, units, reason, inactive, not stock-tracked, unknown line, coded line, cancelled, hand-entered, Amazon, unmatch rules) changed nothing; API: logistics, viewer and operator 403; Inventory manager matches and unmatches`;
+});
+
+await step('code-less website lines: units — 1 and 3 listings matched ×1 and ×3 read the same everywhere (drawer, list, stock needs); reservation and dispatch use them; refused once reserved, unmatch before reservation; full audit trail', async () => {
+  const bad = [];
+  const m1 = await clMatch(CL.sample, CL.a, 1);
+  const m3 = await clMatch(CL.promo, CL.a, 3, 'Promo pack = 3 bottles');
+  if (!m1.changed || m3.units_per_listing !== 3) bad.push('match results');
+  const units = await clUnits(CL.o1);
+  if (units[CL.sample] !== 1 || units[CL.promo] !== 3) bad.push(`drawer units ${JSON.stringify(units)}`);
+  const list = (await listOrders({ q: `${SH_PREFIX}9101` })).orders[0];
+  const li = (list?.line_skus || []).filter((l) => l.sku_id === CL.a).map((l) => `${l.quantity}x${l.units_per_listing}`).sort().join(',');
+  if (li !== '1x1,3x3') bad.push(`list lines ${li}`);
+  if ((await unmappedLinesWithoutCode()).some((l) => [CL.sample, CL.promo].includes(Number(l.line_id)))) bad.push('matched lines still listed as code-less');
+  const { shipmentId: sid } = await clShip(9101, 'AWB-CL-1');
+  CL.s1 = sid;
+  let st = await shipmentStock(sid);
+  const need = st.lines.find((l) => l.sku_id === CL.a)?.required;
+  if (st.state !== 'needs_reservation' || need !== 10) bad.push(`needs ${st.state} ${need} (want 1×1 + 3×3 = 10)`);
+  // Unmatch before reservation, then match again.
+  await unmatchImportedLine(CL.promo, { reason: 'Wrong pack size' }, { actor: ACTOR });
+  st = await shipmentStock(sid);
+  if (st.state !== 'unmapped' || st.lines.find((l) => l.sku_id === CL.a)?.required !== 1) bad.push(`after unmatch ${st.state}`);
+  await clMatch(CL.promo, CL.a, 3, 'Re-checked: 3 per pack');
+  st = await shipmentStock(sid);
+  await reserveShipmentStock(sid, st.lines.flatMap((l) => l.suggestion.picks), { actor: ACTOR });
+  // Reserved: neither matching nor unmatching can change the lines.
+  await expectErr('unmatch while reserved', () => unmatchImportedLine(CL.promo, { reason: 'try' }, { actor: ACTOR }), (e) => e.status === 409 && e.needsStock);
+  const before = await ledgerSum(CL.a);
+  const sh = (await orderShipments(CL.o1))[0];
+  const out = await updateShipment(CL.o1, sh.id, { shipment_status: 'dispatched' }, { actor: ACTOR, version: sh.version });
+  // 10 units of the matched product (1×1 + 3×3) and 1 of the order's coded CL-B line.
+  if (out.stock?.deducted !== 11 || await ledgerSum(CL.a) !== before - 10) bad.push(`dispatch ${JSON.stringify(out.stock)} CL-A ${await ledgerSum(CL.a) - before}`);
+  await expectErr('unmatch after dispatch', () => unmatchImportedLine(CL.sample, { reason: 'try' }, { actor: ACTOR }), (e) => e.status === 409);
+  // Audit: every match and unmatch, with old and new values, the person and the reason.
+  const ev = (await orderEvents(CL.o1)).filter((e) => /^item_(un)?matched_manually$/.test(e.event_type));
+  const matched = ev.filter((e) => e.event_type === 'item_matched_manually');
+  const unmatched = ev.filter((e) => e.event_type === 'item_unmatched_manually');
+  if (matched.length !== 3 || unmatched.length !== 1) bad.push(`events ${ev.map((e) => e.event_type)}`);
+  const u = unmatched[0]?.metadata;
+  if (!u || u.from.units_per_listing !== 3 || u.from.sku_id !== CL.a || u.to.sku_id !== null || u.reason !== 'Wrong pack size' || unmatched[0].actor !== ACTOR) bad.push(`unmatch event ${JSON.stringify(u)}`);
+  if (!matched.every((e) => e.metadata.reason && e.metadata.to.sku_id === CL.a && e.metadata.from.sku_id === null && e.actor === ACTOR)) bad.push('match events incomplete');
+  const aud = (await getPool().query(`SELECT action, actor, metadata FROM inventory_audit WHERE action IN ('order_line_matched','order_line_unmatched') AND (metadata->>'order_id')::bigint = $1 ORDER BY id`, [CL.o1])).rows;
+  if (aud.filter((a) => a.action === 'order_line_matched').length !== 3 || aud.filter((a) => a.action === 'order_line_unmatched').length !== 1
+    || aud.some((a) => a.actor !== ACTOR || !a.metadata.reason || !a.metadata.from || !a.metadata.to)) bad.push(`inventory audit ${JSON.stringify(aud.map((a) => [a.action, a.actor]))}`);
+  const lines = await clLines(CL.o1);
+  const p = lines.find((l) => l.id === CL.promo);
+  if (p.matched_by !== ACTOR || p.match_reason !== 'Re-checked: 3 per pack') bad.push('who/why not kept on the line');
+  if (bad.length) throw new Error(bad.join(' | '));
+  return 'lines ×1 and ×3 → drawer 1/3, list "1x1,3x3", no longer code-less; parcel needs 1 + 9 = 10; unmatch → unmapped, re-match → needs 10; reserved → unmatch refused; dispatch deducted 10 of the matched product (+1 coded line); after dispatch refused; 3 match + 1 unmatch events and audit rows with old/new values, person and reason';
+});
+
+await step('code-less website lines: a shared parcel holding stock blocks matching changes on every order in it', async () => {
+  clStore.push(shOrder(9104, { lines: [{ sku: null, qty: 2, title: 'Sample sachet' }] }));
+  clStore.push(shOrder(9105, { lines: [{ sku: `${TS}-CL-B`, qty: 1 }] }));
+  await clSync();
+  CL.o4 = await clOrder(9104);
+  const line4 = (await clLines(CL.o4))[0].id;
+  await clMatch(line4, CL.a, 1);
+  const { shipmentId: shared } = await clShip(9105, 'AWB-CL-SHARED');
+  await attachToShipment(shared, { orderIds: [CL.o4] }, { actor: ACTOR });
+  const st = await shipmentStock(shared);
+  if (st.lines.find((l) => l.sku_id === CL.a)?.required !== 2) throw new Error(`shared needs ${JSON.stringify(st.lines.map((l) => [l.sku, l.required]))}`);
+  await reserveShipmentStock(shared, st.lines.flatMap((l) => l.suggestion.picks), { actor: ACTOR });
+  await expectErr('unmatch in a reserved shared parcel', () => unmatchImportedLine(line4, { reason: 'try' }, { actor: ACTOR }), (e) => e.status === 409 && e.needsStock);
+  await releaseShipmentStock(shared, { actor: ACTOR });
+  await unmatchImportedLine(line4, { reason: 'released first' }, { actor: ACTOR });
+  return 'member order\'s code-less line matched ×1 → shared parcel needs 2; reserved → unmatch refused (409); released → unmatch allowed';
+});
+
+await step('code-less website lines: Shopify re-sync keeps a match while the line has no code; a code from Shopify supersedes it through normal resolution, recorded on the order; a reserved order keeps its match (lines locked)', async () => {
+  const bad = [];
+  clStore.push(shOrder(9106, { lines: [{ sku: null, qty: 1, title: 'Sample sachet' }] }));
+  clStore.push(shOrder(9107, { lines: [{ sku: null, qty: 1, title: 'Sample sachet' }] }));
+  clStore.push(shOrder(9108, { lines: [{ sku: null, qty: 1, title: 'Sample sachet' }] }));
+  await clSync();
+  const [o6, o7, o8] = [await clOrder(9106), await clOrder(9107), await clOrder(9108)];
+  const [l6, l7, l8] = [(await clLines(o6))[0].id, (await clLines(o7))[0].id, (await clLines(o8))[0].id];
+  await clMatch(l6, CL.a, 2); await clMatch(l7, CL.a, 2); await clMatch(l8, CL.a, 1);
+  // Unchanged, and changed but still code-less (title), re-syncs: the match stays.
+  await clSync();
+  const i6 = clStore.findIndex((x) => x.id.endsWith('9106'));
+  clStore[i6].lineItems.nodes[0].title = 'Sample sachet (new name)'; clStore[i6].lineItems.nodes[0].name = 'Sample sachet (new name)'; clStore[i6].updatedAt = shDays(0);
+  await clSync();
+  let x6 = (await clLines(o6))[0];
+  if (x6.sku_id !== CL.a || x6.matched_units_per_listing !== 2 || (await clUnits(o6))[l6] !== 2) bad.push(`re-sync lost the match ${JSON.stringify(x6)}`);
+  // Shopify now sends a master code for 9106 and an unknown code for 9107.
+  clStore[i6].lineItems.nodes[0].sku = `${TS}-CL-B`; clStore[i6].updatedAt = shDays(0);
+  const i7 = clStore.findIndex((x) => x.id.endsWith('9107'));
+  clStore[i7].lineItems.nodes[0].sku = 'SHOP-CL-NEW-CODE'; clStore[i7].updatedAt = shDays(0);
+  // 9108 is reserved first: its lines are locked, so Shopify's change is a conflict and the match stays.
+  const { shipmentId: s8 } = await clShip(9108, 'AWB-CL-8');
+  await reserveShipmentStock(s8, (await shipmentStock(s8)).lines.flatMap((l) => l.suggestion.picks), { actor: ACTOR });
+  const i8 = clStore.findIndex((x) => x.id.endsWith('9108'));
+  clStore[i8].lineItems.nodes[0].sku = `${TS}-CL-B`; clStore[i8].updatedAt = shDays(0);
+  await clSync();
+  x6 = (await clLines(o6))[0];
+  const x7 = (await clLines(o7))[0];
+  const x8 = (await clLines(o8))[0];
+  if (x6.sku !== `${TS}-CL-B` || x6.sku_id !== CL.b || x6.matched_units_per_listing !== null || x6.matched_by !== null || (await clUnits(o6))[l6] !== 1) bad.push(`code did not supersede ${JSON.stringify(x6)}`);
+  if (x7.sku !== 'SHOP-CL-NEW-CODE' || x7.sku_id !== null || x7.matched_units_per_listing !== null) bad.push(`unknown code ${JSON.stringify(x7)}`);
+  if (x8.sku !== null || x8.sku_id !== CL.a || x8.matched_units_per_listing !== 1) bad.push(`locked order changed ${JSON.stringify(x8)}`);
+  const sup6 = (await orderEvents(o6)).find((e) => e.event_type === 'item_match_superseded')?.metadata;
+  const sup7 = (await orderEvents(o7)).find((e) => e.event_type === 'item_match_superseded')?.metadata;
+  if (!sup6 || sup6.from.units_per_listing !== 2 || sup6.from.sku_id !== CL.a || sup6.to.sku_id !== CL.b || sup6.to.resolved !== true || sup6.code !== `${TS}-CL-B`) bad.push(`superseded event ${JSON.stringify(sup6)}`);
+  if (!sup7 || sup7.to.resolved !== false || sup7.to.sku_id !== null) bad.push(`superseded (unknown) event ${JSON.stringify(sup7)}`);
+  if (!(await orderEvents(o8)).some((e) => e.event_type === 'shopify_sync_conflict' && e.metadata.kind === 'lines_locked')) bad.push('locked order: no conflict recorded');
+  if ((await orderEvents(o8)).some((e) => e.event_type === 'item_match_superseded')) bad.push('locked order: match superseded');
+  await releaseShipmentStock(s8, { actor: ACTOR });
+  if (bad.length) throw new Error(bad.join(' | '));
+  return 'unchanged and title-only re-syncs keep the match (×2); master code from Shopify → linked by code, ×1, hand match cleared, "superseded" event with old ×2 and new SKU; unknown code → unmapped, event says not resolved; reserved order → lines locked conflict, match kept';
+});
+
+await step('code-less website lines: two matches at once — one wins, one event; unmatch racing a reservation never leaves stock reserved for an unlinked line', async () => {
+  const bad = [];
+  clStore.push(shOrder(9109, { lines: [{ sku: null, qty: 1, title: 'Sample sachet' }] }));
+  await clSync();
+  const o9 = await clOrder(9109);
+  const l9 = (await clLines(o9))[0].id;
+  const race = await Promise.allSettled([clMatch(l9, CL.a, 1, 'Tab one checked it', 'tab-1'), clMatch(l9, CL.b, 2, 'Tab two checked it', 'tab-2')]);
+  const won = race.filter((r) => r.status === 'fulfilled').length;
+  if (won !== 1 || race.some((r) => r.status === 'rejected' && !(r.reason.status === 409 && r.reason.conflict))) bad.push(`match race ${race.map((r) => r.status + (r.reason ? ` ${r.reason.message}` : '')).join(' / ')}`);
+  if ((await orderEvents(o9)).filter((e) => e.event_type === 'item_matched_manually').length !== 1) bad.push('match race: events');
+  // Unmatch vs reservation, several times: exactly one of them wins each time, and the end state is consistent.
+  await unmatchImportedLine(l9, { reason: 'reset for race' }, { actor: ACTOR });
+  const { shipmentId: s9 } = await clShip(9109, 'AWB-CL-9');
+  const outcomes = [];
+  for (let i = 0; i < 4; i++) {
+    await clMatch(l9, CL.a, 1, 'Race round');
+    const picks = (await shipmentStock(s9)).lines.flatMap((l) => l.suggestion.picks);
+    // Alternate which request starts first, so both orders of arrival are exercised.
+    const un = () => unmatchImportedLine(l9, { reason: 'race' }, { actor: 'tab-1' });
+    const rs = () => reserveShipmentStock(s9, picks, { actor: 'tab-2' });
+    const r = i % 2 ? (await Promise.allSettled([rs(), un()])).reverse() : await Promise.allSettled([un(), rs()]);
+    const line = (await clLines(o9))[0];
+    const live = (await getPool().query(`SELECT count(*)::int n FROM inventory_reservations WHERE shipment_id = $1 AND status = 'active'`, [s9])).rows[0].n;
+    outcomes.push(`${r.map((x) => x.status[0]).join('')}`);
+    if (r.every((x) => x.status === 'fulfilled')) bad.push(`round ${i}: both won`);
+    if (live && line.sku_id === null) bad.push(`round ${i}: stock reserved for an unlinked line`);
+    if (live) await releaseShipmentStock(s9, { actor: ACTOR });
+    if ((await clLines(o9))[0].sku_id !== null) await unmatchImportedLine(l9, { reason: 'reset' }, { actor: ACTOR });
+  }
+  // Deterministic: a gate holds the parcel row, both requests queue on it in a chosen order, the gate lets go.
+  const { default: pgMod } = await import('pg');
+  const conn = async () => { const c = new pgMod.Client({ connectionString: process.env.DATABASE_URL }); await c.connect(); return c; };
+  const gate = await conn(); const mon = await conn();
+  const gatePid = (await gate.query('SELECT pg_backend_pid() p')).rows[0].p;
+  const waits = async () => (await mon.query(`SELECT count(*)::int n FROM pg_stat_activity WHERE datname = current_database() AND wait_event_type = 'Lock' AND pid NOT IN ($1, pg_backend_pid())`, [gatePid])).rows[0].n;
+  const until = async (n, label) => { const t = Date.now(); while ((await waits()) < n) { if (Date.now() - t > 15000) throw new Error(`timed out waiting for ${label}`); await new Promise((r) => setTimeout(r, 15)); } };
+  const settle = (p) => p.then((v) => ({ ok: v }), (e) => ({ err: e }));
+  const gated = [];
+  try {
+    for (const first of ['reserve', 'unmatch']) {
+      await clMatch(l9, CL.a, 1, 'Gated round');
+      const picks = (await shipmentStock(s9)).lines.flatMap((l) => l.suggestion.picks);
+      await gate.query('BEGIN');
+      await gate.query('SELECT id FROM order_shipments WHERE id = $1 FOR UPDATE', [s9]);
+      const start = { reserve: () => settle(reserveShipmentStock(s9, picks, { actor: 'tab-2' })), unmatch: () => settle(unmatchImportedLine(l9, { reason: 'gated race' }, { actor: 'tab-1' })) };
+      const second = first === 'reserve' ? 'unmatch' : 'reserve';
+      const p1 = start[first](); await until(1, `${first} to queue on the parcel`);
+      const p2 = start[second](); await until(2, `${second} to queue too`);
+      await gate.query('ROLLBACK');
+      const res = { [first]: await p1, [second]: await p2 };
+      const line = (await clLines(o9))[0];
+      const live = (await getPool().query(`SELECT count(*)::int n FROM inventory_reservations WHERE shipment_id = $1 AND status = 'active'`, [s9])).rows[0].n;
+      gated.push(`${first} first → reserve ${res.reserve.ok ? 'won' : 'refused'}, unmatch ${res.unmatch.ok ? 'won' : 'refused'}`);
+      if (first === 'reserve' && !(res.reserve.ok && res.unmatch.err?.status === 409 && res.unmatch.err?.needsStock && live > 0 && line.sku_id === CL.a)) bad.push(`reserve-first: ${JSON.stringify({ r: !!res.reserve.ok, u: res.unmatch.err?.message, live, sku: line.sku_id })}`);
+      if (first === 'unmatch' && !(res.unmatch.ok && res.reserve.err && live === 0 && line.sku_id === null)) bad.push(`unmatch-first: ${JSON.stringify({ u: !!res.unmatch.ok, r: res.reserve.err?.message, live, sku: line.sku_id })}`);
+      if (Object.values(res).some((x) => x.err && (x.err.code === '40P01' || !x.err.status))) bad.push(`${first} first: unexpected error ${Object.values(res).map((x) => x.err?.message).join(' / ')}`);
+      if (live) await releaseShipmentStock(s9, { actor: ACTOR });
+      if ((await clLines(o9))[0].sku_id !== null) await unmatchImportedLine(l9, { reason: 'reset' }, { actor: ACTOR });
+    }
+  } finally {
+    await gate.query('ROLLBACK').catch(() => {});
+    await gate.end().catch(() => {}); await mon.end().catch(() => {});
+  }
+  if (bad.length) throw new Error(bad.join(' | '));
+  return `two matches at once → 1 won (409 for the other), 1 event; gated: ${gated.join('; ')}; unmatch/reserve ×4, alternating who starts → ${outcomes.join(' ')} (unmatch then reserve; f=won, r=refused), never both, never stock reserved for an unlinked line`;
 });
 
 await step('amazon sp-api cleanup', async () => {
