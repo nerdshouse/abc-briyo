@@ -74,7 +74,7 @@ import { runShopifySync, mapShopifyOrder, shopifyPaymentMethod, shopifyPaymentSt
 import { ensureOrderFinancialSnapshotSchema, financialSnapshotFrom, recordFinancialSnapshot, addAmounts, FINANCIAL_TABLES } from '../lib/order-financial-snapshots.js';
 import { SHOPIFY_MAX_QUERY_COST, SHOPIFY_ORDER_QUERIES, LIMITS as SHOPIFY_LIMITS, shopifyOrderQuery, estimateShopifyOrderQueryCost } from '../lib/shopify-order-queries.js';
 import { istDateTime, istDate, istTime, istDayKey as uiIstDayKey } from '../public/ui/ist.js';
-import { unitSummary, unitSummaryText } from '../public/ui/units.js';
+import { unitSummary, unitSummaryText, unmappedUnitsNote, UNMAPPED_UNITS_NOTE, CODELESS_UNITS_NOTE, NO_CODE_UNITS_NOTE } from '../public/ui/units.js';
 import { issueFormToken, verifyTurnstile, normalizeHost, isCareersRequest } from '../lib/careers.js';
 import net from 'node:net';
 import {
@@ -4483,6 +4483,9 @@ await step('order drawer unit total: packs counted as units; a platform line not
     const items = await orderItems(orderId);
     const got = unitSummary(items);
     if (JSON.stringify(got) !== JSON.stringify(want) || unitSummaryText(items) !== wantText) bad.push(`${label}: ${JSON.stringify(got)} "${unitSummaryText(items)}"`);
+    // The total's tooltip: a line with a platform code is mapped in Inventory; nothing when every unit is known.
+    const note = unmappedUnitsNote(items);
+    if (note !== (want.unmapped ? UNMAPPED_UNITS_NOTE : '')) bad.push(`${label}: note "${note}"`);
   };
   const UNM = `${TS}-UT-UNMAPPED`;
   // Fully mapped: 2 × pack of 3 + 1 single of the same product = 7 units.
@@ -4506,7 +4509,7 @@ await step('order drawer unit total: packs counted as units; a platform line not
   await check('mixed, mapped later', mixed, { lines: 2, known: 7, unmapped: 0 }, '2 lines · 7 units');
   await check('unmapped only, mapped later', only, { lines: 1, known: 3, unmapped: 0 }, '1 line · 3 units');
   if (bad.length) throw new Error(bad.join('; '));
-  return '2×3 + 1 = "2 lines · 7 units"; unmapped only "units unknown"; mixed "6 known units · 1 unmapped line"; hand-entered in units; mapping later completes the totals';
+  return '2×3 + 1 = "2 lines · 7 units"; unmapped only "units unknown"; mixed "6 known units · 1 unmapped line"; hand-entered in units; mapping later completes the totals; tooltip says "Map it in Inventory → Unmapped SKUs" only while a coded line is unmapped';
 });
 await step('master SKU import: parser — Briyo SKU + Product Name only; platform columns ignored with a warning', async () => {
   const two = planSkuSheet([['Briyo SKU', 'Product Name'], ['A1', 'Alpha'], ['', ''], ['A2', '  Beta   capsules ']]);
@@ -7610,6 +7613,176 @@ await step('code-less website lines: no deadlock with a Shopify sync page — th
   }
   if (bad.length) throw new Error(bad.join(' | '));
   return `${results.join('; ')}; no deadlock error, one match and one event each, external shipment untouched`;
+});
+
+// Shared by the two foreign-key deadlock regressions below: a gate connection, a monitor, and a lock-wait counter.
+const clGated = async () => {
+  const { default: pgMod } = await import('pg');
+  const conn = async () => { const c = new pgMod.Client({ connectionString: process.env.DATABASE_URL }); await c.connect(); return c; };
+  const gate = await conn(); const mon = await conn();
+  const gatePid = (await gate.query('SELECT pg_backend_pid() p')).rows[0].p;
+  const waiting = async () => (await mon.query(`SELECT count(*)::int n FROM pg_stat_activity WHERE datname = current_database() AND wait_event_type = 'Lock' AND pid NOT IN ($1, pg_backend_pid())`, [gatePid])).rows[0].n;
+  const until = async (n, label) => { const t = Date.now(); while ((await waiting()) < n) { if (Date.now() - t > 15000) throw new Error(`timed out waiting for ${label}`); await new Promise((r) => setTimeout(r, 15)); } };
+  // Whether the order row can be taken in a mode right now, without waiting.
+  const free = async (orderId, mode) => mon.query(`SELECT id FROM orders WHERE id = $1 FOR ${mode} NOWAIT`, [orderId]).then(() => true, (e) => { if (e.code !== '55P03') throw e; return false; });
+  const end = async () => { await gate.query('ROLLBACK').catch(() => {}); await gate.end().catch(() => {}); await mon.end().catch(() => {}); };
+  return { gate, until, free, end };
+};
+const clSettle = (p) => p.then((v) => ({ ok: v }), (e) => ({ err: e }));
+const isDeadlock = (r) => r.err?.code === '40P01';
+
+await step('code-less website lines: no deadlock with a Shopify sync page that holds the line and then writes a row referencing the order (its event, snapshot or external shipment) while a match waits for the line', async () => {
+  // Inserting a row whose foreign key points at the order takes FOR KEY SHARE on the order row. The match holds the
+  // order and waits for the line the sync holds; with the order held FOR UPDATE the sync's insert waited for the match
+  // and the match for the sync (40P01). FOR NO KEY UPDATE lets the insert through, so the sync finishes first.
+  const bad = [];
+  clStore.push(shOrder(9112, { lines: [{ sku: null, qty: 1, title: 'Sample sachet' }] }));
+  await clSync();
+  const oid = await clOrder(9112);
+  const lineId = (await clLines(oid))[0].id;
+  const { shipmentId: sid } = await clShip(9112, 'AWB-CL-12');
+  const snap = async () => (await getPool().query(
+    `SELECT o.order_status, o.channel, o.source, o.order_value, s.shipment_status, s.version AS ship_version, s.tracking_id
+     FROM orders o JOIN order_shipments s ON s.order_id = o.id WHERE o.id = $1 AND s.id = $2`, [oid, sid])).rows[0];
+  const before = await snap();
+  const g = await clGated();
+  let probe = {};
+  let r;
+  try {
+    // 1. The sync page holds the line, as its upsert does (it locks every existing line, changed or not).
+    await g.gate.query('BEGIN');
+    await g.gate.query(`SET LOCAL lock_timeout = '10s'`);
+    await g.gate.query('SELECT id FROM order_items WHERE id = $1 FOR UPDATE', [lineId]);
+    // 2. A person matches the line: it takes the order, then queues on the line.
+    const match = clSettle(clMatch(lineId, CL.a, 1, 'FK deadlock regression (sync)'));
+    await g.until(1, 'the match to wait for the line');
+    // The match holds the order against updates, yet a foreign-key check can still take it.
+    probe = { update: await g.free(oid, 'UPDATE'), noKeyUpdate: await g.free(oid, 'NO KEY UPDATE'), keyShare: await g.free(oid, 'KEY SHARE') };
+    // 3. The sync writes a row referencing the order (logEvent, recordFinancialSnapshot, attributeOrder, mirrorExternalFulfillments all do).
+    const ins = await clSettle(g.gate.query(
+      `INSERT INTO order_events (order_id, event_type, actor, metadata) VALUES ($1, 'shopify_synced', $2, '{"fk_regression": true}') RETURNING id`, [oid, SH_ACTOR]));
+    await g.gate.query(ins.err ? 'ROLLBACK' : 'COMMIT').catch(() => g.gate.query('ROLLBACK'));
+    r = { ins, match: await match };
+  } finally { await g.end(); }
+  if (probe.update !== false || probe.noKeyUpdate !== false) bad.push(`the match did not hold the order against updates ${JSON.stringify(probe)}`);
+  if (probe.keyShare !== true) bad.push(`a foreign-key check could not take the order while the match held it ${JSON.stringify(probe)}`);
+  if (isDeadlock(r.ins) || isDeadlock(r.match)) bad.push(`deadlock (40P01): sync ${r.ins.err?.message || 'ok'} / match ${r.match.err?.message || 'ok'}`);
+  else {
+    if (r.ins.err) bad.push(`sync insert failed ${r.ins.err.code} ${r.ins.err.message}`);
+    if (r.match.err) bad.push(`match failed ${r.match.err.code || r.match.err.status} ${r.match.err.message}`);
+  }
+  const line = (await clLines(oid))[0];
+  const evs = await orderEvents(oid);
+  if (line.sku_id !== CL.a || line.matched_units_per_listing !== 1 || line.matched_by !== ACTOR) bad.push(`line ${JSON.stringify(line)}`);
+  if (evs.filter((e) => e.event_type === 'item_matched_manually').length !== 1) bad.push('match events');
+  if (evs.filter((e) => e.metadata?.fk_regression === true).length !== 1) bad.push('the sync\'s row was not written exactly once');
+  const after = await snap();
+  if (JSON.stringify(after) !== JSON.stringify(before)) bad.push(`order or shipment changed ${JSON.stringify({ before, after })}`);
+  if ((await getPool().query('SELECT count(*)::int n FROM inventory_reservations WHERE shipment_id = $1', [sid])).rows[0].n) bad.push('stock reserved');
+  if (line.matched_units_per_listing !== null) await unmatchImportedLine(lineId, { reason: 'reset after deadlock test' }, { actor: ACTOR });
+  if (bad.length) throw new Error(bad.join(' | '));
+  return `match held the order against FOR UPDATE / NO KEY UPDATE but not FOR KEY SHARE; the sync's insert went through while the match waited, then the match finished — no deadlock; line ×1, one match event, the sync's row once, order and shipment unchanged, nothing reserved`;
+});
+
+await step('code-less website lines: no deadlock between a shared parcel\'s dispatch and unmatching its member order — dispatch writes the member\'s stock movement while the unmatch holds the order and waits for the parcel; unmatch refused, stock deducted once', async () => {
+  // Dispatch locks only the lead order, then the parcel, then writes a stock movement per order — for the member order
+  // a foreign-key check on it. An unmatch on the member holds that order and waits for the parcel; with the order held
+  // FOR UPDATE, dispatch and unmatch waited on each other (40P01).
+  const bad = [];
+  clStore.push(shOrder(9113, { lines: [{ sku: `${TS}-CL-B`, qty: 1 }] }));
+  clStore.push(shOrder(9114, { lines: [{ sku: null, qty: 2, title: 'Sample sachet' }] }));
+  await clSync();
+  const [lead, mem] = [await clOrder(9113), await clOrder(9114)];
+  const memLine = (await clLines(mem))[0].id;
+  await clMatch(memLine, CL.a, 1, 'Member line checked');
+  const { shipmentId: sid } = await clShip(9113, 'AWB-CL-13');
+  await attachToShipment(sid, { orderIds: [mem] }, { actor: ACTOR });
+  const st = await shipmentStock(sid);
+  if (st.lines.find((l) => l.sku_id === CL.a)?.required !== 2) bad.push(`needs ${JSON.stringify(st.lines.map((l) => [l.sku, l.required]))}`);
+  await reserveShipmentStock(sid, st.lines.flatMap((l) => l.suggestion.picks), { actor: ACTOR });
+  const [ledA, ledB] = [await ledgerSum(CL.a), await ledgerSum(CL.b)];
+  const sh = (await orderShipments(lead)).find((x) => Number(x.id) === Number(sid));
+  const g = await clGated();
+  let keyShare;
+  let r;
+  try {
+    // 1. A gate holds the parcel's reservations, so the dispatch stops after taking the lead order and the parcel.
+    await g.gate.query('BEGIN');
+    await g.gate.query(`SELECT id FROM inventory_reservations WHERE shipment_id = $1 AND status = 'active' FOR UPDATE`, [sid]);
+    const disp = clSettle(updateShipment(lead, sid, { shipment_status: 'dispatched' }, { actor: ACTOR, version: sh.version }));
+    await g.until(1, 'the dispatch to hold the parcel');
+    // 2. The unmatch takes the member order and its line, then queues on the parcel the dispatch holds.
+    const un = clSettle(unmatchImportedLine(memLine, { reason: 'FK deadlock regression (dispatch)' }, { actor: 'tab-1' }));
+    await g.until(2, 'the unmatch to wait for the parcel');
+    keyShare = await g.free(mem, 'KEY SHARE');
+    // 3. The gate lets go: the dispatch writes the member's movement (a foreign-key check on the member order).
+    await g.gate.query('ROLLBACK');
+    r = { disp: await disp, un: await un };
+  } finally { await g.end(); }
+  if (keyShare !== true) bad.push('a foreign-key check could not take the member order while the unmatch held it');
+  if (isDeadlock(r.disp) || isDeadlock(r.un)) bad.push(`deadlock (40P01): dispatch ${r.disp.err?.message || 'ok'} / unmatch ${r.un.err?.message || 'ok'}`);
+  else {
+    if (r.disp.err) bad.push(`dispatch failed ${r.disp.err.code || r.disp.err.status} ${r.disp.err.message}`);
+    if (!(r.un.err?.status === 409 && r.un.err?.needsStock)) bad.push(`unmatch not refused for stock: ${r.un.err?.message || 'it succeeded'}`);
+  }
+  if (r.disp.ok && r.disp.ok.stock?.deducted !== 3) bad.push(`dispatch ${JSON.stringify(r.disp.ok.stock)} (want 2 of the matched product + 1 coded)`);
+  const line = (await clLines(mem))[0];
+  if (line.sku_id !== CL.a || line.matched_units_per_listing !== 1) bad.push(`member line changed ${JSON.stringify(line)}`);
+  if ((await orderEvents(mem)).some((e) => e.event_type === 'item_unmatched_manually')) bad.push('an unmatch event was written');
+  const { rows: mv } = await getPool().query(
+    `SELECT order_id, sku_id, sum(quantity)::int q, count(*)::int n FROM inventory_movements
+     WHERE shipment_id = $1 AND movement_type = 'shipment_dispatched' GROUP BY order_id, sku_id ORDER BY order_id`, [sid]);
+  const got = mv.map((m) => `${Number(m.order_id) === Number(mem) ? 'member' : Number(m.order_id) === Number(lead) ? 'lead' : m.order_id}:${m.sku_id === CL.a ? 'A' : m.sku_id === CL.b ? 'B' : m.sku_id}:${m.q}`).join(',');
+  if (got !== (Number(lead) < Number(mem) ? 'lead:B:-1,member:A:-2' : 'member:A:-2,lead:B:-1')) bad.push(`movements ${got}`);
+  if (await ledgerSum(CL.a) !== ledA - 2 || await ledgerSum(CL.b) !== ledB - 1) bad.push(`ledger moved A ${await ledgerSum(CL.a) - ledA}, B ${await ledgerSum(CL.b) - ledB}`);
+  if ((await getPool().query(`SELECT count(*)::int n FROM inventory_reservations WHERE shipment_id = $1 AND status = 'active'`, [sid])).rows[0].n) bad.push('reservation left active');
+  const { rows: drift } = await getPool().query(
+    `SELECT b.id FROM inventory_batches b WHERE b.sku_id = ANY($1)
+       AND b.on_hand <> (SELECT coalesce(sum(m.quantity), 0) FROM inventory_movements m WHERE m.batch_id = b.id)`, [[CL.a, CL.b]]);
+  if (drift.length) bad.push(`batch on hand differs from its ledger (${drift.map((d) => d.id)})`);
+  if (bad.length) throw new Error(bad.join(' | '));
+  return 'dispatch held lead + parcel, unmatch held the member order and waited for the parcel; the member\'s movement still went through (FOR KEY SHARE free) — no deadlock; dispatch deducted 3 (member 2 × matched product, lead 1), each once; unmatch then refused (409, stock left), line and events unchanged; no active reservation; batch on hand = ledger';
+});
+
+await step('code-less lines: guidance — never "map it in Inventory" for a line with no code; an imported website line points to Match product; a coded line keeps its Inventory guidance (drawer total and orders list)', async () => {
+  const bad = [];
+  // Drawer total tooltip, on real drawer lines: code-less only; code-less beside an unknown platform code; an Amazon line with no code.
+  clStore.push(shOrder(9115, { lines: [{ sku: null, qty: 1, title: 'Sample sachet' }] }));
+  clStore.push(shOrder(9116, { lines: [{ sku: null, qty: 1, title: 'Sample sachet' }, { sku: 'SHOP-CL-UNKNOWN', qty: 1 }] }));
+  await clSync();
+  const only = await orderItems(await clOrder(9115));
+  const both = await orderItems(await clOrder(9116));
+  const amz = await createOrder({ ...R('amazon'), channel: 'amazon', source_order_id: `${SH_PREFIX}9152`, order_value: 100 }, { actor: ACTOR });
+  await getPool().query(`UPDATE orders SET source = 'amazon_import' WHERE id = $1`, [amz]);
+  await getPool().query(`INSERT INTO order_items (order_id, source_line_item_id, sku, title, quantity) VALUES ($1, 'CL-AMZ-NOTE', NULL, 'x', 1)`, [amz]);
+  const amzItems = await orderItems(amz);
+  if (!only[0]?.codeless_import || amzItems[0]?.codeless_import) bad.push('fixture: codeless_import flags');
+  const n1 = unmappedUnitsNote(only); const n2 = unmappedUnitsNote(both); const n3 = unmappedUnitsNote(amzItems);
+  if (n1 !== CODELESS_UNITS_NOTE) bad.push(`code-less only: "${n1}"`);
+  if (/Unmapped SKUs|Map it in Inventory/.test(n1) || !/Match product/.test(n1)) bad.push('code-less note sends the user to Inventory or not to Match product');
+  if (n2 !== `${UNMAPPED_UNITS_NOTE} ${CODELESS_UNITS_NOTE}`) bad.push(`code-less + coded: "${n2}"`);
+  if (n3 !== NO_CODE_UNITS_NOTE || /Unmapped SKUs|Map it in Inventory|Match product/.test(n3)) bad.push(`Amazon line with no code: "${n3}"`);
+  if (!/Map it in Inventory → Unmapped SKUs\./.test(UNMAPPED_UNITS_NOTE)) bad.push('coded guidance lost');
+  // Orders list, Item column (public/orders.js itemLines, run as written): the tooltip of each line, and the Inventory link.
+  const js = await fsp.readFile(new URL('../public/orders.js', import.meta.url), 'utf8');
+  const i = js.indexOf('function itemLines('); const j = js.indexOf('const itemCell', i);
+  if (i < 0 || j < 0) throw new Error('orders.js: itemLines not found');
+  // The page's own esc(), read from components.js (the module itself needs a browser to load).
+  const comp = await fsp.readFile(new URL('../public/ui/components.js', import.meta.url), 'utf8');
+  const e0 = comp.indexOf('export const esc = '); const e1 = comp.indexOf('\n\n', e0);
+  if (e0 < 0 || e1 < 0) throw new Error('components.js: esc not found');
+  const esc = new Function(`${comp.slice(e0 + 'export '.length, e1)}; return esc;`)();
+  const itemLines = new Function('esc', 'canMapSkus', `${js.slice(i, j)}; return itemLines;`)(esc, () => true);
+  const titles = (html) => [...html.matchAll(/title="([^"]*)"/g)].map((m) => m[1].replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&amp;/g, '&'));
+  const o = (lines) => ({ channel: 'amazon', channel_label: 'Amazon', line_skus: lines.map((l) => ({ quantity: 1, units_per_listing: 1, sku_id: null, mappable: true, ...l })) });
+  const mixed = itemLines(o([{ code: null, title: 'Loose item' }, { code: 'AMZ-CODE-1', title: 'Coded item' }]));
+  const [tNone, tCoded] = titles(mixed);
+  if (!/^Amazon line with no SKU — Loose item is not mapped to a Briyo product\. It has no product code, so it cannot be mapped in Inventory/.test(tNone || '') || /Once it is mapped in Inventory|\(none\)/.test(tNone || '')) bad.push(`list, no code: "${tNone}"`);
+  if (tCoded !== 'Amazon SKU AMZ-CODE-1 — Coded item is not mapped to a Briyo product. Once it is mapped in Inventory, this order shows the product.') bad.push(`list, coded: "${tCoded}"`);
+  if (!/Map in Inventory/.test(mixed)) bad.push('list: Inventory link missing for a coded line');
+  if (/Map in Inventory/.test(itemLines(o([{ code: null, title: 'Loose item' }])))) bad.push('list: Inventory link offered for a line with no code');
+  if (bad.length) throw new Error(bad.join(' | '));
+  return 'drawer: code-less website line → "cannot be mapped in Inventory … Match product", with a coded line both notes, Amazon line with no code → "cannot be mapped in Inventory" (no Match product); coded lines keep "Map it in Inventory → Unmapped SKUs"; list: no-code line says it cannot be mapped there, coded line and "Map in Inventory" link unchanged, no link for a code-less line only';
 });
 
 await step('amazon sp-api cleanup', async () => {
