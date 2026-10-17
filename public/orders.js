@@ -984,6 +984,19 @@ async function patchOrder(fields, doneText = 'Saved', { shipment = false } = {})
     drawerActions().forEach((b) => { b.disabled = false; });
   }
 }
+/** What dispatching did to stock: the units deducted, or the supported reason none were. */
+const STOCK_NONE = {
+  external: 'no Briyo stock deducted — fulfilled by Buy with Amazon',
+  historical: 'no stock deducted — dated before the stock cutover',
+  not_tracked: 'no stock deducted — its products are not stock-tracked',
+  already_sent: 'no stock deducted — its other parcels already carried everything',
+  no_orders: 'no stock deducted — every order in it is cancelled',
+};
+function stockNote(stock) {
+  if (!stock || stock.reason === 'repeated') return '';
+  if (stock.reason === 'deducted') return ` · ${count(stock.deducted)} unit${stock.deducted === 1 ? '' : 's'} deducted from stock`;
+  return STOCK_NONE[stock.reason] ? ` · ${STOCK_NONE[stock.reason]}` : '';
+}
 async function patchOrderNow(fields, doneText, { shipment }) {
   const o = state.detail.order;
   const ship = currentShip();
@@ -994,10 +1007,11 @@ async function patchOrderNow(fields, doneText, { shipment }) {
   saved.textContent = 'Saving…';
   try {
     const data = await api(url, { method: 'PATCH', body: JSON.stringify({ ...fields, version }) });
+    const text = data.changed ? `${doneText}${stockNote(data.stock)}` : 'Nothing changed';
     saved.className = 'saved';
-    saved.textContent = data.changed ? doneText : 'Nothing changed';
+    saved.textContent = text;
     await openOrder(o.id);
-    saved.textContent = data.changed ? doneText : 'Nothing changed';
+    saved.textContent = text;
     load();
     return true;
   } catch (err) {
@@ -1512,7 +1526,10 @@ function openCreate() {
   const m = state.meta;
   fillRoute(f, '#cDestField', { type: state.type === 'none' ? '' : state.type, channel: state.f.channel });
   $('#cExtras').innerHTML = '';
+  $('#cProds').innerHTML = '';
   syncExtras();
+  prodSummary();
+  loadLineSkus();
   f.courier_partner_id.innerHTML = opt('', 'Choose courier', true)
     + m.couriers.filter((c) => c.active).map((c) => opt(c.id, c.name)).join('');
   // Packed by default: an AWB means ready to go, not gone. Dispatch is chosen.
@@ -1552,7 +1569,58 @@ function syncExtras() {
   const amazon = $('#createForm').channel.value === 'amazon';
   $('#cExtraSec').hidden = !amazon;
   if (!amazon) $('#cExtras').innerHTML = '';
+  // Amazon order products come from the report import; every other hand-entered order takes them here.
+  $('#cProdSec').hidden = amazon;
+  $('#cProdAmazon').hidden = !amazon;
+  if (amazon) { $('#cProds').innerHTML = ''; prodSummary(); }
 }
+
+// ---- New Shipment products: one row per product (a master SKU and the units packed), checked before saving.
+const skuName = (k) => [k.product_name, k.variant_name].filter(Boolean).join(' — ') || k.sku;
+async function loadLineSkus() {
+  if (!state.lineSkus) state.lineSkus = (await api('/api/orders/line-skus').catch(() => ({ skus: [] }))).skus || [];
+  return state.lineSkus;
+}
+async function addProdRow() {
+  const skus = await loadLineSkus();
+  const n = $('#cProds').children.length + 1;
+  $('#cProds').insertAdjacentHTML('beforeend', `<div class="prod-row">
+    <select class="select p-sku" aria-label="Product ${n}">${opt('', skus.length ? 'Choose product' : 'No active products', true)}${skus.map((k) => opt(k.id, `${skuName(k)} · ${k.sku}`)).join('')}</select>
+    <input class="input p-qty" inputmode="numeric" placeholder="Units" aria-label="Units of product ${n}" autocomplete="off" />
+    <button type="button" class="icon-btn bare p-remove" title="Remove" aria-label="Remove product ${n}">${icon('x')}</button></div>`);
+  renderIcons();
+  $('#cProds .prod-row:last-child .p-sku').focus();
+  prodSummary();
+}
+/** The rows as lines, with a message per row that cannot be saved. A row left completely empty is ignored. */
+function prodLines() {
+  const lines = []; const problems = []; const seen = new Map();
+  [...document.querySelectorAll('#cProds .prod-row')].forEach((r, i) => {
+    const sku = r.querySelector('.p-sku').value;
+    const q = r.querySelector('.p-qty').value.trim();
+    r.classList.remove('bad');
+    if (!sku && !q) return;
+    const name = sku ? skuName((state.lineSkus || []).find((k) => String(k.id) === sku) || {}) : '';
+    let why = null;
+    if (!sku) why = 'choose the product';
+    else if (!/^\d+$/.test(q) || Number(q) < 1) why = 'enter the units packed (a whole number, at least 1)';
+    else if (seen.has(sku)) why = `${name} is already on row ${seen.get(sku)} — put the whole quantity on one row`;
+    if (why) { problems.push(`Product row ${i + 1}: ${why}.`); r.classList.add('bad'); return; }
+    seen.set(sku, i + 1);
+    lines.push({ sku_id: Number(sku), quantity: Number(q), name, row: i });
+  });
+  return { lines, problems };
+}
+function prodSummary() {
+  const { lines } = prodLines();
+  const units = lines.reduce((t, l) => t + l.quantity, 0);
+  $('#cProdSum').textContent = lines.length ? `${count(lines.length)} product${lines.length === 1 ? '' : 's'} · ${count(units)} unit${units === 1 ? '' : 's'}` : 'none added';
+  document.querySelectorAll('#cProds .prod-row').forEach((r) => r.classList.remove('bad'));
+}
+$('#cAddProd').addEventListener('click', addProdRow);
+$('#cProds').addEventListener('click', (e) => { const x = e.target.closest('.p-remove'); if (x) { x.closest('.prod-row').remove(); prodSummary(); } });
+$('#cProds').addEventListener('input', prodSummary);
+$('#cProds').addEventListener('change', prodSummary);
 function addExtraRow() {
   $('#cExtras').insertAdjacentHTML('beforeend', `<div class="extra-row">
     <input class="input plain mono x-num" placeholder="Amazon order number" aria-label="Amazon order number" autocomplete="off" />
@@ -1601,11 +1669,17 @@ $('#createForm').addEventListener('submit', async (e) => {
     ['source_order_id', 'order number'], ['courier_partner_id', 'courier partner'], ['tracking_id', 'tracking ID / AWB']]
     .filter(([k]) => !String(body[k] || '').trim()).map(([, l]) => l);
   if (missing.length) { err.textContent = `Enter the ${missing.join(', ')}.`; err.hidden = false; return; }
+  const prods = $('#cProdSec').hidden ? { lines: [], problems: [] } : prodLines();
+  if (prods.problems.length) { err.textContent = prods.problems.join(' '); err.hidden = false; err.scrollIntoView({ block: 'nearest' }); return; }
+  if (prods.lines.length) body.lines = prods.lines.map((l) => ({ sku_id: l.sku_id, quantity: l.quantity }));
   // Dispatched (or later): the shipment is saved as Packed, any photos
-  // (optional) go up, then it moves to the chosen status.
+  // (optional) go up, then it moves to the chosen status. With products, it
+  // stays Packed: their batches are confirmed in the order first.
   const SHIPPED = ['dispatched', 'in_transit', 'out_for_delivery', 'delivered', 'delivery_failed', 'rto'];
-  const target = body.shipment_status;
+  let target = body.shipment_status;
+  const holdForStock = SHIPPED.includes(target) && prods.lines.length > 0;
   if (SHIPPED.includes(target)) body.shipment_status = 'packed';
+  if (holdForStock) target = 'packed';
   // Photos first: they are the primary proof. Receipt and invoice are optional.
   const items = [
     ...[...f.dispatch_files.files].map((file) => ({ file, type: 'dispatch_product_image' })),
@@ -1626,13 +1700,15 @@ $('#createForm').addEventListener('submit', async (e) => {
     // shipment; the drawer lists what failed with a Retry that keeps the files.
     const failed = await uploadAll(data.orderId, items, $('#cSaved'));
     let moveError = null;
+    let moved = '';
     if (target !== body.shipment_status) {
       try {
         const { shipments } = await api(`/api/orders/${data.orderId}`);
         const ship = shipments.find((x) => x.id === data.shipmentId);
-        await api(`/api/orders/${data.orderId}/shipments/${ship.id}`, {
+        const m = await api(`/api/orders/${data.orderId}/shipments/${ship.id}`, {
           method: 'PATCH', body: JSON.stringify({ shipment_status: target, version: ship.version }),
         });
+        moved = stockNote(m.stock);
       } catch (ex2) { moveError = ex2.message; }
     }
     showPreviews([]);
@@ -1641,10 +1717,12 @@ $('#createForm').addEventListener('submit', async (e) => {
     await openOrder(data.orderId, { shipmentId: data.shipmentId });
     const saved = $('#dSaved');
     saved.className = failed.length || moveError ? 'saved failed' : 'saved';
+    const withProds = prods.lines.length ? ` with ${count(prods.lines.length)} product${prods.lines.length === 1 ? '' : 's'}` : '';
     saved.textContent = failed.length
       ? `Shipment saved as Packed, but ${failed.length} of ${items.length} upload${items.length === 1 ? '' : 's'} failed — Retry is under Dispatch Proof.`
       : moveError ? `Shipment saved as Packed. ${moveError}`
-        : (data.createdOrder ? `Shipment created${extras.length ? ` with ${extras.length + 1} orders` : ''}` : 'Shipment added to this order');
+        : holdForStock ? `Shipment saved as Packed${withProds}. Confirm the stock batches packed, then mark it dispatched.`
+          : `${data.createdOrder ? `Shipment created${extras.length ? ` with ${extras.length + 1} orders` : ''}${withProds}` : `Shipment added to this order${withProds}`}${moved}`;
   } catch (ex) {
     $('#cSaved').textContent = '';
     if (ex.data?.orderExists) {
@@ -1662,6 +1740,9 @@ $('#createForm').addEventListener('submit', async (e) => {
       err.innerHTML = esc(ex.message) + (ex.data?.existingId
         ? ` <a href="/orders?open=${ex.data.existingId}" data-goto="${ex.data.existingId}">Open the order</a>` : '');
       err.hidden = false;
+      // A product line the server refused: mark its row (the server counts only the rows that were sent).
+      const row = Number.isInteger(ex.data?.line) ? prods.lines[ex.data.line]?.row : undefined;
+      if (row !== undefined) document.querySelectorAll('#cProds .prod-row')[row]?.classList.add('bad');
     }
   } finally {
     btn.disabled = false;
