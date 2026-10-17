@@ -659,19 +659,20 @@ function itemLines(o, { max = 2 } = {}) {
   const qty = (l) => (per(l) > 1 ? ` <span class="it-qty">×${esc(units(l))} (${esc(l.quantity)} × pack of ${esc(per(l))})</span>`
     : l.quantity > 1 ? ` <span class="it-qty">×${esc(l.quantity)}</span>` : '');
   const nameOf = (l) => [l.product, l.variant].filter(Boolean).join(' — ') || l.briyo_sku;
+  // Each line's name is cut at two lines on its own; the quantity after it is never cut off.
   const one = (l) => {
     if (l.sku_id) {
       const packs = per(l) > 1 ? ` · ${units(l)} units: ${l.quantity} × pack of ${per(l)}` : '';
-      return `<span class="it" title="${esc(`${nameOf(l)} · Briyo SKU ${l.briyo_sku}${packs}`)}">${esc(nameOf(l))}${qty(l)}</span>`;
+      return `<span class="it" title="${esc(`${nameOf(l)} · Briyo SKU ${l.briyo_sku}${packs}`)}"><span class="it-name">${esc(nameOf(l))}</span>${qty(l)}</span>`;
     }
     if (l.review) {
       return `<span class="it" title="${esc(`Not matched to a Briyo product yet: ${l.title || 'no name'}. Open the order and use Match product.`)}">`
-        + `<span class="warn-text">Not matched</span> · ${esc(l.title || '—')}${qty(l)}</span>`;
+        + `<span class="it-name"><span class="warn-text">Not matched</span> · ${esc(l.title || '—')}</span>${qty(l)}</span>`;
     }
     const why = l.mappable ? 'Once it is mapped in Inventory, this order shows the product.'
       : `${o.channel_label || 'This channel'} has no product-code list in Inventory yet, so its SKUs cannot be mapped there.`;
     return `<span class="it" title="${esc(`${o.channel_label || 'Platform'} SKU ${l.code || '(none)'}${l.title ? ` — ${l.title}` : ''} is not mapped to a Briyo product. ${why}`)}">`
-      + `<span class="warn-text">Not mapped</span> · <span class="mono">${esc(l.code || '—')}</span>${qty(l)}</span>`;
+      + `<span class="it-name"><span class="warn-text">Not mapped</span> · <span class="mono">${esc(l.code || '—')}</span></span>${qty(l)}</span>`;
   };
   const more = lines.length > max
     ? `<span class="it soft" title="${esc(lines.slice(max).map((l) => (l.sku_id ? nameOf(l) : l.title || l.code || '—')).join('\n'))}">+${lines.length - max} more</span>` : '';
