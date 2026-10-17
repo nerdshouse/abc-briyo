@@ -3,6 +3,8 @@
  * recording returns need inventory.move — the API checks both, the page only hides what you cannot do.
  * A draft takes no stock; Issue takes the chosen batches through the stock ledger; what comes back is recorded
  * by kind, and only units confirmed saleable go back into stock.
+ * Several products can be entered at once: they are saved together as a group (one outward per product, all or
+ * none), issued together from the batches confirmed for each, and each is then reconciled and closed on its own.
  */
 import { $, $$, esc, count, money, icon, renderIcons, initShell, pageFetch, hasCap } from './ui/components.js';
 import { istDateTime, formatDayKey } from './ui/ist.js';
@@ -44,7 +46,7 @@ async function load() {
   const { outwards } = await api(`/api/inventory/outward?${qs}`);
   state.list = outwards;
   $('#rows').innerHTML = outwards.length ? outwards.map((o) => `<tr data-id="${o.id}" tabindex="0">
-      <td class="mono">${esc(o.reference)}${o.request_reference ? `<span class="cell-sub muted">${esc(o.request_reference)}</span>` : ''}</td>
+      <td class="mono">${esc(o.reference)}${o.group_reference ? `<span class="cell-sub muted">in ${esc(o.group_reference)}</span>` : ''}${o.request_reference ? `<span class="cell-sub muted">${esc(o.request_reference)}</span>` : ''}</td>
       <td>${esc(day(o.movement_date))}</td>
       <td>${esc(o.purpose_label)}${o.campaign ? `<span class="cell-sub muted">${esc(o.campaign)}</span>` : ''}</td>
       <td><span class="mono">${esc(o.sku)}</span><span class="cell-sub muted">${esc(o.product_name)}</span></td>
@@ -75,9 +77,13 @@ function formHtml(o = {}) {
   return `<form id="soForm" novalidate><section class="dsec"><div class="form-grid">
     <label class="fld"><span>Movement date</span><input class="input" type="date" name="movement_date" required value="${esc(o.movement_date || todayKey)}" /></label>
     <label class="fld"><span>Purpose</span><select class="select" name="purpose" required><option value="">Choose</option>${m.purposes.map((p) => opt(p.key, p.label, p.key === o.purpose)).join('')}</select></label>
-    <label class="fld wide"><span>Product</span><select class="select" name="sku_id" required><option value="">Choose a product</option>${m.skus.map((k) => opt(k.id, `${skuLabel(k)} · ${count(k.available)} available`, k.id === o.sku_id)).join('')}</select>
+    ${o.id ? `<label class="fld wide"><span>Product</span><select class="select" name="sku_id" required><option value="">Choose a product</option>${m.skus.map((k) => opt(k.id, `${skuLabel(k)} · ${count(k.available)} available`, k.id === o.sku_id)).join('')}</select>
       <span class="help" id="soAvail"></span></label>
-    <label class="fld"><span>Quantity</span><input class="input" name="quantity" inputmode="numeric" required value="${esc(o.quantity ?? '')}" /></label>
+    <label class="fld"><span>Quantity</span><input class="input" name="quantity" inputmode="numeric" required value="${esc(o.quantity ?? '')}" /></label>`
+    : `<div class="fld wide"><span class="fld-lbl">Products <span class="soft" id="soProdSum"></span></span>
+      <div class="prod-rows" id="soProds">${prodRowHtml(1)}</div>
+      <button type="button" class="btn" id="soAddProd">${icon('plus')}Add product</button>
+      <span class="help">One row per product, with the units going out. Each product is recorded, issued and reconciled on its own.</span></div>`}
     <div class="fld"><label class="fld-lbl" for="soReqBy"><span>Requested by</span></label>
       <select class="select" id="soReqBy" name="requested_by" required>${people(o.requested_by_phone)}${opt('other', 'Other', Boolean(o.id && !o.requested_by_phone))}</select>
       <label class="so-other" id="soOtherWrap"${o.id && !o.requested_by_phone ? '' : ' hidden'}><span>Enter Requester's Name</span>
@@ -94,12 +100,63 @@ function formHtml(o = {}) {
     <label class="fld wide"><span>Notes</span><textarea class="input" name="notes" maxlength="1000">${esc(o.notes || '')}</textarea></label>
   </div><p class="imp-note">Saving creates a draft. No stock moves until it is issued.</p></section></form>`;
 }
+function prodRowHtml(n) {
+  return `<div class="prod-row">
+    <select class="select p-sku" aria-label="Product ${n}"><option value="">Choose a product</option>${state.meta.skus.map((k) => opt(k.id, `${skuLabel(k)} · ${count(k.available)} available`)).join('')}</select>
+    <input class="input p-qty" inputmode="numeric" placeholder="Units" aria-label="Units of product ${n}" autocomplete="off" />
+    <button type="button" class="icon-btn bare p-remove" title="Remove" aria-label="Remove product ${n}">${icon('x')}</button></div>`;
+}
+/** The product rows as lines, with a message per row that cannot be saved. A completely empty row is ignored. */
+function prodLines() {
+  const lines = []; const problems = []; const seen = new Map();
+  $$('#soProds .prod-row').forEach((r, i) => {
+    const sku = r.querySelector('.p-sku').value;
+    const q = r.querySelector('.p-qty').value.trim();
+    r.classList.remove('bad');
+    if (!sku && !q) return;
+    const k = state.meta.skus.find((x) => String(x.id) === sku);
+    let why = null;
+    if (!sku) why = 'choose the product';
+    else if (!/^\d+$/.test(q) || Number(q) < 1) why = 'enter the units (a whole number, at least 1)';
+    else if (seen.has(sku)) why = `${k?.sku || 'this product'} is already on row ${seen.get(sku)} — put the whole quantity on one row`;
+    if (why) { problems.push(`Product row ${i + 1}: ${why}.`); r.classList.add('bad'); return; }
+    seen.set(sku, i + 1);
+    lines.push({ sku_id: Number(sku), quantity: Number(q), row: i });
+  });
+  return { lines, problems };
+}
+function prodSummary() {
+  if (!$('#soProdSum')) return;
+  const { lines } = prodLines();
+  const units = lines.reduce((t, l) => t + l.quantity, 0);
+  $('#soProdSum').textContent = lines.length ? `· ${count(lines.length)} product${lines.length === 1 ? '' : 's'}, ${count(units)} unit${units === 1 ? '' : 's'}` : '';
+  $$('#soProds .prod-row').forEach((r) => r.classList.remove('bad'));
+}
+function wireProducts() {
+  const box = $('#soProds');
+  if (!box) return;
+  $('#soAddProd').addEventListener('click', () => {
+    box.insertAdjacentHTML('beforeend', prodRowHtml(box.children.length + 1));
+    renderIcons();
+    box.lastElementChild.querySelector('.p-sku').focus();
+    prodSummary();
+  });
+  box.addEventListener('click', (e) => { const x = e.target.closest('.p-remove'); if (x) { x.closest('.prod-row').remove(); prodSummary(); } });
+  box.addEventListener('input', prodSummary);
+  box.addEventListener('change', prodSummary);
+}
 /**
  * The form as sent: the typed requester name only with "Other" (a team member never carries a stale typed name).
  * Returns null, with the message beside the field, when "Other" has no name — the server checks the same.
  */
 const formValues = () => {
   const v = Object.fromEntries(new FormData($('#soForm')));
+  if ($('#soProds')) {
+    const { lines, problems } = prodLines();
+    if (problems.length) { saved(problems.join(' '), true); return null; }
+    if (!lines.length) { saved('Add at least one product and its units.', true); return null; }
+    v.lines = lines.map((l) => ({ sku_id: l.sku_id, quantity: l.quantity }));
+  }
   if (v.requested_by !== 'other') { delete v.requested_by_name; return v; }
   v.requested_by_name = String(v.requested_by_name || '').replace(/\s+/g, ' ').trim();
   if (!v.requested_by_name) {
@@ -137,8 +194,46 @@ function openNew() {
   openDrawer('New stock outward', 'A draft first; stock moves only when you issue it.');
   $('#dBody').innerHTML = formHtml();
   $('#dActions').innerHTML = '<button class="btn" type="button" data-act="close">Cancel</button><button class="btn primary" type="button" data-act="create">Save draft</button>';
-  $('#soForm [name=sku_id]').addEventListener('change', showAvailable);
+  state.groupKey = null;
+  wireProducts();
+  prodSummary();
   wireRequester();
+  renderIcons();
+}
+
+/**
+ * A group: the products recorded together. Drafts are issued together from the batches confirmed for each
+ * (earliest expiry suggested); each line opens as its own record for returns and closing.
+ */
+async function openGroup(id) {
+  const { group: g } = await api(`/api/inventory/outward/groups/${id}`);
+  state.open = null; state.group = g;
+  const first = g.outwards[0];
+  openDrawer(`${g.reference} · ${count(g.outwards.length)} product${g.outwards.length === 1 ? '' : 's'}`, `${first.purpose_label} · ${first.recipient_name} · ${count(g.total_quantity)} units`);
+  const drafts = g.outwards.filter((o) => o.status === 'draft');
+  const stock = canMove() ? await Promise.all(drafts.map((o) => api(`/api/inventory/outward/stock/${o.sku_id}?quantity=${o.quantity}`))) : [];
+  const allocOf = (o, i) => {
+    const st = stock[i];
+    const pre = new Map(st.suggestion.map((x) => [x.batch_id, x.quantity]));
+    return st.batches.length ? `<div class="so-alloc">${st.batches.map((b) => `<label class="fld"><span><span class="mono">${esc(b.batch_number)}</span>${b.expiry_date ? ` · exp ${esc(day(b.expiry_date))}` : ''} · ${count(b.available)} free</span>
+        <input class="input" inputmode="numeric" autocomplete="off" data-gout="${o.id}" data-gbatch="${b.id}" value="${pre.get(b.id) || ''}" /></label>`).join('')}</div>
+        ${st.available < o.quantity ? `<p class="warn-text" style="margin:4px 0 0">Only ${count(st.available)} available.</p>` : ''}`
+      : '<p class="warn-text" style="margin:0">No sellable stock of this product.</p>';
+  };
+  $('#dBody').innerHTML = `<section class="dsec"><dl class="facts">
+      <dt>Movement date</dt><dd>${esc(day(first.movement_date))}</dd><dt>Requested by</dt><dd>${esc(first.requested_by_name)}</dd>
+      <dt>Issued by</dt><dd>${esc(first.issued_by_name)}</dd><dt>Recipient / POC</dt><dd>${esc(first.recipient_name)}${first.recipient_org ? ` · ${esc(first.recipient_org)}` : ''}</dd>
+      <dt>Total</dt><dd>${count(g.outwards.length)} product${g.outwards.length === 1 ? '' : 's'}, ${count(g.total_quantity)} units</dd></dl></section>
+    <section class="dsec"><h3 class="dsec-title">Products</h3><div class="table-wrap"><table class="table">
+      <thead><tr><th>Record</th><th>Product</th><th class="r">Units</th><th class="r">Outstanding</th><th>Status</th></tr></thead>
+      <tbody>${g.outwards.map((o) => `<tr data-open="${o.id}" tabindex="0"><td class="mono">${esc(o.reference)}</td><td><span class="mono">${esc(o.sku)}</span><span class="cell-sub muted">${esc(o.product_name)}</span></td>
+        <td class="r num">${count(o.quantity)}</td><td class="r num">${['draft', 'cancelled'].includes(o.status) ? '—' : count(o.outstanding)}</td><td>${statusTag(o.status)}</td></tr>`).join('')}</tbody></table></div>
+      <p class="muted" style="margin:6px 0 0;font-size:12px">Open a product to record what came back, was used or kept, and to close it.</p></section>
+    ${drafts.length && canMove() ? `<section class="dsec"><h3 class="dsec-title">Issue stock <span class="dsec-meta soft">${count(drafts.length)} product${drafts.length === 1 ? '' : 's'} to issue</span></h3>
+      <p class="muted" style="margin:0 0 8px">Confirm the batches each product is taken from (earliest expiry suggested). All are issued together, or none.</p>
+      ${drafts.map((o, i) => `<div class="so-gline"><b>${esc(o.sku)}</b> <span class="muted">${esc(o.product_name)} · ${count(o.quantity)} needed</span>${allocOf(o, i)}</div>`).join('')}</section>` : ''}`;
+  $('#dActions').innerHTML = `<button class="btn" type="button" data-act="close">Close</button>${drafts.length && canMove() ? '<button class="btn primary" type="button" data-act="issue-group">Issue all</button>' : ''}`;
+  $('#dBody').onclick = (e) => { const tr = e.target.closest('tr[data-open]'); if (tr) openOutward(Number(tr.dataset.open)).catch((err) => saved(err.message, true)); };
   renderIcons();
 }
 
@@ -154,6 +249,7 @@ async function openOutward(id) {
     ['Cost at CP', o.cost_value === null ? (o.status === 'draft' ? '—' : 'Unknown (a batch has no CP)') : esc(money(o.cost_value))],
   ];
   const issued = !['draft', 'cancelled'].includes(o.status);
+  if (o.group_id) facts.splice(1, 0, ['Recorded with', `<a href="#" data-group="${o.group_id}">${esc(o.group_reference)}</a>`]);
   let body = `<section class="dsec"><dl class="facts">${facts.map(([k, v]) => `<dt>${k}</dt><dd>${v}</dd>`).join('')}</dl>
     ${o.notes ? `<p class="muted" style="margin:8px 0 0">${esc(o.notes)}</p>` : ''}</section>`;
   if (issued) {
@@ -201,6 +297,7 @@ async function openOutward(id) {
       ${e.event_type === 'edited' ? `<div class="muted">${Object.keys(e.metadata?.changes || {}).map(esc).join(', ')}</div>` : ''}
       ${e.notes ? `<div class="muted">${esc(e.notes)}</div>` : ''}</li>`).join('')}</ul></section>`;
   $('#dBody').innerHTML = body;
+  $('#dBody').onclick = (e) => { const a = e.target.closest('[data-group]'); if (a) { e.preventDefault(); openGroup(Number(a.dataset.group)).catch((err) => saved(err.message, true)); } };
   const acts = [];
   if (o.status === 'draft' && canMove()) acts.push('<button class="btn" type="button" data-act="cancel-draft">Cancel draft</button>', '<button class="btn" type="button" data-act="save-draft">Save changes</button>', '<button class="btn primary" type="button" data-act="issue">Issue stock</button>');
   if (['issued', 'partially_returned'].includes(o.status) && canMove()) acts.push('<button class="btn" type="button" data-act="close-out">Close</button>', '<button class="btn primary" type="button" data-act="record">Record</button>');
@@ -218,10 +315,32 @@ async function act(name, btn) {
     if (name === 'create') {
       const v = formValues();
       if (!v) return;
-      const r = await api('/api/inventory/outward', { method: 'POST', body: JSON.stringify(v) });
+      const { lines, ...header } = v;
+      if (lines.length === 1) {
+        // One product: the single stock outward, exactly as before.
+        const r = await api('/api/inventory/outward', { method: 'POST', body: JSON.stringify({ ...header, ...lines[0] }) });
+        await load();
+        await openOutward(r.id);
+        saved(`Draft ${r.reference} saved. Issue it when the stock is handed over.`);
+        return;
+      }
+      // Several: one group, all or none. The key survives a lost response, so a retry returns the same group.
+      const r = await api('/api/inventory/outward/groups', { method: 'POST', body: JSON.stringify({ ...header, lines, request_id: state.groupKey || (state.groupKey = rid()) }) });
+      state.groupKey = null;
       await load();
-      await openOutward(r.id);
-      saved(`Draft ${r.reference} saved. Issue it when the stock is handed over.`);
+      await openGroup(r.id);
+      saved(`${r.repeated ? 'Already saved' : 'Saved'}: ${r.reference}, ${count(r.outwards.length)} drafts. Issue them when the stock is handed over.`);
+    } else if (name === 'issue-group') {
+      const g = state.group;
+      const drafts = g.outwards.filter((o) => o.status === 'draft');
+      const lines = drafts.map((o) => ({ outward_id: o.id,
+        allocations: $$(`[data-gout="${o.id}"]`).map((i) => ({ batch_id: i.dataset.gbatch, quantity: i.value })).filter((a) => String(a.quantity).trim()) }));
+      const short = drafts.find((o) => lines.find((l) => l.outward_id === o.id).allocations.reduce((t, a) => t + (Number(a.quantity) || 0), 0) !== o.quantity);
+      if (short) { saved(`${short.sku}: the batches must add up to ${count(short.quantity)}.`, true); return; }
+      if (!confirm(`Issue ${drafts.map((o) => `${count(o.quantity)} × ${o.sku}`).join(', ')} to ${drafts[0].recipient_name}? This takes the stock out of inventory.`)) return;
+      const r = await api(`/api/inventory/outward/groups/${g.id}/issue`, { method: 'POST', body: JSON.stringify({ lines }) });
+      await load(); await openGroup(g.id);
+      saved(r.issued ? `Issued ${count(r.issued)} product${r.issued === 1 ? '' : 's'} — stock taken out of inventory` : 'Already issued — nothing taken twice');
     } else if (name === 'save-draft') {
       const v = formValues();
       if (!v) return;
@@ -275,6 +394,11 @@ async function act(name, btn) {
     }
     saved(err.message, true);
     if (err.data?.field === 'requested_by_name' && $('#soOtherErr')) $('#soOtherErr').textContent = err.message;
+    if (name === 'create' && Number.isInteger(err.data?.line)) {
+      const { lines } = prodLines();
+      const row = lines[err.data.line]?.row;
+      if (row !== undefined) $$('#soProds .prod-row')[row]?.classList.add('bad');
+    }
   } finally { btn.disabled = false; }
 }
 

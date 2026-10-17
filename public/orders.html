@@ -240,6 +240,17 @@
       </div>
       <div class="banner mock website-warn" hidden style="margin-top:12px">Website orders normally come in through <b>Shopify Sync</b> (Orders → Shopify). Creating one by hand makes the sync hold the real Shopify order back as a possible duplicate, so its products are never imported. Only continue if this order is not in Shopify.</div>
     </section>
+    <section class="dsec" id="cProdSec">
+      <h3 class="dsec-title">Products in this parcel <span class="dsec-meta soft" id="cProdSum">none added</span></h3>
+      <div class="prod-rows" id="cProds"></div>
+      <button type="button" class="btn" id="cAddProd"><i data-lucide="plus"></i>Add product</button>
+      <p class="help" style="margin:8px 0 0">One row per product, with the units packed. Nothing leaves stock now: after saving, confirm the batches packed
+        (the earliest expiry is suggested), then mark it dispatched. A parcel with no products cannot be dispatched.</p>
+    </section>
+    <section class="dsec" id="cProdAmazon" hidden>
+      <h3 class="dsec-title">Products in this parcel</h3>
+      <p class="help" style="margin:0">Amazon order products come from the Amazon order report import, not from this form.</p>
+    </section>
     <section class="dsec" id="cExtraSec" hidden>
       <h3 class="dsec-title">More Amazon orders in this parcel <span class="dsec-meta soft">optional</span></h3>
       <div class="extras" id="cExtras"></div>

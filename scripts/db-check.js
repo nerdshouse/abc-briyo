@@ -35,7 +35,8 @@ import {
   updateMappingUnits, unitsPerListingOf, getInventoryCutover, setInventoryCutover, isInventoryEligible,
 } from '../lib/inventory.js';
 import { planSkuSheet, previewSkuImport, commitSkuImport } from '../lib/sku-master-import.js';
-import { createOutward, updateOutward, cancelOutward, issueOutward, recordOutwardReturn, closeOutward, listOutwards, getOutward, outwardReport, outwardStockOptions } from '../lib/stock-outward.js';
+import { createOutward, updateOutward, cancelOutward, issueOutward, recordOutwardReturn, closeOutward, listOutwards, getOutward, outwardReport, outwardStockOptions,
+  createOutwardGroup, getOutwardGroup, issueOutwardGroup } from '../lib/stock-outward.js';
 import { router as inventoryRouterForTest } from '../lib/inventory-routes.js';
 import { DOCUMENT_FORMATS } from '../lib/orders.js';
 import {
@@ -1264,10 +1265,25 @@ const JPEG = Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0, 0x10, 0x4a, 0x46, 0x49, 0x4
 const addPhoto = (orderId) => saveUploadedDocument({ orderId, filename: 'dispatch.jpg', buffer: JPEG,
   documentType: 'dispatch_product_image', actor: 'db-check',
   store: { async put() {}, async remove() {} } });
+/**
+ * An order with no products cannot be dispatched (it would leave with nothing deducted). The logistics checks are
+ * about couriers, AWBs, photos and shared parcels, not stock, so their parcels carry one line of a product that is
+ * not stock-tracked — a supported case that dispatches without touching stock. The product's code starts with the
+ * inventory test prefix, so purgeTestInventory removes it.
+ */
+const NOSTOCK_SKU = 'DBCHECK-INV-NOSTOCK-FIXTURE';
+const untracked = async (oid) => {
+  await ensureInventorySchema();
+  let id = (await getPool().query('SELECT id FROM skus WHERE sku = $1', [NOSTOCK_SKU])).rows[0]?.id;
+  if (!id) id = (await createSku({ sku: NOSTOCK_SKU, product_name: 'Not stock-tracked (test fixture)', track_inventory: false }, { actor: 'db-check' })).id;
+  await getPool().query(`INSERT INTO order_items (order_id, source_line_item_id, sku, title, quantity, sku_id)
+    VALUES ($1, 'DBCHECK-NOSTOCK', $2, 'Not stock-tracked', 1, $3) ON CONFLICT (order_id, source_line_item_id) DO NOTHING`, [oid, NOSTOCK_SKU, id]);
+};
 
 await step('create order: one empty shipment, numbering continues', async () => {
   orderId = await createOrder({ ...R('amazon'), channel: 'amazon', source_order_id: `${TEST_ORDER}-1`,
     order_date: NOW(), order_value: '1,299.50' }, { actor: ACTOR });
+  await untracked(orderId);
   const o = await getOrder(orderId);
   if (!/^ORD-\d{6}$/.test(o.internal_order_id)) throw new Error(`bad internal id ${o.internal_order_id}`);
   if (o.order_value !== 1299.5 || o.order_status !== 'new' || o.shipment_status !== 'not_ready') throw new Error('defaults wrong');
@@ -2132,14 +2148,17 @@ await step('new shipment: required fields; explicit Dispatched is honoured and s
   }
   if ((await listOrders({ q: `${TEST_ORDER}-S2` })).total !== 0) throw new Error('a refused shipment left an order behind');
   // Dispatched straight away, with no photo: accepted and stamped (photos are optional).
+  // (The order says what it carries first: a parcel with no products cannot be dispatched.)
+  await untracked(await createOrder({ ...R('zepto'), channel: 'zepto', source_order_id: `${TEST_ORDER}-S2N` }, { actor: ACTOR }));
   const r0 = await createShipment({ ...R('zepto'), channel: 'zepto', source_order_id: `${TEST_ORDER}-S2N`, courier_partner_id: dl.id,
-    tracking_id: 'AWB-S2N', shipment_status: 'dispatched' }, { actor: ACTOR });
+    tracking_id: 'AWB-S2N', shipment_status: 'dispatched' }, { actor: ACTOR, addToExisting: true });
   const o0 = await getOrder(r0.orderId);
   if (o0.shipment_status !== 'dispatched' || !o0.dispatch_date) throw new Error('direct dispatch without a photo not stamped');
   if ((await orderDocuments(r0.orderId)).length) throw new Error('a document row was created without an upload');
   // The screen's way: saved as Packed, photo added, then Dispatched.
   const r = await createShipment({ ...R('zepto'), channel: 'zepto', source_order_id: `${TEST_ORDER}-S2`, courier_partner_id: dl.id,
     tracking_id: 'AWB-S2' }, { actor: ACTOR });
+  await untracked(r.orderId);
   await addPhoto(r.orderId);
   const sh = (await orderShipments(r.orderId))[0];
   await updateShipment(r.orderId, sh.id, { shipment_status: 'dispatched' }, { actor: ACTOR, version: sh.version });
@@ -2248,6 +2267,7 @@ await step('multiple dispatch images per shipment, stored in document storage, n
   const dl = (await listCouriers()).find((c) => c.name === 'Delhivery');
   const r = await createShipment({ ...R('zepto'), channel: 'zepto', source_order_id: `${TEST_ORDER}-IMG`, courier_partner_id: dl.id, tracking_id: 'AWB-IMG' }, { actor: ACTOR });
   proofOrder = r.orderId;
+  await untracked(proofOrder);
   const store = storage();
   const ids = [];
   for (const [name, buf] of [['carton-1.jpg', JPG], ['label.png', PNG], ['package.webp', WEBP]]) {
@@ -2332,6 +2352,7 @@ await step('dispatch photo is optional: no image dispatches, image still works, 
   const dl = (await listCouriers()).find((c) => c.name === 'Delhivery');
   // No image: Packed → Dispatched → In transit → Delivered, same transitions as before.
   const n = await createShipment({ ...R('bigbasket'), channel: 'bigbasket', source_order_id: `${TEST_ORDER}-NP`, courier_partner_id: dl.id, tracking_id: 'AWB-NP' }, { actor: ACTOR });
+  await untracked(n.orderId);
   for (const to of ['dispatched', 'in_transit', 'delivered']) {
     const s0 = (await orderShipments(n.orderId))[0];
     await updateShipment(n.orderId, s0.id, { shipment_status: to }, { actor: ACTOR, version: s0.version });
@@ -2344,6 +2365,7 @@ await step('dispatch photo is optional: no image dispatches, image still works, 
   if (!(await orderEvents(n.orderId)).some((e) => e.event_type === 'shipment_status_changed')) throw new Error('status change not logged');
   // With an image: unchanged.
   const r = await createShipment({ ...R('bigbasket'), channel: 'bigbasket', source_order_id: `${TEST_ORDER}-PH`, courier_partner_id: dl.id, tracking_id: 'AWB-PH' }, { actor: ACTOR });
+  await untracked(r.orderId);
   let sh = (await orderShipments(r.orderId))[0];
   const docId = await addPhoto(r.orderId);
   await updateShipment(r.orderId, sh.id, { shipment_status: 'dispatched' }, { actor: ACTOR, version: sh.version });
@@ -2449,6 +2471,7 @@ await step('shared shipment: no order in two shipments; wrong channel/type/desti
 await step('shared shipment: one status for all members; take an order out', async () => {
   const lead = (await shipmentMembers(sharedShip))[0].id;
   let sh = (await orderShipments(lead))[0];
+  for (const m of await shipmentMembers(sharedShip)) await untracked(m.id);
   await addPhoto(lead);
   await updateShipment(lead, sh.id, { shipment_status: 'dispatched' }, { actor: ACTOR, version: sh.version });
   const list = await listOrders({ q: 'AWB-SHARED-1' });
@@ -4288,7 +4311,7 @@ await step('post-cutover dispatch: a manual order with products reserves and ded
   if ((await stockOf(ML.a)).res !== 0 || (await stockOf(ML.a)).on !== 5) throw new Error(JSON.stringify(await stockOf(ML.a)));
   return 'qty 3 reserved and dispatched → on hand 10 → 7 (−3, not −9); reserving 11 of 10 refused; lines locked while reserved and after dispatch; A×2 + B×4 → −2 and −4; cancelled shipment released its 1';
 });
-await step('post-cutover dispatch guard: no lines (or only code-less ones) → refused with a clear message; before the cutover and historical orders unchanged', async () => {
+await step('dispatch guard: no lines (or only code-less ones) → refused with a clear message, with or without a cutover; historical orders unchanged', async () => {
   const MSG = 'Cannot dispatch — this order has no inventory lines. Add the products and quantities before dispatching.';
   // B. A current order with no products: dispatch refused, nothing changes.
   const none = await mlOrder('NONE');
@@ -4318,14 +4341,18 @@ await step('post-cutover dispatch guard: no lines (or only code-less ones) → r
   const { shipmentId: os } = await mlShip('OLD');
   const r = await mlDispatch(old);
   if ((await orderShipments(old))[0].shipment_status !== 'dispatched' || await movementsFor(os) !== 0 || !r) throw new Error('historical dispatch changed');
-  // Cutover unset: the existing behaviour — a line-less shipment dispatches with nothing deducted.
+  // Cutover unset: every order takes part in stock, so the same rule holds — a parcel with no products no longer
+  // leaves silently with nothing deducted. Refused, status unchanged, nothing written.
   await getPool().query('UPDATE inventory_settings SET cutover_at = NULL WHERE id');
-  await mlDispatch(none);
-  const { shipmentId: ns } = await mlShip('NONE-PRE');
-  if ((await orderShipments(none))[0].shipment_status !== 'dispatched' || await movementsFor(ns) !== 0) throw new Error('pre-cutover behaviour changed');
+  const mvUnset = (await getPool().query('SELECT count(*)::int n FROM inventory_movements')).rows[0].n;
+  await expectErr('no lines, cutover unset', () => mlDispatch(none), (e) => e.status === 409 && e.message === MSG && e.noInventoryLines);
+  if ((await orderShipments(none))[0].shipment_status !== 'packed') throw new Error('status changed with the cutover unset');
+  await expectErr('created dispatched, cutover unset', () => mlShip('NONE-DIRECT2', { status: 'dispatched' }), (e) => e.message === MSG);
+  if ((await getPool().query(`SELECT 1 FROM orders WHERE source_order_id = $1`, [`${TEST_ORDER}-ML-NONE-DIRECT2`])).rows.length) throw new Error('order created despite the refusal');
+  if ((await getPool().query('SELECT count(*)::int n FROM inventory_movements')).rows[0].n !== mvUnset) throw new Error('movements written by a refused dispatch');
   const plain = await mlOrder('PLAIN', { channel: 'hyugalife' });
   if (!plain) throw new Error('a non-website manual order could not be created');
-  return `after cutover: no-lines dispatch refused ("${MSG.slice(0, 40)}…"), direct-dispatched create refused and rolled back, code-less-only refused, line-less order cannot join a dispatched parcel; historical order and no-cutover dispatch unchanged (0 movements); non-website manual orders unaffected`;
+  return `after cutover: no-lines dispatch refused ("${MSG.slice(0, 40)}…"), direct-dispatched create refused and rolled back, code-less-only refused, line-less order cannot join a dispatched parcel; historical order unchanged (0 movements); cutover unset: no-lines dispatch and direct-dispatched create refused the same way, nothing written; non-website manual orders unaffected`;
 });
 await step('manual order lines: channel and order number are fixed while the order has manual products (no route onto an Amazon order)', async () => {
   const MSG = 'Cannot change channel or order number while this order has manual products. Remove the products first.';
@@ -4652,22 +4679,224 @@ await step('inventory: every change is attributed (user, time, reason, reference
   }
   return `${rows[0].n} movements all with user, time and reason; SKU, batch, document and reservation actions audited`;
 });
-await step('inventory: manual orders (no items) still dispatch exactly as before', async () => {
+await step('inventory: a manual order with no products cannot be dispatched; with only a not-stock-tracked product it dispatches, says why nothing was deducted, and can move back', async () => {
   const dl = (await listCouriers()).find((x) => x.name === 'Delhivery');
   const r = await createShipment({ ...R('website'), channel: 'website', source_order_id: `${TEST_ORDER}-INV-MANUAL`, courier_partner_id: dl.id, tracking_id: 'AWB-INV-MAN' }, { actor: ACTOR });
   await addPhoto(r.orderId);
-  const sh = (await orderShipments(r.orderId))[0];
-  await updateShipment(r.orderId, sh.id, { shipment_status: 'dispatched' }, { actor: ACTOR, version: sh.version });
+  let sh = (await orderShipments(r.orderId))[0];
+  await expectErr('no products', () => updateShipment(r.orderId, sh.id, { shipment_status: 'dispatched' }, { actor: ACTOR, version: sh.version }), (e) => e.status === 409 && e.noInventoryLines);
+  if ((await orderShipments(r.orderId))[0].shipment_status !== 'packed') throw new Error('refused dispatch changed the status');
+  await untracked(r.orderId);
+  sh = (await orderShipments(r.orderId))[0];
+  const out = await updateShipment(r.orderId, sh.id, { shipment_status: 'dispatched' }, { actor: ACTOR, version: sh.version });
+  if (out.stock?.deducted !== 0 || out.stock?.reason !== 'not_tracked') throw new Error(`stock result ${JSON.stringify(out.stock)}`);
+  const aud = (await getPool().query(`SELECT metadata FROM inventory_audit WHERE action = 'dispatch_without_stock' AND shipment_id = $1`, [sh.id])).rows;
+  if (aud.length !== 1 || aud[0].metadata.reason !== 'not_tracked') throw new Error(`audit ${JSON.stringify(aud)}`);
   const back = (await orderShipments(r.orderId))[0];
   await updateShipment(r.orderId, back.id, { shipment_status: 'packed' }, { actor: ACTOR, version: back.version });
   if ((await getPool().query('SELECT count(*)::int n FROM inventory_movements WHERE shipment_id = $1', [sh.id])).rows[0].n) throw new Error('stock moved');
-  return 'no items → no stock check, no movement; can still be moved back (no stock left)';
+  return 'no products → dispatch refused (status stays Packed); a not-stock-tracked product → dispatched, 0 deducted, reason "not_tracked" returned and audited; no movement; can still be moved back';
 });
 await step('inventory: an order with items cannot join a parcel that already left', async () => {
   await invOrders([amzRow({ 'order-id': AZ(50), 'order-item-id': 'I50', sku: `${TS}-D3-60`, 'quantity-purchased': '1' })]);
   const late = await amzOrder(50);
   await expectErr('attach', () => attachToShipment(INV.s1, { orderIds: [late.id] }, { actor: ACTOR }), (e) => e.alreadyShipped);
   return 'attach to a dispatched shipment refused for an order with items';
+});
+
+// ---- New Shipment with several products (createShipment `lines`), then the usual confirm-batches → dispatch -----
+const MP = {};
+const mpCourier = async () => (await listCouriers()).find((x) => x.name === 'Delhivery');
+const mpShipNew = async (number, extra = {}) => createShipment({ ...R('blinkit'), channel: 'blinkit', source_order_id: `${TEST_ORDER}-MP-${number}`, order_date: NOW(),
+  courier_partner_id: (await mpCourier()).id, tracking_id: `AWB-MP-${number}`, ...extra }, { actor: ACTOR });
+const mpShip = async (orderId) => (await orderShipments(orderId))[0];
+const mpOrders = async () => (await getPool().query('SELECT count(*)::int n FROM orders WHERE source_order_id LIKE $1', [`${TEST_ORDER}-MP-%`])).rows[0].n;
+const mpMoves = async () => (await getPool().query('SELECT count(*)::int n FROM inventory_movements')).rows[0].n;
+const mpDispatch = async (orderId, sh = null) => {
+  const s = sh || await mpShip(orderId);
+  return updateShipment(orderId, s.id, { shipment_status: 'dispatched' }, { actor: ACTOR, version: s.version });
+};
+const mpQty = async (orderId) => Object.fromEntries((await orderItems(orderId)).map((l) => [l.sku_id, l.quantity]));
+
+await step('new shipment with products: one parcel, three products (3, 2, 4) — saved as Packed with nothing reserved or deducted; FEFO suggested, staff confirm the batches packed; dispatch deducts each product by its own quantity, once', async () => {
+  const bad = [];
+  MP.d3 = (await createSku({ sku: `${TS}-MP-D3`, product_name: 'Vitamin D3 2000 IU', variant_name: '60 Capsules' }, { actor: ACTOR })).id;
+  MP.om = (await createSku({ sku: `${TS}-MP-OM`, product_name: 'Omega-3' }, { actor: ACTOR })).id;
+  MP.el = (await createSku({ sku: `${TS}-MP-EL`, product_name: 'Electrolytes' }, { actor: ACTOR })).id;
+  // D3 has an early batch (suggested first) and a later one; staff may pack from either.
+  MP.d3Late = (await receiveInventory({ sku_id: MP.d3, batch_number: 'MP-D3-LATE', expiry_date: dayOffset(600), quantity: 40, request_id: rid() }, { actor: ACTOR })).batchId;
+  MP.d3Early = (await receiveInventory({ sku_id: MP.d3, batch_number: 'MP-D3-EARLY', expiry_date: dayOffset(200), quantity: 2, request_id: rid() }, { actor: ACTOR })).batchId;
+  MP.om1 = (await receiveInventory({ sku_id: MP.om, batch_number: 'MP-OM-1', expiry_date: dayOffset(400), quantity: 20, request_id: rid() }, { actor: ACTOR })).batchId;
+  MP.el1 = (await receiveInventory({ sku_id: MP.el, batch_number: 'MP-EL-1', expiry_date: dayOffset(400), quantity: 20, request_id: rid() }, { actor: ACTOR })).batchId;
+  const led = async () => ({ d3: await ledgerSum(MP.d3), om: await ledgerSum(MP.om), el: await ledgerSum(MP.el) });
+  const before = await led();
+  const mv0 = await mpMoves();
+  const r = await mpShipNew('1', { lines: [{ sku_id: MP.d3, quantity: 3 }, { sku_id: MP.om, quantity: '2' }, { sku_id: String(MP.el), quantity: 4 }] });
+  if (r.lines !== 3) bad.push(`lines ${r.lines}`);
+  const q = await mpQty(r.orderId);
+  if (q[MP.d3] !== 3 || q[MP.om] !== 2 || q[MP.el] !== 4 || Object.keys(q).length !== 3) bad.push(`order lines ${JSON.stringify(q)}`);
+  let sh = await mpShip(r.orderId);
+  if (sh.shipment_status !== 'packed') bad.push(`status ${sh.shipment_status}`);
+  if ((await mpMoves()) !== mv0 || JSON.stringify(await led()) !== JSON.stringify(before)) bad.push('creating the shipment moved stock');
+  if ((await getPool().query(`SELECT 1 FROM inventory_reservations WHERE shipment_id = $1`, [sh.id])).rows.length) bad.push('creating the shipment reserved stock');
+  if ((await orderEvents(r.orderId)).filter((e) => e.event_type === 'item_added').length !== 3) bad.push('item events');
+  // The stock panel: three lines, each needing its own quantity; FEFO suggestion takes the early D3 batch first.
+  const st = await shipmentStock(r.shipmentId);
+  const need = Object.fromEntries(st.lines.map((l) => [l.sku_id, l.required]));
+  if (st.state !== 'needs_reservation' || need[MP.d3] !== 3 || need[MP.om] !== 2 || need[MP.el] !== 4) bad.push(`stock panel ${st.state} ${JSON.stringify(need)}`);
+  const sug = st.lines.find((l) => l.sku_id === MP.d3).suggestion.picks;
+  if (sug.length !== 2 || sug[0].batch_id !== MP.d3Early || sug[0].quantity !== 2 || sug[1].batch_id !== MP.d3Late || sug[1].quantity !== 1) bad.push(`FEFO suggestion ${JSON.stringify(sug)}`);
+  // Not confirmed yet: dispatch refused, nothing changes.
+  await expectErr('dispatch before confirming', () => mpDispatch(r.orderId), (e) => e.status === 409 && e.needsStock);
+  if ((await mpShip(r.orderId)).shipment_status !== 'packed' || (await mpMoves()) !== mv0) bad.push('refused dispatch changed something');
+  // Staff packed D3 from the later batch only — the suggestion is not forced.
+  await reserveShipmentStock(r.shipmentId, [{ batch_id: MP.d3Late, quantity: 3 }, { batch_id: MP.om1, quantity: 2 }, { batch_id: MP.el1, quantity: 4 }], { actor: ACTOR });
+  if ((await mpMoves()) !== mv0) bad.push('reserving moved stock');
+  const out = await mpDispatch(r.orderId);
+  if (!out.changed || out.stock?.deducted !== 9 || out.stock?.reason !== 'deducted') bad.push(`dispatch result ${JSON.stringify(out.stock)}`);
+  const after = await led();
+  if (after.d3 !== before.d3 - 3 || after.om !== before.om - 2 || after.el !== before.el - 4) bad.push(`deducted ${JSON.stringify({ before, after })}`);
+  const early = (await getPool().query('SELECT on_hand FROM inventory_batches WHERE id = $1', [MP.d3Early])).rows[0].on_hand;
+  if (early !== 2) bad.push('the batch staff did not pack was touched');
+  const mv = (await getPool().query(`SELECT sku_id, quantity, order_id FROM inventory_movements WHERE shipment_id = $1 AND movement_type = 'shipment_dispatched' ORDER BY sku_id`, [r.shipmentId])).rows;
+  if (mv.length !== 3 || mv.some((m) => Number(m.order_id) !== r.orderId)) bad.push(`movements ${JSON.stringify(mv)}`);
+  if ((await getPool().query(`SELECT 1 FROM inventory_reservations WHERE shipment_id = $1 AND status = 'active'`, [r.shipmentId])).rows.length) bad.push('reservations left active');
+  // Repeats: the same status again changes nothing; the dispatch step itself is a no-op the second time.
+  sh = await mpShip(r.orderId);
+  const again = await updateShipment(r.orderId, sh.id, { shipment_status: 'dispatched' }, { actor: ACTOR, version: sh.version });
+  const c = await getPool().connect();
+  try { await c.query('BEGIN'); const rep = await dispatchShipmentStock(c, r.shipmentId, { actor: ACTOR }); await c.query('COMMIT'); if (!rep.repeated) bad.push('dispatch step not idempotent'); } finally { c.release(); }
+  if (again.changed || (await mpMoves()) !== mv0 + 3 || JSON.stringify(await led()) !== JSON.stringify(after)) bad.push('a repeat deducted again');
+  if (bad.length) throw new Error(bad.join(' | '));
+  return 'lines 3/2/4 on the order; Packed, 0 reserved, 0 moved; panel needs 3/2/4, FEFO suggests early ×2 + late ×1; dispatch before confirming refused; staff confirmed late ×3 (suggestion not forced) + 2 + 4; dispatch → 9 units, −3/−2/−4, early batch untouched, 3 movements on the order; repeat status and repeat dispatch step deducted nothing';
+});
+
+await step('new shipment with products: several orders in one parcel — products on the main and a new order, an existing order\'s ×3 pack listing counted in units; each order\'s movements name it', async () => {
+  const bad = [];
+  await addPlatformMappings(MP.d3, PF.blinkit, [`${TS}-MP-D3-PACK3`], { actor: ACTOR, unitsPerListing: 3 });
+  const packOrder = await lineOn('blinkit', 'MP-PACK', `${TS}-MP-D3-PACK3`, 2);   // 2 listings × 3 = 6 units
+  const r = await mpShipNew('2', {
+    extra_orders: [{ source_order_id: `${TEST_ORDER}-MP-PACK` }, { source_order_id: `${TEST_ORDER}-MP-2B` }],
+    lines: [{ sku_id: MP.om, quantity: 1 }, { sku_id: MP.el, quantity: 2, order: `${TEST_ORDER}-MP-2B` }, { sku_id: MP.om, quantity: 3, order: `${TEST_ORDER}-mp-2b` }],
+  });
+  const members = await shipmentMembers(r.shipmentId);
+  const b = members.find((m) => m.source_order_id === `${TEST_ORDER}-MP-2B`)?.id;
+  if (members.length !== 3 || !members.some((m) => m.id === packOrder) || !b) bad.push(`members ${members.length}`);
+  const qa = await mpQty(r.orderId); const qb = await mpQty(b); const qp = await mpQty(packOrder);
+  if (qa[MP.om] !== 1 || Object.keys(qa).length !== 1 || qb[MP.el] !== 2 || qb[MP.om] !== 3 || qp[MP.d3] !== 2) bad.push(`lines ${JSON.stringify({ qa, qb, qp })}`);
+  const st = await shipmentStock(r.shipmentId);
+  const need = Object.fromEntries(st.lines.map((l) => [l.sku_id, l.required]));
+  if (need[MP.d3] !== 6 || need[MP.om] !== 4 || need[MP.el] !== 2) bad.push(`needs ${JSON.stringify(need)}`);
+  const before = { d3: await ledgerSum(MP.d3), om: await ledgerSum(MP.om), el: await ledgerSum(MP.el) };
+  await reserveShipmentStock(r.shipmentId, st.lines.flatMap((l) => l.suggestion.picks), { actor: ACTOR });
+  const out = await mpDispatch(r.orderId);
+  if (out.stock?.deducted !== 12) bad.push(`deducted ${JSON.stringify(out.stock)}`);
+  if (await ledgerSum(MP.d3) !== before.d3 - 6 || await ledgerSum(MP.om) !== before.om - 4 || await ledgerSum(MP.el) !== before.el - 2) bad.push('ledger');
+  const per = (await getPool().query(`SELECT order_id, sku_id, sum(-quantity)::int q FROM inventory_movements WHERE shipment_id = $1 GROUP BY 1, 2`, [r.shipmentId])).rows
+    .map((x) => `${Number(x.order_id) === r.orderId ? 'A' : Number(x.order_id) === b ? 'B' : Number(x.order_id) === packOrder ? 'P' : '?'}:${x.sku_id === MP.d3 ? 'd3' : x.sku_id === MP.om ? 'om' : 'el'}=${x.q}`).sort().join(',');
+  if (per !== 'A:om=1,B:el=2,B:om=3,P:d3=6') bad.push(`per order ${per}`);
+  if (bad.length) throw new Error(bad.join(' | '));
+  return 'main order om×1, new order el×2 + om×3 (order named in any case), existing Blinkit order with a ×3 listing ×2 → needs d3 6, om 4, el 2; confirmed and dispatched → 12 units; movements per order A:om=1, B:el=2, B:om=3, P:d3=6';
+});
+
+await step('new shipment with products: bad lines, Amazon orders and "dispatched with products" are refused before anything is written; insufficient stock, an unmapped product and a batch that turns unsellable all stop dispatch with nothing changed', async () => {
+  const bad = [];
+  const n0 = await mpOrders();
+  const mv0 = await mpMoves();
+  const refused = async (label, extra, check) => { await expectErr(label, () => mpShipNew(`BAD-${label.replace(/\W+/g, '-')}`, extra), check); };
+  await refused('no product', { lines: [{ quantity: 1 }] }, (e) => e.status === 400 && e.line === 0 && /line 1: choose the product/i.test(e.message));
+  await refused('zero', { lines: [{ sku_id: MP.d3, quantity: 1 }, { sku_id: MP.om, quantity: 0 }] }, (e) => e.status === 400 && e.line === 1 && /line 2/.test(e.message));
+  await refused('fraction', { lines: [{ sku_id: MP.d3, quantity: '1.5' }] }, (e) => e.status === 400 && e.line === 0);
+  await refused('twice', { lines: [{ sku_id: MP.d3, quantity: 1 }, { sku_id: MP.d3, quantity: 2 }] }, (e) => e.status === 400 && e.line === 1 && /already listed/.test(e.message));
+  await refused('unknown order', { lines: [{ sku_id: MP.d3, quantity: 1, order: 'NOT-IN-PARCEL' }] }, (e) => e.status === 400 && /not one of this shipment/.test(e.message));
+  await refused('not a list', { lines: 'D3 x3' }, (e) => e.status === 400);
+  await refused('too many', { lines: Array.from({ length: 51 }, () => ({ sku_id: MP.d3, quantity: 1 })) }, (e) => e.status === 400 && /Up to 50/.test(e.message));
+  await refused('dispatched with products', { shipment_status: 'dispatched', lines: [{ sku_id: MP.d3, quantity: 1 }] }, (e) => e.status === 400 && e.needsStock);
+  // Refused inside the transaction: the order and shipment it had already made are rolled back.
+  const off = (await createSku({ sku: `${TS}-MP-OFF`, product_name: 'Inactive' }, { actor: ACTOR })).id;
+  await updateSku(off, { active: false }, { actor: ACTOR, version: (await getSku(off)).version });
+  await refused('inactive', { lines: [{ sku_id: MP.d3, quantity: 1 }, { sku_id: off, quantity: 1 }] }, (e) => e.status === 400 && /inactive/.test(e.message));
+  const dl = await mpCourier();
+  await expectErr('amazon', () => createShipment({ ...R('amazon'), channel: 'amazon', source_order_id: `${TEST_ORDER}-MP-AMZ`, courier_partner_id: dl.id, tracking_id: 'AWB-MP-AMZ',
+    lines: [{ sku_id: MP.d3, quantity: 1 }] }, { actor: ACTOR }), (e) => e.status === 409 && /Amazon order products come from the Amazon order report/.test(e.message));
+  if ((await getPool().query('SELECT count(*)::int n FROM orders WHERE source_order_id = $1', [`${TEST_ORDER}-MP-AMZ`])).rows[0].n) bad.push('Amazon order left behind');
+  if ((await mpOrders()) !== n0 || (await mpMoves()) !== mv0) bad.push('a refused shipment left an order or a movement');
+  // Insufficient: 1 unit in stock, 5 in the parcel.
+  const few = (await createSku({ sku: `${TS}-MP-FEW`, product_name: 'Few left' }, { actor: ACTOR })).id;
+  const fewB = (await receiveInventory({ sku_id: few, batch_number: 'MP-FEW-1', expiry_date: dayOffset(300), quantity: 1, request_id: rid() }, { actor: ACTOR })).batchId;
+  const s = await mpShipNew('SHORT', { lines: [{ sku_id: few, quantity: 5 }] });
+  if ((await shipmentStock(s.shipmentId)).state !== 'insufficient') bad.push('panel does not say insufficient');
+  await expectErr('reserve short', () => reserveShipmentStock(s.shipmentId, [{ batch_id: fewB, quantity: 5 }], { actor: ACTOR }), (e) => e.insufficientStock);
+  await expectErr('dispatch short', () => mpDispatch(s.orderId), (e) => e.status === 409 && e.needsStock);
+  // Unmapped: an existing order whose platform code is not mapped rides in the parcel → reserve and dispatch refused, by code.
+  await lineOn('blinkit', 'MP-UNMAPPED', `${TS}-MP-NO-SUCH-CODE`, 1);
+  const u = await mpShipNew('U', { extra_orders: [{ source_order_id: `${TEST_ORDER}-MP-UNMAPPED` }], lines: [{ sku_id: MP.om, quantity: 1 }] });
+  if ((await shipmentStock(u.shipmentId)).state !== 'unmapped') bad.push('panel does not say unmapped');
+  await expectErr('reserve unmapped', () => reserveShipmentStock(u.shipmentId, [{ batch_id: MP.om1, quantity: 1 }], { actor: ACTOR }), (e) => e.unmappedSkus);
+  await expectErr('dispatch unmapped', () => mpDispatch(u.orderId), (e) => e.unmappedSkus && e.message.includes(`${TS}-MP-NO-SUCH-CODE`));
+  // A batch that turns unsellable after it was confirmed: dispatch fails as a whole — status, reservations and stock unchanged.
+  const f = await mpShipNew('FAIL', { lines: [{ sku_id: MP.om, quantity: 1 }, { sku_id: MP.el, quantity: 1 }] });
+  await reserveShipmentStock(f.shipmentId, [{ batch_id: MP.om1, quantity: 1 }, { batch_id: MP.el1, quantity: 1 }], { actor: ACTOR });
+  const ledF = [await ledgerSum(MP.om), await ledgerSum(MP.el)];
+  await getPool().query(`UPDATE inventory_batches SET status = 'quarantined' WHERE id = $1`, [MP.el1]);
+  try {
+    await expectErr('dispatch unsellable', () => mpDispatch(f.orderId), (e) => e.status === 409 && e.unsellable);
+  } finally { await getPool().query(`UPDATE inventory_batches SET status = 'active' WHERE id = $1`, [MP.el1]); }
+  const fsh = await mpShip(f.orderId);
+  const live = (await getPool().query(`SELECT count(*)::int n FROM inventory_reservations WHERE shipment_id = $1 AND status = 'active'`, [f.shipmentId])).rows[0].n;
+  if (fsh.shipment_status !== 'packed' || live !== 2 || (await movementsFor(f.shipmentId)) !== 0 || await ledgerSum(MP.om) !== ledF[0] || await ledgerSum(MP.el) !== ledF[1]) {
+    bad.push(`failed dispatch left a change: ${fsh.shipment_status}, ${live} reservations, ${await movementsFor(f.shipmentId)} movements`);
+  }
+  // Once the batch is fine again the same reservation dispatches, deducting each product once.
+  const ok = await mpDispatch(f.orderId);
+  if (ok.stock?.deducted !== 2) bad.push(`retry after fix ${JSON.stringify(ok.stock)}`);
+  if (bad.length) throw new Error(bad.join(' | '));
+  return 'no product / 0 / 1.5 / twice / unknown order / not a list / 51 lines / dispatched-with-products refused, inactive product and Amazon order rolled back — no order or movement left; short stock → panel "insufficient", reserve and dispatch refused; unmapped code → panel "unmapped", reserve and dispatch refused naming it; batch quarantined after confirming → dispatch refused, status Packed, 2 reservations kept, 0 movements; fixed → dispatched, 2 units';
+});
+
+await step('new shipment with products: quantities edited before stock is confirmed; locked while reserved; release → edit → confirm again; two dispatches at once deduct once', async () => {
+  const bad = [];
+  const r = await mpShipNew('EDIT', { lines: [{ sku_id: MP.om, quantity: 3 }, { sku_id: MP.el, quantity: 1 }] });
+  const lineOf2 = async (sku) => (await orderItems(r.orderId)).find((l) => l.sku_id === sku);
+  await updateManualOrderLine(r.orderId, (await lineOf2(MP.om)).id, { quantity: 5 }, { actor: ACTOR });
+  await removeManualOrderLine(r.orderId, (await lineOf2(MP.el)).id, { actor: ACTOR });
+  await addManualOrderLine(r.orderId, { sku_id: MP.d3, quantity: 2 }, { actor: ACTOR });
+  let need = Object.fromEntries((await shipmentStock(r.shipmentId)).lines.map((l) => [l.sku_id, l.required]));
+  if (need[MP.om] !== 5 || need[MP.d3] !== 2 || need[MP.el] !== undefined) bad.push(`after edits ${JSON.stringify(need)}`);
+  await reserveShipmentStock(r.shipmentId, [{ batch_id: MP.om1, quantity: 5 }, { batch_id: MP.d3Late, quantity: 2 }], { actor: ACTOR });
+  const omLine = (await lineOf2(MP.om)).id;
+  await expectErr('edit while reserved', () => updateManualOrderLine(r.orderId, omLine, { quantity: 4 }, { actor: ACTOR }), (e) => e.status === 409 && e.needsStock);
+  await releaseShipmentStock(r.shipmentId, { actor: ACTOR });
+  await updateManualOrderLine(r.orderId, (await lineOf2(MP.om)).id, { quantity: 4 }, { actor: ACTOR });
+  // The earlier confirmation no longer matches: dispatch refused until the batches are confirmed again.
+  need = Object.fromEntries((await shipmentStock(r.shipmentId)).lines.map((l) => [l.sku_id, l.required]));
+  if (need[MP.om] !== 4) bad.push('edit after release not applied');
+  await reserveShipmentStock(r.shipmentId, [{ batch_id: MP.om1, quantity: 4 }, { batch_id: MP.d3Late, quantity: 2 }], { actor: ACTOR });
+  const before = [await ledgerSum(MP.om), await ledgerSum(MP.d3)];
+  const sh = await mpShip(r.orderId);
+  // Two people press Dispatch at once with the same screen: one wins, stock leaves once.
+  const race = await Promise.allSettled([1, 2].map((i) => updateShipment(r.orderId, sh.id, { shipment_status: 'dispatched' }, { actor: `tab-${i}`, version: sh.version })));
+  const won = race.filter((x) => x.status === 'fulfilled');
+  if (won.length !== 1 || race.some((x) => x.status === 'rejected' && x.reason.status !== 409)) bad.push(`race ${race.map((x) => x.status + (x.reason ? `:${x.reason.message}` : '')).join(' / ')}`);
+  if (await ledgerSum(MP.om) !== before[0] - 4 || await ledgerSum(MP.d3) !== before[1] - 2 || (await movementsFor(r.shipmentId)) !== 2) bad.push('race deducted wrongly');
+  await expectErr('edit after dispatch', () => updateManualOrderLine(r.orderId, omLine, { quantity: 1 }, { actor: ACTOR }), (e) => e.status === 409);
+  if (bad.length) throw new Error(bad.join(' | '));
+  return 'om 3→5, el removed, d3×2 added → needs om 5, d3 2; reserved → edit refused (409); released → om 4 → confirmed again; two simultaneous dispatches → 1 wins (other 409), −4 and −2 once, 2 movements; edit after dispatch refused';
+});
+
+await step('existing single-product shipment and Amazon-style imported line: unchanged — confirm, dispatch, deduct', async () => {
+  const one = await mpShipNew('ONE', { lines: [{ sku_id: MP.el, quantity: 1 }] });
+  await reserveShipmentStock(one.shipmentId, [{ batch_id: MP.el1, quantity: 1 }], { actor: ACTOR });
+  const b0 = await ledgerSum(MP.el);
+  const out = await mpDispatch(one.orderId);
+  if (out.stock?.deducted !== 1 || await ledgerSum(MP.el) !== b0 - 1) throw new Error(JSON.stringify(out.stock));
+  // A shipment created with no products in the request (the old form) still works once the order has its lines.
+  const old = await mpShipNew('OLDFORM');
+  await addManualOrderLine(old.orderId, { sku_id: MP.el, quantity: 2 }, { actor: ACTOR });
+  await reserveShipmentStock(old.shipmentId, [{ batch_id: MP.el1, quantity: 2 }], { actor: ACTOR });
+  const o2 = await mpDispatch(old.orderId);
+  if (o2.stock?.deducted !== 2) throw new Error(JSON.stringify(o2.stock));
+  return 'one product ×1 → −1; a shipment made without products, given its line in the drawer → −2';
 });
 
 await step('new shipment cleanup', async () => {
@@ -7532,6 +7761,145 @@ await step('stock outward: return retries — an exact retry is a repeat with th
   if (bad.length) throw new Error(bad.join(' | '));
   return 'saved then retried (lost response) → repeat with real outstanding 2, 1 event, 1 movement, stock +2 once; same key with other quantities → 409 requestReused, invalid ones → the normal 400, nothing recorded; multi-batch: an ambiguous single saleable quantity on a used key is a 400 not a repeat, per-batch retries match regardless of order, a moved unit is a 409; new key records; 3 concurrent identical → 1 recorded + 2 repeats; concurrent different with one key → 1 recorded, 1 refused; totals reconcile; page keeps one key per record and shows the server\'s outcome';
 });
+// ---- Stock outward: several products in one operation (a group of single-product outwards) --------------------
+const OG = {};
+const ogBase = () => ({ movement_date: dayOffset(0), purpose: 'event', requested_by: FIX_A, issued_by: FIX_B, recipient_name: 'Dbcheck Event Desk', campaign: 'Dbcheck expo' });
+const ogCounts = async () => (await getPool().query(`SELECT (SELECT count(*) FROM stock_outward_groups)::int g, (SELECT count(*) FROM stock_outwards)::int o,
+  (SELECT count(*) FROM inventory_movements)::int m`)).rows[0];
+const ogOnHand = async (b) => (await getPool().query('SELECT on_hand FROM inventory_batches WHERE id = $1', [b])).rows[0].on_hand;
+
+await step('stock outward group: three products in one submission — each its own draft (product, quantity, purpose) in one group; nothing leaves stock; every line checked first and a bad one writes nothing', async () => {
+  const bad = [];
+  OG.a = (await createSku({ sku: `${TS}-OG-A`, product_name: 'Group A' }, { actor: ACTOR })).id;
+  OG.b = (await createSku({ sku: `${TS}-OG-B`, product_name: 'Group B' }, { actor: ACTOR })).id;
+  OG.c = (await createSku({ sku: `${TS}-OG-C`, product_name: 'Group C' }, { actor: ACTOR })).id;
+  OG.untracked = (await createSku({ sku: `${TS}-OG-NT`, product_name: 'Not tracked', track_inventory: false }, { actor: ACTOR })).id;
+  OG.a1 = (await receiveInventory({ sku_id: OG.a, batch_number: 'OG-A1', expiry_date: dayOffset(200), quantity: 4, unit_cost: '50', request_id: rid() }, { actor: ACTOR })).batchId;
+  OG.a2 = (await receiveInventory({ sku_id: OG.a, batch_number: 'OG-A2', expiry_date: dayOffset(500), quantity: 10, unit_cost: '60', request_id: rid() }, { actor: ACTOR })).batchId;
+  OG.b1 = (await receiveInventory({ sku_id: OG.b, batch_number: 'OG-B1', expiry_date: dayOffset(300), quantity: 10, request_id: rid() }, { actor: ACTOR })).batchId;
+  OG.c1 = (await receiveInventory({ sku_id: OG.c, batch_number: 'OG-C1', expiry_date: dayOffset(300), quantity: 10, request_id: rid() }, { actor: ACTOR })).batchId;
+  const c0 = await ogCounts();
+  // Refusals, each before anything is written.
+  await expectErr('no lines', () => createOutwardGroup({ ...ogBase(), lines: [] }, { actor: ACTOR }), (e) => e.status === 400);
+  await expectErr('line 2 zero', () => createOutwardGroup({ ...ogBase(), lines: [{ sku_id: OG.a, quantity: 1 }, { sku_id: OG.b, quantity: 0 }] }, { actor: ACTOR }),
+    (e) => e.status === 400 && e.line === 1 && /^Product line 2:/.test(e.message));
+  await expectErr('duplicate', () => createOutwardGroup({ ...ogBase(), lines: [{ sku_id: OG.a, quantity: 1 }, { sku_id: OG.a, quantity: 2 }] }, { actor: ACTOR }),
+    (e) => e.status === 400 && /already listed/.test(e.message));
+  await expectErr('not tracked', () => createOutwardGroup({ ...ogBase(), lines: [{ sku_id: OG.a, quantity: 1 }, { sku_id: OG.untracked, quantity: 1 }] }, { actor: ACTOR }),
+    (e) => e.status === 400 && /not stock-tracked/.test(e.message));
+  await expectErr('no recipient', () => createOutwardGroup({ ...ogBase(), recipient_name: '', lines: [{ sku_id: OG.a, quantity: 1 }] }, { actor: ACTOR }),
+    (e) => e.status === 400 && !/Product line/.test(e.message));
+  await expectErr('too many', () => createOutwardGroup({ ...ogBase(), lines: Array.from({ length: 51 }, () => ({ sku_id: OG.a, quantity: 1 })) }, { actor: ACTOR }), (e) => e.status === 400);
+  await expectErr('bad request id', () => createOutwardGroup({ ...ogBase(), request_id: 'x', lines: [{ sku_id: OG.a, quantity: 1 }] }, { actor: ACTOR }), (e) => e.status === 400);
+  if (JSON.stringify(await ogCounts()) !== JSON.stringify(c0)) bad.push('a refused group wrote something');
+  OG.key = rid();
+  const g = await createOutwardGroup({ ...ogBase(), request_id: OG.key, lines: [{ sku_id: OG.a, quantity: 3 }, { sku_id: OG.b, quantity: '2' }, { sku_id: OG.c, quantity: 4 }] }, { actor: ACTOR });
+  OG.g = g.id;
+  const full = await getOutwardGroup(g.id);
+  if (g.repeated || !/^SOG-\d{5}$/.test(g.reference) || full.outwards.length !== 3 || full.total_quantity !== 9) bad.push(`group ${JSON.stringify({ ref: g.reference, n: full.outwards.length, t: full.total_quantity })}`);
+  const by = Object.fromEntries(full.outwards.map((o) => [o.sku_id, o]));
+  if (by[OG.a]?.quantity !== 3 || by[OG.b]?.quantity !== 2 || by[OG.c]?.quantity !== 4) bad.push('quantities');
+  if (full.outwards.some((o) => o.status !== 'draft' || o.purpose !== 'event' || o.recipient_name !== 'Dbcheck Event Desk' || o.group_reference !== g.reference || o.group_id !== g.id)) bad.push('shared fields');
+  const c1 = await ogCounts();
+  if (c1.g !== c0.g + 1 || c1.o !== c0.o + 3 || c1.m !== c0.m || (await ogOnHand(OG.a1)) !== 4) bad.push('stock moved or counts wrong');
+  const listed = await listOutwards({ group: g.id });
+  if (listed.length !== 3 || listed.some((o) => o.group_reference !== g.reference)) bad.push('list by group');
+  if (!(await getOutward(by[OG.a].id)).events.some((e) => e.event_type === 'created' && e.metadata.group === g.reference)) bad.push('created event names the group');
+  if (bad.length) throw new Error(bad.join(' | '));
+  return `${g.reference}: A×3, B×2, C×4 as 3 drafts sharing purpose/people/recipient, total 9; nothing moved; empty, zero on line 2 (named), duplicate, not-tracked, no recipient (not blamed on a line), 51 lines, bad id refused with nothing written`;
+});
+
+await step('stock outward group: retries — the same request returns the same group (no new rows), the same id with other products is refused, two identical submissions at once make one group', async () => {
+  const bad = [];
+  const c0 = await ogCounts();
+  const again = await createOutwardGroup({ ...ogBase(), request_id: OG.key, lines: [{ sku_id: OG.c, quantity: 4 }, { sku_id: OG.a, quantity: 3 }, { sku_id: OG.b, quantity: 2 }] }, { actor: ACTOR });
+  if (!again.repeated || again.id !== OG.g || again.outwards.length !== 3) bad.push(`retry ${JSON.stringify(again)}`);
+  await expectErr('reused id', () => createOutwardGroup({ ...ogBase(), request_id: OG.key, lines: [{ sku_id: OG.a, quantity: 1 }] }, { actor: ACTOR }), (e) => e.status === 409 && e.conflict);
+  const key = rid();
+  const both = await Promise.allSettled([1, 2].map(() => createOutwardGroup({ ...ogBase(), request_id: key, lines: [{ sku_id: OG.b, quantity: 1 }, { sku_id: OG.c, quantity: 1 }] }, { actor: ACTOR })));
+  const ids = new Set(both.filter((x) => x.status === 'fulfilled').map((x) => x.value.id));
+  if (both.some((x) => x.status === 'rejected') || ids.size !== 1) bad.push(`concurrent ${both.map((x) => x.status + (x.reason ? `:${x.reason.message}` : '')).join(' / ')}`);
+  const c1 = await ogCounts();
+  if (c1.g !== c0.g + 1 || c1.o !== c0.o + 2 || c1.m !== c0.m) bad.push(`counts ${JSON.stringify({ c0, c1 })}`);
+  OG.small = [...ids][0];
+  if (bad.length) throw new Error(bad.join(' | '));
+  return 'retry (lines in another order) → repeated, same group, 0 new rows; same id with other products → 409; 2 identical at once → 1 group of 2 drafts';
+});
+
+await step('stock outward group: issue all in one transaction from the batches staff confirm (FEFO only suggested) — one line that cannot be issued issues none; a retry issues nothing twice; each product deducted by its own quantity', async () => {
+  const bad = [];
+  const g = await getOutwardGroup(OG.g);
+  const by = Object.fromEntries(g.outwards.map((o) => [o.sku_id, o]));
+  const sug = await outwardStockOptions(OG.a, 3);
+  if (sug.suggestion.length !== 1 || sug.suggestion[0].batch_id !== OG.a1 || sug.suggestion[0].quantity !== 3) bad.push(`FEFO ${JSON.stringify(sug.suggestion)}`);
+  const lines = (aAlloc) => [
+    { outward_id: by[OG.a].id, allocations: aAlloc },
+    { outward_id: by[OG.b].id, allocations: [{ batch_id: OG.b1, quantity: 2 }] },
+    { outward_id: by[OG.c].id, allocations: [{ batch_id: OG.c1, quantity: 4 }] },
+  ];
+  const m0 = (await ogCounts()).m;
+  const hands = async () => [await ogOnHand(OG.a1), await ogOnHand(OG.a2), await ogOnHand(OG.b1), await ogOnHand(OG.c1)].join(',');
+  const h0 = await hands();
+  // A: batches add up to 2, not 3 → the whole operation is refused; B and C are not issued either.
+  await expectErr('short line', () => issueOutwardGroup(OG.g, { lines: lines([{ batch_id: OG.a2, quantity: 2 }]) }, { actor: ACTOR }), (e) => e.status === 400 && e.message.startsWith(by[OG.a].reference));
+  await expectErr('missing line', () => issueOutwardGroup(OG.g, { lines: lines([{ batch_id: OG.a2, quantity: 3 }]).slice(0, 2) }, { actor: ACTOR }), (e) => e.status === 400);
+  await expectErr('wrong product batch', () => issueOutwardGroup(OG.g, { lines: lines([{ batch_id: OG.b1, quantity: 3 }]) }, { actor: ACTOR }), (e) => e.status === 400);
+  await expectErr('foreign line', () => issueOutwardGroup(OG.g, { lines: [...lines([{ batch_id: OG.a2, quantity: 3 }]), { outward_id: 999999999, allocations: [] }] }, { actor: ACTOR }), (e) => e.status === 400);
+  if ((await getOutwardGroup(OG.g)).outwards.some((o) => o.status !== 'draft') || (await ogCounts()).m !== m0 || (await hands()) !== h0) bad.push('a refused issue changed something');
+  // Staff packed A from the later batch (not the suggested one).
+  const r = await issueOutwardGroup(OG.g, { lines: lines([{ batch_id: OG.a2, quantity: 3 }]) }, { actor: ACTOR });
+  if (r.issued !== 3 || r.repeated !== 0) bad.push(`issue ${JSON.stringify(r)}`);
+  if ((await hands()) !== '4,7,8,6' || (await ogCounts()).m !== m0 + 3) bad.push(`on hand ${await hands()}`);
+  const retry = await issueOutwardGroup(OG.g, { lines: lines([{ batch_id: OG.a2, quantity: 3 }]) }, { actor: ACTOR });
+  if (retry.issued !== 0 || retry.repeated !== 3 || (await hands()) !== '4,7,8,6' || (await ogCounts()).m !== m0 + 3) bad.push(`retry ${JSON.stringify(retry)}`);
+  if ((await getOutwardGroup(OG.g)).outwards.some((o) => o.status !== 'issued')) bad.push('not all issued');
+  if (bad.length) throw new Error(bad.join(' | '));
+  return 'FEFO suggests the early batch A1 ×3; short, missing, wrong-product and foreign lines refused with nothing issued; A from A2 ×3 (suggestion not forced), B ×2, C ×4 → on hand 4,7,8,6, 3 movements; retry → 0 issued, 3 repeats, no movement';
+});
+
+await step('stock outward group: each product reconciled on its own — saleable (inspected) back to its batch, damaged not restocked, consumed, retained; closes when nothing is outstanding; a cancelled draft is skipped', async () => {
+  const bad = [];
+  const g = await getOutwardGroup(OG.g);
+  const by = Object.fromEntries(g.outwards.map((o) => [o.sku_id, o]));
+  await expectErr('saleable not inspected', () => recordOutwardReturn(by[OG.a].id, { returned_saleable: '1', request_id: rid() }, { actor: ACTOR }), (e) => e.confirmRequired);
+  await recordOutwardReturn(by[OG.a].id, { returned_saleable: '1', saleable_verified: true, returned_non_saleable: 1, consumed: 1, request_id: rid() }, { actor: ACTOR });
+  await recordOutwardReturn(by[OG.b].id, { retained: 2, request_id: rid() }, { actor: ACTOR });
+  await recordOutwardReturn(by[OG.c].id, { returned_non_saleable: 1, request_id: rid() }, { actor: ACTOR });
+  await expectErr('over-record', () => recordOutwardReturn(by[OG.c].id, { consumed: 4, request_id: rid() }, { actor: ACTOR }), (e) => (e.status === 400 || e.status === 409) && /outstanding/.test(e.message));
+  await expectErr('close outstanding', () => closeOutward(by[OG.c].id, { actor: ACTOR }), (e) => e.status === 409 || e.status === 400);
+  const now = Object.fromEntries((await getOutwardGroup(OG.g)).outwards.map((o) => [o.sku_id, o]));
+  if (now[OG.a].status !== 'closed' || now[OG.b].status !== 'closed' || now[OG.c].status !== 'partially_returned' || now[OG.c].outstanding !== 3) {
+    bad.push(`states ${[OG.a, OG.b, OG.c].map((k) => `${now[k].status}/${now[k].outstanding}`).join(' ')}`);
+  }
+  if ((await ogOnHand(OG.a2)) !== 8 || (await ogOnHand(OG.c1)) !== 6) bad.push(`restock A2 ${await ogOnHand(OG.a2)} C1 ${await ogOnHand(OG.c1)}`);
+  // The small group: cancel one draft, issue the rest — the cancelled one is skipped, the other issued.
+  const small = await getOutwardGroup(OG.small);
+  await cancelOutward(small.outwards[0].id, { actor: ACTOR, reason: 'not needed' });
+  const live = small.outwards[1];
+  const bt = live.sku_id === OG.b ? OG.b1 : OG.c1;
+  const r = await issueOutwardGroup(OG.small, { lines: [{ outward_id: live.id, allocations: [{ batch_id: bt, quantity: 1 }] }] }, { actor: ACTOR });
+  if (r.issued !== 1 || r.skipped !== 1) bad.push(`small ${JSON.stringify(r)}`);
+  if (bad.length) throw new Error(bad.join(' | '));
+  return 'A: 1 saleable (after inspection) back into A2, 1 damaged, 1 consumed → closed; B: 2 retained → closed; C: 1 damaged, over-recording and closing with 3 outstanding refused → partially returned; cancelled draft skipped, the other issued';
+});
+
+await step('stock outward group: two groups issuing the same batches in opposite product order at once — no deadlock, never oversold', async () => {
+  const x = (await createSku({ sku: `${TS}-OG-X`, product_name: 'Race X' }, { actor: ACTOR })).id;
+  const y = (await createSku({ sku: `${TS}-OG-Y`, product_name: 'Race Y' }, { actor: ACTOR })).id;
+  const bx = (await receiveInventory({ sku_id: x, batch_number: 'OG-X', expiry_date: dayOffset(300), quantity: 5, request_id: rid() }, { actor: ACTOR })).batchId;
+  const by = (await receiveInventory({ sku_id: y, batch_number: 'OG-Y', expiry_date: dayOffset(300), quantity: 5, request_id: rid() }, { actor: ACTOR })).batchId;
+  const g1 = await createOutwardGroup({ ...ogBase(), lines: [{ sku_id: x, quantity: 3 }, { sku_id: y, quantity: 3 }] }, { actor: ACTOR });
+  const g2 = await createOutwardGroup({ ...ogBase(), lines: [{ sku_id: y, quantity: 3 }, { sku_id: x, quantity: 3 }] }, { actor: ACTOR });
+  const plan = async (gid) => (await getOutwardGroup(gid)).outwards.map((o) => ({ outward_id: o.id, allocations: [{ batch_id: o.sku_id === x ? bx : by, quantity: 3 }] }));
+  const res = await Promise.allSettled([g1, g2].map(async (g) => issueOutwardGroup(g.id, { lines: await plan(g.id) }, { actor: ACTOR })));
+  const ok = res.filter((r) => r.status === 'fulfilled').length;
+  const errs = res.filter((r) => r.status === 'rejected').map((r) => r.reason);
+  if (ok !== 1 || errs.some((e) => e.code === '40P01' || !(e.status === 409 || e.status === 400))) throw new Error(res.map((r) => r.status + (r.reason ? `:${r.reason.code || ''} ${r.reason.message}` : '')).join(' / '));
+  const left = [await ogOnHand(bx), await ogOnHand(by)];
+  if (left.join() !== '2,2') throw new Error(`on hand ${left}`);
+  return '5 + 5 in stock, two groups each wanting 3 + 3 in opposite order → one issued, the other refused for stock (no deadlock); 2 + 2 left';
+});
+
 await step('retailer orders without Briyo SKUs (e.g. Medkart): retailer name/code kept beside the Briyo product, code optional; an unmatched line is flagged and blocks stock until a person matches it; then deducted exactly once', async () => {
   const bad = [];
   const db = getPool();
