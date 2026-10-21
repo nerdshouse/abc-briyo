@@ -561,7 +561,7 @@ function renderDrawer() {
       ${shipments.length > 1 ? `<div class="ship-tabs" role="tablist" aria-label="Shipments">${shipments.map((x, i) => `
         <button type="button" role="tab" class="pill${x.id === ship.id ? ' on' : ''}" data-ship="${x.id}" aria-selected="${x.id === ship.id}">
           ${i + 1} · ${esc(x.tracking_id || 'no AWB')}</button>`).join('')}</div>` : ''}
-      ${ship.external_fulfillment_id ? `<div class="banner mock" style="margin:8px 0">Fulfilled externally by <b>Buy with Amazon</b> — mirrored from Shopify${ship.external_carrier ? ` (${esc(ship.external_carrier)}${ship.external_display_status ? ` · ${esc(label(String(ship.external_display_status).toLowerCase()))}` : ''})` : ''}. It updates on each Shopify sync. No Briyo stock is reserved or deducted for it.</div>` : ''}
+      ${externalBanner(ship)}
       ${!canEdit() ? `<dl class="kv">
         <dt>Courier</dt><dd>${esc(courier?.name || '—')}</dd>
         <dt>AWB / Tracking ID</dt><dd class="mono">${esc(ship.tracking_id || '—')}</dd>
@@ -595,6 +595,24 @@ function renderDrawer() {
 
     ${drawerCommon(o, documents, proofDocs, events, notes)}`;
   renderIcons();
+}
+
+/** What a person must do about a Delta Velocity parcel (lib/courier-check.js decides; the API sends courier_check). */
+const COURIER_CHECK = {
+  left_not_dispatched: 'The courier has this parcel, but its stock has not left here yet. Confirm the batches below, then set the shipment status to match.',
+  delivery_attempted: 'Delivery was attempted and not completed. Follow up with the customer or Delta Velocity; the status is not changed for you.',
+  booking_cancelled: 'Delta Velocity cancelled this booking. Check whether the parcel was rebooked or is not going.',
+};
+/** The banner on a shipment mirrored from Shopify: Buy with Amazon (Amazon's stock) or Delta Velocity (ours). */
+function externalBanner(ship) {
+  if (!ship.external_fulfillment_id) return '';
+  const state = ship.external_carrier ? ` (${esc(ship.external_carrier)}${ship.external_display_status ? ` · ${esc(label(String(ship.external_display_status).toLowerCase()))}` : ''})` : '';
+  if (ship.external_provider === 'bwa') {
+    return `<div class="banner mock" style="margin:8px 0">Fulfilled externally by <b>Buy with Amazon</b> — mirrored from Shopify${state}. It updates on each Shopify sync. No Briyo stock is reserved or deducted for it.</div>`;
+  }
+  const check = COURIER_CHECK[ship.courier_check];
+  return `<div class="banner" style="margin:8px 0">Booked through <b>Delta Velocity</b> — courier, AWB and tracking link from Shopify${state}. It updates on each Shopify sync; stock is reserved and deducted as for any shipment.</div>`
+    + (check ? `<div class="banner mock" role="status" style="margin:8px 0"><b>Courier update to check.</b> ${esc(check)}</div>` : '');
 }
 
 /** Channels whose orders carry Briyo's own master SKU codes. Every other channel is a marketplace. */
@@ -1411,7 +1429,7 @@ async function openShipEdit(orderId) {
   const list = data.shipments || [];
   const ship = (state.openId === o.id && list.find((x) => x.id === state.shipId)) || list.find((x) => Number(x.order_id) === Number(o.id)) || list[0];
   if (!ship) return toast('This order has no shipment yet.', { tone: 'bad' });
-  if (ship.external_fulfillment_id) return toast('This shipment is mirrored from an external fulfiller; its details come from Shopify.', { tone: 'bad' });
+  if (ship.external_fulfillment_id) return toast('This shipment is mirrored from Shopify (Buy with Amazon or Delta Velocity); its courier, AWB and link come from Shopify.', { tone: 'bad' });
   Object.assign(shipEdit, { order: o, ship });
   // The order number belongs to the shipment's own (lead) order, and only one entered by hand: imports find theirs by it.
   const ownOrder = Number(ship.order_id) === Number(o.id);
