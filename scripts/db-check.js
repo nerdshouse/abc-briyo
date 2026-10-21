@@ -7785,6 +7785,143 @@ await step('code-less lines: guidance — never "map it in Inventory" for a line
   return 'drawer: code-less website line → "cannot be mapped in Inventory … Match product", with a coded line both notes, Amazon line with no code → "cannot be mapped in Inventory" (no Match product); coded lines keep "Map it in Inventory → Unmapped SKUs"; list: no-code line says it cannot be mapped there, coded line and "Map in Inventory" link unchanged, no link for a code-less line only';
 });
 
+await step('shopify orders: Delta Velocity fulfilments become Briyo shipments in the stock flow — new or linked (same AWB / the only unsent shipment), courier progress forward only through the normal rules, stock only from confirmed batches, attempted delivery and cancelled bookings flagged, never a duplicate', async () => {
+  const bad = [];
+  const FGID = (n, k = 1) => `gid://shopify/Fulfillment/${SH_NUM}${n}${k}`;
+  const awb = (n, k = 1) => `5129231${n}${k}`;
+  const dvUrl = (n) => `https://briyo.deltavelocity.in/${n}`;
+  const ful = (n, k, o = {}) => ({ id: FGID(n, k), name: `#${n}-F${k}`, status: o.status || 'SUCCESS', displayStatus: o.display ?? 'READY_FOR_PICKUP',
+    createdAt: new Date(Date.now() - 3600000).toISOString(), updatedAt: new Date().toISOString(), inTransitAt: o.inTransit ?? null, deliveredAt: o.deliveredAt ?? null,
+    estimatedDeliveryAt: null, trackingInfo: [{ company: o.carrier ?? 'delhivery', number: o.number ?? awb(n, k), url: o.url ?? dvUrl(n) }] });
+  const NON_BWA = ['COD', 'GoKwik', 'Non Buy with Amazon'];
+  const order = (n, fulfillments, { tags = NON_BWA, lines } = {}) => ({ ...shOrder(n, { created: new Date(Date.now() - 7200000).toISOString(), lines: lines || [{ sku: `${TS}-DV-A`, qty: 2 }] }),
+    tags, fulfillments, updatedAt: new Date().toISOString() });
+  const store = [];
+  const gql = shFake(() => store);
+  const sync = (actor = SH_ACTOR) => runShopifySync({ window: { days: 1 }, dryRun: false, gql, actor });
+  const gid = (n) => `${SH_PREFIX}${String(n).padStart(4, '0')}`;
+  const oid = async (n) => Number((await getPool().query('SELECT id FROM orders WHERE source_order_id = $1', [gid(n)])).rows[0]?.id);
+  const ships = async (n) => orderShipments(await oid(n));
+  const touch = (n, patch) => {
+    const o = store.find((x) => x.id === gid(n));
+    if (patch) Object.assign(o.fulfillments[0], patch, { updatedAt: new Date(Date.now() + 1000).toISOString() });
+    o.updatedAt = new Date(Date.now() + 1000).toISOString();
+  };
+  const reserve = async (sid) => reserveShipmentStock(sid, (await shipmentStock(sid)).lines.flatMap((l) => l.suggestion.picks), { actor: ACTOR });
+  const checks = async (n) => (await orderEvents(await oid(n))).filter((e) => e.event_type === 'courier_update_to_check');
+  const inView = async (n) => (await listOrders({ view: 'courier_check', q: gid(n) })).orders.some((o) => o.source_order_id === gid(n));
+  const dl = (await listCouriers()).find((c) => c.name === 'Delhivery');
+  const A = (await createSku({ sku: `${TS}-DV-A`, product_name: 'Delta Velocity test product' }, { actor: ACTOR })).id;
+  await receiveInventory({ sku_id: A, batch_number: 'DV-A1', expiry_date: dayOffset(400), quantity: 50, request_id: rid() }, { actor: ACTOR });
+  const led0 = await ledgerSum(A);
+
+  // 9201 ready for pickup; 9202 picked up before anyone confirmed batches; 9208 a Buy with Amazon order (never Delta Velocity);
+  // 9209 an unmapped line, already delivered.
+  store.push(order(9201, [ful(9201, 1)]), order(9202, [ful(9202, 1, { display: 'IN_TRANSIT', inTransit: new Date(Date.now() - 1800000).toISOString() })]),
+    order(9208, [ful(9208, 1)], { tags: ['Buy with Amazon', 'COD'] }),
+    order(9209, [ful(9209, 1, { display: 'DELIVERED', deliveredAt: new Date().toISOString() })], { lines: [{ sku: 'SHOP-DV-UNKNOWN', qty: 1 }] }));
+  const pre = await runShopifySync({ window: { days: 1 }, dryRun: true, gql });
+  if (pre.summary.newDeltaVelocityShipments !== 3) bad.push(`preview ${pre.summary.newDeltaVelocityShipments}`);
+  const r1 = await sync();
+  if (r1.summary.deltaVelocityShipmentsCreated !== 3 || r1.summary.deltaVelocityToCheck !== 2) bad.push(`summary ${JSON.stringify([r1.summary.deltaVelocityShipmentsCreated, r1.summary.deltaVelocityToCheck])}`);
+  // New shipment: Packed, Delhivery, Delta Velocity's AWB and link, provider deltavelocity, nothing to check, no stock moved.
+  const [a] = await ships(9201);
+  if (!a || a.shipment_status !== 'packed' || a.courier_partner_id !== dl.id || a.tracking_id !== awb(9201, 1) || a.tracking_url !== dvUrl(9201)
+    || a.external_provider !== 'deltavelocity' || a.external_fulfillment_id !== FGID(9201, 1) || a.external_display_status !== 'READY_FOR_PICKUP' || a.courier_check !== null) bad.push(`9201 ${JSON.stringify(a)}`);
+  // Left without confirmed batches: the status stays, flagged once, listed under "Courier updates to check"; no stock moved.
+  let [b] = await ships(9202);
+  if (b?.shipment_status !== 'packed' || b.courier_check !== 'left_not_dispatched' || !(await inView(9202)) || (await checks(9202)).length !== 1) bad.push(`9202 ${JSON.stringify(b && [b.shipment_status, b.courier_check])}`);
+  if (await ledgerSum(A) !== led0) bad.push('stock moved without confirmed batches');
+  await sync();
+  if ((await checks(9202)).length !== 1 || (await ships(9202)).length !== 1) bad.push('a re-sync flagged again or duplicated');
+  // The person confirms the batches (allowed: it is our stock); the courier's next update takes the stock, exactly once.
+  await reserve(b.id);
+  touch(9202, { displayStatus: 'OUT_FOR_DELIVERY' });
+  await sync();
+  [b] = await ships(9202);
+  if (b.shipment_status !== 'out_for_delivery' || !b.dispatch_date || b.courier_check !== null || await inView(9202) || await ledgerSum(A) !== led0 - 2) bad.push(`9202 after batches ${b.shipment_status} ${b.courier_check} ${await ledgerSum(A) - led0}`);
+  touch(9202, { displayStatus: 'DELIVERED', deliveredAt: new Date().toISOString() });
+  await sync();
+  touch(9202, { displayStatus: 'IN_TRANSIT' });   // an older state never moves it back
+  await sync();
+  [b] = await ships(9202);
+  if (b.shipment_status !== 'delivered' || !b.delivered_at || await ledgerSum(A) !== led0 - 2) bad.push(`9202 delivered ${b.shipment_status} ${await ledgerSum(A) - led0}`);
+  // Buy with Amazon order: not Delta Velocity, whatever its link says.
+  if ((await ships(9208)).length) bad.push('a Buy with Amazon order was mirrored as Delta Velocity');
+  // Unmapped line: dispatch is refused, so the status stays and it is flagged.
+  const [g] = await ships(9209);
+  if (g?.shipment_status !== 'packed' || g.courier_check !== 'left_not_dispatched') bad.push(`9209 ${JSON.stringify(g && [g.shipment_status, g.courier_check])}`);
+
+  // Linking to a shipment someone already made: same AWB → that shipment; the only unsent one with no AWB → that shipment, AWB filled;
+  // a different AWB → left alone and reported.
+  const own = async (n, extra) => createShipment({ ...R('website'), channel: 'website', source_order_id: gid(n), shipment_status: 'packed', ...extra }, { actor: ACTOR, addToExisting: true });
+  store.push(order(9203, []), order(9204, []), order(9205, []));
+  await sync();
+  const m3 = await own(9203, { courier_partner_id: dl.id, tracking_id: awb(9203, 1) });
+  // An empty placeholder shipment (no courier, no AWB, not ready): New Shipment always asks for both, so it is never one a person filled.
+  const m4 = { shipmentId: (await getPool().query(`INSERT INTO order_shipments (order_id, shipment_status, created_by, updated_by) VALUES ($1, 'not_ready', $2, $2) RETURNING id`, [await oid(9204), ACTOR])).rows[0].id };
+  const m5 = await own(9205, { courier_partner_id: dl.id, tracking_id: 'BRIYO-OTHER-AWB' });
+  for (const n of [9203, 9204, 9205]) { store.find((x) => x.id === gid(n)).fulfillments = [ful(n, 1)]; touch(n); }
+  const r2 = await sync();
+  const s3 = await ships(9203); const s4 = await ships(9204); const s5 = await ships(9205);
+  if (s3.length !== 1 || s3[0].id !== Number(m3.shipmentId) || s3[0].external_fulfillment_id !== FGID(9203, 1)) bad.push(`same AWB ${JSON.stringify(s3.map((x) => [x.id, x.external_fulfillment_id]))}`);
+  if (s4.length !== 1 || s4[0].id !== Number(m4.shipmentId) || s4[0].tracking_id !== awb(9204, 1) || s4[0].courier_partner_id !== dl.id) bad.push(`no AWB ${JSON.stringify(s4.map((x) => [x.id, x.tracking_id]))}`);
+  if (s5.length !== 1 || s5[0].id !== Number(m5.shipmentId) || s5[0].tracking_id !== 'BRIYO-OTHER-AWB' || s5[0].external_fulfillment_id !== null) bad.push(`other AWB ${JSON.stringify(s5.map((x) => [x.id, x.tracking_id, x.external_fulfillment_id]))}`);
+  if (r2.summary.deltaVelocityShipmentsLinked !== 2 || !r2.summary.deltaVelocitySkipped) bad.push(`linked ${r2.summary.deltaVelocityShipmentsLinked}, skipped ${r2.summary.deltaVelocitySkipped}`);
+  if (!(await orderEvents(await oid(9203))).some((e) => e.event_type === 'external_shipment_linked')) bad.push('no link event');
+
+  // Delivery attempted: a flag, never a status; delivered later clears it.
+  store.push(order(9206, [ful(9206, 1)]));
+  await sync();
+  let [d] = await ships(9206);
+  await reserve(d.id);
+  touch(9206, { displayStatus: 'IN_TRANSIT' }); await sync();
+  touch(9206, { displayStatus: 'ATTEMPTED_DELIVERY' }); await sync();
+  [d] = await ships(9206);
+  if (d.shipment_status !== 'in_transit' || d.courier_check !== 'delivery_attempted' || !(await inView(9206))) bad.push(`attempted ${d.shipment_status} ${d.courier_check}`);
+  touch(9206, { displayStatus: 'DELIVERED', deliveredAt: new Date().toISOString() }); await sync();
+  [d] = await ships(9206);
+  if (d.shipment_status !== 'delivered' || d.courier_check !== null) bad.push(`attempted then delivered ${d.shipment_status} ${d.courier_check}`);
+
+  // Booking cancelled: flagged, the shipment and its reservation kept; Delta Velocity's rebooking takes over the same shipment.
+  store.push(order(9207, [ful(9207, 1)]));
+  await sync();
+  let [e] = await ships(9207);
+  await reserve(e.id);
+  touch(9207, { status: 'CANCELLED', displayStatus: 'CANCELED' }); await sync();
+  [e] = await ships(9207);
+  const live = async (sid) => (await getPool().query(`SELECT count(*)::int n FROM inventory_reservations WHERE shipment_id = $1 AND status = 'active'`, [sid])).rows[0].n;
+  if (e.shipment_status !== 'packed' || e.courier_check !== 'booking_cancelled' || !(await live(e.id))) bad.push(`cancelled ${e.shipment_status} ${e.courier_check}`);
+  const o7 = store.find((x) => x.id === gid(9207));
+  o7.fulfillments.push(ful(9207, 2, { number: awb(9207, 2) })); touch(9207); await sync();
+  const s7 = await ships(9207);
+  if (s7.length !== 1 || s7[0].id !== e.id || s7[0].external_fulfillment_id !== FGID(9207, 2) || s7[0].tracking_id !== awb(9207, 2) || s7[0].courier_check !== null || !(await live(e.id))) bad.push(`rebooked ${JSON.stringify(s7.map((x) => [x.id, x.external_fulfillment_id, x.tracking_id, x.courier_check]))}`);
+
+  // Two syncs at once (poll + Sync now), and a sync racing a person saving the same shipment: one shipment, no deadlock.
+  store.push(order(9210, [ful(9210, 1)]));
+  await Promise.all([sync(), sync('shopify-poll')]);
+  if ((await ships(9210)).length !== 1) bad.push(`concurrent syncs ${(await ships(9210)).length}`);
+  const usual = (await sync()).summary.deltaVelocitySkipped;   // 9205 only: a different AWB, left for a person
+  if (usual !== 1) bad.push(`usual skips ${usual}`);
+  for (let i = 0; i < 3; i++) {
+    const [x] = await ships(9210);
+    touch(9210, { displayStatus: i % 2 ? 'READY_FOR_PICKUP' : 'IN_TRANSIT' });
+    const res = await Promise.allSettled([sync(), updateShipment(await oid(9210), x.id, { expected_delivery_date: dayOffset(3 + i) }, { actor: ACTOR, version: x.version })]);
+    for (const r of res) if (r.status === 'rejected' && (r.reason.code === '40P01' || !r.reason.status)) bad.push(`race ${i}: ${r.reason.code || ''} ${r.reason.message}`);
+    for (const r of res) if (r.status === 'fulfilled' && r.value?.summary && r.value.summary.deltaVelocitySkipped !== usual) bad.push(`race ${i}: skipped ${JSON.stringify(r.value.summary)}`);
+  }
+  // Stock: only the confirmed, delivered parcels (9202 and 9206, 2 each) left; every batch matches its ledger.
+  const { rows: drift } = await getPool().query(`SELECT b.id FROM inventory_batches b WHERE b.sku_id = $1
+    AND b.on_hand <> (SELECT coalesce(sum(m.quantity), 0) FROM inventory_movements m WHERE m.batch_id = b.id)`, [A]);
+  if (await ledgerSum(A) !== led0 - 4 || drift.length) bad.push(`ledger ${await ledgerSum(A) - led0}, drift ${drift.length}`);
+  for (const n of [9201, 9203, 9204, 9205, 9207, 9210]) {
+    for (const s of await ships(n)) if (await live(s.id)) await releaseShipmentStock(s.id, { actor: ACTOR });
+  }
+  await getPool().query(`DELETE FROM order_imports WHERE kind = 'shopify_sync' AND imported_by = 'shopify-poll' AND started_at > now() - interval '1 hour'`);
+  if (bad.length) throw new Error(bad.join(' | '));
+  return 'ready for pickup → new Packed shipment (Delhivery, DV AWB + link, provider deltavelocity); in transit without batches → status kept, flagged once, in "Courier updates to check", no stock; batches confirmed → out for delivery took 2 once, delivered, never back; unmapped line → flagged; Buy with Amazon order → not DV; same AWB / only unsent shipment → linked (AWB filled), different AWB → left alone and reported; attempted delivery → flag only, cleared on delivery; cancelled booking → flagged, reservation kept, rebooking takes over the same shipment; concurrent syncs → one shipment; sync vs a person saving → no deadlock; ledger −4 = delivered parcels only, batches match their ledger';
+});
+
 await step('amazon sp-api cleanup', async () => {
   await purgeTestOrders(`${TEST_ORDER}-AZSP`);
   await getPool().query(`DELETE FROM order_imports WHERE kind = 'amazon_sync' AND imported_by = $1`, [AZ_ACTOR]);
