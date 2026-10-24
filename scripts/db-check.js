@@ -27,6 +27,7 @@ import {
 } from '../lib/orders.js';
 import { saveUploadedDocument, router as ordersRouterForTest, destinationRouter as destinationRouterForTest } from '../lib/orders-routes.js';
 import { planAmazon, readTable, previewAmazonImport, commitAmazonImport } from '../lib/amazon-import.js';
+import { planSheet, previewBulkDispatch, commitBulkDispatch } from '../lib/bulk-dispatch.js';
 import { orderItems } from '../lib/orders.js';
 import {
   ensureInventorySchema, createSku, updateSku, getSku, skuDetail, receiveInventory, adjustStock, transferStock, updateBatch,
@@ -4511,6 +4512,111 @@ await step('order drawer unit total: packs counted as units; a platform line not
   if (bad.length) throw new Error(bad.join('; '));
   return '2×3 + 1 = "2 lines · 7 units"; unmapped only "units unknown"; mixed "6 known units · 1 unmapped line"; hand-entered in units; mapping later completes the totals; tooltip says "Map it in Inventory → Unmapped SKUs" only while a coded line is unmapped';
 });
+await step('bulk dispatch: file parser — column names, Excel-mangled AWB, repeats, one order with two AWBs, one AWB on two orders', async () => {
+  const couriers = [{ id: 1, name: 'Amazon Shipping' }, { id: 2, name: 'Delhivery' }];
+  const rows = planSheet([
+    ['﻿Amazon Order ID', 'Tracking ID', 'Courier'],
+    ['A-1', 'AWB-1', ''],
+    ['', '', ''],
+    ['A-2', '3.62E+11', ''],
+    ['A-3', 'AWB-3', 'Nobody Express'],
+    ['A-1', 'AWB-1', ''],
+    ['A-4', 'AWB-4A', ''], ['A-4', 'AWB-4B', ''],
+    ['A-5', 'AWB-S', 'delhivery'], ['A-6', 'AWB-S', 'Delhivery'],
+    ['A-7', 'AWB-S', ''],
+    ['A-8', '', ''],
+  ], couriers, 1);
+  const at = (n) => rows.find((r) => r.row === n);
+  const bad = [];
+  if (rows.length !== 10) bad.push(`rows ${rows.length}`);
+  if (at(2).status || at(2).courierId !== 1) bad.push(`plain ${JSON.stringify(at(2))}`);
+  if (at(4).status !== 'error' || !/Excel/.test(at(4).reason)) bad.push(`excel ${JSON.stringify(at(4))}`);
+  if (at(5).status !== 'error' || !/Unknown courier/.test(at(5).reason)) bad.push(`courier ${JSON.stringify(at(5))}`);
+  if (at(6).status !== 'duplicate') bad.push(`repeat ${JSON.stringify(at(6))}`);
+  if (at(7).status !== 'error' || at(8).status !== 'error' || !/more than once/.test(at(7).reason)) bad.push('two AWBs');
+  // Same AWB at the same courier (any letter case of its name) is refused; at another courier it is a different parcel.
+  if (at(9).status !== 'error' || at(10).status !== 'error' || !/more than one order/.test(at(9).reason) || at(11).status) bad.push(`shared AWB ${JSON.stringify([at(9), at(10), at(11)])}`);
+  if (at(12).status !== 'error' || at(12).reason !== 'No AWB.') bad.push('no AWB');
+  await expectErr('no awb column', async () => planSheet([['order-id', 'x'], ['A', 'B']], couriers, 1), (e) => e.status === 400);
+  if (!/Choose the courier/.test(planSheet([['order-id', 'awb'], ['A', 'B']], couriers, null)[0].reason || '')) bad.push('no courier');
+  if (bad.length) throw new Error(bad.join('; '));
+  return 'aliases and BOM read; blank rows skipped; Excel number, unknown courier, repeat, two AWBs, shared AWB and missing AWB each named';
+});
+
+await step('bulk dispatch: preview writes nothing and shares stock in file order; dispatch reserves FEFO, deducts, and is safe to run again', async () => {
+  const sku = (await createSku({ sku: `${TS}-BD-A`, product_name: 'Bulk dispatch test product' }, { actor: ACTOR })).id;
+  await addPlatformMappings(sku, PF.amazon, [`${TS}-BD-AMZ`], { actor: ACTOR });
+  await addPlatformMappings(sku, PF.amazon, [`${TS}-BD-P2`], { actor: ACTOR, unitsPerListing: 2 });
+  const early = (await receiveInventory({ sku_id: sku, batch_number: 'BD-EARLY', expiry_date: dayOffset(100), quantity: 3, request_id: rid() }, { actor: ACTOR })).batchId;
+  const late = (await receiveInventory({ sku_id: sku, batch_number: 'BD-LATE', expiry_date: dayOffset(300), quantity: 10, request_id: rid() }, { actor: ACTOR })).batchId;
+  const o1 = await lineOn('amazon', 'BD-1', `${TS}-BD-AMZ`, 2);   // 2 units
+  const o2 = await lineOn('amazon', 'BD-2', `${TS}-BD-P2`, 1);    // 1 pack of 2 = 2 units
+  const o3 = await lineOn('amazon', 'BD-3', `${TS}-BD-AMZ`, 10);  // 10 units: more than is left
+  await lineOn('amazon', 'BD-4', `${TS}-BD-UNMAPPED`, 1);
+  const o5 = await lineOn('amazon', 'BD-5', `${TS}-BD-AMZ`, 1);
+  const o6 = await lineOn('amazon', 'BD-6', `${TS}-BD-AMZ`, 1);
+  {
+    const c = await getPool().connect();
+    try { if (!(await isInventoryEligible(c, o1))) throw new Error('test orders are before the stock cutover; this step needs them to take part in stock'); } finally { c.release(); }
+  }
+  const delhivery = (await listCouriers()).find((x) => x.name === 'Delhivery').id;
+  // Order 6 is already packed by hand with its AWB: bulk dispatch uses that shipment rather than add one.
+  const { shipmentId: packed } = await createShipmentForOrders([o6], { courier_partner_id: delhivery, tracking_id: 'BD-AWB-6', shipment_status: 'packed' }, { actor: ACTOR });
+  const N = (n) => `${TEST_ORDER}-BD-${n}`;
+  const csv = ['order-id,awb', `${N(1)},BD-AWB-1`, `${N(2)},BD-AWB-2`, `${N(3)},BD-AWB-3`, `${N(4)},BD-AWB-4`, `${N(9)},BD-AWB-9`, `${N(1)},BD-AWB-1`, `${N(6)},BD-AWB-6`].join('\n');
+  const shipsOf = async (id) => (await getPool().query(`SELECT id, shipment_status, tracking_id, courier_partner_id FROM order_shipments WHERE order_id = $1 AND shipment_status <> 'cancelled' ORDER BY id`, [id])).rows;
+  // An order entered by hand starts with an empty "not ready" shipment; "touched" means anything beyond that.
+  const touched = async (id) => (await shipsOf(id)).some((x) => x.shipment_status !== 'not_ready' || x.tracking_id);
+  const bad = [];
+
+  const p = await previewBulkDispatch(Buffer.from(csv), 'bd.csv', { courierId: delhivery });
+  const st = (n) => p.rows.find((r) => r.orderId === N(n) && r.status !== 'duplicate');
+  if (st(1).status !== 'ready' || st(1).units !== 2) bad.push(`o1 ${JSON.stringify(st(1))}`);
+  if (st(2).status !== 'ready' || st(2).units !== 2) bad.push(`o2 pack ${JSON.stringify(st(2))}`);
+  if (st(3).status !== 'error' || !/Not enough stock/.test(st(3).reason) || !/needs 10, 9 left/.test(st(3).reason)) bad.push(`o3 short ${JSON.stringify(st(3))}`);
+  if (st(4).status !== 'error' || !/not mapped/.test(st(4).reason)) bad.push(`o4 unmapped ${JSON.stringify(st(4))}`);
+  if (st(9).status !== 'error' || !/No Amazon order/.test(st(9).reason)) bad.push(`missing ${JSON.stringify(st(9))}`);
+  if (st(6).status !== 'ready' || st(6).units !== 1) bad.push(`o6 packed ${JSON.stringify(st(6))}`);
+  if (p.summary.duplicates !== 1 || p.summary.ready !== 3 || p.summary.units !== 5) bad.push(`summary ${JSON.stringify(p.summary)}`);
+  const line = p.stock.find((x) => x.sku === `${TS}-BD-A`);
+  if (!line || line.needed !== 15 || line.available !== 13 || line.short !== 10) bad.push(`stock ${JSON.stringify(line)}`);
+  if (await touched(o1) || await touched(o2) || (await shipsOf(o6))[0].shipment_status !== 'packed') bad.push('preview wrote');
+
+  const ready = p.rows.filter((r) => r.status === 'ready');
+  const { results } = await commitBulkDispatch({ filename: 'bd.csv', rows: ready }, { actor: ACTOR });
+  if (results.length !== 3 || results.some((r) => r.status !== 'dispatched')) bad.push(`commit ${JSON.stringify(results)}`);
+  const s1s = await shipsOf(o1);
+  const s1 = s1s[0];
+  if (s1s.length !== 1 || !s1 || s1.shipment_status !== 'dispatched' || s1.tracking_id !== 'BD-AWB-1' || Number(s1.courier_partner_id) !== delhivery) bad.push(`o1 shipment ${JSON.stringify(s1)}`);
+  const s6 = await shipsOf(o6);
+  if (s6.length !== 1 || Number(s6[0].id) !== Number(packed) || s6[0].shipment_status !== 'dispatched') bad.push(`o6 reused ${JSON.stringify(s6)}`);
+  // FEFO: order 1 takes 2 of the early batch, order 2 the last early unit and one late, order 6 one late.
+  const onHand = async (b) => (await getPool().query('SELECT on_hand FROM inventory_batches WHERE id = $1', [b])).rows[0].on_hand;
+  if (await onHand(early) !== 0 || await onHand(late) !== 8) bad.push(`batches early ${await onHand(early)} late ${await onHand(late)}`);
+  const moved = (await getPool().query(`SELECT order_id, -sum(quantity)::int q FROM inventory_movements WHERE movement_type = 'shipment_dispatched' AND order_id = ANY($1) GROUP BY order_id`, [[o1, o2, o6]])).rows;
+  const q = (id) => moved.find((m) => Number(m.order_id) === Number(id))?.q;
+  if (q(o1) !== 2 || q(o2) !== 2 || q(o6) !== 1) bad.push(`movements ${JSON.stringify(moved)}`);
+
+  // Again: nothing happens twice.
+  const again = await commitBulkDispatch({ rows: ready }, { actor: ACTOR });
+  if (again.results.some((r) => r.status !== 'already')) bad.push(`rerun ${JSON.stringify(again.results)}`);
+  if (await onHand(late) !== 8) bad.push('rerun deducted');
+  const p2 = await previewBulkDispatch(Buffer.from(csv), 'bd.csv', { courierId: delhivery });
+  if (p2.summary.already !== 3 || p2.summary.ready !== 0) bad.push(`preview after ${JSON.stringify(p2.summary)}`);
+  // Order 3 still cannot go (8 left, it needs 10), and a refusal leaves its shipment as it was.
+  const short = await commitBulkDispatch({ rows: [{ row: 4, orderId: N(3), awb: 'BD-AWB-3', courierId: delhivery }] }, { actor: ACTOR });
+  if (short.results[0].status !== 'error' || !/Not enough stock/.test(short.results[0].reason)) bad.push(`short commit ${JSON.stringify(short.results)}`);
+  if (await touched(o3)) bad.push('short changed its shipment');
+  // An AWB already on another order's shipment at this courier is refused; another AWB on a dispatched order too.
+  const dupe = await commitBulkDispatch({ rows: [{ row: 2, orderId: N(5), awb: 'bd-awb-1', courierId: delhivery }, { row: 3, orderId: N(1), awb: 'BD-AWB-OTHER', courierId: delhivery }] }, { actor: ACTOR });
+  if (dupe.results[0].status !== 'error' || !/already used by order/.test(dupe.results[0].reason)) bad.push(`dup awb ${JSON.stringify(dupe.results[0])}`);
+  if (dupe.results[1].status !== 'error' || !/already has a shipment/.test(dupe.results[1].reason)) bad.push(`other awb ${JSON.stringify(dupe.results[1])}`);
+  if (await touched(o5)) bad.push('dup awb changed its shipment');
+  await expectErr('too many rows', () => commitBulkDispatch({ rows: Array.from({ length: 26 }, (_, i) => ({ row: i, orderId: 'x', awb: 'y', courierId: delhivery })) }, { actor: ACTOR }), (e) => e.status === 400);
+  if (bad.length) throw new Error(bad.join('; '));
+  return 'preview: 3 ready, 5 units, short / unmapped / missing / repeat named, nothing written; dispatch: FEFO across batches, pack of 2 = 2 units, packed shipment reused; rerun skipped; short and duplicate-AWB rows refused with nothing left behind';
+});
+
 await step('master SKU import: parser — Briyo SKU + Product Name only; platform columns ignored with a warning', async () => {
   const two = planSkuSheet([['Briyo SKU', 'Product Name'], ['A1', 'Alpha'], ['', ''], ['A2', '  Beta   capsules ']]);
   if (two.errors.length || two.warnings.length || two.masters.map((m) => `${m.sku}:${m.name}`).join('|') !== 'A1:Alpha|A2:Beta capsules') throw new Error(JSON.stringify(two));
