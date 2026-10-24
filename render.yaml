@@ -1,14 +1,14 @@
-# Render Blueprint — free tier, no credit card required.
-# Create the service from this file: Render dashboard -> New -> Blueprint.
+# Render Blueprint. Create the service from this file: Render dashboard -> New -> Blueprint.
 #
-# Free web services sleep after 15 minutes of inactivity and take about a minute
-# to wake. Keep one warm by pinging /healthz every 10 minutes (see README).
+# Production runs on the Standard instance type. Keep `plan` matching the
+# dashboard: a Blueprint sync applies it, so a stale value would change the
+# live instance.
 
 services:
   - type: web
     name: abc-briyo
     runtime: node
-    plan: free
+    plan: standard
     region: singapore          # closest Render region to India
     branch: main
     buildCommand: npm ci
