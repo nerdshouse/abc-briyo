@@ -2011,7 +2011,7 @@ function openShipNew() {
 
 function closeShipNew() {
   $('#shipDrawer').hidden = true;
-  if ($('#drawer').hidden && $('#formDrawer').hidden && $('#createDrawer').hidden && $('#importDrawer').hidden) $('#drawerScrim').hidden = true;
+  if ($('#drawer').hidden && $('#formDrawer').hidden && $('#createDrawer').hidden && $('#importDrawer').hidden && $('#bulkDrawer').hidden) $('#drawerScrim').hidden = true;
 }
 
 async function submitShipNew(e) {
@@ -2080,7 +2080,7 @@ async function loadImportHistory() {
 function closeImport() {
   if (imp.busy) return;
   $('#importDrawer').hidden = true;
-  if ($('#drawer').hidden && $('#formDrawer').hidden && $('#createDrawer').hidden) $('#drawerScrim').hidden = true;
+  if ($('#drawer').hidden && $('#formDrawer').hidden && $('#createDrawer').hidden && $('#bulkDrawer').hidden) $('#drawerScrim').hidden = true;
 }
 
 const importError = (msg) => { $('#iError').textContent = msg; $('#iError').hidden = !msg; };
@@ -2186,6 +2186,156 @@ async function commitImport() {
   } finally {
     imp.busy = false;
   }
+}
+
+/* ---------------------------------------------------- Amazon bulk dispatch */
+
+// The server takes at most this many rows per request (lib/bulk-dispatch.js MAX_COMMIT_ROWS), so no request runs long.
+const BULK_CHUNK = 25;
+const bulk = { file: null, rows: [], busy: false, done: false };
+const bulkError = (msg) => { $('#bError').textContent = msg; $('#bError').hidden = !msg; };
+const bulkLeaveGuard = (e) => { e.preventDefault(); e.returnValue = ''; };
+
+function openBulk() {
+  Object.assign(bulk, { file: null, rows: [], done: false });
+  $('#bFile').value = '';
+  $('#bResult').innerHTML = '';
+  bulkError('');
+  $('#bSaved').textContent = '';
+  const couriers = state.meta.couriers.filter((c) => c.active);
+  const amazon = couriers.find((c) => /^amazon/i.test(c.name));
+  $('#bCourier').innerHTML = opt('', 'Choose the courier') + couriers.map((c) => opt(c.id, c.name, amazon && c.id === amazon.id)).join('');
+  $('#bSubmit').disabled = true;
+  $('#bSubmit').textContent = 'Dispatch';
+  $('#bCancel').textContent = 'Cancel';
+  $('#bulkDrawer').hidden = false;
+  $('#drawerScrim').hidden = false;
+  $('#bFile').focus();
+}
+
+function closeBulk() {
+  if (bulk.busy) return;
+  $('#bulkDrawer').hidden = true;
+  if ($('#drawer').hidden && $('#formDrawer').hidden && $('#createDrawer').hidden && $('#importDrawer').hidden && $('#shipDrawer').hidden) $('#drawerScrim').hidden = true;
+}
+
+function downloadBulkTemplate(e) {
+  e.preventDefault();
+  const csv = 'order-id,awb,courier\n402-1234567-1234567,AWB-FOR-THIS-ORDER,Amazon Shipping\n';
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([csv], { type: 'text/csv' }));
+  a.download = 'bulk-dispatch-template.csv';
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+}
+
+const BULK_STATUS = { ready: 'Ready', already: 'Already dispatched', duplicate: 'Repeated row', error: 'Problem', dispatched: 'Dispatched' };
+
+function bulkRowsTable(rows, { units = false } = {}) {
+  return `<div class="imp-scroll"><table class="imp-errors"><thead><tr><th>Row</th><th>Order</th><th>AWB</th><th>Courier</th>${units ? '<th>Units</th>' : '<th>Reason</th>'}</tr></thead><tbody>
+    ${rows.map((r) => `<tr><td class="mono">${r.row ?? '—'}</td><td class="mono">${esc(r.orderId || '—')}</td><td class="mono">${esc(r.awb || '—')}</td><td>${esc(r.courier || '—')}</td>
+      ${units ? `<td class="num">${count(r.units || 0)}${r.note ? ` <span class="soft">${esc(r.note)}</span>` : ''}</td>` : `<td>${esc(r.reason || BULK_STATUS[r.status] || '')}</td>`}</tr>`).join('')}
+  </tbody></table></div>`;
+}
+
+async function previewBulk() {
+  bulkError('');
+  $('#bSubmit').disabled = true;
+  bulk.rows = [];
+  if (!bulk.file) { $('#bResult').innerHTML = ''; return; }
+  $('#bResult').innerHTML = '<section class="dsec"><p class="muted" style="margin:0">Checking the file…</p></section>';
+  try {
+    const res = await fetch(`/api/orders/bulk-dispatch/preview?courier=${encodeURIComponent($('#bCourier').value)}`, {
+      method: 'POST', body: bulk.file, headers: { 'x-filename': encodeURIComponent(bulk.file.name) },
+    });
+    const p = await res.json().catch(() => ({ ok: false, error: res.status === 413 ? 'The file is too large (15 MB at most).' : `HTTP ${res.status}` }));
+    if (!res.ok || p.ok === false) throw new Error(p.error || `HTTP ${res.status}`);
+    const s = p.summary;
+    const ready = p.rows.filter((r) => r.status === 'ready');
+    const problems = p.rows.filter((r) => r.status === 'error' || r.status === 'duplicate');
+    const already = p.rows.filter((r) => r.status === 'already');
+    bulk.rows = ready;
+    $('#bResult').innerHTML = `
+      <section class="dsec">
+        <h3 class="dsec-title">Preview <span class="dsec-meta soft">nothing saved yet</span></h3>
+        <div class="imp-stats">
+          ${stat(s.rows, 'Rows in file')}
+          ${stat(s.ready, 'Ready to dispatch')}
+          ${stat(s.units, 'Units to deduct')}
+          ${stat(s.already, 'Already dispatched')}
+          ${stat(s.errors, 'Rows with problems', s.errors ? 'bad' : '')}
+          ${stat(s.duplicates, 'Repeated rows', s.duplicates ? 'warn' : '')}
+        </div>
+        ${s.errors ? '<p class="imp-note">Rows with problems are left out; the rest can still go. Fix them and upload the same file again — what was dispatched is skipped.</p>' : ''}
+      </section>
+      ${p.stock.length ? `<section class="dsec">
+        <h3 class="dsec-title">Stock <span class="dsec-meta soft">${count(p.stock.length)} SKU${p.stock.length > 1 ? 's' : ''}</span></h3>
+        <div class="imp-scroll"><table class="imp-errors"><thead><tr><th>SKU</th><th>Needed</th><th>Available</th><th>Short</th></tr></thead><tbody>
+          ${p.stock.map((x) => `<tr><td class="mono">${esc(x.sku)}</td><td class="num">${count(x.needed)}</td><td class="num">${count(x.available)}</td><td class="num">${x.short ? `<b>${count(x.short)}</b>` : '—'}</td></tr>`).join('')}
+        </tbody></table></div>
+        ${p.stock.some((x) => x.short) ? '<p class="imp-note">When a SKU runs short, rows are served in file order: the later ones wait. Receive the stock in Inventory, then upload the file again.</p>' : ''}
+      </section>` : ''}
+      ${problems.length ? `<section class="dsec"><h3 class="dsec-title">Rows left out <span class="dsec-meta soft">${count(problems.length)}</span></h3>${bulkRowsTable(problems)}</section>` : ''}
+      ${ready.length ? `<details class="dsec"><summary class="dsec-title" style="cursor:pointer">Ready to dispatch <span class="dsec-meta soft">${count(ready.length)}</span></summary>${bulkRowsTable(ready, { units: true })}</details>` : ''}
+      ${already.length ? `<details class="dsec"><summary class="dsec-title" style="cursor:pointer">Already dispatched <span class="dsec-meta soft">${count(already.length)}, skipped</span></summary>${bulkRowsTable(already)}</details>` : ''}`;
+    $('#bSubmit').disabled = !ready.length;
+    $('#bSubmit').textContent = ready.length ? `Dispatch ${count(ready.length)} order${ready.length > 1 ? 's' : ''}` : 'Nothing to dispatch';
+  } catch (err) {
+    $('#bResult').innerHTML = '';
+    bulkError(err.message);
+  }
+}
+
+async function commitBulk() {
+  if (!bulk.rows.length || bulk.busy) return;
+  bulk.busy = true;
+  $('#bSubmit').disabled = true;
+  $('#bCancel').disabled = true;
+  window.addEventListener('beforeunload', bulkLeaveGuard);
+  const total = bulk.rows.length;
+  const results = [];
+  let stopped = null;
+  try {
+    for (let i = 0; i < total; i += BULK_CHUNK) {
+      $('#bSaved').textContent = `Dispatching… ${count(i)} of ${count(total)}`;
+      try {
+        const r = await api('/api/orders/bulk-dispatch/commit', {
+          method: 'POST',
+          body: JSON.stringify({ filename: bulk.file?.name, rows: bulk.rows.slice(i, i + BULK_CHUNK).map(({ row, orderId, awb, courierId }) => ({ row, orderId, awb, courierId })) }),
+        });
+        results.push(...r.results);
+      } catch (err) { stopped = { at: i, message: err.message }; break; }
+    }
+  } finally {
+    bulk.busy = false;
+    $('#bCancel').disabled = false;
+    window.removeEventListener('beforeunload', bulkLeaveGuard);
+  }
+  const courierOf = new Map(bulk.rows.map((r) => [r.row, r.courier]));
+  const withCourier = (list) => list.map((r) => ({ ...r, courier: courierOf.get(r.row) }));
+  const sent = results.filter((r) => r.status === 'dispatched');
+  const already = results.filter((r) => r.status === 'already');
+  const failed = withCourier(results.filter((r) => r.status === 'error'));
+  bulk.done = true;
+  bulk.rows = [];
+  $('#bResult').innerHTML = `
+    <section class="dsec">
+      <h3 class="dsec-title">${stopped ? 'Stopped' : 'Dispatched'} ${stopped || failed.length ? '' : `<span class="dsec-meta">${indicator('completed')}</span>`}</h3>
+      <div class="imp-stats">
+        ${stat(sent.length, 'Orders dispatched')}
+        ${stat(sent.reduce((s, r) => s + (r.units || 0), 0), 'Units deducted')}
+        ${stat(already.length, 'Already dispatched')}
+        ${stat(failed.length, 'Not dispatched', failed.length ? 'bad' : '')}
+      </div>
+      ${stopped ? `<p class="imp-note"><b>Stopped after ${count(stopped.at)} of ${count(total)} rows:</b> ${esc(stopped.message)} The orders dispatched so far are saved. Upload the same file again to finish the rest; those already dispatched are skipped.</p>` : ''}
+    </section>
+    ${failed.length ? `<section class="dsec"><h3 class="dsec-title">Not dispatched <span class="dsec-meta soft">${count(failed.length)}</span></h3>
+      <p class="imp-note" style="margin:0 0 4px">Nothing was changed for these orders.</p>${bulkRowsTable(failed)}</section>` : ''}`;
+  $('#bSaved').textContent = '';
+  $('#bSubmit').textContent = 'Done';
+  $('#bSubmit').disabled = false;
+  $('#bCancel').textContent = 'Close';
+  load();
 }
 
 /* ------------------------------------------------------------------ Shopify button: sync new and changed orders */
@@ -2450,6 +2600,13 @@ function bind() {
   $('#iCancel').addEventListener('click', closeImport);
   $('#iFile').addEventListener('change', (e) => { imp.file = e.target.files[0] || null; imp.done = false; previewImport(); });
   $('#iSubmit').addEventListener('click', () => (imp.done ? closeImport() : commitImport()));
+  $('#bulkDispatch').addEventListener('click', openBulk);
+  $('#bClose').addEventListener('click', closeBulk);
+  $('#bCancel').addEventListener('click', closeBulk);
+  $('#bTemplate').addEventListener('click', downloadBulkTemplate);
+  $('#bFile').addEventListener('change', (e) => { bulk.file = e.target.files[0] || null; bulk.done = false; previewBulk(); });
+  $('#bCourier').addEventListener('change', () => { if (bulk.file && !bulk.busy) { bulk.done = false; previewBulk(); } });
+  $('#bSubmit').addEventListener('click', () => (bulk.done ? closeBulk() : commitBulk()));
   $('#cClose').addEventListener('click', closeCreate);
   $('#cCancel').addEventListener('click', closeCreate);
   $('#dClose').addEventListener('click', closeDrawer);
@@ -2457,6 +2614,7 @@ function bind() {
   $('#fCancel').addEventListener('click', closeForm);
   const closeTop = () => {
     if (!$('#shipDrawer').hidden) closeShipNew();
+    else if (!$('#bulkDrawer').hidden) closeBulk();
     else if (!$('#importDrawer').hidden) closeImport();
     else if (!$('#createDrawer').hidden) closeCreate();
     else if (!$('#formDrawer').hidden) closeForm();
