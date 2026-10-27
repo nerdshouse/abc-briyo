@@ -4617,6 +4617,75 @@ await step('bulk dispatch: preview writes nothing and shares stock in file order
   return 'preview: 3 ready, 5 units, short / unmapped / missing / repeat named, nothing written; dispatch: FEFO across batches, pack of 2 = 2 units, packed shipment reused; rerun skipped; short and duplicate-AWB rows refused with nothing left behind';
 });
 
+await step('bulk dispatch: website orders — Shopify number with or without "#", per-row courier, Buy with Amazon and Delta Velocity orders refused, channels kept apart', async () => {
+  const code = `${TS}-BDW-A`;
+  const sku = (await createSku({ sku: code, product_name: 'Bulk dispatch website test product' }, { actor: ACTOR })).id;
+  await receiveInventory({ sku_id: sku, batch_number: 'BDW-1', expiry_date: dayOffset(200), quantity: 10, request_id: rid() }, { actor: ACTOR });
+  const N = (n) => `${TEST_ORDER}-BDW-${n}`;
+  // A synced order: source_order_id is Shopify's id, its "#number" is in the payload (as lib/shopify-orders.js keeps it).
+  const synced = async (n, tags = []) => {
+    const id = await lineOn('website', `BDW-GID-${n}`, code, 1);
+    await getPool().query(`UPDATE orders SET source_payload = jsonb_build_object('shopify', jsonb_build_object('name', $2::text, 'tags', $3::jsonb)) WHERE id = $1`,
+      [id, `#${N(n)}`, JSON.stringify(tags)]);
+    return id;
+  };
+  const w1 = await synced(1);                               // file gives the number without "#"
+  const w2 = await lineOn('website', 'BDW-2', code, 2);     // entered by hand; file gives it with "#"
+  const w3 = await synced(3, ['Buy with Amazon']);
+  const w4 = await lineOn('website', 'BDW-4', code, 1);
+  await getPool().query(
+    `INSERT INTO order_shipments (order_id, shipment_status, external_source, external_provider, external_fulfillment_id, external_carrier, tracking_id, created_by, updated_by)
+     VALUES ($1, 'packed', 'shopify', 'deltavelocity', $2, 'Delta Velocity', 'BDW-DV-4', $3, $3)`, [w4, `gid://shopify/Fulfillment/77${String(Date.now()).slice(-9)}`, ACTOR]);
+  await lineOn('amazon', 'BDW-5', code, 1);
+  const couriers = await listCouriers();
+  const delhivery = couriers.find((x) => x.name === 'Delhivery');
+  const other = couriers.find((x) => x.id !== delhivery.id && x.active !== false && !/,|"/.test(x.name));
+  if (!other) throw new Error('needs a second courier');
+  const csv = Buffer.from(['order-id,awb,courier', `${N(1)},BDW-AWB-1,Delhivery`, `#${N(2)},BDW-AWB-2,${other.name}`, `${N(3)},BDW-AWB-3,Delhivery`,
+    `${N(4)},BDW-AWB-4,Delhivery`, `${N(5)},BDW-AWB-5,Delhivery`, `#${N(1)},BDW-AWB-1,Delhivery`].join('\n'));
+  const moved = async (id) => (await getPool().query(`SELECT -coalesce(sum(quantity), 0)::int q FROM inventory_movements WHERE movement_type = 'shipment_dispatched' AND order_id = $1`, [id])).rows[0].q;
+  const shipsOf = async (id) => (await getPool().query(`SELECT shipment_status, tracking_id, courier_partner_id, external_provider FROM order_shipments WHERE order_id = $1 AND shipment_status <> 'cancelled' ORDER BY id`, [id])).rows;
+  const bad = [];
+
+  const p = await previewBulkDispatch(csv, 'bdw.csv', { channel: 'website' });
+  const st = (rows, n) => rows.find((r) => r.orderId.replace(/^#/, '') === N(n) && r.status !== 'duplicate');
+  if (p.channel !== 'website') bad.push(`channel ${p.channel}`);
+  if (st(p.rows, 1).status !== 'ready' || st(p.rows, 1).units !== 1 || st(p.rows, 1).courierId !== delhivery.id) bad.push(`synced ${JSON.stringify(st(p.rows, 1))}`);
+  if (st(p.rows, 2).status !== 'ready' || st(p.rows, 2).units !== 2 || st(p.rows, 2).courierId !== other.id) bad.push(`"#" by hand ${JSON.stringify(st(p.rows, 2))}`);
+  if (st(p.rows, 3).status !== 'error' || !/Buy with Amazon/.test(st(p.rows, 3).reason)) bad.push(`bwa ${JSON.stringify(st(p.rows, 3))}`);
+  if (st(p.rows, 4).status !== 'error' || !/Delta Velocity/.test(st(p.rows, 4).reason)) bad.push(`dv ${JSON.stringify(st(p.rows, 4))}`);
+  if (st(p.rows, 5).status !== 'error' || !/No website order/.test(st(p.rows, 5).reason)) bad.push(`amazon order in a website file ${JSON.stringify(st(p.rows, 5))}`);
+  if (p.summary.duplicates !== 1 || p.summary.ready !== 2 || p.summary.units !== 3) bad.push(`summary ${JSON.stringify(p.summary)}`);
+  if (await moved(w1) || (await shipsOf(w1)).some((x) => x.shipment_status !== 'not_ready' || x.tracking_id)) bad.push('preview wrote');
+
+  // The same file as Amazon: the website numbers are not Amazon orders; the Amazon one is.
+  const pa = await previewBulkDispatch(csv, 'bdw.csv', {});
+  if (pa.channel !== 'amazon' || !/No Amazon order/.test(st(pa.rows, 3).reason || '') || st(pa.rows, 5).status !== 'ready') bad.push(`as amazon ${JSON.stringify([pa.channel, st(pa.rows, 3), st(pa.rows, 5)])}`);
+  await expectErr('unknown channel', () => previewBulkDispatch(csv, 'bdw.csv', { channel: 'blinkit' }), (e) => e.status === 400);
+
+  const { results } = await commitBulkDispatch({ filename: 'bdw.csv', channel: 'website', rows: p.rows.filter((r) => r.status === 'ready') }, { actor: ACTOR });
+  if (results.length !== 2 || results.some((r) => r.status !== 'dispatched')) bad.push(`commit ${JSON.stringify(results)}`);
+  const [s1] = await shipsOf(w1);
+  const [s2] = await shipsOf(w2);
+  if (s1?.shipment_status !== 'dispatched' || s1.tracking_id !== 'BDW-AWB-1' || Number(s1.courier_partner_id) !== delhivery.id) bad.push(`w1 shipment ${JSON.stringify(s1)}`);
+  if (s2?.shipment_status !== 'dispatched' || s2.tracking_id !== 'BDW-AWB-2' || Number(s2.courier_partner_id) !== other.id) bad.push(`w2 shipment ${JSON.stringify(s2)}`);
+  if (await moved(w1) !== 1 || await moved(w2) !== 2) bad.push(`deducted ${await moved(w1)} / ${await moved(w2)}`);
+
+  // Sent straight to dispatch (not from the preview), BWA and DV are refused again and left as they were.
+  const forced = await commitBulkDispatch({ channel: 'website', rows: [{ row: 4, orderId: N(3), awb: 'BDW-AWB-3', courierId: delhivery.id }, { row: 5, orderId: `#${N(4)}`, awb: 'BDW-AWB-4', courierId: delhivery.id }] }, { actor: ACTOR });
+  if (!/Buy with Amazon/.test(forced.results[0].reason || '') || !/Delta Velocity/.test(forced.results[1].reason || '')) bad.push(`forced ${JSON.stringify(forced.results)}`);
+  if (await moved(w3) || await moved(w4) || (await shipsOf(w3)).some((x) => x.tracking_id) || !(await shipsOf(w4)).some((x) => x.external_provider === 'deltavelocity' && x.shipment_status === 'packed')) bad.push('refused rows changed');
+  if ((await shipsOf(w4)).some((x) => x.tracking_id === 'BDW-AWB-4')) bad.push('dv order got the file AWB');
+
+  // Again, with the other spelling of the number: nothing happens twice.
+  const again = await commitBulkDispatch({ channel: 'website', rows: [{ row: 2, orderId: `#${N(1)}`, awb: 'BDW-AWB-1', courierId: delhivery.id }, { row: 3, orderId: N(2), awb: 'BDW-AWB-2', courierId: other.id }] }, { actor: ACTOR });
+  if (again.results.some((r) => r.status !== 'already')) bad.push(`rerun ${JSON.stringify(again.results)}`);
+  if (await moved(w1) !== 1 || await moved(w2) !== 2) bad.push('rerun deducted');
+  await expectErr('unknown channel on commit', () => commitBulkDispatch({ channel: 'nowhere', rows: [{ row: 1, orderId: N(1), awb: 'x', courierId: delhivery.id }] }, { actor: ACTOR }), (e) => e.status === 400);
+  if (bad.length) throw new Error(bad.join('; '));
+  return 'synced order found by its "#number" (file without "#"), hand-entered one with "#"; per-row couriers kept; BWA and DV refused in preview and dispatch with nothing changed; an Amazon number is not a website order (and vice versa); rerun skipped';
+});
+
 await step('bundles: contents rules; a bundle holds no stock; its orders reserve and deduct each product inside (by hand, in bulk dispatch, mixed with a loose line)', async () => {
   const bad = [];
   const mk = async (code, name) => (await createSku({ sku: `${TS}-BN-${code}`, product_name: name }, { actor: ACTOR })).id;

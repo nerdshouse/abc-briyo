@@ -2188,11 +2188,16 @@ async function commitImport() {
   }
 }
 
-/* ---------------------------------------------------- Amazon bulk dispatch */
+/* ---------------------------------------------------- bulk dispatch (Amazon or website) */
 
 // The server takes at most this many rows per request (lib/bulk-dispatch.js MAX_COMMIT_ROWS), so no request runs long.
 const BULK_CHUNK = 25;
-const bulk = { file: null, rows: [], busy: false, done: false };
+const bulk = { file: null, rows: [], busy: false, done: false, channel: 'amazon' };
+// The channels a file can be for (lib/bulk-dispatch.js CHANNELS): what the order id is, and a template row.
+const BULK_CHANNELS = {
+  amazon: { help: 'Amazon order ids, from orders already imported from the order report.', example: '402-1234567-1234567,AWB-FOR-THIS-ORDER,Amazon Shipping' },
+  website: { help: 'Shopify order numbers (#1001 or 1001). Buy with Amazon and Delta Velocity orders are refused: their parcels come from Shopify.', example: '#1001,AWB-FOR-THIS-ORDER,Delhivery' },
+};
 const bulkError = (msg) => { $('#bError').textContent = msg; $('#bError').hidden = !msg; };
 const bulkLeaveGuard = (e) => { e.preventDefault(); e.returnValue = ''; };
 
@@ -2202,15 +2207,24 @@ function openBulk() {
   $('#bResult').innerHTML = '';
   bulkError('');
   $('#bSaved').textContent = '';
-  const couriers = state.meta.couriers.filter((c) => c.active);
-  const amazon = couriers.find((c) => /^amazon/i.test(c.name));
-  $('#bCourier').innerHTML = opt('', 'Choose the courier') + couriers.map((c) => opt(c.id, c.name, amazon && c.id === amazon.id)).join('');
+  const channels = state.meta.channels.filter((c) => BULK_CHANNELS[c.key]);
+  $('#bChannel').innerHTML = channels.map((c) => opt(c.key, c.label, c.key === 'amazon')).join('');
+  bulkChannelChanged();
   $('#bSubmit').disabled = true;
   $('#bSubmit').textContent = 'Dispatch';
   $('#bCancel').textContent = 'Cancel';
   $('#bulkDrawer').hidden = false;
   $('#drawerScrim').hidden = false;
   $('#bFile').focus();
+}
+
+// Amazon orders mostly go with Amazon's own courier; website orders with one of ours, so there is no default.
+function bulkChannelChanged() {
+  const ch = $('#bChannel').value;
+  const couriers = state.meta.couriers.filter((c) => c.active);
+  const amazon = ch === 'amazon' && couriers.find((c) => /^amazon/i.test(c.name));
+  $('#bCourier').innerHTML = opt('', 'Choose the courier') + couriers.map((c) => opt(c.id, c.name, amazon && c.id === amazon.id)).join('');
+  $('#bChannelHelp').textContent = BULK_CHANNELS[ch]?.help || '';
 }
 
 function closeBulk() {
@@ -2221,7 +2235,7 @@ function closeBulk() {
 
 function downloadBulkTemplate(e) {
   e.preventDefault();
-  const csv = 'order-id,awb,courier\n402-1234567-1234567,AWB-FOR-THIS-ORDER,Amazon Shipping\n';
+  const csv = `order-id,awb,courier\n${(BULK_CHANNELS[$('#bChannel').value] || BULK_CHANNELS.amazon).example}\n`;
   const a = document.createElement('a');
   a.href = URL.createObjectURL(new Blob([csv], { type: 'text/csv' }));
   a.download = 'bulk-dispatch-template.csv';
@@ -2245,7 +2259,7 @@ async function previewBulk() {
   if (!bulk.file) { $('#bResult').innerHTML = ''; return; }
   $('#bResult').innerHTML = '<section class="dsec"><p class="muted" style="margin:0">Checking the file…</p></section>';
   try {
-    const res = await fetch(`/api/orders/bulk-dispatch/preview?courier=${encodeURIComponent($('#bCourier').value)}`, {
+    const res = await fetch(`/api/orders/bulk-dispatch/preview?channel=${encodeURIComponent($('#bChannel').value)}&courier=${encodeURIComponent($('#bCourier').value)}`, {
       method: 'POST', body: bulk.file, headers: { 'x-filename': encodeURIComponent(bulk.file.name) },
     });
     const p = await res.json().catch(() => ({ ok: false, error: res.status === 413 ? 'The file is too large (15 MB at most).' : `HTTP ${res.status}` }));
@@ -2255,6 +2269,7 @@ async function previewBulk() {
     const problems = p.rows.filter((r) => r.status === 'error' || r.status === 'duplicate');
     const already = p.rows.filter((r) => r.status === 'already');
     bulk.rows = ready;
+    bulk.channel = p.channel;
     $('#bResult').innerHTML = `
       <section class="dsec">
         <h3 class="dsec-title">Preview <span class="dsec-meta soft">nothing saved yet</span></h3>
@@ -2301,7 +2316,7 @@ async function commitBulk() {
       try {
         const r = await api('/api/orders/bulk-dispatch/commit', {
           method: 'POST',
-          body: JSON.stringify({ filename: bulk.file?.name, rows: bulk.rows.slice(i, i + BULK_CHUNK).map(({ row, orderId, awb, courierId }) => ({ row, orderId, awb, courierId })) }),
+          body: JSON.stringify({ filename: bulk.file?.name, channel: bulk.channel, rows: bulk.rows.slice(i, i + BULK_CHUNK).map(({ row, orderId, awb, courierId }) => ({ row, orderId, awb, courierId })) }),
         });
         results.push(...r.results);
       } catch (err) { stopped = { at: i, message: err.message }; break; }
@@ -2606,6 +2621,7 @@ function bind() {
   $('#bTemplate').addEventListener('click', downloadBulkTemplate);
   $('#bFile').addEventListener('change', (e) => { bulk.file = e.target.files[0] || null; bulk.done = false; previewBulk(); });
   $('#bCourier').addEventListener('change', () => { if (bulk.file && !bulk.busy) { bulk.done = false; previewBulk(); } });
+  $('#bChannel').addEventListener('change', () => { bulkChannelChanged(); if (bulk.file && !bulk.busy) { bulk.done = false; previewBulk(); } });
   $('#bSubmit').addEventListener('click', () => (bulk.done ? closeBulk() : commitBulk()));
   $('#cClose').addEventListener('click', closeCreate);
   $('#cCancel').addEventListener('click', closeCreate);
