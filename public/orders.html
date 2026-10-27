@@ -44,7 +44,7 @@
           <button class="btn" id="shopifyOrders" type="button" hidden title="Sync new and changed Shopify orders"><img class="shopify-mark" src="/brand/shopify-bag.svg" alt="" aria-hidden="true" width="16" height="18" /><span id="shopifyLabel">Shopify</span></button>
           <button class="btn" id="amazonOrders" type="button" hidden title="Sync new and changed Amazon orders" aria-label="Sync Amazon orders"><i data-lucide="package"></i><span id="amazonLabel">Amazon</span></button>
           <button class="btn" id="importOrders" type="button" data-cap="logistics.edit"><i data-lucide="upload"></i>Import</button>
-          <button class="btn" id="bulkDispatch" type="button" data-cap="logistics.edit" title="Dispatch many Amazon orders from a file of order ids and AWBs"><i data-lucide="truck"></i>Bulk dispatch</button>
+          <button class="btn" id="bulkDispatch" type="button" data-cap="logistics.edit" title="Dispatch many Amazon or website orders from a file of order ids and AWBs"><i data-lucide="truck"></i>Bulk dispatch</button>
           <button class="btn primary" id="newShipment" type="button" data-cap="logistics.edit"><i data-lucide="plus"></i>New shipment</button>
         </div>
       </div>
@@ -339,13 +339,15 @@
 
 <aside class="drawer drawer-wide" id="bulkDrawer" hidden aria-label="Bulk dispatch">
   <div class="drawer-head">
-    <div><h2 class="drawer-title">Bulk dispatch</h2><div class="drawer-sub">Amazon orders already imported, one AWB each. You see what will happen before anything is saved.</div></div>
+    <div><h2 class="drawer-title">Bulk dispatch</h2><div class="drawer-sub">Amazon or website orders already in Briyo, one AWB each. You see what will happen before anything is saved.</div></div>
     <div class="drawer-nav"><button class="icon-btn" id="bClose" type="button" title="Close" aria-label="Close"><i data-lucide="x"></i></button></div>
   </div>
   <div class="drawer-body">
     <div class="form-error" id="bError" role="alert" hidden></div>
     <section class="dsec">
       <div class="form-grid">
+        <label class="fld"><span>Channel</span><select class="select" id="bChannel"></select>
+          <span class="help" id="bChannelHelp"></span></label>
         <label class="fld"><span>Courier</span><select class="select" id="bCourier"></select>
           <span class="help">For every row, unless the file has a courier column.</span></label>
         <label class="fld wide"><span>Dispatch file</span>
