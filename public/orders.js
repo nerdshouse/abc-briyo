@@ -1915,7 +1915,7 @@ function renderStock() {
         <span>${isMarketplace(st.channel) && (l.codes || []).some((c) => c.toLowerCase() !== l.sku.toLowerCase())
           ? `SKU <b class="mono">${esc((l.codes || []).join(', ') || '—')}</b> · Briyo SKU <a class="mono" href="/inventory?sku=${l.sku_id}">${esc(l.sku)}</a>`
           : `SKU <b><a class="mono" href="/inventory?sku=${l.sku_id}">${esc(l.sku)}</a></b>`}
-          <span class="soft">${esc(l.product_name)}${l.variant_name ? ` · ${esc(l.variant_name)}` : ''}</span></span>
+          <span class="soft">${esc(l.product_name)}${l.variant_name ? ` · ${esc(l.variant_name)}` : ''}</span>${l.bundles?.length ? ` <span class="mini-tag">in bundle ${esc(l.bundles.join(', '))}</span>` : ''}</span>
         <span class="stock-nums">${st.split && !done
           ? `<b>${count(l.required)}</b> left to send of ${count(l.ordered)} ordered`
           : `<b>${count(l.required)}</b> needed`}${done ? '' : ` · ${count(l.available)} available to dispatch ${l.enough ? '<span class="ok-mark">✓</span>' : '<span class="mini-tag warn">Insufficient</span>'}`}</span>

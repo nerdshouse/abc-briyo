@@ -34,7 +34,7 @@ import {
   uploadBatchDocument, getBatchDocument, shipmentStock, reserveShipmentStock, releaseShipmentStock, dispatchShipmentStock,
   inventoryOverview, resolveSkuIds, purgeTestInventory, saveWarehouse, unmappedSkus, unmappedLinesWithoutCode, fefoSuggest,
   addPlatformMappings, removePlatformMapping, savePlatform, listPlatforms, splitPlatformCell, migrateLegacyAmazonSkus, mappingUsage,
-  updateMappingUnits, unitsPerListingOf, getInventoryCutover, setInventoryCutover, isInventoryEligible,
+  updateMappingUnits, unitsPerListingOf, getInventoryCutover, setInventoryCutover, isInventoryEligible, setBundleComponents,
 } from '../lib/inventory.js';
 import { planSkuSheet, previewSkuImport, commitSkuImport } from '../lib/sku-master-import.js';
 import { createOutward, updateOutward, cancelOutward, issueOutward, recordOutwardReturn, closeOutward, listOutwards, getOutward, outwardReport, outwardStockOptions,
@@ -4615,6 +4615,88 @@ await step('bulk dispatch: preview writes nothing and shares stock in file order
   await expectErr('too many rows', () => commitBulkDispatch({ rows: Array.from({ length: 26 }, (_, i) => ({ row: i, orderId: 'x', awb: 'y', courierId: delhivery })) }, { actor: ACTOR }), (e) => e.status === 400);
   if (bad.length) throw new Error(bad.join('; '));
   return 'preview: 3 ready, 5 units, short / unmapped / missing / repeat named, nothing written; dispatch: FEFO across batches, pack of 2 = 2 units, packed shipment reused; rerun skipped; short and duplicate-AWB rows refused with nothing left behind';
+});
+
+await step('bundles: contents rules; a bundle holds no stock; its orders reserve and deduct each product inside (by hand, in bulk dispatch, mixed with a loose line)', async () => {
+  const bad = [];
+  const mk = async (code, name) => (await createSku({ sku: `${TS}-BN-${code}`, product_name: name }, { actor: ACTOR })).id;
+  const d3 = await mk('D3', 'Bundle test Vitamin D3');
+  const om = await mk('OM', 'Bundle test OrthoMax');
+  const bone = await mk('BONE', 'Bundle test Bone Strength Bundle');
+  const other = await mk('OTHER', 'Bundle test second bundle');
+  const stocked = await mk('STOCKED', 'Bundle test product with its own stock');
+  const recv = async (sku, batch, days, qty) => (await receiveInventory({ sku_id: sku, batch_number: batch, expiry_date: dayOffset(days), quantity: qty, request_id: rid() }, { actor: ACTOR })).batchId;
+  const d3Early = await recv(d3, 'BN-D3-EARLY', 90, 2);
+  const d3Late = await recv(d3, 'BN-D3-LATE', 300, 10);
+  const omB = await recv(om, 'BN-OM-1', 200, 5);
+  await recv(stocked, 'BN-ST-1', 200, 1);
+
+  // Contents rules.
+  const set = (id, parts) => setBundleComponents(id, parts, { actor: ACTOR });
+  if (!(await set(bone, [{ sku_id: d3, quantity: 1 }, { sku_id: om, quantity: 1 }])).changed) bad.push('set');
+  if ((await set(bone, [{ sku_id: om, quantity: 1 }, { sku_id: d3, quantity: 1 }])).changed) bad.push('same contents, other order, counted as a change');
+  await expectErr('itself', () => set(other, [{ sku_id: other, quantity: 1 }]), (e) => e.status === 400);
+  await expectErr('twice', () => set(other, [{ sku_id: d3, quantity: 1 }, { sku_id: d3, quantity: 2 }]), (e) => e.status === 400);
+  await expectErr('zero', () => set(other, [{ sku_id: d3, quantity: 0 }]), (e) => e.status === 400);
+  await expectErr('bundle in a bundle', () => set(other, [{ sku_id: bone, quantity: 1 }]), (e) => e.status === 409 && /cannot contain another bundle/.test(e.message));
+  await expectErr('component becomes a bundle', () => set(d3, [{ sku_id: om, quantity: 1 }]), (e) => e.status === 409 && /is in bundle/.test(e.message));
+  await expectErr('own stock', () => set(stocked, [{ sku_id: om, quantity: 1 }]), (e) => e.status === 409 && /stock batches of its own/.test(e.message));
+  await expectErr('receive into a bundle', () => recv(bone, 'BN-BONE-1', 200, 3), (e) => e.status === 409 && e.bundle);
+  const b = await getSku(bone);
+  if (!b.is_bundle || b.bundle_components.length !== 2 || b.can_make !== 5 || b.out_of_stock || b.low_stock) bad.push(`bundle sku ${JSON.stringify({ is: b.is_bundle, parts: b.bundle_components, can: b.can_make, out: b.out_of_stock })}`);
+  if ((await getSku(d3)).is_bundle) bad.push('component marked a bundle');
+
+  // The bundle listing maps to the bundle like any other: a pack of 2 bundles, and a single.
+  await addPlatformMappings(bone, PF.amazon, [`${TS}-BN-AMZ2`], { actor: ACTOR, unitsPerListing: 2 });
+  await addPlatformMappings(bone, PF.amazon, [`${TS}-BN-AMZ1`], { actor: ACTOR });
+  const delhivery = (await listCouriers()).find((x) => x.name === 'Delhivery').id;
+  const moved = async (id) => (await getPool().query(`SELECT sku_id, -sum(quantity)::int q FROM inventory_movements WHERE movement_type = 'shipment_dispatched' AND order_id = $1 GROUP BY sku_id`, [id])).rows;
+  const q = (rows, sku) => rows.find((r) => Number(r.sku_id) === Number(sku))?.q || 0;
+
+  // In bulk dispatch: 1 × pack of 2 bundles → 2 D3 (the early batch, FEFO) + 2 OrthoMax; nothing of the bundle itself.
+  const oa = await lineOn('amazon', 'BN-A', `${TS}-BN-AMZ2`, 1);
+  const csv = Buffer.from(`order-id,awb\n${TEST_ORDER}-BN-A,BN-AWB-A\n`);
+  const p = await previewBulkDispatch(csv, 'bn.csv', { courierId: delhivery });
+  const pr = p.rows[0];
+  if (pr.status !== 'ready' || pr.units !== 4) bad.push(`preview ${JSON.stringify(pr)}`);
+  const names = p.stock.map((x) => x.sku).sort();
+  if (names.join() !== [`${TS}-BN-D3`, `${TS}-BN-OM`].sort().join()) bad.push(`preview stock ${JSON.stringify(p.stock)}`);
+  const c = await commitBulkDispatch({ rows: p.rows }, { actor: ACTOR });
+  if (c.results[0].status !== 'dispatched' || c.results[0].units !== 4) bad.push(`bulk ${JSON.stringify(c.results)}`);
+  const ma = await moved(oa);
+  if (q(ma, d3) !== 2 || q(ma, om) !== 2 || q(ma, bone) !== 0) bad.push(`bulk movements ${JSON.stringify(ma)}`);
+  const onHand = async (bid) => (await getPool().query('SELECT on_hand FROM inventory_batches WHERE id = $1', [bid])).rows[0].on_hand;
+  if (await onHand(d3Early) !== 0) bad.push('FEFO: early D3 batch not used first');
+
+  // By hand, mixed: a bundle line (1 single bundle) and a loose D3 line (2) → 3 D3 + 1 OrthoMax, summed per product.
+  const ob = await lineOn('amazon', 'BN-B', `${TS}-BN-AMZ1`, 1);
+  await getPool().query(`INSERT INTO order_items (order_id, source_line_item_id, sku, title, quantity, item_price, sku_id) VALUES ($1, 'L2', $2, 'Loose D3', 2, 100, $3)`, [ob, `${TS}-BN-D3`, d3]);
+  const { shipmentId: sb } = await createShipmentForOrders([ob], { courier_partner_id: delhivery, tracking_id: 'BN-AWB-B', shipment_status: 'packed' }, { actor: ACTOR });
+  const st = await shipmentStock(sb);
+  const need = (sku) => st.lines.find((l) => Number(l.sku_id) === Number(sku));
+  if (need(d3)?.required !== 3 || need(om)?.required !== 1 || need(bone) || !(need(om)?.bundles || []).includes(`${TS}-BN-BONE`)) bad.push(`needs ${JSON.stringify(st.lines.map((l) => [l.sku, l.required, l.bundles]))}`);
+  await reserveShipmentStock(sb, st.lines.flatMap((l) => l.suggestion.picks), { actor: ACTOR });
+  const ver = async (id) => (await getPool().query('SELECT version FROM order_shipments WHERE id = $1', [id])).rows[0].version;
+  await updateShipment(ob, sb, { shipment_status: 'dispatched' }, { actor: ACTOR, version: await ver(sb) });
+  const mb = await moved(ob);
+  if (q(mb, d3) !== 3 || q(mb, om) !== 1) bad.push(`hand movements ${JSON.stringify(mb)}`);
+  if (await onHand(d3Late) !== 7 || await onHand(omB) !== 2) bad.push(`left d3 ${await onHand(d3Late)} om ${await onHand(omB)}`);
+  if ((await getSku(bone)).can_make !== 2) bad.push(`can make after ${(await getSku(bone)).can_make}`);
+
+  // New contents after a reservation: the parcel must confirm its stock again before it can leave.
+  const oc = await lineOn('amazon', 'BN-C', `${TS}-BN-AMZ1`, 1);
+  const { shipmentId: sc } = await createShipmentForOrders([oc], { courier_partner_id: delhivery, tracking_id: 'BN-AWB-C', shipment_status: 'packed' }, { actor: ACTOR });
+  await reserveShipmentStock(sc, (await shipmentStock(sc)).lines.flatMap((l) => l.suggestion.picks), { actor: ACTOR });
+  await set(bone, [{ sku_id: d3, quantity: 2 }, { sku_id: om, quantity: 1 }]);
+  await expectErr('stale contents dispatch', async () => updateShipment(oc, sc, { shipment_status: 'dispatched' }, { actor: ACTOR, version: await ver(sc) }), (e) => e.needsStock);
+  if ((await moved(oc)).length) bad.push('stale reservation deducted');
+  await releaseShipmentStock(sc, { actor: ACTOR });
+
+  // No contents: an ordinary SKU again.
+  await set(bone, []);
+  if ((await getSku(bone)).is_bundle) bad.push('still a bundle after clearing');
+  if (bad.length) throw new Error(bad.join('; '));
+  return 'rules: itself / twice / zero / nested / component / own stock refused, receiving into a bundle refused; can make = fewest; bulk: pack of 2 bundles = 2 + 2, FEFO; by hand: bundle + loose D3 summed; new contents after reserving block dispatch; cleared → ordinary SKU';
 });
 
 await step('master SKU import: parser — Briyo SKU + Product Name only; platform columns ignored with a warning', async () => {
