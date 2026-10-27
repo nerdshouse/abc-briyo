@@ -599,7 +599,7 @@ function renderDrawer() {
 
 /** What a person must do about a Delta Velocity parcel (lib/courier-check.js decides; the API sends courier_check). */
 const COURIER_CHECK = {
-  left_not_dispatched: 'The courier has this parcel, but its stock has not left here yet. Confirm the batches below, then set the shipment status to match.',
+  left_not_dispatched: 'The courier has this parcel, but its stock has not left here yet: it could not be reserved automatically (an unmapped product, not enough stock, or no products on the order). Fix that and confirm the batches below, then set the shipment status to match.',
   delivery_attempted: 'Delivery was attempted and not completed. Follow up with the customer or Delta Velocity; the status is not changed for you.',
   booking_cancelled: 'Delta Velocity cancelled this booking. Check whether the parcel was rebooked or is not going.',
 };
@@ -611,7 +611,7 @@ function externalBanner(ship) {
     return `<div class="banner mock" style="margin:8px 0">Fulfilled externally by <b>Buy with Amazon</b> — mirrored from Shopify${state}. It updates on each Shopify sync. No Briyo stock is reserved or deducted for it.</div>`;
   }
   const check = COURIER_CHECK[ship.courier_check];
-  return `<div class="banner" style="margin:8px 0">Booked through <b>Delta Velocity</b> — courier, AWB and tracking link from Shopify${state}. It updates on each Shopify sync; stock is reserved and deducted as for any shipment.</div>`
+  return `<div class="banner" style="margin:8px 0">Booked through <b>Delta Velocity</b> — courier, AWB and tracking link from Shopify${state}. It updates on each Shopify sync; when the courier picks it up, stock is reserved by earliest expiry (unless batches were confirmed) and deducted.</div>`
     + (check ? `<div class="banner mock" role="status" style="margin:8px 0"><b>Courier update to check.</b> ${esc(check)}</div>` : '');
 }
 
