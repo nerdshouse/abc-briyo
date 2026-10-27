@@ -66,6 +66,9 @@ const stockFlag = (r) => (r.out_of_stock ? '<span class="xtag out" style="margin
 const nil = (n) => (Number(n) === 0 ? '<span class="nil">Nil</span>' : count(n));
 const plural = (n, unit) => `${count(n)} ${unit || 'unit'}${n === 1 ? '' : /(s|x|ch|sh)$/i.test(unit || '') ? 'es' : 's'}`;
 const incomingTag = (n) => (n > 0 ? `<span class="xtag incoming">+${count(n)} incoming</span>` : '');
+// A bundle holds no stock: the list shows what it contains and how many whole bundles its contents make.
+const bundleWhat = (r) => (r.bundle_components || []).map((c) => `${c.quantity > 1 ? `${count(c.quantity)} × ` : ''}${esc(c.sku)}`).join(' + ');
+const canMakeText = (r) => (r.can_make === null ? 'contents not stock-tracked' : `can make ${count(r.can_make)}`);
 const altLine = (alts) => (alts?.length ? `<span class="alt-line">Alternatives: ${alts.map((a) => `<span class="mono">${esc(a.sku)}</span>${a.variant_name ? ` (${esc(a.variant_name)})` : ''} — ${a.available ? `${count(a.available)} available` : 'Nil'}`).join('; ')}</span>` : '');
 
 // ------------------------------------------------------------------ URL
@@ -216,9 +219,9 @@ function render() {
     <tr class="orow${r.sku_id === state.openSku ? ' open' : ''}" data-sku="${r.sku_id}" tabindex="0">
       <td><span class="cell-main mono" style="font-weight:500">${esc(r.sku)}</span>${r.sku_active === false ? '<span class="mini-tag">Inactive</span>' : ''}</td>
       <td><span class="cell-main">${esc(r.product_name)}</span>${r.variant_name ? `<span class="cell-sub muted">${esc(r.variant_name)}</span>` : ''}</td>
-      <td class="r num">${r.empty ? nil(r.sku_available) : nil(r.available)}${stockFlag(r) || r.sku_incoming ? `<span class="cell-sub">${stockFlag(r)}${incomingTag(r.sku_incoming)}</span>` : ''}${altLine(r.alternatives)}</td>
+      <td class="r num">${r.is_bundle ? `<span class="mini-tag">Bundle</span><span class="cell-sub muted">${esc(canMakeText(r))}</span>` : r.empty ? nil(r.sku_available) : nil(r.available)}${stockFlag(r) || r.sku_incoming ? `<span class="cell-sub">${stockFlag(r)}${incomingTag(r.sku_incoming)}</span>` : ''}${altLine(r.alternatives)}</td>
       <td class="r num">${r.empty || !r.reserved ? '<span class="muted-cell">—</span>' : count(r.reserved)}</td>
-      <td>${r.empty ? '<span class="muted-cell">No stock yet</span>' : `<span class="mono">${esc(r.batch_number)}</span><span class="cell-sub muted">${count(r.on_hand)} on hand</span>`}</td>
+      <td>${r.is_bundle ? `<span class="muted-cell">${bundleWhat(r) || 'Contents not set'}</span>` : r.empty ? '<span class="muted-cell">No stock yet</span>' : `<span class="mono">${esc(r.batch_number)}</span><span class="cell-sub muted">${count(r.on_hand)} on hand</span>`}</td>
       <td>${r.empty ? '<span class="muted-cell">—</span>' : expiryCell(r)}</td>
       <td>${r.empty ? '<span class="muted-cell">—</span>' : `${esc(r.warehouse_name)}${r.location ? `<span class="cell-sub muted">${esc(r.location)}</span>` : ''}`}</td>
       <td>${r.empty ? '<span class="muted-cell">—</span>' : statusTag(r.effective_status)}</td>
@@ -227,8 +230,8 @@ function render() {
     <li class="oitem" data-sku="${r.sku_id}" tabindex="0">
       <div class="oi-top"><span class="oi-id mono">${esc(r.sku)}</span>${r.empty ? '' : `<span class="oi-val">${statusTag(r.effective_status)}</span>`}</div>
       <div class="oi-sub">${esc(r.product_name)}${r.variant_name ? ` · ${esc(r.variant_name)}` : ''}</div>
-      <div class="oi-sub">${r.empty ? 'No stock yet' : `Batch <span class="mono">${esc(r.batch_number)}</span> · ${esc(r.warehouse_name)}${r.location ? ` · ${esc(r.location)}` : ''}`}</div>
-      ${r.empty ? `<div class="oi-stat"><span class="soft" style="font-size:12.5px">Available: ${nil(r.sku_available)}</span>${stockFlag(r)}${incomingTag(r.sku_incoming)}</div>${altLine(r.alternatives)}`
+      <div class="oi-sub">${r.is_bundle ? `Bundle · ${bundleWhat(r) || 'contents not set'} · ${esc(canMakeText(r))}` : r.empty ? 'No stock yet' : `Batch <span class="mono">${esc(r.batch_number)}</span> · ${esc(r.warehouse_name)}${r.location ? ` · ${esc(r.location)}` : ''}`}</div>
+      ${r.is_bundle ? '' : r.empty ? `<div class="oi-stat"><span class="soft" style="font-size:12.5px">Available: ${nil(r.sku_available)}</span>${stockFlag(r)}${incomingTag(r.sku_incoming)}</div>${altLine(r.alternatives)}`
         : `<div class="oi-stat"><span class="soft" style="font-size:12.5px">Available: ${nil(r.available)}${r.reserved ? ` · ${count(r.reserved)} reserved` : ''}</span>
         <span style="font-size:12.5px">${expiryCell(r)}</span>${stockFlag(r)}${incomingTag(r.sku_incoming)}</div>${altLine(r.alternatives)}`}
     </li>`).join('');
@@ -265,6 +268,7 @@ function syncScrollLock() {
 // ------------------------------------------------------------------ SKU drawer
 
 async function openSku(id) {
+  if (state.openSku !== id) state.bundleEdit = null;
   state.openSku = id;
   writeUrl();
   $$('.orow').forEach((r) => r.classList.toggle('open', Number(r.dataset.sku) === id));
@@ -337,7 +341,7 @@ function renderSku() {
     </td></tr>`;
 
   $('#dBody').innerHTML = `
-    <section class="dsec">
+    ${s.is_bundle || state.bundleEdit ? bundleSection(s, batches) : `<section class="dsec">
       <h3 class="dsec-title">Stock ${s.out_of_stock ? '<span class="mini-tag warn">Out of stock</span>' : s.low_stock ? '<span class="mini-tag warn">Low stock</span>' : ''}</h3>
       <div class="imp-stats stock-cards">
         <div class="imp-stat"><b>${count(s.on_hand)}</b><span>On hand</span></div>
@@ -366,7 +370,7 @@ function renderSku() {
         ${old.length ? `<details class="old-batches"><summary class="soft">${count(old.length)} depleted batch${old.length > 1 ? 'es' : ''}</summary>
           <div class="table-wrap"><table class="table batch-table"><tbody>${old.map(batchRow).join('')}</tbody></table></div></details>` : ''}`
         : '<p class="soft" style="margin:0">No batches yet.</p>'}
-    </section>
+    </section>`}
 
     ${reservations.length ? `<section class="dsec">
       <h3 class="dsec-title">Reserved for shipments <span class="dsec-meta soft">${count(reservations.reduce((n, r) => n + r.quantity, 0))} units</span></h3>
@@ -377,17 +381,18 @@ function renderSku() {
 
     ${incomingSection(incoming, s)}
     ${alternativesSection(alternatives, s)}
+    ${s.is_bundle || state.bundleEdit ? '' : bundleSection(s, batches)}
     ${returnsSection(returns)}
 
     <section class="dsec">
-      <h3 class="dsec-title">Master SKU <span class="dsec-meta soft">Briyo's internal identifier · holds the stock</span></h3>
+      <h3 class="dsec-title">Master SKU <span class="dsec-meta soft">Briyo's internal identifier · ${s.is_bundle ? 'a bundle: its products hold the stock' : 'holds the stock'}</span></h3>
       <dl class="kv">
         <dt>Master Briyo SKU</dt><dd class="mono"><b>${esc(s.sku)}</b></dd>
         <dt>Product</dt><dd>${esc(s.product_name)}</dd>
         ${s.variant_name ? `<dt>Variant</dt><dd>${esc(s.variant_name)}</dd>` : ''}
         ${s.category ? `<dt>Category</dt><dd>${esc(s.category)}</dd>` : ''}
         <dt>Unit</dt><dd>${esc(s.unit_type)}</dd>
-        <dt>Inventory</dt><dd>${s.track_inventory ? 'Tracked — stock is reserved and deducted at dispatch' : 'Not tracked — no stock check at dispatch'}</dd>
+        <dt>Inventory</dt><dd>${s.is_bundle ? 'Bundle — each product inside is reserved and deducted at dispatch' : s.track_inventory ? 'Tracked — stock is reserved and deducted at dispatch' : 'Not tracked — no stock check at dispatch'}</dd>
         <dt>Website / Shopify</dt><dd>Uses the master SKU <span class="mono">${esc(s.sku)}</span> as is</dd>
         <dt>On orders</dt><dd>${count(orderLines.orders)} orders · ${count(orderLines.units)} units</dd>
       </dl>
@@ -437,6 +442,92 @@ function incomingSection(list, s) {
     <ul class="inc-list">${list.slice(0, 20).map((i) => incomingItem(i)).join('')}</ul>
   </section>`;
 }
+/**
+ * Bundle: a master SKU sold as several products packed together at dispatch. It holds no stock; its orders reserve and
+ * deduct each product inside it. Shown in place of Stock and Batches for a bundle; for a SKU without stock of its own,
+ * an offer to make it one. The contents are edited here (state.bundleEdit) and saved in one go.
+ */
+function bundleSection(s, batches) {
+  const edit = state.bundleEdit;
+  if (edit) {
+    const choices = (state.skus || []).filter((x) => x.id !== s.id && x.active && !x.is_bundle);
+    return `<section class="dsec" id="bundleEditor">
+      <h3 class="dsec-title">Bundle contents <span class="dsec-meta soft">what one ${esc(s.sku)} contains</span></h3>
+      ${edit.map((p, i) => `<div class="alt-add" style="margin-top:${i ? 8 : 0}px">
+        <select class="select" data-bundle-sku="${i}" aria-label="Product ${i + 1}" style="flex:1;min-width:180px">${opt('', 'Choose a product…', !p.sku_id)}${choices.map((x) => opt(x.id, `${x.sku} — ${x.product_name}${x.variant_name ? ` (${x.variant_name})` : ''}`, x.id === p.sku_id)).join('')}</select>
+        <input class="input" type="number" min="1" max="1000" step="1" data-bundle-qty="${i}" value="${esc(p.quantity)}" aria-label="Quantity of product ${i + 1}" style="width:84px" />
+        <button type="button" class="linkish" data-bundle-remove="${i}">Remove</button></div>`).join('')}
+      <div class="form-actions" style="margin-top:12px">
+        <button type="button" class="btn" data-bundle-act="add">${icon('plus')}Add product</button>
+        <span style="flex:1"></span>
+        <button type="button" class="btn" data-bundle-act="cancel">Cancel</button>
+        <button type="button" class="btn primary" data-bundle-act="save">Save contents</button>
+      </div>
+      <p class="imp-note">Each order of ${esc(s.sku)} reserves and deducts these products, earliest expiry first, when it is dispatched. Remove every product to make it an ordinary SKU again.</p>
+    </section>`;
+  }
+  if (s.is_bundle) {
+    const parts = s.bundle_components || [];
+    return `<section class="dsec">
+      <h3 class="dsec-title">Bundle <span class="dsec-meta soft">holds no stock · its orders take stock of each product below</span></h3>
+      <div class="imp-stats stock-cards">
+        <div class="imp-stat ${s.can_make === 0 ? 'bad' : 'good'}"><b>${s.can_make === null ? '—' : count(s.can_make)}</b><span>Bundles the stock can make</span></div>
+        <div class="imp-stat"><b>${count(parts.length)}</b><span>Products inside</span></div>
+      </div>
+      <div class="table-wrap" style="margin-top:8px"><table class="table batch-table"><thead><tr><th>Product</th><th class="r">Per bundle</th><th class="r">Available</th></tr></thead>
+        <tbody>${parts.map((c) => `<tr><td><a class="linkish mono" href="#" data-open-sku="${c.sku_id}">${esc(c.sku)}</a><span class="cell-sub muted">${esc(c.product_name || '')}${c.variant_name ? ` · ${esc(c.variant_name)}` : ''}</span></td>
+          <td class="r num">${count(c.quantity)}</td>
+          <td class="r num">${c.track_inventory ? nil(c.available) : '<span class="muted-cell">not tracked</span>'}${c.active ? '' : '<span class="cell-sub"><span class="mini-tag">Inactive</span></span>'}</td></tr>`).join('')}</tbody></table></div>
+      <p class="imp-note">Map the platform SKUs of the bundle (e.g. the Shopify bundle listing) to ${esc(s.sku)} as usual. Stock is received, returned and counted product by product, never for the bundle.</p>
+      ${canCatalog() ? `<div class="form-actions"><button class="btn" type="button" data-bundle-act="edit">${icon('pencil')}Edit contents</button>
+        <button class="btn" type="button" data-act="edit-sku">${icon('pencil')}Edit master SKU</button></div>` : ''}
+    </section>`;
+  }
+  // An ordinary SKU: only one with no stock of its own can become a bundle.
+  if (!canCatalog() || batches.length) return '';
+  return `<section class="dsec">
+    <h3 class="dsec-title">Bundle <span class="dsec-meta soft">optional</span></h3>
+    <p class="soft" style="margin:0 0 8px">Is ${esc(s.sku)} several products packed together at dispatch (for example D3 + OrthoMax)? List them, and its orders will take stock of each one.</p>
+    <button class="btn" type="button" data-bundle-act="edit">${icon('package-plus')}Make it a bundle</button>
+  </section>`;
+}
+
+/** The editor's rows as typed (selects and quantities), kept across re-renders. */
+function readBundleEdit() {
+  if (!state.bundleEdit) return;
+  state.bundleEdit = state.bundleEdit.map((p, i) => ({
+    sku_id: Number($(`[data-bundle-sku="${i}"]`)?.value) || null,
+    quantity: $(`[data-bundle-qty="${i}"]`)?.value ?? p.quantity,
+  }));
+}
+
+async function bundleAct(act) {
+  const s = state.detail.sku;
+  const fail = (msg) => { $('#dSaved').className = 'saved failed'; $('#dSaved').textContent = msg; };
+  if (act === 'edit') {
+    state.bundleEdit = s.bundle_components?.length ? s.bundle_components.map((c) => ({ sku_id: c.sku_id, quantity: c.quantity })) : [{ sku_id: null, quantity: 1 }, { sku_id: null, quantity: 1 }];
+    renderSku();
+    return $('#bundleEditor')?.scrollIntoView({ block: 'nearest' });
+  }
+  if (act === 'add') { readBundleEdit(); state.bundleEdit.push({ sku_id: null, quantity: 1 }); return renderSku(); }
+  if (act === 'cancel') { state.bundleEdit = null; $('#dSaved').textContent = ''; return renderSku(); }
+  if (act === 'save') {
+    readBundleEdit();
+    const components = state.bundleEdit.filter((p) => p.sku_id).map((p) => ({ sku_id: p.sku_id, quantity: p.quantity }));
+    if (state.bundleEdit.some((p) => !p.sku_id)) return fail('Choose a product on every line, or remove the empty ones.');
+    if (!components.length && !s.is_bundle) return fail('Choose at least one product.');
+    if (!components.length && !window.confirm(`Make ${s.sku} an ordinary SKU again? Its orders will then need stock of ${s.sku} itself.`)) return null;
+    try {
+      $('#dSaved').className = 'saved'; $('#dSaved').textContent = 'Saving…';
+      await api(`/api/inventory/skus/${s.id}/bundle`, { method: 'PUT', body: JSON.stringify({ components }) });
+      state.bundleEdit = null; state.skusStale = true;
+      await openSku(s.id); load();
+      $('#dSaved').className = 'saved'; $('#dSaved').textContent = 'Saved';
+    } catch (err) { fail(err.message); }
+  }
+  return null;
+}
+
 function alternativesSection(alts, s) {
   if (!alts.length && !canCatalog()) return '';
   const others = (state.skus || []).filter((x) => x.id !== s.id && x.active && !alts.some((a) => a.sku_id === x.id));
@@ -509,11 +600,12 @@ function openForm(kind, ctx = {}) {
   state.form = { kind, ctx, requestId: requestId() };
   const f = $('#invForm');
   const m = state.meta;
-  const skus = (state.skus || []).map((x) => ({ sku_id: x.id, sku: x.sku, product_name: x.product_name, variant_name: x.variant_name, sku_active: x.active }));
+  const skus = (state.skus || []).map((x) => ({ sku_id: x.id, sku: x.sku, product_name: x.product_name, variant_name: x.variant_name, sku_active: x.active, is_bundle: x.is_bundle }));
   const batch = ctx.batchId ? state.detail?.batches.find((b) => b.id === ctx.batchId) : null;
   const wh = (sel) => m.warehouses.filter((w) => w.active).map((w) => opt(w.id, w.name, String(w.id) === String(sel))).join('');
-  const skuOptions = (sel) => opt('', 'Choose a SKU', !sel) + skus.filter((r) => r.sku_active !== false)
-    .map((r) => opt(r.sku_id, `${r.sku} — ${r.product_name}${r.variant_name ? ` (${r.variant_name})` : ''}`, String(r.sku_id) === String(sel))).join('');
+  // Stock forms leave bundles out (a bundle holds no stock); mapping lists them, marked, since a bundle listing maps to one.
+  const skuOptions = (sel, { bundles = false } = {}) => opt('', 'Choose a SKU', !sel) + skus.filter((r) => r.sku_active !== false && (bundles || !r.is_bundle))
+    .map((r) => opt(r.sku_id, `${r.sku} — ${r.product_name}${r.variant_name ? ` (${r.variant_name})` : ''}${r.is_bundle ? ' · bundle' : ''}`, String(r.sku_id) === String(sel))).join('');
   const s = kind === 'edit-sku' ? state.detail.sku : (ctx.prefill || {});
   let title = ''; let sub = ''; let submit = 'Save'; let body = '';
 
@@ -548,8 +640,8 @@ function openForm(kind, ctx = {}) {
     submit = 'Map to master SKU';
     body = `<section class="dsec"><dl class="kv"><dt>Platform</dt><dd>${esc(ctx.platformLabel)}</dd><dt>Platform SKU</dt><dd class="mono">${esc(ctx.code)}</dd><dt>Item on the order</dt><dd>${esc(ctx.title || '—')}</dd>${ctx.asin ? `<dt>ASIN</dt><dd class="mono">${esc(ctx.asin)}</dd>` : ''}</dl>
       <div class="form-grid" style="margin-top:12px">
-        <label class="fld wide"><span>Master Briyo SKU</span><select class="select" name="sku_id" required>${skuOptions('')}</select>
-          <span class="help">No new SKU is created. If the product is not in the master list yet, create it with New master SKU first, then map.</span></label>
+        <label class="fld wide"><span>Master Briyo SKU</span><select class="select" name="sku_id" required>${skuOptions('', { bundles: true })}</select>
+          <span class="help">No new SKU is created. If the product is not in the master list yet, create it with New master SKU first, then map. A listing of several products packed together maps to a bundle SKU (open the master SKU → Make it a bundle).</span></label>
         <label class="fld"><span>Units per listing</span><input class="input" name="units_per_listing" type="number" min="1" step="1" value="1" inputmode="numeric" required />
           <span class="help">How many inventory units are represented by one platform listing.</span></label>
       </div></section>`;
@@ -1247,6 +1339,10 @@ function bind() {
       } catch (err) { $('#dSaved').className = 'saved failed'; $('#dSaved').textContent = err.message; }
       return null;
     }
+    const ba = e.target.closest('[data-bundle-act]');
+    if (ba) return bundleAct(ba.dataset.bundleAct);
+    const br = e.target.closest('[data-bundle-remove]');
+    if (br) { readBundleEdit(); state.bundleEdit.splice(Number(br.dataset.bundleRemove), 1); renderSku(); return null; }
     const ar = e.target.closest('[data-alt-remove]');
     if (ar) {
       try { await api(`/api/inventory/alternatives/${ar.dataset.altRemove}`, { method: 'DELETE' }); await openSku(state.detail.sku.id); load(); } catch (err) { $('#dSaved').className = 'saved failed'; $('#dSaved').textContent = err.message; }

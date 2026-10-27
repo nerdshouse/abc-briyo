@@ -32,7 +32,7 @@ Baseline: production `cad0feb`. This audit is read-only and covers the whole rep
 | Department | Screens | Roles (capabilities) |
 |---|---|---|
 | Logistics | Orders (by type and view), order drawer, shipments (create, attach, reserve/release, dispatch), documents, couriers, destinations, Amazon import, Amazon bulk dispatch (one AWB per order) | viewer (view), operator (+edit), manager (+setup) |
-| Inventory | Stock overview, SKU drawer (batches, movements, COA), master SKUs, platform mappings, unmapped SKUs, receive/adjust/transfer, suppliers, warehouses | viewer (view), operator (+move), manager (+catalog) |
+| Inventory | Stock overview, SKU drawer (batches, movements, COA), master SKUs, bundle SKUs (contents set by catalog; stock taken per product at dispatch), platform mappings, unmapped SKUs, receive/adjust/transfer, suppliers, warehouses | viewer (view), operator (+move), manager (+catalog) |
 | Support | Call board (to call, callbacks, mine, all), cart drawer and history, CSV export; admin: cart import, report | agent and lead (support.work) |
 | HR | Jobs, job editor and preview, candidates, application drawer, resume, delete job | manager (hr.view, hr.manage) |
 | Admin | Dashboard (operations and recovery analytics), Members, member log | `is_admin` / ADMIN_PHONES |
