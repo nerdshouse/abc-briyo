@@ -8267,6 +8267,60 @@ await step('shopify orders: a Delta Velocity parcel that leaves with no confirme
   return 'in transit, no batches → FEFO early batch then later one, in transit, audit source delta_velocity; short of stock → Packed, flagged once with the reason, in "Courier updates to check", nothing reserved; stock received → next update reserves and deducts; confirmed batch kept; bundle → 1 + 2 of its products, none of the bundle; ledgers match';
 });
 
+await step('shopify orders: a Delta Velocity parcel whose first update is attempted delivery has left — with stock it moves to In transit (FEFO reserved and deducted) and still shows delivery attempted; short of stock it stays Packed for checking', async () => {
+  const bad = [];
+  const ful = (n, display) => ({ id: `gid://shopify/Fulfillment/${SH_NUM}${n}1`, name: `#${n}-F1`, status: 'SUCCESS', displayStatus: display,
+    createdAt: new Date(Date.now() - 3600000).toISOString(), updatedAt: new Date().toISOString(), inTransitAt: null, deliveredAt: null,
+    estimatedDeliveryAt: null, trackingInfo: [{ company: 'delhivery', number: `5129241${n}1`, url: `https://briyo.deltavelocity.in/${n}` }] });
+  const order = (n, display, lines) => ({ ...shOrder(n, { created: new Date(Date.now() - 7200000).toISOString(), lines }),
+    tags: ['COD', 'GoKwik', 'Non Buy with Amazon'], fulfillments: [ful(n, display)], updatedAt: new Date().toISOString() });
+  const store = [];
+  const gql = shFake(() => store);
+  const sync = () => runShopifySync({ window: { days: 1 }, dryRun: false, gql, actor: SH_ACTOR });
+  const gid = (n) => `${SH_PREFIX}${String(n).padStart(4, '0')}`;
+  const oid = async (n) => Number((await getPool().query('SELECT id FROM orders WHERE source_order_id = $1', [gid(n)])).rows[0]?.id);
+  const ship = async (n) => (await orderShipments(await oid(n)))[0];
+  const moved = async (sid) => (await getPool().query(
+    `SELECT batch_id, sku_id, -sum(quantity)::int q FROM inventory_movements WHERE movement_type = 'shipment_dispatched' AND shipment_id = $1 GROUP BY batch_id, sku_id ORDER BY batch_id`, [sid])).rows
+    .map((r) => [Number(r.batch_id), Number(r.sku_id), r.q]);
+  const live = async (sid) => (await getPool().query(`SELECT count(*)::int n FROM inventory_reservations WHERE shipment_id = $1 AND status = 'active'`, [sid])).rows[0].n;
+  const checks = async (n) => (await orderEvents(await oid(n))).filter((e) => e.event_type === 'courier_update_to_check');
+  const inView = async (n) => (await listOrders({ view: 'courier_check', q: gid(n) })).orders.some((o) => o.source_order_id === gid(n));
+  const mk = async (code, name) => (await createSku({ sku: `${TS}-DVA-${code}`, product_name: name }, { actor: ACTOR })).id;
+  const recv = async (sku, batch, days, qty) => (await receiveInventory({ sku_id: sku, batch_number: batch, expiry_date: dayOffset(days), quantity: qty, request_id: rid() }, { actor: ACTOR })).batchId;
+  const A = await mk('A', 'DV attempted product');
+  const S = await mk('S', 'DV attempted scarce product');
+  const aEarly = Number(await recv(A, 'DVA-A-EARLY', 90, 1));
+  const aLate = Number(await recv(A, 'DVA-A-LATE', 300, 10));
+  await recv(S, 'DVA-S-1', 200, 1);
+  const led0 = { A: await ledgerSum(A), S: await ledgerSum(S) };
+
+  // 9311: A × 2 with stock; 9312: S × 2 with only 1 in stock. Shopify's first status for both is attempted delivery.
+  store.push(order(9311, 'ATTEMPTED_DELIVERY', [{ sku: `${TS}-DVA-A`, qty: 2 }]), order(9312, 'ATTEMPTED_DELIVERY', [{ sku: `${TS}-DVA-S`, qty: 2 }]));
+  await sync();
+
+  const s1 = await ship(9311);
+  if (s1?.shipment_status !== 'in_transit' || s1.courier_check !== 'delivery_attempted' || !(await inView(9311)) || !s1.dispatch_date
+    || JSON.stringify(await moved(s1.id)) !== JSON.stringify([[aEarly, A, 1], [aLate, A, 1]].sort((x, y) => x[0] - y[0]))) bad.push(`9311 ${JSON.stringify([s1?.shipment_status, s1?.courier_check, s1?.dispatch_date, await moved(s1?.id)])}`);
+  const { rows: aud } = await getPool().query(`SELECT metadata FROM inventory_audit WHERE action = 'stock_reserved' AND shipment_id = $1`, [s1.id]);
+  if (aud.length !== 1 || aud[0].metadata.source !== 'delta_velocity' || !aud[0].metadata.fefo) bad.push(`9311 audit ${JSON.stringify(aud)}`);
+
+  const s2 = await ship(9312);
+  const c2 = await checks(9312);
+  if (s2?.shipment_status !== 'packed' || s2.courier_check !== 'left_not_dispatched' || !(await inView(9312)) || await live(s2.id) || (await moved(s2.id)).length
+    || c2.length !== 1 || c2[0].metadata.reason !== 'left_not_dispatched' || !/Not enough stock/.test(c2[0].metadata.not_applied || '')) bad.push(`9312 short ${JSON.stringify([s2?.shipment_status, s2?.courier_check, c2.map((e) => e.metadata)])}`);
+
+  // Run again: nothing moves twice, nothing flagged twice.
+  await sync();
+  if ((await ship(9311)).shipment_status !== 'in_transit' || (await moved(s1.id)).reduce((t, r) => t + r[2], 0) !== 2) bad.push('9311 re-sync');
+  if ((await checks(9312)).length !== 1 || (await ship(9312)).shipment_status !== 'packed') bad.push('9312 re-sync flagged again or moved');
+
+  const delta = { A: await ledgerSum(A) - led0.A, S: await ledgerSum(S) - led0.S };
+  if (delta.A !== -2 || delta.S !== 0) bad.push(`ledger ${JSON.stringify(delta)}`);
+  if (bad.length) throw new Error(bad.join(' | '));
+  return 'attempted delivery first, with stock → FEFO early then later batch, In transit, −2 once, still delivery_attempted in "Courier updates to check"; short → Packed, left_not_dispatched, flagged once with the reason, nothing reserved; re-sync changes nothing';
+});
+
 await step('amazon sp-api cleanup', async () => {
   await purgeTestOrders(`${TEST_ORDER}-AZSP`);
   await getPool().query(`DELETE FROM order_imports WHERE kind = 'amazon_sync' AND imported_by = $1`, [AZ_ACTOR]);
