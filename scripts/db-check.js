@@ -13216,6 +13216,120 @@ await step('affiliate payouts and TDS: 194H threshold over the financial year (f
   return '₹15k → no TDS; next ₹10k → ₹500 (2% of the year\'s ₹25k); no PAN → 20%; preview with blocked / left out / held; a batch takes each commission once (reversal refused meanwhile); bank file has full accounts; paid with UTR → commissions paid; UTR reuse and future dates refused; failed → back in the pool; cancel releases; amounts, payee and history fixed in the database; register with PAN, quarter and UTR; settings validated; money and pages gated to finance; details masked';
 });
 
+await step('affiliate programme report: clicks, orders (link / coupon / cancelled), order value, commissions by status, payouts paid, per-affiliate rows, daily series, period rules, money gated by role', async () => {
+  const bad = [];
+  const pool = getPool();
+  const { attributeOrder } = await import('../lib/affiliate-referrals.js');
+  const { createCommissionForAttribution, setCommissionStatus } = await import('../lib/affiliate-commissions.js');
+  const { tx: aTx } = await import('../lib/affiliates.js');
+  const { affiliateProgrammeReport, reportPeriod } = await import('../lib/affiliate-report.js');
+  const { istDayKey } = await import('../lib/timezone.js');
+  const ACT = 'db-check-report';
+  const P = `${TEST_ORDER}-RP`;
+  await purgeTestOrders(P); await purgeTestAffiliates(ACT);
+  // Yesterday and today (IST), so a run near midnight IST still has every fixture inside the period.
+  const period = reportPeriod({ from: istDayKey(new Date(Date.now() - 86400000)), to: istDayKey(new Date()) });
+  const full = { commissions: true, payouts: true };
+  const before = await affiliateProgrammeReport(period, full);
+  const { rows: [cat] } = await pool.query(`SELECT key FROM affiliate_categories WHERE NOT requires_verification ORDER BY sort LIMIT 1`);
+  const mkAff = async (pid, rateBps, coupon) => {
+    const { rows: [a] } = await pool.query(`INSERT INTO affiliates (public_id, category, display_name, status, activated_at, created_by) VALUES ($1, $2, $3, 'active', now(), $4) RETURNING id`, [pid, cat.key, `DBCHECK-AF ${pid}`, ACT]);
+    await pool.query(`INSERT INTO affiliate_rates (affiliate_id, rate_bps, effective_from, created_by) VALUES ($1, $2, now() - interval '50 days', $3)`, [a.id, rateBps, ACT]);
+    const { rows: [link] } = await pool.query(`INSERT INTO affiliate_referral_assets (public_id, affiliate_id, type, created_by, created_at) VALUES ($1, $2, 'link', $3, now() - interval '50 days') RETURNING id`, [`${pid}WEB2`.slice(0, 10).padEnd(10, "2"), a.id, ACT]);
+    if (coupon) await pool.query(`INSERT INTO affiliate_referral_assets (public_id, affiliate_id, type, code, created_by, created_at) VALUES ($1, $2, 'coupon', $3, $4, now() - interval '1 day')`, [`${pid}CPN2`.slice(0, 10).padEnd(10, '2'), a.id, coupon, ACT]);
+    return { id: Number(a.id), link: Number(link.id) };
+  };
+  const A = await mkAff('RPAAAA', 1000, 'RP-CPN-A');
+  const B = await mkAff('RPBBBB', 2000, null);
+  let n = 0;
+  const click = async (aff, ago = '0 seconds') => {
+    n += 1;
+    const id = `rpReportClick${String(n).padStart(9, '0')}`;
+    await pool.query(`INSERT INTO affiliate_referral_clicks (public_id, affiliate_id, referral_asset_id, visitor_id, clicked_at) VALUES ($1, $2, $3, $4, now() - $5::interval)`,
+      [id, aff.id, aff.link, `rpReportVisitor${String(n).padStart(7, '0')}`, ago]);
+    return id;
+  };
+  const a1 = await click(A); await click(A); await click(A); const a4 = await click(A);
+  const b1 = await click(B); await click(B);
+  await click(A, '40 days');   // outside the period
+  let gid = 991000900;
+  const order = async (tag, value, ago = '0 seconds') => {
+    const { rows: [o] } = await pool.query(`INSERT INTO orders (channel, source_order_id, source, order_status, order_date, created_by, source_payload)
+      VALUES ('website', $1, 'shopify_sync', 'new', now() - $2::interval, $3, $4) RETURNING id`, [`${P}-${tag}`, ago, ACT, JSON.stringify({ shopify: { name: `#RP${tag}` } })]);
+    gid += 1;
+    await pool.query(`INSERT INTO order_financial_snapshots (order_id, shopify_order_gid, sequence, content_hash, shop_currency, presentment_currency, taxes_included,
+        financial_status, current_subtotal, current_total_tax, current_shipping, current_total_discounts, current_total_price, total_price, total_refunded, total_refunded_shipping, money)
+      VALUES ($1, $2, 1, $3, 'INR', 'INR', true, 'PAID', $4, 0, 0, 0, $4, $4, 0, 0, '{}')`, [o.id, `gid://shopify/Order/${gid}`, crypto.createHash('sha256').update(`rp-${tag}`).digest('hex'), value]);
+    return Number(o.id);
+  };
+  const byClick = async (orderId, aff, clickId, ago = '0 seconds') => {
+    const { rows: [t] } = await pool.query(`INSERT INTO affiliate_order_attributions (order_id, affiliate_id, referral_asset_id, click_id, attribution_method, order_placed_at, rule_version, attributed_at)
+      VALUES ($1, $2, $3, $4, 'referral_click', now() - $5::interval, 'v1', now() - $5::interval) RETURNING id`, [orderId, aff.id, aff.link, clickId, ago]);
+    await aTx((client) => createCommissionForAttribution(client, Number(t.id), { actor: ACT }));
+  };
+  // A: ₹1000 by link (10% = ₹100), ₹500 by coupon (₹50), ₹300 by link then cancelled (₹30 on a cancelled order).
+  await byClick(await order('A1', '1000.00'), A, a1);
+  const oA2 = await order('A2', '500.00');
+  await aTx((client) => attributeOrder(client, oA2, { orderedAt: new Date().toISOString(), discountCodes: ['RP-CPN-A'], customAttributes: [] }, { actor: ACT }));
+  const oA3 = await order('A3', '300.00');
+  await byClick(oA3, A, a4);
+  await pool.query(`UPDATE orders SET order_status = 'cancelled' WHERE id = $1`, [oA3]);
+  // B: ₹200 by link (20% = ₹40), approved.
+  const oB1 = await order('B1', '200.00');
+  await byClick(oB1, B, b1);
+  const { rows: [cB] } = await pool.query('SELECT id, version FROM affiliate_commissions WHERE order_id = $1', [oB1]);
+  await setCommissionStatus('RPBBBB', Number(cB.id), { status: 'approved', actor: ACT, version: cB.version });
+  // An order 40 days ago: outside the period.
+  await byClick(await order('OLD', '999.00', '40 days'), A, a1, '40 days');
+  // A payout to A paid at the bank today: gross ₹100, TDS ₹2, net ₹98.
+  const { rows: [batch] } = await pool.query(`INSERT INTO affiliate_payout_batches (public_id, status, created_by) VALUES ('RPRPBATCH2', 'closed', $1) RETURNING id`, [ACT]);
+  await pool.query(`INSERT INTO affiliate_payouts (public_id, batch_id, affiliate_id, currency, gross_amount, tds_section, tds_rate_bps, tds_amount, net_amount, financial_year,
+      payee_name, bank_account, bank_ifsc, status, utr, paid_on, paid_at, paid_by, created_by)
+    VALUES ('RPRPPAYUT2', $1, $2, 'INR', 100, '194H', 200, 2, 98, '2026-27', 'DBCHECK payee', '123456789', 'HDFC0001234', 'paid', 'UTRRP123456', (now() AT TIME ZONE 'Asia/Kolkata')::date, now(), $3, $3)`, [batch.id, A.id, ACT]);
+
+  const after = await affiliateProgrammeReport(period, full);
+  const d = (f) => Math.round((f(after) - f(before)) * 100) / 100;
+  const want = {
+    clicks: [d((r) => r.totals.clicks), 6], orders: [d((r) => r.totals.orders), 4], cancelled: [d((r) => r.totals.cancelled), 1],
+    link: [d((r) => r.totals.by_method.link), 3], coupon: [d((r) => r.totals.by_method.coupon), 1], value: [d((r) => r.totals.order_value), 1700],
+    earned: [d((r) => r.totals.commissions.earned), 190], pending: [d((r) => r.totals.commissions.by_status.pending), 150], approved: [d((r) => r.totals.commissions.by_status.approved), 40],
+    onCancelled: [d((r) => r.totals.commissions.on_cancelled_orders), 30], paidNet: [d((r) => r.totals.payouts.paid.net), 98], paidTds: [d((r) => r.totals.payouts.paid.tds), 2],
+    seriesClicks: [d((r) => r.series.reduce((x, s) => x + s.clicks, 0)), 6], seriesOrders: [d((r) => r.series.reduce((x, s) => x + s.orders, 0)), 4],
+  };
+  for (const [k, [got, exp]] of Object.entries(want)) if (got !== exp) bad.push(`${k}: ${got} (want ${exp})`);
+  // Earned reconciles with its breakdown, as on the affiliate page.
+  const c = after.totals.commissions;
+  if (Math.round((c.by_status.pending + c.by_status.approved + c.by_status.paid) * 100) !== Math.round(c.earned * 100)) bad.push(`earned ≠ pending + approved + paid ${JSON.stringify(c)}`);
+  const rowA = after.rows.find((r) => r.public_id === 'RPAAAA');
+  const rowB = after.rows.find((r) => r.public_id === 'RPBBBB');
+  if (!rowA || rowA.clicks !== 4 || rowA.orders !== 3 || rowA.cancelled !== 1 || rowA.by_method.link !== 2 || rowA.by_method.coupon !== 1 || rowA.order_value !== 1500
+    || rowA.commission_earned !== 150 || rowA.paid_net !== 98 || rowA.paid_tds !== 2 || rowA.conversion !== 50) bad.push(`row A ${JSON.stringify(rowA)}`);
+  if (!rowB || rowB.clicks !== 2 || rowB.orders !== 1 || rowB.order_value !== 200 || rowB.commission_earned !== 40 || rowB.conversion !== 50) bad.push(`row B ${JSON.stringify(rowB)}`);
+  if (after.rows.indexOf(rowA) > after.rows.indexOf(rowB)) bad.push('rows not ordered by orders');
+  if (after.series.length !== 2 || after.series[1].day !== period.to) bad.push(`series days ${JSON.stringify(after.series.map((s) => s.day))}`);
+  // Without money rights: no commission or payout figures anywhere.
+  const plain = await affiliateProgrammeReport(period, {});
+  if (plain.totals.commissions || plain.totals.payouts || 'commission_earned' in plain.rows[0] || 'paid_net' in plain.rows[0]) bad.push('money in a plain report');
+  // Period rules.
+  await expectErr('reversed', async () => reportPeriod({ from: '2026-10-10', to: '2026-10-01' }), (e) => e.status === 400);
+  await expectErr('too long', async () => reportPeriod({ from: '2025-01-01', to: '2026-10-01' }), (e) => e.status === 400);
+  await expectErr('not a date', async () => reportPeriod({ from: '01-10-2026', to: '2026-10-05' }), (e) => e.status === 400);
+  if (reportPeriod({}, new Date('2026-10-28T06:00:00Z')).from !== '2026-09-29') bad.push('default period is not the last 30 IST days');
+  // Over HTTP: viewer sees clicks and orders only; finance sees money; a member without the role is refused; page gated.
+  const q = `/api/affiliates/report?from=${period.from}&to=${period.to}`;
+  const v = await af('viewer', 'GET', q);
+  const f = await af('finance', 'GET', q);
+  const none = await af('none', 'GET', q);
+  if (v.status !== 200 || v.body.totals.commissions || v.body.totals.payouts || v.body.money.commissions) bad.push(`viewer ${v.status} ${JSON.stringify(v.body.money)}`);
+  if (f.status !== 200 || !f.body.totals.commissions || !f.body.totals.payouts) bad.push(`finance ${f.status}`);
+  if (none.status !== 403) bad.push(`no role ${none.status}`);
+  if ((await af('viewer', 'GET', '/affiliate-report')).status !== 200 || (await af('none', 'GET', '/affiliate-report')).status === 200) bad.push('page gate');
+  if ((await af('viewer', 'GET', '/api/affiliates/report?from=2026-10-10&to=2026-10-01')).status !== 400) bad.push('bad period not 400');
+  await purgeTestOrders(P); await purgeTestAffiliates(ACT);
+  if (bad.length) throw new Error(bad.join('; '));
+  return 'deltas: +6 clicks (40-day-old one out), +4 orders (3 link, 1 coupon, 1 cancelled), +₹1,700 value, ₹190 earned = ₹150 pending + ₹40 approved, ₹30 apart on the cancelled order, ₹98 paid net / ₹2 TDS; per-affiliate rows and ranking; daily series; period rules; viewer without money, finance with, others 403';
+});
+
 await step('tickets: any member raises one (validated, TKT- numbers unique under concurrency, idempotent per request id), assigned to the ticket owner by member record (refused when not exactly one); members see only their own (404 otherwise); owner/admins see and manage all; status, reassignment and resend refused to members; activity recorded; WhatsApp notice through the 11za client (mocked) — survives provider failure, retried safely without duplicates, never via the OTP template; no token or number in logs', async () => {
   const bad = [];
   const db = getPool();
