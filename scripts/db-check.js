@@ -9920,7 +9920,7 @@ await step('shopify oauth: APP_BASE_URL pins the callback; connecting stores the
     const state = (install.headers['set-cookie'] || []).join(';').match(/shopify_oauth_state=([0-9a-f]+)/)?.[1];
     if (install.statusCode !== 302 || loc.host !== SHOP || loc.pathname !== '/admin/oauth/authorize') bad.push(`install ${install.statusCode} ${loc}`);
     if (loc.searchParams.get('redirect_uri') !== 'https://abc.briyo.xyz/auth/shopify/callback') bad.push(`redirect_uri ${loc.searchParams.get('redirect_uri')}`);
-    if (loc.searchParams.get('scope') !== 'read_online_store_navigation,write_online_store_navigation,read_orders' || !state) bad.push(`scope/state ${loc.searchParams.get('scope')}`);
+    if (loc.searchParams.get('scope') !== 'read_online_store_navigation,write_online_store_navigation,read_orders,read_discounts,write_discounts' || !state) bad.push(`scope/state ${loc.searchParams.get('scope')}`);
     // Non-admins cannot start it.
     const nonAdmin = await fetch(`${base}/auth/shopify/install`, { headers: { cookie: `${SESSION_COOKIE}=${issueSession(HRM.nonHr)}` }, redirect: 'manual' });
     if (nonAdmin.status === 302 && /myshopify/.test(nonAdmin.headers.get('location') || '')) bad.push('non-admin reached Shopify');
@@ -12884,7 +12884,15 @@ await step('affiliate commissions: one per attribution, rate and base fixed at c
   // 8. Status path pending → approved → paid; illegal moves refused; every move in the history and the activity log.
   await expectErr('pending → paid', () => setCommissionStatus('CMAXQT', Number(c1[0].id), { status: 'paid', actor: ACT }), (e) => e.status === 409);
   await setCommissionStatus('CMAXQT', Number(c1[0].id), { status: 'approved', actor: ACT });
-  await setCommissionStatus('CMAXQT', Number(c1[0].id), { status: 'paid', actor: ACT });
+  // approved → paid only through a payout batch (it records TDS and the bank reference), never by hand.
+  await expectErr('approved → paid by hand', () => setCommissionStatus('CMAXQT', Number(c1[0].id), { status: 'paid', actor: ACT }), (e) => e.status === 409 && /payout batch/.test(e.message));
+  {
+    const PO = await import('../lib/affiliate-payouts.js');
+    await PO.setPayoutDetails('CMAXQT', { payee_name: 'DBCHECK CM Payee', bank_account: '000111222333', bank_ifsc: 'HDFC0001234' }, { actor: ACT });
+    const { ref } = await PO.createPayoutBatch({ only: ['CMAXQT'], actor: ACT });
+    const batch = await PO.getPayoutBatch(ref);
+    await PO.markPayoutPaid(batch.payouts[0].ref, { utr: 'DBCHECKUTRCM01', paid_on: new Date().toISOString().slice(0, 10), actor: ACT });
+  }
   await expectErr('reversed → approved', () => setCommissionStatus('CMAXQT', Number(cc.id), { status: 'approved', actor: ACT }), (e) => e.status === 409);
   const hist = (await pool.query('SELECT from_status, to_status FROM affiliate_commission_events WHERE commission_id = $1 ORDER BY id', [c1[0].id])).rows.map((r) => `${r.from_status}>${r.to_status}`).join(',');
   if (hist !== 'null>pending,pending>approved,approved>paid') bad.push(`history ${hist}`);
@@ -12905,7 +12913,8 @@ await step('affiliate commissions: one per attribution, rate and base fixed at c
   (e) => /created as pending/.test(e.message));
   if ((await pool.query('SELECT status FROM affiliate_commissions WHERE id = $1', [pend.id])).rows[0].status !== 'pending') bad.push('a refused raw update changed the status');
   const logged = (await pool.query(`SELECT action FROM affiliate_events WHERE affiliate_id = $1 AND action LIKE 'commission_%' ORDER BY id`, [A])).rows.map((r) => r.action);
-  for (const want of ['commission_created', 'commission_not_created', 'commission_reversed', 'commission_approved', 'commission_paid']) if (!logged.includes(want)) bad.push(`audit ${want}`);
+  for (const want of ['commission_created', 'commission_not_created', 'commission_reversed', 'commission_approved']) if (!logged.includes(want)) bad.push(`audit ${want}`);
+  if (!(await pool.query(`SELECT 1 FROM affiliate_events WHERE affiliate_id = $1 AND action = 'payout_paid'`, [A])).rows.length) bad.push('audit payout_paid');
   // 9. API: admins and finance staff see money; a viewer sees orders without money fields (absent, not zero); viewers cannot move statuses.
   const adm = await af('adm', 'GET', '/api/affiliates/CMAXQT/performance');
   const fin = await af('finance', 'GET', '/api/affiliates/CMAXQT/performance');
@@ -12957,6 +12966,254 @@ await step('affiliate commissions: one per attribution, rate and base fixed at c
   await purgeTestOrders(P); await purgeTestAffiliates(ACT);
   if (bad.length) throw new Error(bad.join(' | '));
   return 'base = subtotal ₹215.00 − recorded tax ₹41.64 = ₹173.36 (shipping ₹58 and tax excluded) × 12.5% → one ₹21.67 commission (rate 1250 kept after a new 10% rate; amounts and history immutable); negative base → none; USD kept as USD ₹→$2.50; no record / no rate / voided → none, logged; retried by the backfill only when skipped-and-logged (pre-ledger #2809-like never); cancelled order flagged, not earned, reversed with a reason; pending→approved→paid audited, illegal moves 409; admin/finance see money, viewer gets no money fields and cannot move statuses; activity shows no amounts';
+});
+
+await step('affiliate coupons: a real Shopify discount code per affiliate (all customers, all products, % fixed), Shopify first then the record (undone if the record fails), codes credit their affiliate, paused in Shopify while the affiliate is suspended, disabled for good with a reason, scope errors reported', async () => {
+  const bad = [];
+  const pool = getPool();
+  const { createCoupon, disableCoupon, listCoupons, syncCouponsForAffiliate } = await import('../lib/affiliate-coupons.js');
+  const { attributeOrder } = await import('../lib/affiliate-referrals.js');
+  const { tx: aTx, setAffiliateStatus } = await import('../lib/affiliates.js');
+  const ACT = 'db-check-coupons';
+  const P = `${TEST_ORDER}-CP`;
+  await purgeTestOrders(P); await purgeTestAffiliates(ACT);
+  const { rows: [cat] } = await pool.query(`SELECT key FROM affiliate_categories WHERE NOT requires_verification ORDER BY sort LIMIT 1`);
+  const mkAff = async (pid, status = 'active') => {
+    const { rows: [a] } = await pool.query(`INSERT INTO affiliates (public_id, category, display_name, status, activated_at, created_by) VALUES ($1, $2, $3, $4, now(), $5) RETURNING id`, [pid, cat.key, `DBCHECK-CP ${pid}`, status, ACT]);
+    await pool.query(`INSERT INTO affiliate_rates (affiliate_id, rate_bps, effective_from, created_by) VALUES ($1, 1000, now() - interval '2 days', $2)`, [a.id, ACT]);
+    return Number(a.id);
+  };
+  const A = await mkAff('CPAXQT');
+  await mkAff('CPSXQT', 'suspended');
+  // A stand-in for Shopify's Admin API: records every call; `mode` makes it refuse, deny the scope, or (as a side
+  // effect while Shopify is "working") suspend the affiliate so that saving the record fails.
+  const shop = { calls: [], mode: 'ok', n: 0 };
+  const gql = async (query, vars) => {
+    const op = /(discountCode\w+)/.exec(query)?.[1];
+    shop.calls.push({ op, vars });
+    if (shop.mode === 'scope') throw new Error('Access denied for discountCodeBasicCreate field. Required access: `write_discounts` access scope.');
+    if (op === 'discountCodeBasicCreate') {
+      if (shop.mode === 'taken') return { discountCodeBasicCreate: { codeDiscountNode: null, userErrors: [{ field: ['basicCodeDiscount', 'code'], message: 'Code must be unique.' }] } };
+      if (shop.mode === 'suspend-meanwhile') await pool.query(`UPDATE affiliates SET status = 'suspended', suspended_at = now(), suspension_reason = 'meanwhile' WHERE id = $1`, [A]);
+      shop.n += 1;
+      return { discountCodeBasicCreate: { codeDiscountNode: { id: `gid://shopify/DiscountCodeNode/9900${shop.n}` }, userErrors: [] } };
+    }
+    return { [op]: { codeDiscountNode: { id: vars.id }, deletedCodeDiscountId: vars.id, userErrors: [] } };
+  };
+  const ops = () => shop.calls.map((c) => c.op);
+  // Input rules: nothing reaches Shopify.
+  for (const [input, field] of [[{ code: 'ab', discount_percent: '10' }, 'code'], [{ code: '-BAD-', discount_percent: '10' }, 'code'], [{ code: 'GOOD10', discount_percent: '95' }, 'discount_percent'],
+    [{ code: 'GOOD10', discount_percent: '0' }, 'discount_percent'], [{ code: 'GOOD10', discount_percent: '1.234' }, 'discount_percent']]) {
+    await expectErr(`input ${JSON.stringify(input)}`, () => createCoupon('CPAXQT', input, { actor: ACT, gql }), (e) => e.status === 400 && e.field === field);
+  }
+  await expectErr('suspended affiliate', () => createCoupon('CPSXQT', { code: 'CPSUSP10', discount_percent: '10' }, { actor: ACT, gql }), (e) => e.status === 409);
+  if (shop.calls.length) bad.push(`Shopify called for refused input ${JSON.stringify(ops())}`);
+  // Created: the Shopify discount as specified, then the record.
+  const made = await createCoupon('CPAXQT', { code: 'dbchk-cp10', discount_percent: '12.5', once_per_customer: 'true' }, { actor: ACT, gql });
+  const d = shop.calls[0]?.vars?.d;
+  if (!d || d.code !== 'DBCHK-CP10' || d.customerGets.value.percentage !== 0.125 || d.customerGets.items.all !== true || d.context.all !== 'ALL' || d.appliesOncePerCustomer !== true || !d.startsAt || 'customerSelection' in d) bad.push(`Shopify input ${JSON.stringify(d)}`);
+  const c = made.coupons.find((x) => x.code === 'DBCHK-CP10');
+  if (!c || c.discount_bps !== 1250 || !c.once_per_customer || !c.shopify.set || !c.shopify.active || c.status !== 'active') bad.push(`coupon ${JSON.stringify(c)}`);
+  // The same code again (any case) → refused before Shopify.
+  shop.calls = [];
+  await expectErr('duplicate', () => createCoupon('CPAXQT', { code: 'DBCHK-cp10', discount_percent: '5' }, { actor: ACT, gql }), (e) => e.status === 409 && e.field === 'code');
+  if (shop.calls.length) bad.push('Shopify called for a duplicate code');
+  // Shopify refuses → nothing saved; scope missing → reported as such.
+  shop.mode = 'taken';
+  await expectErr('Shopify refuses', () => createCoupon('CPAXQT', { code: 'DBCHKTAKEN', discount_percent: '5' }, { actor: ACT, gql }), (e) => e.status === 409 && /Shopify refused/.test(e.message));
+  shop.mode = 'scope';
+  await expectErr('scope', () => createCoupon('CPAXQT', { code: 'DBCHKSCOPE', discount_percent: '5' }, { actor: ACT, gql }), (e) => e.status === 409 && e.scope === true);
+  // The record cannot be saved (the affiliate was suspended while Shopify worked) → the Shopify discount is deleted again.
+  shop.mode = 'suspend-meanwhile'; shop.calls = [];
+  await expectErr('undo', () => createCoupon('CPAXQT', { code: 'DBCHKUNDO', discount_percent: '5' }, { actor: ACT, gql }), (e) => e.status === 409);
+  if (ops().join() !== 'discountCodeBasicCreate,discountCodeDelete') bad.push(`undo calls ${ops().join()}`);
+  const codes = (await pool.query(`SELECT code FROM affiliate_referral_assets WHERE affiliate_id = $1 AND type = 'coupon'`, [A])).rows.map((r) => r.code);
+  if (codes.join() !== 'DBCHK-CP10') bad.push(`records ${codes.join()}`);
+  // Suspended now: syncing pauses the code in Shopify; reactivated: it comes back. Attribution follows eligibility.
+  shop.mode = 'ok'; shop.calls = [];
+  const s1 = await syncCouponsForAffiliate('CPAXQT', { actor: ACT, gql });
+  const paused = (await listCoupons('CPAXQT')).coupons[0];
+  if (s1.synced !== 1 || ops().join() !== 'discountCodeDeactivate' || paused.shopify.active) bad.push(`pause ${JSON.stringify([s1, ops(), paused.shopify])}`);
+  await pool.query(`UPDATE affiliates SET status = 'active', suspended_at = NULL, suspension_reason = NULL WHERE id = $1`, [A]);
+  shop.calls = [];
+  await syncCouponsForAffiliate('CPAXQT', { actor: ACT, gql });
+  if (ops().join() !== 'discountCodeActivate' || !(await listCoupons('CPAXQT')).coupons[0].shopify.active) bad.push('resume');
+  // A sync that fails is recorded on the coupon, not thrown.
+  await pool.query(`UPDATE affiliates SET status = 'suspended', suspended_at = now(), suspension_reason = 'x' WHERE id = $1`, [A]);
+  shop.mode = 'scope';
+  const s2 = await syncCouponsForAffiliate('CPAXQT', { actor: ACT, gql });
+  if (s2.failed !== 1 || !/discounts permission/.test((await listCoupons('CPAXQT')).coupons[0].shopify.error || '')) bad.push(`failed sync ${JSON.stringify(s2)}`);
+  shop.mode = 'ok';
+  await pool.query(`UPDATE affiliates SET status = 'active', suspended_at = NULL, suspension_reason = NULL WHERE id = $1`, [A]);
+  await syncCouponsForAffiliate('CPAXQT', { actor: ACT, gql });
+  if ((await listCoupons('CPAXQT')).coupons[0].shopify.error) bad.push('error not cleared');
+  // An order using the code (any case) credits this affiliate by coupon, with a commission.
+  const { rows: [o] } = await pool.query(`INSERT INTO orders (channel, source_order_id, source, order_status, order_date, created_by, source_payload)
+    VALUES ('website', $1, 'shopify_sync', 'new', now() - interval '1 hour', $2, $3) RETURNING id`, [`${P}-1`, ACT, JSON.stringify({ shopify: { name: '#CP1' } })]);
+  const r = await aTx((client) => attributeOrder(client, o.id, { orderedAt: new Date().toISOString(), discountCodes: ['dbchk-CP10'], customAttributes: [] }, { actor: ACT }));
+  const t = (await pool.query('SELECT affiliate_id, attribution_method FROM affiliate_order_attributions WHERE order_id = $1', [o.id])).rows[0];
+  if (!r?.recorded || t?.attribution_method !== 'coupon' || Number(t.affiliate_id) !== A || (await listCoupons('CPAXQT')).coupons[0].orders !== 1) bad.push(`attribution ${JSON.stringify([r, t])}`);
+  // The discount and code are fixed once created (database).
+  await expectErr('db: change discount', () => pool.query(`UPDATE affiliate_referral_assets SET discount_bps = 500 WHERE code = 'DBCHK-CP10'`), (e) => /identity is immutable/.test(e.message));
+  // Disabled for good: Shopify first, a reason required, final.
+  await expectErr('disable without reason', () => disableCoupon('CPAXQT', c.ref, { actor: ACT, gql }), (e) => e.status === 400);
+  shop.mode = 'scope';
+  await expectErr('disable while Shopify refuses', () => disableCoupon('CPAXQT', c.ref, { reason: 'Partner left', actor: ACT, gql }), (e) => e.status === 409 && e.scope);
+  if ((await listCoupons('CPAXQT')).coupons[0].status !== 'active') bad.push('disabled although Shopify was not updated');
+  shop.mode = 'ok'; shop.calls = [];
+  const off = await disableCoupon('CPAXQT', c.ref, { reason: 'Partner left', actor: ACT, gql });
+  if (ops().join() !== 'discountCodeDeactivate' || off.coupons[0].status !== 'disabled' || off.coupons[0].disable_reason !== 'Partner left') bad.push(`disable ${JSON.stringify(off.coupons[0])}`);
+  await expectErr('disable twice', () => disableCoupon('CPAXQT', c.ref, { reason: 'again', actor: ACT, gql }), (e) => e.status === 409);
+  const ev = (await afEvents('CPAXQT')).map((e) => e.action);
+  for (const want of ['coupon_created', 'coupon_deactivated_in_shopify', 'coupon_activated_in_shopify', 'coupon_disabled', 'order_attributed']) if (!ev.includes(want)) bad.push(`event ${want}`);
+  // API: a viewer reads but cannot create; the manager can reach the create path (Shopify is not configured in tests).
+  const vList = await af('viewer', 'GET', '/api/affiliates/CPAXQT/coupons');
+  const vMake = await af('viewer', 'POST', '/api/affiliates/CPAXQT/coupons', { code: 'VIEWER10', discount_percent: '10' });
+  const fMake = await af('finance', 'POST', '/api/affiliates/CPAXQT/coupons', { code: 'FINANCE10', discount_percent: '10' });
+  if (vList.status !== 200 || vList.body.canManage || vList.body.coupons?.length !== 1 || vMake.status !== 403 || fMake.status !== 403) bad.push(`API ${vList.status}/${vMake.status}/${fMake.status}`);
+  await purgeTestOrders(P); await purgeTestAffiliates(ACT);
+  if (bad.length) throw new Error(bad.join(' | '));
+  return 'bad code / % refused before Shopify; created as a % off all products for all customers (context ALL), once per customer; duplicate code refused before Shopify; Shopify refusal / missing scope → nothing saved; record failure → Shopify discount deleted; paused / resumed in Shopify with eligibility, failure recorded then cleared; order with the code (any case) credited by coupon; discount fixed in the database; disable needs a reason and Shopify first, final; events logged; viewer and finance cannot create';
+});
+
+await step('affiliate payouts and TDS: 194H threshold over the financial year (first payout over the line covers the year), 20% without PAN, batches take commissions once, bank file, paid with UTR → commissions paid, failed → back in the pool, cancel, TDS register, payee fixed, details masked, money gated', async () => {
+  const bad = [];
+  const pool = getPool();
+  const PO = await import('../lib/affiliate-payouts.js');
+  const { setCommissionStatus } = await import('../lib/affiliate-commissions.js');
+  const ACT = 'db-check-payouts';
+  const P = `${TEST_ORDER}-PY`;
+  await purgeTestOrders(P); await purgeTestAffiliates(ACT);
+  await PO.ensureAffiliatePayoutSchema();
+  const savedTds = await PO.tdsSettings();
+  try {
+    // Pure rules first.
+    const s = { tds_threshold_inr: 20000, tds_rate_bps: 200, tds_no_pan_rate_bps: 2000 };
+    const tds = (g, b, t, pan) => PO.computeTds({ grossPaise: g * 100, fyGrossBeforePaise: b * 100, fyTdsBeforePaise: t * 100, hasPan: pan, settings: s }).tdsPaise / 100;
+    for (const [args, want] of [[[15000, 0, 0, true], 0], [[20000, 0, 0, true], 0], [[10000, 15000, 0, true], 500], [[5000, 25000, 500, true], 100], [[25000, 0, 0, false], 5000], [[100, 20000, 0, true], 100]]) {
+      if (tds(...args) !== want) bad.push(`tds ${JSON.stringify(args)} = ${tds(...args)}, want ${want}`);
+    }
+    if (PO.financialYearOf(new Date('2027-03-31T18:29:59Z')) !== '2026-27' || PO.financialYearOf(new Date('2027-03-31T18:30:00Z')) !== '2027-28') bad.push('financial year boundary (IST)');
+    if (PO.toPaise('1234.5') !== 123450 || PO.fromPaise(123450) !== '1234.50' || PO.fromPaise(5) !== '0.05') bad.push('paise');
+    await PO.updateTdsSettings({ tds_section: '194H', tds_rate_percent: '2', tds_no_pan_rate_percent: '20', tds_threshold_inr: '20000' }, { actor: ACT });
+
+    const { rows: [cat] } = await pool.query(`SELECT key FROM affiliate_categories WHERE NOT requires_verification ORDER BY sort LIMIT 1`);
+    const mkAff = async (pid) => Number((await pool.query(`INSERT INTO affiliates (public_id, category, display_name, status, activated_at, created_by) VALUES ($1, $2, $3, 'active', now(), $4) RETURNING id`,
+      [pid, cat.key, `DBCHECK-PY ${pid}`, ACT])).rows[0].id);
+    const A = await mkAff('PYAXQT'); const B = await mkAff('PYBXQT'); await mkAff('PYCXQT');
+    let n = 0;
+    const commission = async (affId, amount, status = 'approved') => {
+      n += 1;
+      const { rows: [o] } = await pool.query(`INSERT INTO orders (channel, source_order_id, source, order_status, order_date, created_by, source_payload)
+        VALUES ('website', $1, 'shopify_sync', 'new', now() - interval '1 hour', $2, $3) RETURNING id`, [`${P}-${n}`, ACT, JSON.stringify({ shopify: { name: `#PY${n}` } })]);
+      const { rows: [t] } = await pool.query(`INSERT INTO affiliate_order_attributions (order_id, affiliate_id, attribution_method, order_placed_at, rule_version) VALUES ($1, $2, 'coupon', now(), 'v1') RETURNING id`, [o.id, affId]);
+      const { rows: [c] } = await pool.query(`INSERT INTO affiliate_commissions (affiliate_id, attribution_id, order_id, currency, rate_bps, base_amount, commission_amount, created_by)
+        VALUES ($1, $2, $3, 'INR', 1000, $4::numeric * 10, $4::numeric, $5) RETURNING id`, [affId, t.id, o.id, amount, ACT]);
+      if (status === 'approved') await pool.query(`UPDATE affiliate_commissions SET status = 'approved' WHERE id = $1`, [c.id]);
+      return Number(c.id);
+    };
+    const statusOf = async (id) => (await pool.query('SELECT status FROM affiliate_commissions WHERE id = $1', [id])).rows[0].status;
+    const cA1 = await commission(A, '15000.00');
+    const cB1 = await commission(B, '25000.00');
+    await commission(await (async () => (await pool.query(`SELECT id FROM affiliates WHERE public_id = 'PYCXQT'`)).rows[0].id)(), '500.00');
+    await commission(A, '99.00', 'pending');   // not approved: never paid
+    // Payout details: validated, masked, logged by field name only.
+    for (const [input, field] of [[{ pan: 'ABCD1234F' }, 'pan'], [{ bank_ifsc: 'HDFC1234567' }, 'bank_ifsc'], [{ bank_account: '12AB' }, 'bank_account']]) {
+      await expectErr(`details ${field}`, () => PO.setPayoutDetails('PYAXQT', input, { actor: ACT }), (e) => e.status === 400 && e.field === field);
+    }
+    const dA = await PO.setPayoutDetails('PYAXQT', { pan: 'abcde1234f', payee_name: 'DBCHECK Payee A', bank_account: '123456789012', bank_ifsc: 'hdfc0001234' }, { actor: ACT });
+    await PO.setPayoutDetails('PYBXQT', { payee_name: 'DBCHECK Payee B', bank_account: '998877665544', bank_ifsc: 'ICIC0000001' }, { actor: ACT });
+    if (dA.pan !== '••••••234F' || dA.bank_account !== '•••• 9012' || dA.bank_ifsc !== 'HDFC0001234' || !dA.complete) bad.push(`masked ${JSON.stringify(dA)}`);
+    const kept = await PO.setPayoutDetails('PYAXQT', { payee_name: 'DBCHECK Payee A', bank_account: '', pan: '' }, { actor: ACT });
+    if (kept.bank_account !== '•••• 9012' || !kept.has_pan) bad.push('blank field cleared a stored value');
+    const detEv = (await afEvents('PYAXQT')).filter((e) => e.action === 'payout_details_updated');
+    if (!detEv.length || JSON.stringify(detEv).includes('123456789012') || JSON.stringify(detEv).includes('ABCDE1234F')) bad.push('payout details values in the log');
+    // Preview: A ₹15,000 (below the threshold: no TDS); B ₹25,000 without PAN → 20% = ₹5,000; C has no bank details.
+    const pv = await PO.previewPayoutBatch({ only: ['PYAXQT', 'PYBXQT', 'PYCXQT'] });
+    const row = (pid) => pv.payouts.find((x) => x.affiliate === pid);
+    if (row('PYAXQT')?.tds !== '0.00' || !row('PYAXQT').below_threshold || row('PYBXQT')?.tds !== '5000.00' || row('PYBXQT').tds_rate_bps !== 2000 || row('PYBXQT').net !== '20000.00'
+      || pv.totals.gross !== '40000.00' || pv.totals.tds !== '5000.00' || pv.totals.net !== '35000.00' || !pv.blocked.find((b) => b.affiliate === 'PYCXQT' && /Bank details/.test(b.reason))) bad.push(`preview ${JSON.stringify(pv)}`);
+    if (JSON.stringify(pv).includes('123456789012')) bad.push('full account number in the preview');
+    const left = await PO.previewPayoutBatch({ only: ['PYAXQT', 'PYBXQT'], exclude: ['PYBXQT'] });
+    if (left.payouts.length !== 1 || !left.blocked.find((b) => b.affiliate === 'PYBXQT' && /Left out/.test(b.reason))) bad.push('exclude');
+    // Batch 1.
+    const { ref: b1 } = await PO.createPayoutBatch({ only: ['PYAXQT', 'PYBXQT', 'PYCXQT'], note: 'DBCHECK batch one', actor: ACT });
+    let batch = await PO.getPayoutBatch(b1);
+    const pA = batch.payouts.find((x) => x.affiliate === 'PYAXQT'); const pB = batch.payouts.find((x) => x.affiliate === 'PYBXQT');
+    if (batch.payouts.length !== 2 || batch.status !== 'open' || pA.commissions !== 1 || pB.tds !== '5000.00' || batch.totals.net !== '35000.00') bad.push(`batch ${JSON.stringify(batch)}`);
+    if ((await PO.previewPayoutBatch({ only: ['PYAXQT', 'PYBXQT'] })).payouts.length) bad.push('commissions in an open batch offered again');
+    await expectErr('second batch, nothing left', () => PO.createPayoutBatch({ only: ['PYAXQT', 'PYBXQT'], actor: ACT }), (e) => e.status === 409);
+    await expectErr('reverse while in a payout', () => setCommissionStatus('PYAXQT', cA1, { status: 'reversed', reason: 'x', actor: ACT }), (e) => e.status === 409 && /waiting for the bank/.test(e.message));
+    // Bank file: the full account numbers, one row per pending payout; the download is logged.
+    const file = await PO.payoutBankFile(b1, { actor: ACT });
+    const lines = file.body.trim().split('\r\n');
+    if (lines.length !== 3 || !lines[0].startsWith('Beneficiary Name,Account Number,IFSC,Amount') || !file.body.includes('123456789012,HDFC0001234,15000.00') || !file.body.includes('998877665544,ICIC0000001,20000.00')) bad.push(`bank file ${file.body}`);
+    // Paid: UTR and date required; commissions paid; the same UTR twice refused.
+    await expectErr('no UTR', () => PO.markPayoutPaid(pA.ref, { utr: '12', paid_on: '2026-10-01', actor: ACT }), (e) => e.status === 400 && e.field === 'utr');
+    await expectErr('future date', () => PO.markPayoutPaid(pA.ref, { utr: 'DBCHKUTR0001', paid_on: '2099-01-01', actor: ACT }), (e) => e.status === 400 && e.field === 'paid_on');
+    await PO.markPayoutPaid(pA.ref, { utr: 'DBCHKUTR0001', paid_on: new Date().toISOString().slice(0, 10), actor: ACT });
+    if (await statusOf(cA1) !== 'paid') bad.push('commission not paid with its payout');
+    await expectErr('paid twice', () => PO.markPayoutPaid(pA.ref, { utr: 'DBCHKUTR0002', paid_on: new Date().toISOString().slice(0, 10), actor: ACT }), (e) => e.status === 409);
+    await expectErr('UTR reused', () => PO.markPayoutPaid(pB.ref, { utr: 'dbchkutr0001', paid_on: new Date().toISOString().slice(0, 10), actor: ACT }), (e) => e.status === 409 && e.field === 'utr');
+    // Failed: reason required; its commission goes back to the pool, still approved; the batch closes (one paid).
+    await expectErr('fail without reason', () => PO.markPayoutFailed(pB.ref, { actor: ACT }), (e) => e.status === 400);
+    await PO.markPayoutFailed(pB.ref, { reason: 'Bank returned it: account closed', actor: ACT });
+    batch = await PO.getPayoutBatch(b1);
+    if (batch.status !== 'closed' || await statusOf(cB1) !== 'approved') bad.push(`after failure ${batch.status}/${await statusOf(cB1)}`);
+    await expectErr('cancel a closed batch', () => PO.cancelPayoutBatch(b1, { reason: 'x', actor: ACT }), (e) => e.status === 409);
+    // Batch 2: A earns ₹10,000 more → the year reaches ₹25,000 → 2% of the whole year = ₹500, covering the earlier ₹15,000;
+    // B's failed payout no longer counts towards the year, so B again pays 20% on ₹25,000.
+    const cA2 = await commission(A, '10000.00');
+    const pv2 = await PO.previewPayoutBatch({ only: ['PYAXQT', 'PYBXQT'] });
+    const a2 = pv2.payouts.find((x) => x.affiliate === 'PYAXQT'); const b2 = pv2.payouts.find((x) => x.affiliate === 'PYBXQT');
+    if (a2?.fy_gross_before !== '15000.00' || a2.tds !== '500.00' || a2.tds_rate_bps !== 200 || a2.net !== '9500.00' || b2?.tds !== '5000.00') bad.push(`year TDS ${JSON.stringify([a2, b2])}`);
+    const { ref: bt2 } = await PO.createPayoutBatch({ only: ['PYAXQT', 'PYBXQT'], actor: ACT });
+    await expectErr('cancel without reason', () => PO.cancelPayoutBatch(bt2, { actor: ACT }), (e) => e.status === 400);
+    await PO.cancelPayoutBatch(bt2, { reason: 'Wrong month', actor: ACT });
+    const c2 = await PO.getPayoutBatch(bt2);
+    if (c2.status !== 'cancelled' || c2.payouts.some((x) => x.status !== 'cancelled') || await statusOf(cA2) !== 'approved'
+      || (await PO.previewPayoutBatch({ only: ['PYAXQT'] })).payouts[0]?.gross !== '10000.00') bad.push('cancel did not release');
+    // Payee and amounts fixed; history kept (database).
+    const { rows: [rawA] } = await pool.query(`SELECT id FROM affiliate_payouts WHERE public_id = $1`, [pA.ref]);
+    await expectErr('db: change amount', () => pool.query('UPDATE affiliate_payouts SET net_amount = 1 WHERE id = $1', [rawA.id]), (e) => /fixed when it is created/.test(e.message));
+    await expectErr('db: paid → pending', () => pool.query(`UPDATE affiliate_payouts SET status = 'pending' WHERE id = $1`, [rawA.id]), (e) => /paid payout cannot become pending/.test(e.message));
+    await expectErr('db: delete', () => pool.query('DELETE FROM affiliate_payouts WHERE id = $1', [rawA.id]), (e) => /never deleted/.test(e.message));
+    await expectErr('db: revive item', () => pool.query('UPDATE affiliate_payout_items SET active = true WHERE commission_id = $1', [cB1]), (e) => /only ever stops being live/.test(e.message));
+    await expectErr('db: one live payout per commission', () => pool.query(`INSERT INTO affiliate_payout_items (payout_id, commission_id, amount) VALUES ($1, $2, 1)`, [rawA.id, cA1]), (e) => /affiliate_payout_items_one_live/.test(e.message));
+    // TDS register: the paid payout, with the full PAN, quarter, gross, TDS and UTR.
+    const reg = await PO.tdsRegister({ fy: PO.financialYearOf() });
+    const regLine = reg.body.split('\r\n').find((l) => l.includes('DBCHKUTR0001'));
+    if (!regLine || !regLine.includes('ABCDE1234F') || !regLine.includes(',194H,15000.00,0.00,0.00,15000.00,') || !/,Q[1-4],/.test(regLine)) bad.push(`register ${regLine}`);
+    await expectErr('register year', () => PO.tdsRegister({ fy: '26' }), (e) => e.status === 400);
+    // Settings: validated, logged.
+    await expectErr('rate', () => PO.updateTdsSettings({ tds_rate_percent: '150' }, { actor: ACT }), (e) => e.status === 400);
+    const ns = await PO.updateTdsSettings({ tds_rate_percent: '1' }, { actor: ACT });
+    if (ns.tds_rate_bps !== 100 || (await PO.tdsSettings()).tds_rate_bps !== 100) bad.push('settings not saved');
+    // Commissions are never paid by hand any more.
+    await expectErr('paid by hand', () => setCommissionStatus('PYAXQT', cA2, { status: 'paid', actor: ACT }), (e) => e.status === 409);
+    // API: money is affiliate.payouts only; payout details are masked for everyone; finance edits details; the page is gated.
+    const ov = (who) => af(who, 'GET', '/api/affiliates/payouts/overview');
+    const [oAdm, oFin, oMan, oView] = await Promise.all([ov('adm'), ov('finance'), ov('manager'), ov('viewer')]);
+    if (oAdm.status !== 200 || oFin.status !== 200 || !oFin.body.batches?.some((x) => x.ref === b1) || oMan.status !== 403 || oView.status !== 403) bad.push(`overview ${oAdm.status}/${oFin.status}/${oMan.status}/${oView.status}`);
+    const vDet = await af('viewer', 'GET', '/api/affiliates/PYAXQT/payout-details');
+    const fDet = await af('finance', 'GET', '/api/affiliates/PYAXQT/payout-details');
+    if (vDet.status !== 200 || vDet.body.canEdit || vDet.body.payouts !== null || JSON.stringify(vDet.body).includes('123456789012') || fDet.body.payouts?.length !== 2) bad.push(`details API ${JSON.stringify([vDet.body, fDet.body.payouts?.length])}`);
+    const vPut = await af('viewer', 'PUT', '/api/affiliates/PYAXQT/payout-details', { payee_name: 'x' });
+    const fPut = await af('finance', 'PUT', '/api/affiliates/PYAXQT/payout-details', { payee_name: 'DBCHECK Payee A2' });
+    const mBatch = await af('manager', 'POST', '/api/affiliates/payouts/batches', {});
+    const vFile = await af('viewer', 'GET', `/api/affiliates/payouts/batches/${b1}/bank-file`);
+    if (vPut.status !== 403 || fPut.status !== 200 || fPut.body.details?.payee_name !== 'DBCHECK Payee A2' || mBatch.status !== 403 || vFile.status !== 403) bad.push(`writes ${vPut.status}/${fPut.status}/${mBatch.status}/${vFile.status}`);
+    const reg2 = await af('finance', 'GET', `/api/affiliates/payouts/tds-register?fy=${PO.financialYearOf()}`);
+    if (reg2.status !== 200 || !String(reg2.headers.get('content-disposition')).includes('briyo-affiliate-tds-') || reg2.headers.get('cache-control') !== 'private, no-store') bad.push('register download');
+    const page = (who) => af(who, 'GET', '/affiliate-payouts');
+    const [pgF, pgV] = await Promise.all([page('finance'), page('viewer')]);
+    if (pgF.status !== 200 || pgV.status !== 302) bad.push(`page ${pgF.status}/${pgV.status}`);
+  } finally {
+    await PO.updateTdsSettings({ tds_section: savedTds.tds_section, tds_rate_percent: String(savedTds.tds_rate_bps / 100), tds_no_pan_rate_percent: String(savedTds.tds_no_pan_rate_bps / 100), tds_threshold_inr: String(savedTds.tds_threshold_inr) }, { actor: ACT });
+    await purgeTestOrders(P); await purgeTestAffiliates(ACT);
+  }
+  if (bad.length) throw new Error(bad.join(' | '));
+  return '₹15k → no TDS; next ₹10k → ₹500 (2% of the year\'s ₹25k); no PAN → 20%; preview with blocked / left out / held; a batch takes each commission once (reversal refused meanwhile); bank file has full accounts; paid with UTR → commissions paid; UTR reuse and future dates refused; failed → back in the pool; cancel releases; amounts, payee and history fixed in the database; register with PAN, quarter and UTR; settings validated; money and pages gated to finance; details masked';
 });
 
 await step('tickets: any member raises one (validated, TKT- numbers unique under concurrency, idempotent per request id), assigned to the ticket owner by member record (refused when not exactly one); members see only their own (404 otherwise); owner/admins see and manage all; status, reassignment and resend refused to members; activity recorded; WhatsApp notice through the 11za client (mocked) — survives provider failure, retried safely without duplicates, never via the OTP template; no token or number in logs', async () => {

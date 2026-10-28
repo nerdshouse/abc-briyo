@@ -543,6 +543,8 @@ app.get(['/hr/jobs', '/hr/candidates'], requirePage('hr.view'), (_req, res) => r
 // by the opaque public id. Reading needs affiliate.view, changes affiliate.manage.
 app.use('/api/affiliates', requirePermission('affiliate.view'), affiliateRouter);
 app.get(['/affiliates', '/affiliates/:publicId([A-Za-z0-9]{6,12})'], requirePage('affiliate.view'), (_req, res) => res.sendFile(path.join(PUBLIC, 'affiliates.html')));
+// Affiliate payouts and TDS: money, so finance staff (affiliate.payouts) and admins only.
+app.get(['/affiliate-payouts', '/affiliate-payouts.html'], requirePage('affiliate.payouts'), (_req, res) => res.sendFile(path.join(PUBLIC, 'affiliate-payouts.html')));
 
 // Tickets: every signed-in member (no module role needed) raises tickets and sees their own; the ticket owner (the
 // founder) and admins see and manage all. Who may do what is checked in lib/tickets.js on every request.
