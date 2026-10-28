@@ -185,9 +185,9 @@ async function loadDetail() {
   $('#alerts').innerHTML = '';
   try {
     const pid = encodeURIComponent(state.publicId);
-    const [data, ver, ref, perf] = await Promise.all([api(`/api/affiliates/${pid}`), api(`/api/affiliates/${pid}/verification`), api(`/api/affiliates/${pid}/referral`),
-      api(`/api/affiliates/${pid}/performance`).catch(() => null)]);
-    state.detail = data; state.ver = ver; state.ref = ref; state.perf = perf;
+    const [data, ver, ref, perf, coupons, pay] = await Promise.all([api(`/api/affiliates/${pid}`), api(`/api/affiliates/${pid}/verification`), api(`/api/affiliates/${pid}/referral`),
+      api(`/api/affiliates/${pid}/performance`).catch(() => null), api(`/api/affiliates/${pid}/coupons`).catch(() => null), api(`/api/affiliates/${pid}/payout-details`).catch(() => null)]);
+    state.detail = data; state.ver = ver; state.ref = ref; state.perf = perf; state.coupons = coupons; state.pay = pay;
     renderDetail();
   } catch (err) {
     if (err.status === 404) {
@@ -256,6 +256,8 @@ function renderDetail() {
       ${performanceCard()}
       ${verificationCard()}
       ${referralCard()}
+      ${couponsCard()}
+      ${payoutDetailsCard()}
 
       <section class="card af-activity">
         <header class="card-head"><h2 class="card-title">${icon('history')}Activity</h2><span class="card-meta">${count(events.length)} event${events.length === 1 ? '' : 's'}</span></header>
@@ -317,6 +319,8 @@ function openForm(kind, extra) {
   const a = state.detail?.affiliate;
   if (kind === 'ver') { openVerificationForm(extra); return; }
   if (kind === 'ref') { openReferralForm(extra); return; }
+  if (kind === 'coupon') { openCouponForm(extra); return; }
+  if (kind === 'pay') { openPayoutDetailsForm(); return; }
   state.form = kind;
   if (kind === 'new') {
     showDrawer('New affiliate', 'A public ID is issued automatically', `<form id="afForm" novalidate><div class="form-grid">
@@ -378,6 +382,8 @@ async function saveForm() {
     }
     if (VER_FORMS.includes(state.form?.ver)) { await saveVerification(); return; }
     if (state.form?.ref) { await saveReferral(); return; }
+    if (state.form?.coupon) { await saveCoupon(); return; }
+    if (state.form?.pay) { await savePayoutDetails(); return; }
     if (state.form?.cm) { await saveCommission(); return; }
     let out;
     if (state.form === 'edit') out = await send(`/api/affiliates/${a.public_id}`, 'PATCH', { ...formData(), version: a.version });
@@ -393,6 +399,8 @@ async function saveForm() {
     state.detail = out;
     state.ver = await api(`/api/affiliates/${encodeURIComponent(a.public_id)}/verification`).catch(() => state.ver);
     state.ref = await api(`/api/affiliates/${encodeURIComponent(a.public_id)}/referral`).catch(() => state.ref);
+    // A status or category change switches the affiliate's Shopify discount codes on or off.
+    state.coupons = await api(`/api/affiliates/${encodeURIComponent(a.public_id)}/coupons`).catch(() => state.coupons);
     state.dirty = false; closeDrawer({ force: true });
     renderDetail();
   } catch (err) {
@@ -600,11 +608,10 @@ function performanceCard() {
     if (!c || c.status === 'reversed') return '';
     const b = [];
     if (state.perf.canApprove && c.status === 'pending') b.push(`<button class="btn" type="button" data-cm="approved" data-cm-id="${c.id}">Approve</button>`);
-    if (state.perf.canPay && c.status === 'approved') b.push(`<button class="btn" type="button" data-cm="paid" data-cm-id="${c.id}">Mark paid</button>`);
     if (state.perf.canApprove) b.push(`<button class="btn" type="button" data-cm="reversed" data-cm-id="${c.id}">Reverse</button>`);
     return b.join(' ');
   };
-  const anyActs = money && (state.perf.canApprove || state.perf.canPay);
+  const anyActs = money && state.perf.canApprove;
   const rows = P.orders.map((o) => {
     const c = o.commission;
     const orderCell = `${esc(o.order || '—')}${o.cancelled ? ' <span class="mini-tag warn">Cancelled</span>' : ''}`;
@@ -626,7 +633,7 @@ function performanceCard() {
       ${P.orders.length ? `<div class="table-wrap"><table class="table"><thead>${head}</thead><tbody>${rows}</tbody></table></div>`
     : '<div class="empty-note"><b>No attributed orders yet.</b></div>'}
       <div class="pane-foot">${money
-    ? 'Order value is Shopify\'s current total for the order. Commission base = Shopify net subtotal excluding recorded tax (subtotal after discounts, without shipping, minus the tax Shopify recorded) — Shopify can record GST on shipping on product lines, so this is not an exact tax-exclusive merchandise value. Commission = base × the rate in effect when the order was attributed, both fixed when recorded; cancelled orders earn none; a later rate change does not alter it. Payouts are not part of Briyo OS yet.'
+    ? 'Order value is Shopify\'s current total for the order. Commission base = Shopify net subtotal excluding recorded tax (subtotal after discounts, without shipping, minus the tax Shopify recorded) — Shopify can record GST on shipping on product lines, so this is not an exact tax-exclusive merchandise value. Commission = base × the rate in effect when the order was attributed, both fixed when recorded; cancelled orders earn none; a later rate change does not alter it. Approved commissions are paid in a payout batch (Affiliate payouts), which deducts TDS and records the bank reference.'
     : 'Order values and commissions are visible to admins and affiliate finance staff.'}</div>
     </div>
   </section>`;
@@ -747,6 +754,131 @@ async function saveReferral() {
   renderDetail();
 }
 
+// ------------------------------------------------------------------ coupon codes (Phase 2B)
+
+function couponsCard() {
+  const C = state.coupons;
+  if (!C) return '';
+  const a = state.detail.affiliate;
+  const canM = C.canManage && a.status !== 'closed';
+  const live = C.coupons.filter((c) => c.status === 'active');
+  const old = C.coupons.filter((c) => c.status !== 'active');
+  const shop = (c) => (c.status !== 'active' ? '<span class="soft">Off</span>'
+    : c.shopify.error ? `<span class="mini-tag warn" title="${esc(c.shopify.error)}">Not in sync</span>`
+      : c.shopify.active ? '<span class="status recovered"><span class="dot"></span>Live</span>' : '<span class="status noresp"><span class="dot"></span>Paused</span>');
+  const row = (c) => `<tr><td><b class="mono">${esc(c.code)}</b></td><td class="r num">${esc(pct(c.discount_bps))} off</td>
+    <td>${c.once_per_customer ? 'Once per customer' : 'Unlimited'}</td><td>${shop(c)}</td><td class="r num">${count(c.orders)}</td>
+    <td>${by(c.created_at, c.created_by)}</td>${canM ? `<td class="r">${c.status === 'active' ? `<button class="btn" type="button" data-coupon="disable:${esc(c.ref)}">Disable</button>` : ''}</td>` : ''}</tr>`;
+  const err = live.find((c) => c.shopify.error);
+  const notice = !C.eligible && live.length ? `<div class="alert warn">${icon('info')}<span>This affiliate is not eligible now (suspended, closed or not verified), so their codes are paused in Shopify and credit nobody. They come back on when the affiliate is eligible again.</span></div>`
+    : !C.eligible ? `<div class="alert warn">${icon('info')}<span>A coupon can be created once the affiliate is active${a.requires_verification ? ' and their verification is approved' : ''}.</span></div>` : '';
+  return `<section class="card af-coupons">
+    <header class="card-head"><h2 class="card-title">${icon('ticket-percent')}Coupon codes</h2>
+      ${canM && C.eligible ? `<div class="card-tools"><button class="btn" type="button" data-coupon="new">${icon('plus')}New code</button></div>` : ''}</header>
+    <div class="pane">
+      ${notice ? `<div class="pad">${notice}</div>` : ''}
+      ${err ? `<div class="pad"><div class="alert warn">${icon('info')}<span>Shopify could not be updated for ${esc(err.code)}: ${esc(err.shopify.error)}${canM ? ' <button class="linkish" type="button" data-coupon="sync">Sync with Shopify</button>' : ''}</span></div></div>` : ''}
+      ${live.length ? `<div class="table-wrap"><table class="table"><thead><tr><th>Code</th><th class="r">Discount</th><th>Use</th><th>Shopify</th><th class="r">Orders</th><th>Created</th>${canM ? '<th></th>' : ''}</tr></thead>
+        <tbody>${live.map(row).join('')}</tbody></table></div>`
+    : `<div class="empty-note"><b>No coupon code.</b>${canM && C.eligible ? 'Create one: it becomes a real discount code in Shopify, and every order that uses it credits this affiliate.' : ''}</div>`}
+      ${old.length ? `<details class="more af-gap"><summary>${icon('chevron-right')}Disabled codes <span class="soft">— ${old.length}, kept</span></summary>
+        <div class="table-wrap"><table class="table"><tbody>${old.map((c) => `<tr><td class="mono">${esc(c.code)}</td><td class="r num">${esc(pct(c.discount_bps))}</td><td class="r num">${count(c.orders)} orders</td>
+          <td>${by(c.disabled_at, c.disabled_by)}<span class="cell-sub">${esc(c.disable_reason || '')}</span></td></tr>`).join('')}</tbody></table></div></details>` : ''}
+      <div class="pane-foot">An order that uses one of these codes is credited to this affiliate, ahead of any referral link, and earns the usual commission on the order value after the discount. The discount is fixed when the code is created: to change it, disable the code and create a new one.</div>
+    </div>
+  </section>`;
+}
+
+function openCouponForm(kind) {
+  const a = state.detail.affiliate;
+  if (kind === 'sync') { state.form = { coupon: 'sync', noForm: true }; saveForm(); return; }
+  if (kind.startsWith('disable:')) {
+    const c = state.coupons.coupons.find((x) => x.ref === kind.slice(8));
+    state.form = { coupon: 'disable', ref: c.ref, version: c.version };
+    showDrawer('Disable code', `${c.code} · ${a.display_name}`, `<form id="afForm" novalidate><div class="form-grid">
+      <label class="fld wide"><span>Reason <em>*</em></span><textarea class="input" name="reason" rows="3" maxlength="300"></textarea><span class="help">Recorded with your name and the time.</span></label>
+      <p class="help wide">The code stops working in Shopify straight away and credits nobody from now on. It is kept with its orders, and cannot be switched back on.</p>
+    </div></form>`, '<button class="btn" type="button" data-close>Cancel</button><button class="btn danger" type="button" id="dSave">Disable code</button>');
+    return;
+  }
+  state.form = { coupon: 'new' };
+  const suggest = `${a.display_name.replace(/^(dr|mr|ms|mrs)\.?\s+/i, '').replace(/[^A-Za-z]/g, '').slice(0, 8).toUpperCase() || a.public_id}10`;
+  showDrawer('New coupon code', `${a.display_name} · ${a.public_id}`, `<form id="afForm" novalidate><div class="form-grid">
+    ${inp('code', 'Code', suggest, { req: true, attrs: 'maxlength="20" autocapitalize="characters" spellcheck="false" style="text-transform:uppercase"', help: '4–20 letters, numbers or hyphens. Customers type this at checkout.' })}
+    ${inp('discount_percent', 'Discount for the customer (%)', '10', { req: true, attrs: 'inputmode="decimal"', help: 'Off the whole order (all products), up to 90%. Fixed once created.' })}
+    <label class="fld wide"><span><input type="checkbox" name="once_per_customer" value="true" checked /> Once per customer</span><span class="help">A customer can use the code once. Untick to let them use it on every order.</span></label>
+    <p class="help wide">This creates the discount code in Shopify straight away, for all customers. It is the affiliate's own code: orders using it are credited to ${esc(a.display_name)}.</p>
+  </div></form>`, footButtons('Create code'));
+}
+
+async function saveCoupon() {
+  const pid = encodeURIComponent(state.publicId);
+  const f = state.form;
+  if (f.coupon === 'new') state.coupons = await send(`/api/affiliates/${pid}/coupons`, 'POST', formData());
+  else if (f.coupon === 'disable') state.coupons = await send(`/api/affiliates/${pid}/coupons/${encodeURIComponent(f.ref)}/disable`, 'POST', { ...formData(), version: f.version });
+  else state.coupons = await send(`/api/affiliates/${pid}/coupons/sync`, 'POST', {});
+  state.detail = await api(`/api/affiliates/${pid}`).catch(() => state.detail);
+  state.dirty = false; closeDrawer({ force: true });
+  renderDetail();
+}
+
+// ------------------------------------------------------------------ payout details (Phase 2B)
+
+const PAYOUT_TAG = { pending: ['callback', 'Waiting for bank'], paid: ['recovered', 'Paid'], failed: ['lost', 'Failed'], cancelled: ['none', 'Cancelled'] };
+const payoutTag = (s) => `<span class="status ${PAYOUT_TAG[s]?.[0] || ''}"><span class="dot"></span>${esc(PAYOUT_TAG[s]?.[1] || s)}</span>`;
+const inr = (v) => cash('INR', Number(v));
+
+function payoutDetailsCard() {
+  const P = state.pay;
+  if (!P) return '';
+  const d = P.details;
+  const a = state.detail.affiliate;
+  const kv = (label, value) => `<div class="hr-kv"><span>${esc(label)}</span><span>${value}</span></div>`;
+  const none = '<span class="soft">Not given</span>';
+  return `<section class="card af-pay">
+    <header class="card-head"><h2 class="card-title">${icon('landmark')}Payout details ${d.complete ? '' : '<span class="mini-tag warn">Incomplete</span>'}</h2>
+      ${P.canEdit && a.status !== 'closed' ? `<div class="card-tools"><button class="btn" type="button" data-pay>${icon('pencil')}Edit</button></div>` : ''}</header>
+    <div class="pane pad">
+      ${kv('Account holder', d.payee_name ? esc(d.payee_name) : none)}
+      ${kv('Account number', d.bank_account ? `<span class="mono">${esc(d.bank_account)}</span>` : none)}
+      ${kv('IFSC', d.bank_ifsc ? `<span class="mono">${esc(d.bank_ifsc)}</span>` : none)}
+      ${kv('PAN', d.pan ? `<span class="mono">${esc(d.pan)}</span>` : '<span class="soft">Not given — TDS is deducted at the higher no-PAN rate</span>')}
+      ${d.updated_at ? kv('Last changed', by(d.updated_at, d.updated_by)) : ''}
+      ${P.payouts ? `<h3 class="dsec-title af-gap">Payouts</h3>${P.payouts.length ? `<div class="table-wrap"><table class="table">
+        <thead><tr><th>Payout</th><th class="r">Gross</th><th class="r">TDS</th><th class="r">Net paid</th><th>Status</th><th>UTR</th></tr></thead>
+        <tbody>${P.payouts.map((p) => `<tr><td class="mono">${esc(p.ref)}<span class="cell-sub">FY ${esc(p.financial_year)} · ${count(p.commissions)} commission${p.commissions === 1 ? '' : 's'}</span></td>
+          <td class="r num">${esc(inr(p.gross))}</td><td class="r num">${esc(inr(p.tds))}<span class="cell-sub">${esc(pct(p.tds_rate_bps))} · ${esc(p.tds_section)}</span></td>
+          <td class="r num"><b>${esc(inr(p.net))}</b></td><td>${payoutTag(p.status)}${p.failure_reason ? `<span class="cell-sub">${esc(p.failure_reason)}</span>` : ''}</td>
+          <td class="mono">${esc(p.utr || '—')}${p.paid_on ? `<span class="cell-sub">${esc(istDate(`${p.paid_on}T00:00:00+05:30`))}</span>` : ''}</td></tr>`).join('')}</tbody></table></div>`
+    : '<p class="soft" style="margin:0">No payouts yet.</p>'}` : ''}
+      <p class="soft af-note">The account number and PAN are shown with their last 4 characters only. In full, they leave Briyo OS only in a payout batch's bank file.</p>
+    </div>
+  </section>`;
+}
+
+function openPayoutDetailsForm() {
+  const a = state.detail.affiliate;
+  const d = state.pay.details;
+  state.form = { pay: true, version: d.version };
+  showDrawer('Payout details', `${a.display_name} · ${a.public_id}`, `<form id="afForm" novalidate><div class="form-grid">
+    ${inp('payee_name', 'Account holder name', d.payee_name || '', { attrs: 'maxlength="120"', help: 'Exactly as on the bank account.' })}
+    ${inp('bank_account', 'Account number', '', { ph: d.bank_account ? `${d.bank_account} — leave blank to keep` : '', attrs: 'inputmode="numeric" autocomplete="off" maxlength="18"' })}
+    ${inp('bank_ifsc', 'IFSC', '', { ph: d.bank_ifsc ? `${d.bank_ifsc} — leave blank to keep` : 'HDFC0001234', attrs: 'autocomplete="off" maxlength="11" style="text-transform:uppercase"' })}
+    ${inp('pan', 'PAN', '', { ph: d.pan ? `${d.pan} — leave blank to keep` : 'ABCDE1234F', attrs: 'autocomplete="off" maxlength="10" style="text-transform:uppercase"', help: 'Without a PAN, TDS is deducted at the higher no-PAN rate.' })}
+    ${d.has_pan ? '<label class="fld wide"><span><input type="checkbox" name="clear_pan" value="true" /> Remove the PAN on file</span></label>' : ''}
+    <p class="help wide">Stored values are never shown in full, so a blank field keeps what is already saved. Only the names of the fields you change are recorded in the activity log.</p>
+  </div></form>`, footButtons('Save details'));
+}
+
+async function savePayoutDetails() {
+  const pid = encodeURIComponent(state.publicId);
+  await send(`/api/affiliates/${pid}/payout-details`, 'PUT', { ...formData(), version: state.form.version });
+  state.pay = await api(`/api/affiliates/${pid}/payout-details`);
+  state.detail = await api(`/api/affiliates/${pid}`).catch(() => state.detail);
+  state.dirty = false; closeDrawer({ force: true });
+  renderDetail();
+}
+
 // ------------------------------------------------------------------ events
 
 let searchTimer = null;
@@ -776,6 +908,8 @@ function bind() {
     if (t?.dataset.open) { openForm(t.dataset.open); return; }
     if (t?.dataset.ver) { openForm('ver', t.dataset.ver); return; }
     if (t?.dataset.ref) { openForm('ref', t.dataset.ref); return; }
+    if (t?.dataset.coupon) { openForm('coupon', t.dataset.coupon); return; }
+    if (t?.dataset.pay !== undefined) { openForm('pay'); return; }
     if (t?.dataset.cm) { openCommissionForm(t.dataset.cm, t.dataset.cmId); return; }
     if (t?.dataset.copyLink !== undefined) { copyLink(t); return; }
     go(e);

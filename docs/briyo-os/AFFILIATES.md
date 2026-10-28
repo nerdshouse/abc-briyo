@@ -1,4 +1,4 @@
-# Briyo OS: Affiliates (Phase 1A foundation, 1C admin, 1D professional verification, 1E referral attribution)
+# Briyo OS: Affiliates (Phase 1A foundation, 1C admin, 1D professional verification, 1E referral attribution, 2A commissions, 2B coupons, payouts and TDS)
 
 The affiliate / referral module manages partners such as nutritionists, doctors, influencers and customers who refer orders to the Briyo Supplements storefront. Shopify remains the ecommerce source of truth. Briyo OS will own partner management, verification, attribution, commissions and payouts.
 
@@ -8,7 +8,9 @@ The affiliate / referral module manages partners such as nutritionists, doctors,
 
 **Phase 1E** adds referral links, click tracking and order attribution: who gets credit for an order.
 
-> **Phase 1E does not calculate commissions or payouts.** Commissions, the commission ledger and payouts are not implemented; no figure in the module is a commission or an amount owed.
+**Phase 2A** adds the commission ledger (`lib/affiliate-commissions.js`): one commission per attribution, its rate and base fixed when it is created; pending → approved → paid, or reversed with a reason.
+
+**Phase 2B** adds affiliate **coupon codes** (real Shopify discount codes that credit their affiliate), **payout batches** (approved commissions paid through the bank, with a bank file and the UTR recorded) and **TDS** (Section 194H by default). See [Coupon codes](#coupon-codes-phase-2b) and [Payouts and TDS](#payouts-and-tds-phase-2b).
 
 ## Tables (`lib/affiliates.js`, `ensureAffiliateSchema()`)
 
@@ -45,7 +47,7 @@ The tables are created idempotently on first use, like the other modules (`CREAT
 - **Admins** (and super admins) hold every capability, as before.
 - **Other members:** no existing member gains anything; access needs an explicit `affiliate` role.
 - **Database:** the constraint `member_module_roles_pair_ok` (`lib/db.js`) now also accepts `affiliate` with viewer, manager or finance.
-- **Used by Phase 1C:** `affiliate.view` (pages and every read API) and `affiliate.manage` (create, edit, status, rates). `affiliate.verify`, `affiliate.commissions` and `affiliate.payouts` have no route yet, so a finance member can read but not change anything.
+- **Used by:** `affiliate.view` (pages and every read API), `affiliate.manage` (create, edit, status, rates, referral links, coupons, payout details), `affiliate.verify` (verification decisions), `affiliate.commissions` (approve / reverse commissions), `affiliate.payouts` (payout batches, TDS settings and register, payout details).
 - **Home page:** a member whose only module is Affiliates lands on `/affiliates`.
 
 ## Admin (Phase 1C)
@@ -307,11 +309,43 @@ Clicks are not events; they live in their own table.
 | `affiliate_settings.attribution_window_days` | 30 | Click window, read on every attribution |
 | `affiliate_settings.attribution_rule_version` | `v1` | Stored on every attribution |
 
+## Coupon codes (Phase 2B)
+
+`lib/affiliate-coupons.js`; routes in `lib/affiliate-routes.js`; the **Coupon codes** card on `/affiliates/:publicId`.
+
+- **What a coupon is:** an `affiliate_referral_assets` row of type `coupon` (`code`, `discount_bps` 1–90%, `once_per_customer`) backed by a Shopify discount code (`discountCodeBasicCreate`: all customers via `context: { all: ALL }`, all products, the % off, optionally once per customer). Code and discount are fixed once created (trigger); a different value is a new code. `active → disabled` is final, with a reason.
+- **Shopify first, then the record:** the discount is created in Shopify, then saved. If saving fails, the Shopify discount is deleted again (`discountCodeDelete`), so neither side has a code the other does not know. Disabling deactivates the Shopify discount first; if Shopify cannot be reached, nothing changes.
+- **Follows the affiliate:** after every status or category change, `syncCouponsForAffiliate` turns the affiliate's codes off in Shopify while they are not eligible (suspended, closed, not verified) and back on when they are. A failure is recorded on the coupon (`shopify_error`) and retried with **Sync with Shopify**.
+- **Attribution:** an order carrying an active affiliate code (any letter case) is credited to that affiliate by coupon, ahead of any referral click (rule `v1`, step 1), and earns the usual commission on its net subtotal (after the discount).
+- **Scopes:** `read_discounts`, `write_discounts` (`lib/shopify-oauth.js`). Added scopes take effect only after Shopify is **reconnected** in Briyo OS; until then creating a code reports the missing permission.
+- **RBAC:** read `affiliate.view`; create / disable / sync `affiliate.manage`. Events: `coupon_created`, `coupon_disabled`, `coupon_activated_in_shopify`, `coupon_deactivated_in_shopify`.
+
+## Payouts and TDS (Phase 2B)
+
+`lib/affiliate-payouts.js`; routes under `/api/affiliates/payouts`; the page `/affiliate-payouts` (Growth → Affiliate payouts) and the **Payout details** card on `/affiliates/:publicId`.
+
+**Payout details** (on `affiliates`): PAN, account holder, account number, IFSC, validated on the server. Shown masked (last 4 characters) to everyone; in full they leave Briyo OS only in a batch's bank file and the TDS register. A blank field keeps the stored value. Changed by `affiliate.manage` or `affiliate.payouts`; the log records field names only.
+
+**Flow:**
+1. **New payout batch** previews every approved INR commission not already in a live payout, one payout per affiliate, with TDS. Affiliates without complete bank details, commissions on cancelled orders and non-INR commissions are listed apart with the reason. Affiliates can be left out.
+2. **Create** fixes each payout (gross, TDS, net, the payee snapshot) and takes its commissions out of the pool (`affiliate_payout_items`, one live payout per commission). One batch is created at a time (advisory lock).
+3. **Bank file** (CSV: beneficiary, account, IFSC, net amount, payment reference, narration) for the bank's bulk upload. Each download is logged.
+4. **Mark paid** with the bank's UTR and date: the payout's commissions become `paid` in the same transaction. A UTR can be used once. **Mark failed** with a reason: its commissions go back to the pool. **Cancel batch** (reason) while none of it is paid. A batch closes once no payout is waiting.
+
+Commissions become `paid` **only** through a payout; the manual "Mark paid" is gone, and a commission in a payout waiting for the bank cannot be reversed until that payout is settled.
+
+**TDS** (`affiliate_settings`, editable on the page; confirm with a CA): section `194H`, 2% with PAN, 20% without, threshold ₹20,000 per affiliate per financial year (April–March, IST). No TDS until the year's commission (pending and paid payouts, this one included) passes the threshold; from then on the rate applies to the whole year: TDS = rate × year's gross − TDS already deducted, kept within 0 … this payout. Amounts are worked in paise (integers). The **TDS register** (CSV per financial year: quarter, paid on, payee, PAN, section, gross, rate, TDS, net, UTR) serves the quarterly 26Q return and Form 16A.
+
+**Database rules:** a payout's amounts and payee never change, only `pending → paid | failed | cancelled`; a payout item only ever stops being live; nothing is deleted (test purges excepted).
+
+**RBAC:** everything under `/api/affiliates/payouts` and the page need `affiliate.payouts` (finance role, admins). Events: `payout_created`, `payout_paid`, `payout_failed`, `payout_cancelled`, `payout_batch_created`, `payout_batch_cancelled`, `payout_bank_file_downloaded`, `payout_details_updated`, `tds_settings_changed`.
+
 ## Not implemented yet (by design)
 
-- **Coupons:** creating affiliate coupon codes or Shopify discounts. The coupon attribution path exists but has no source yet.
-- **Money:** commissions, the commission ledger, approval, refunds and reversals, payouts, payout batches, tax / TDS.
-- **Automation:** Shopify order polling, webhooks, theme deployment, DNS / Cloudflare changes, Cloudflare Workers.
+- **Money movement:** Briyo OS never sends money itself. Payments go through the bank (bank file); a payout-provider integration (e.g. RazorpayX) is not built.
+- **Tax filings:** the TDS return, challans and Form 16A are prepared outside Briyo OS from the TDS register; GST on commissions is not handled.
+- **Recovery:** a commission reversed after it was paid is not recovered from the affiliate automatically.
+- **Automation:** theme deployment, DNS / Cloudflare changes, Cloudflare Workers.
 - **Attribution extras:** retroactive attribution, attribution corrections, marketing analytics dashboards.
 - **Verification follow-ups:** automatic expiry handling or renewal reminders, self-service submission by the professional, other kinds of evidence checks.
 - **Interfaces:** an Overview card, the affiliate portal and login, reporting. (The internal admin UI exists since Phase 1C.)
