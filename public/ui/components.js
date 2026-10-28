@@ -396,6 +396,7 @@ function sidebarHtml(me) {
       ${navSection('Growth', (has('marketing.view') ? navDept('Marketing', 'megaphone', '/marketing',
         navLink('/marketing', 'Overview') + navLink('/marketing?view=campaigns', 'Campaigns'), 'marketing') : '')
         + (has('affiliate.view') ? navLink('/affiliates', 'Affiliates', 'handshake', { module: 'affiliates' }) : '')
+        + (has('affiliate.view') ? navLink('/affiliate-report', 'Affiliate report', 'chart-column') : '')
         + (has('affiliate.payouts') ? navLink('/affiliate-payouts', 'Affiliate payouts', 'banknote') : ''))}
       ${navSection('People', has('hr.view') ? navDept('HR', 'briefcase', '/hr/jobs',
         navLink('/hr/jobs', 'Jobs') + navLink('/hr/candidates', 'Candidates'), 'hr') : '')}
