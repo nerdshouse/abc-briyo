@@ -27,7 +27,7 @@ import {
 } from '../lib/orders.js';
 import { saveUploadedDocument, router as ordersRouterForTest, destinationRouter as destinationRouterForTest } from '../lib/orders-routes.js';
 import { planAmazon, readTable, previewAmazonImport, commitAmazonImport } from '../lib/amazon-import.js';
-import { planSheet, previewBulkDispatch, commitBulkDispatch } from '../lib/bulk-dispatch.js';
+import { planSheet, previewBulkDispatch, commitBulkDispatch, dispatchOrder } from '../lib/bulk-dispatch.js';
 import { orderItems } from '../lib/orders.js';
 import {
   ensureInventorySchema, createSku, updateSku, getSku, skuDetail, receiveInventory, adjustStock, transferStock, updateBatch,
@@ -4684,6 +4684,49 @@ await step('bulk dispatch: website orders — Shopify number with or without "#"
   await expectErr('unknown channel on commit', () => commitBulkDispatch({ channel: 'nowhere', rows: [{ row: 1, orderId: N(1), awb: 'x', courierId: delhivery.id }] }, { actor: ACTOR }), (e) => e.status === 400);
   if (bad.length) throw new Error(bad.join('; '));
   return 'synced order found by its "#number" (file without "#"), hand-entered one with "#"; per-row couriers kept; BWA and DV refused in preview and dispatch with nothing changed; an Amazon number is not a website order (and vice versa); rerun skipped';
+});
+
+await step('order Dispatch button: courier + AWB → shipment, FEFO reservation, dispatched and deducted in one step; same refusals as bulk dispatch, nothing changed when refused', async () => {
+  const bad = [];
+  const sku = (await createSku({ sku: `${TS}-DO-A`, product_name: 'Dispatch button test product' }, { actor: ACTOR })).id;
+  await addPlatformMappings(sku, PF.amazon, [`${TS}-DO-AMZ`], { actor: ACTOR });
+  const early = (await receiveInventory({ sku_id: sku, batch_number: 'DO-EARLY', expiry_date: dayOffset(60), quantity: 2, request_id: rid() }, { actor: ACTOR })).batchId;
+  const late = (await receiveInventory({ sku_id: sku, batch_number: 'DO-LATE', expiry_date: dayOffset(300), quantity: 5, request_id: rid() }, { actor: ACTOR })).batchId;
+  const delhivery = (await listCouriers()).find((x) => x.name === 'Delhivery').id;
+  const ok = await lineOn('amazon', 'DO-1', `${TS}-DO-AMZ`, 3);   // 3 units: 2 from the early batch, 1 from the late one
+  const short = await lineOn('amazon', 'DO-2', `${TS}-DO-AMZ`, 9);
+  const cancelled = await lineOn('amazon', 'DO-3', `${TS}-DO-AMZ`, 1);
+  await getPool().query(`UPDATE orders SET order_status = 'cancelled' WHERE id = $1`, [cancelled]);
+  const ships = async (id) => (await getPool().query(`SELECT shipment_status, tracking_id, courier_partner_id FROM order_shipments WHERE order_id = $1 AND shipment_status <> 'cancelled'`, [id])).rows;
+  const onHand = async (b) => (await getPool().query('SELECT on_hand FROM inventory_batches WHERE id = $1', [b])).rows[0].on_hand;
+  // Input refused before anything is touched.
+  await expectErr('no AWB', () => dispatchOrder(ok, { courier_partner_id: delhivery, tracking_id: ' ' }, { actor: ACTOR }), (e) => e.status === 400 && e.field === 'tracking_id');
+  await expectErr('Excel AWB', () => dispatchOrder(ok, { courier_partner_id: delhivery, tracking_id: '3.62E+11' }, { actor: ACTOR }), (e) => e.status === 400 && e.field === 'tracking_id');
+  await expectErr('no courier', () => dispatchOrder(ok, { courier_partner_id: '', tracking_id: 'DO-AWB-1' }, { actor: ACTOR }), (e) => e.status === 400 && e.field === 'courier_partner_id');
+  await expectErr('unknown order', () => dispatchOrder(987654321, { courier_partner_id: delhivery, tracking_id: 'DO-AWB-X' }, { actor: ACTOR }), (e) => e.status === 404);
+  // One step: dispatched with the AWB, FEFO across batches, stock deducted.
+  const r = await dispatchOrder(ok, { courier_partner_id: delhivery, tracking_id: 'DO-AWB-1' }, { actor: ACTOR });
+  const s1 = await ships(ok);
+  if (r.status !== 'dispatched' || r.units !== 3 || s1.length !== 1 || s1[0].shipment_status !== 'dispatched' || s1[0].tracking_id !== 'DO-AWB-1' || Number(s1[0].courier_partner_id) !== delhivery) bad.push(`dispatch ${JSON.stringify([r, s1])}`);
+  if (await onHand(early) !== 0 || await onHand(late) !== 4) bad.push(`FEFO early ${await onHand(early)} late ${await onHand(late)}`);
+  const ev = (await getPool().query(`SELECT metadata FROM order_events WHERE order_id = $1 AND event_type = 'shipment_created'`, [ok])).rows;
+  // A hand-entered test order already has its untouched shipment, which is filled rather than duplicated.
+  if (ev.length > 1) bad.push('a second shipment was created');
+  // A second click: refused, nothing deducted twice.
+  await expectErr('twice', () => dispatchOrder(ok, { courier_partner_id: delhivery, tracking_id: 'DO-AWB-1' }, { actor: ACTOR }), (e) => e.status === 409);
+  await expectErr('another AWB', () => dispatchOrder(ok, { courier_partner_id: delhivery, tracking_id: 'DO-AWB-9' }, { actor: ACTOR }), (e) => e.status === 409 && /already has a shipment/.test(e.message));
+  if (await onHand(late) !== 4) bad.push('deducted twice');
+  // Refused with nothing changed: not enough stock (4 left, 9 needed); a cancelled order; an AWB another order uses.
+  await expectErr('short', () => dispatchOrder(short, { courier_partner_id: delhivery, tracking_id: 'DO-AWB-2' }, { actor: ACTOR }), (e) => e.status === 409 && /Not enough stock/.test(e.message));
+  await expectErr('cancelled', () => dispatchOrder(cancelled, { courier_partner_id: delhivery, tracking_id: 'DO-AWB-3' }, { actor: ACTOR }), (e) => e.status === 409 && /cancelled/.test(e.message));
+  await expectErr('AWB in use', () => dispatchOrder(short, { courier_partner_id: delhivery, tracking_id: 'do-awb-1' }, { actor: ACTOR }), (e) => e.status === 409);
+  if ((await ships(short)).some((x) => x.shipment_status !== 'not_ready' || x.tracking_id)) bad.push('refused dispatch changed the shipment');
+  if (await onHand(late) !== 4) bad.push('refused dispatch moved stock');
+  // The button is on the order drawer.
+  const page = await fsp.readFile(new URL('../public/orders.js', import.meta.url), 'utf8');
+  if (!page.includes('id="dDispatch"') || !page.includes('/dispatch`') || !page.includes("Delta Velocity orders:</b> don\\'t dispatch them here")) bad.push('page button');
+  if (bad.length) throw new Error(bad.join('; '));
+  return 'bad AWB / Excel number / no courier / unknown order refused; one step → dispatched with AWB, 3 units FEFO (2 early + 1 late); second click and another AWB refused; short stock, cancelled order and an AWB in use refused with nothing changed; button on the drawer';
 });
 
 await step('bundles: contents rules; a bundle holds no stock; its orders reserve and deduct each product inside (by hand, in bulk dispatch, mixed with a loose line)', async () => {
