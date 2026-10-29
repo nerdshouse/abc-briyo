@@ -354,6 +354,7 @@ async function openOrder(id, { shipmentId = null } = {}) {
 function closeDrawer() {
   state.openId = null;
   state.detail = null;
+  state.dispatchOpen = null;
   state.shipId = null;
   writeUrl();
   $('#drawer').hidden = true;
@@ -917,6 +918,49 @@ function orderDetailsSection(o, m) {
     </details>`;
 }
 
+/**
+ * Dispatch in one step (POST /api/orders/:id/dispatch): courier + AWB → the shipment, stock reserved from the
+ * earliest-expiring batches, dispatched, stock deducted. The server applies every rule (lib/bulk-dispatch.js).
+ */
+function dispatchForm(o) {
+  const website = o.channel === 'website';
+  return `<form id="dDispatchForm" novalidate>
+    <div class="form-grid">
+      <label class="fld"><span>Courier</span><select class="select" name="courier_partner_id">${opt('', 'Choose courier', true)}${state.meta.couriers.filter((c) => c.active).map((c) => opt(c.id, c.name)).join('')}</select></label>
+      <label class="fld"><span>AWB / Tracking ID</span><input class="input mono" name="tracking_id" maxlength="80" autocomplete="off" spellcheck="false" /></label>
+    </div>
+    <p class="imp-note">This creates the shipment, takes the stock from the earliest-expiring batches and marks it <b>dispatched</b>: the stock is deducted now.${website
+    ? ' <b>Delta Velocity orders:</b> don\'t dispatch them here. Their parcel and AWB come from Shopify by themselves, and the stock comes off when the courier picks them up.' : ''}</p>
+    <div class="form-error" id="dDispatchError" role="alert" hidden></div>
+    <div class="form-actions" style="margin-top:8px"><button class="btn" type="button" id="dDispatchCancel">Cancel</button>
+      <button class="btn primary" type="submit" id="dDispatchGo">${icon('truck')}Dispatch and deduct stock</button></div>
+  </form>`;
+}
+
+async function submitDispatch(form) {
+  const o = state.detail.order;
+  const err = $('#dDispatchError');
+  err.hidden = true;
+  const courier = form.courier_partner_id.value;
+  const awb = form.tracking_id.value.trim();
+  if (!courier) { err.textContent = 'Choose the courier.'; err.hidden = false; form.courier_partner_id.focus(); return; }
+  if (!awb) { err.textContent = 'Enter the AWB / tracking ID.'; err.hidden = false; form.tracking_id.focus(); return; }
+  const btn = $('#dDispatchGo');
+  btn.disabled = true;
+  try {
+    const r = await api(`/api/orders/${o.id}/dispatch`, { method: 'POST', body: JSON.stringify({ courier_partner_id: courier, tracking_id: awb }) });
+    state.dispatchOpen = null;
+    await openOrder(o.id, { shipmentId: r.shipmentId });
+    $('#dSaved').className = 'saved';
+    $('#dSaved').textContent = r.units ? `Dispatched · ${r.units} unit${r.units === 1 ? '' : 's'} deducted` : 'Dispatched';
+    load();
+  } catch (x) {
+    err.textContent = x.message;
+    err.hidden = false;
+    btn.disabled = false;
+  }
+}
+
 /** An order no shipment has been made for yet, e.g. one just imported from Amazon. */
 function renderDrawerNoShipment() {
   const { order: o, documents, events } = state.detail;
@@ -929,8 +973,10 @@ function renderDrawerNoShipment() {
     ${orderFacts(o)}
     <section class="dsec">
       <h3 class="dsec-title">Shipment <span class="dsec-meta">${NO_SHIPMENT}</span></h3>
-      <p class="imp-note" style="margin:0 0 12px">Nothing has been shipped for this order. When it is packed, create a shipment — several orders can share one parcel and AWB.</p>
-      ${o.order_status === 'cancelled' || !canEdit() ? '' : `<div class="form-actions" style="margin-top:0"><button class="btn primary" type="button" id="dShipNew">${icon('package-plus')}Create shipment</button>
+      <p class="imp-note" style="margin:0 0 12px">Nothing has been shipped for this order. <b>Dispatch</b> it in one step with its courier and AWB (stock comes off now), or create a shipment to pack first — several orders can share one parcel and AWB.</p>
+      ${o.order_status === 'cancelled' || !canEdit() ? '' : state.dispatchOpen === o.id ? dispatchForm(o) : `<div class="form-actions" style="margin-top:0">
+        <button class="btn primary" type="button" id="dDispatch">${icon('truck')}Dispatch</button>
+        <button class="btn" type="button" id="dShipNew">${icon('package-plus')}Create shipment</button>
         <button class="btn" type="button" id="dShipPick">${icon('list-checks')}Choose more orders for it</button></div>`}
     </section>
     ${drawerCommon(o, documents, documents, events, notes)}`;
@@ -1218,6 +1264,12 @@ dBody.addEventListener('click', async (e) => {
       STEP_TEXT[step.dataset.step].replace(/^Mark /, 'Marked '), { shipment: true });
   }
   if (e.target.closest('#dEdit')) return openForm(state.detail.order);
+  if (e.target.closest('#dDispatch, #dDispatchCancel')) {
+    state.dispatchOpen = e.target.closest('#dDispatch') ? state.detail.order.id : null;
+    renderDrawer();
+    if (state.dispatchOpen) $('#dDispatchForm [name="courier_partner_id"]')?.focus();
+    return null;
+  }
   // No shipment yet: start one with this order, now or after choosing more in the list.
   if (e.target.closest('#dShipNew, #dShipPick')) {
     const o = state.detail.order;
@@ -1331,6 +1383,7 @@ dBody.addEventListener('click', async (e) => {
 });
 
 dBody.addEventListener('submit', async (e) => {
+  if (e.target.id === 'dDispatchForm') { e.preventDefault(); return submitDispatch(e.target); }
   if (e.target.id === 'shipForm') { e.preventDefault(); return patchOrder(shipmentFields(), 'Shipment saved', { shipment: true }); }
   if (e.target.id !== 'uploadForm') return;
   e.preventDefault();
