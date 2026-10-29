@@ -6837,6 +6837,54 @@ await step('amazon orders: incremental sync — window, watermark, paging, check
   return 'first window from a start date to now − 3 min (Amazon: ≥ 2 min before the request); later windows checkpoint − 5 min; same parameters + paginationToken per page; checkpoint = watermark only after a complete window; repeat run changes nothing; price change updates order + line; pending created once priced; FBA → no dispatch type, fulfillment marketplace; mapped/unmapped SKUs; mixed currency refused by name; failed window continued as the same window; partial → token saved + used; >23 h token or Amazon-rejected token → same window from page 1; 409 for a second Amazon start; Amazon/Shopify independent; no Shopify resume; CSV→API and API→CSV converge on one order, file-only fields kept, locked lines/value kept with conflicts; no stock, shipments, attribution or secrets';
 });
 
+await step('amazon orders: automatic sync — on when connected (off switch), every 15 min (never under 10), continues from the checkpoint, skips while a sync runs, waits for the first hand-run sync', async () => {
+  const bad = [];
+  const db = getPool();
+  const { pollAmazonOrdersOnce, startAmazonOrdersPoll, amazonPollMinutes } = await import('../lib/amazon-orders.js');
+  const CK = 'amazon_orders_checkpoint';
+  const saved = (await db.query('SELECT value FROM system_state WHERE key = $1', [CK])).rows[0]?.value ?? null;
+  const savedEnv = { on: process.env.AMAZON_ORDERS_POLL_ENABLED, min: process.env.AMAZON_ORDERS_POLL_MINUTES };
+  try {
+    // The timer: the off switch, and not started without Amazon credentials (none in tests); the interval.
+    process.env.AMAZON_ORDERS_POLL_ENABLED = 'false';
+    if (startAmazonOrdersPoll() !== null) bad.push('off switch ignored');
+    delete process.env.AMAZON_ORDERS_POLL_ENABLED;
+    // Only where no real credentials are set (CI): with them, this would start a real timer.
+    const { amazonConfigured: azOn } = await import('../lib/amazon-spapi.js');
+    if (!azOn() && startAmazonOrdersPoll() !== null) bad.push('started without credentials');
+    delete process.env.AMAZON_ORDERS_POLL_MINUTES;
+    if (amazonPollMinutes() !== 15) bad.push('default interval');
+    process.env.AMAZON_ORDERS_POLL_MINUTES = '5';
+    if (amazonPollMinutes() !== 10) bad.push('interval floor');
+    // A tick with a checkpoint: the same incremental sync as the button, by "amazon-poll"; a new order comes in.
+    await db.query(`INSERT INTO system_state (key, value) VALUES ($1, $2) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`,
+      [CK, new Date(Date.now() - 3600000).toISOString()]);
+    const s = fakeAmazon();
+    const client = azClient(s);
+    s.pages[''] = { orders: [azOrder(51, [azItem('I1')])] };
+    const r = await pollAmazonOrdersOnce({ client });
+    const o = await azRow(51);
+    const run = r?.runId ? (await db.query('SELECT imported_by, status FROM order_imports WHERE id = $1', [r.runId])).rows[0] : null;
+    if (r?.skipped || r?.summary?.created !== 1 || !o || o.source !== 'amazon_spapi' || run?.imported_by !== 'amazon-poll' || run?.status !== 'completed') bad.push(`tick ${JSON.stringify([r?.skipped, r?.summary, run])}`);
+    // While a sync runs (a person's click), a tick skips; never a second sync.
+    let release;
+    s.hold = new Promise((res) => { release = res; });
+    s.pages[''] = { orders: [azOrder(52, [azItem('I1')])] };
+    const live = await startAmazonIncrementalSync({ client, actor: AZ_ACTOR });
+    const during = await pollAmazonOrdersOnce({ client });
+    release(); s.hold = null;
+    await live.done;
+    if (during?.skipped !== 'already running') bad.push(`busy tick ${JSON.stringify(during)}`);
+    if (!(await azRow(52))) bad.push('the running sync did not finish');
+  } finally {
+    if (saved === null) await db.query('DELETE FROM system_state WHERE key = $1', [CK]);
+    else await db.query(`INSERT INTO system_state (key, value) VALUES ($1, $2) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`, [CK, saved]);
+    for (const [k, v] of [['AMAZON_ORDERS_POLL_ENABLED', savedEnv.on], ['AMAZON_ORDERS_POLL_MINUTES', savedEnv.min]]) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }
+  }
+  if (bad.length) throw new Error(bad.join('; '));
+  return 'off switch and missing credentials keep it off; 15 min default, 10 min floor; a tick continues from the checkpoint and imports (as amazon-poll); a tick while a sync runs skips';
+});
+
 await step('order date integrity: saving other fields keeps the stored date exactly (seconds too) with no date event; a set date cannot be removed (400); an imported order\'s date cannot be changed by hand (409); an undated order can be given one; refusals write nothing; Shopify, Amazon file and Amazon API still update and fill dates', async () => {
   const bad = [];
   const db = getPool();
