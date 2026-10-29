@@ -52,4 +52,5 @@ Background jobs keep per-process state. SLA, ingest-silence and daily-summary al
 what they already sent in memory (`lib/sla-alert.js`), so a second instance on the same
 database and alert settings sends every alert twice. On any standby set
 `SLA_ALERTS_ENABLED=false`, `SHOPIFY_POLL_ENABLED=false` and `KEEPALIVE_ENABLED=false`, and
-leave `SHOPIFY_ORDERS_POLL_ENABLED` unset or `false`.
+leave `SHOPIFY_ORDERS_POLL_ENABLED` unset or `false`. The Amazon order sync is **on by default** wherever the
+Amazon credentials are set, so a standby with them also needs `AMAZON_ORDERS_POLL_ENABLED=false`.

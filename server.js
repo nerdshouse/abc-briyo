@@ -55,6 +55,7 @@ import { startKeepAlive } from './lib/keepalive.js';
 import { startSlaAlerts, isIngestSilent } from './lib/sla-alert.js';
 import { startShopifyPoll, pollShopifyOnce } from './lib/shopify-poll.js';
 import { startShopifyOrdersPoll } from './lib/shopify-orders.js';
+import { startAmazonOrdersPoll } from './lib/amazon-orders.js';
 import { receiveOrdersCreate, processWebhookDelivery, startShopifyWebhookSweep } from './lib/shopify-webhooks.js';
 import { shopifyConfigured, authMode, apiVersionWarning, getAccessToken } from './lib/shopify.js';
 import {
@@ -1353,5 +1354,6 @@ app.listen(port, async () => {
   if (!MOCK) startShopifyPoll();
   // Shopify ORDERS (not carts): opt-in with SHOPIFY_ORDERS_POLL_ENABLED=true, and only after an initial import.
   if (!MOCK) startShopifyOrdersPoll();
+  if (!MOCK) startAmazonOrdersPoll();
   if (!MOCK) startShopifyWebhookSweep();
 });
