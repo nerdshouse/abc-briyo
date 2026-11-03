@@ -1227,6 +1227,9 @@ await step('CSV export neutralises formulas without mangling numbers', async () 
 
 // ---- orders & logistics ----------------------------------------------------
 const TEST_ORDER = 'DBCHECK-ORDER-DELETE-ME';
+// A real-looking Amazon order number (3-7-7 digits), unique per run: db-check runs twice on one database.
+const RUN7 = String(Date.now()).slice(-7);
+const AMZ_REAL = (n) => `999-${RUN7}-${String(n).padStart(7, '0')}`;
 const ACTOR = 'db-check';
 const NOW = () => new Date().toISOString();
 let orderId = null;
@@ -4253,9 +4256,12 @@ await step('manual order lines: a master SKU and a whole quantity; one line per 
   if (items.length !== 1 || items[0].quantity !== 3) throw new Error(JSON.stringify(items));
   const ev = (await orderEvents(o)).map((e) => e.event_type);
   for (const t of ['item_added', 'item_quantity_changed', 'item_removed']) if (!ev.includes(t)) throw new Error(`no ${t} event`);
-  // Not on Amazon (its report adds the real lines) nor on imported orders; import lines cannot be edited here.
-  const amz = await mlOrder('AMZ', { channel: 'amazon' });
+  // Not on a real Amazon order number (the sync/report adds its lines) nor on imported orders; import lines cannot be edited here.
+  const amz = await createOrder({ ...R('amazon'), channel: 'amazon', source_order_id: AMZ_REAL(3), order_value: 100 }, { actor: ACTOR });
   await expectErr('amazon', () => addManualOrderLine(amz, { sku_id: ML.a, quantity: 1 }, { actor: ACTOR }), (e) => e.status === 409 && /Amazon/.test(e.message));
+  // An FBA stock transfer on the Amazon channel is never in Amazon's order feed: it takes products here.
+  const fbaT = await mlOrder('FBA', { channel: 'amazon' });
+  await addManualOrderLine(fbaT, { sku_id: ML.a, quantity: 1 }, { actor: ACTOR });
   const imp = await mlOrder('IMP', { channel: 'website' });
   await getPool().query(`UPDATE orders SET source = 'shopify_sync' WHERE id = $1`, [imp]);
   await expectErr('imported', () => addManualOrderLine(imp, { sku_id: ML.a, quantity: 1 }, { actor: ACTOR }), (e) => e.status === 409);
@@ -4265,7 +4271,7 @@ await step('manual order lines: a master SKU and a whole quantity; one line per 
   const impLine = (await orderItems(other))[0];
   await expectErr('import line', () => updateManualOrderLine(other, impLine.id, { quantity: 2 }, { actor: ACTOR }), (e) => e.status === 409);
   ML.o1 = o;
-  return 'line = master code + title, quantity 2; 0/−1/1.5/abc/blank/null/too large refused; inactive, unknown, missing SKU refused; same SKU twice refused (no merge); quantity edit and remove audited; Amazon and imported orders refused; hand-entered website order allowed; import lines not editable';
+  return 'line = master code + title, quantity 2; 0/−1/1.5/abc/blank/null/too large refused; inactive, unknown, missing SKU refused; same SKU twice refused (no merge); quantity edit and remove audited; real Amazon order numbers and imported orders refused; FBA transfer and hand-entered website order allowed; import lines not editable';
 });
 await step('manual order lines: master units directly — no platform multiplier, even when the SKU has a ×3 listing on the channel', async () => {
   await addPlatformMappings(ML.a, PF.blinkit, [`${TS}-ML-A-PACK3`], { actor: ACTOR, unitsPerListing: 3 });
@@ -4382,9 +4388,10 @@ await step('manual order lines: channel and order number are fixed while the ord
   return 'with a manual product: channel, number and a move onto an Amazon order ID refused (409, order and line unchanged); value edit fine; products removed → number changes; no products → channel and number change as before';
 });
 await step('manual order lines: a hand-entered Amazon order (no manual products possible) gets its Amazon lines from the import exactly once', async () => {
-  const id = await createOrder({ ...R('amazon'), channel: 'amazon', source_order_id: AZ('ML-HAND'), order_value: 1 }, { actor: ACTOR });
+  const HAND = AMZ_REAL(2);
+  const id = await createOrder({ ...R('amazon'), channel: 'amazon', source_order_id: HAND, order_value: 1 }, { actor: ACTOR });
   await expectErr('manual line', () => addManualOrderLine(id, { sku_id: ML.a, quantity: 1 }, { actor: ACTOR }), (e) => e.status === 409);
-  const file = amzCsv([amzRow({ 'order-id': AZ('ML-HAND'), 'order-item-id': 'MLH-1', sku: 'SKU-MLH', 'quantity-purchased': '2' })]);
+  const file = amzCsv([amzRow({ 'order-id': HAND, 'order-item-id': 'MLH-1', sku: 'SKU-MLH', 'quantity-purchased': '2' })]);
   const r = await commitAmazonImport(file, 'ml-hand.csv', { actor: IMPORTER });
   let items = await orderItems(id);
   if (r.summary.ordersUpdated !== 1 || items.length !== 1 || items[0].source_line_item_id !== 'MLH-1' || items[0].quantity !== 2 || items[0].sku !== 'SKU-MLH') throw new Error(JSON.stringify({ s: r.summary, items }));
@@ -5161,10 +5168,17 @@ await step('new shipment with products: bad lines, Amazon orders and "dispatched
   await updateSku(off, { active: false }, { actor: ACTOR, version: (await getSku(off)).version });
   await refused('inactive', { lines: [{ sku_id: MP.d3, quantity: 1 }, { sku_id: off, quantity: 1 }] }, (e) => e.status === 400 && /inactive/.test(e.message));
   const dl = await mpCourier();
-  await expectErr('amazon', () => createShipment({ ...R('amazon'), channel: 'amazon', source_order_id: `${TEST_ORDER}-MP-AMZ`, courier_partner_id: dl.id, tracking_id: 'AWB-MP-AMZ',
-    lines: [{ sku_id: MP.d3, quantity: 1 }] }, { actor: ACTOR }), (e) => e.status === 409 && /Amazon order products come from the Amazon order report/.test(e.message));
-  if ((await getPool().query('SELECT count(*)::int n FROM orders WHERE source_order_id = $1', [`${TEST_ORDER}-MP-AMZ`])).rows[0].n) bad.push('Amazon order left behind');
+  // A real Amazon order number (3-7-7 digits) takes its products from the Amazon sync, never by hand.
+  const AMZ_NO = AMZ_REAL(1);
+  await expectErr('amazon', () => createShipment({ ...R('amazon'), channel: 'amazon', source_order_id: AMZ_NO, courier_partner_id: dl.id, tracking_id: 'AWB-MP-AMZ',
+    lines: [{ sku_id: MP.d3, quantity: 1 }] }, { actor: ACTOR }), (e) => e.status === 409 && /Amazon order products come from the Amazon order sync/.test(e.message));
+  if ((await getPool().query('SELECT count(*)::int n FROM orders WHERE source_order_id = $1', [AMZ_NO])).rows[0].n) bad.push('Amazon order left behind');
   if ((await mpOrders()) !== n0 || (await mpMoves()) !== mv0) bad.push('a refused shipment left an order or a movement');
+  // Anything else on the Amazon channel — an FBA stock transfer (FBA15MSVQLSF) — never comes from Amazon's order feed: it takes products.
+  const fba = await createShipment({ ...R('amazon'), channel: 'amazon', source_order_id: `${TEST_ORDER}-MP-FBA`, courier_partner_id: dl.id, tracking_id: 'AWB-MP-FBA',
+    lines: [{ sku_id: MP.d3, quantity: 2 }] }, { actor: ACTOR });
+  const fbaLines = (await getPool().query('SELECT coalesce(sum(i.quantity), 0)::int q FROM order_items i JOIN orders o ON o.id = i.order_id WHERE o.source_order_id = $1', [`${TEST_ORDER}-MP-FBA`])).rows[0].q;
+  if (!fba || fbaLines !== 2) bad.push(`an FBA transfer on the Amazon channel should take its products by hand (got ${fbaLines} units)`);
   // Insufficient: 1 unit in stock, 5 in the parcel.
   const few = (await createSku({ sku: `${TS}-MP-FEW`, product_name: 'Few left' }, { actor: ACTOR })).id;
   const fewB = (await receiveInventory({ sku_id: few, batch_number: 'MP-FEW-1', expiry_date: dayOffset(300), quantity: 1, request_id: rid() }, { actor: ACTOR })).batchId;

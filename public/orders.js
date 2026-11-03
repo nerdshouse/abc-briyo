@@ -709,8 +709,12 @@ const itemCell = (o) => (isMarketplace(o.channel) ? itemLines(o)
 
 /** Line items, as the marketplace listed them. Manual orders have none. */
 const PARCEL_LEFT = new Set(['dispatched', 'in_transit', 'out_for_delivery', 'delivered', 'delivery_failed', 'rto']);
-/** Hand-entered orders take products here (not Amazon: its report import adds them). lib/orders.js decides again. */
-const takesManualLines = (o) => o.source === 'manual' && o.channel !== 'amazon';
+/**
+ * Hand-entered orders take products here — not a real Amazon order (403-6620554-6141152), whose products come from
+ * the Amazon sync, but an FBA stock transfer (FBA15MSVQLSF) does. lib/orders.js decides again.
+ */
+const isAmazonOrderNo = (v) => /^\d{3}-\d{7}-\d{7}$/.test(String(v || '').trim());
+const takesManualLines = (o) => o.source === 'manual' && (o.channel !== 'amazon' || !isAmazonOrderNo(o.source_order_id));
 const manualLinesOpen = (o) => takesManualLines(o) && canEdit() && o.order_status !== 'cancelled'
   && !(state.detail?.shipments || []).some((x) => PARCEL_LEFT.has(x.shipment_status));
 
@@ -1702,10 +1706,11 @@ function syncExtras() {
   const amazon = $('#createForm').channel.value === 'amazon';
   $('#cExtraSec').hidden = !amazon;
   if (!amazon) $('#cExtras').innerHTML = '';
-  // Amazon order products come from the report import; every other hand-entered order takes them here.
-  $('#cProdSec').hidden = amazon;
-  $('#cProdAmazon').hidden = !amazon;
-  if (amazon) { $('#cProds').innerHTML = ''; prodSummary(); }
+  // A real Amazon order's products come from the Amazon sync; every other hand-entered order (an FBA transfer too) takes them here.
+  const fromAmazon = amazon && isAmazonOrderNo($('#createForm').source_order_id.value);
+  $('#cProdSec').hidden = fromAmazon;
+  $('#cProdAmazon').hidden = !fromAmazon;
+  if (fromAmazon) { $('#cProds').innerHTML = ''; prodSummary(); }
 }
 
 // ---- New Shipment products: one row per product (a master SKU and the units packed), checked before saving.
@@ -1769,6 +1774,7 @@ const extraOrders = () => [...document.querySelectorAll('#cExtras .extra-row')]
   .map((r) => ({ source_order_id: r.querySelector('.x-num').value.trim(), order_date: r.querySelector('.x-date').value || undefined, order_value: r.querySelector('.x-value').value }))
   .filter((x) => x.source_order_id);
 
+$('#createForm').source_order_id.addEventListener('input', syncExtras);
 $('#createForm').addEventListener('change', (e) => {
   if (e.target.name === 'dispatch_files') showPreviews([...e.target.files]);
   if (['dispatch_type', 'channel'].includes(e.target.name)) { routeChanged(e.target.form, '#cDestField', e.target.name, true); syncExtras(); }
