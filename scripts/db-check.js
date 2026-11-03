@@ -1227,6 +1227,9 @@ await step('CSV export neutralises formulas without mangling numbers', async () 
 
 // ---- orders & logistics ----------------------------------------------------
 const TEST_ORDER = 'DBCHECK-ORDER-DELETE-ME';
+// A real-looking Amazon order number (3-7-7 digits), unique per run: db-check runs twice on one database.
+const RUN7 = String(Date.now()).slice(-7);
+const AMZ_REAL = (n) => `999-${RUN7}-${String(n).padStart(7, '0')}`;
 const ACTOR = 'db-check';
 const NOW = () => new Date().toISOString();
 let orderId = null;
@@ -4254,8 +4257,7 @@ await step('manual order lines: a master SKU and a whole quantity; one line per 
   const ev = (await orderEvents(o)).map((e) => e.event_type);
   for (const t of ['item_added', 'item_quantity_changed', 'item_removed']) if (!ev.includes(t)) throw new Error(`no ${t} event`);
   // Not on a real Amazon order number (the sync/report adds its lines) nor on imported orders; import lines cannot be edited here.
-  // CI runs on a fresh database, so this one order outside the TEST_ORDER prefix is harmless (orders are append-only).
-  const amz = await createOrder({ ...R('amazon'), channel: 'amazon', source_order_id: '999-0000000-0000003', order_value: 100 }, { actor: ACTOR });
+  const amz = await createOrder({ ...R('amazon'), channel: 'amazon', source_order_id: AMZ_REAL(3), order_value: 100 }, { actor: ACTOR });
   await expectErr('amazon', () => addManualOrderLine(amz, { sku_id: ML.a, quantity: 1 }, { actor: ACTOR }), (e) => e.status === 409 && /Amazon/.test(e.message));
   // An FBA stock transfer on the Amazon channel is never in Amazon's order feed: it takes products here.
   const fbaT = await mlOrder('FBA', { channel: 'amazon' });
@@ -4386,8 +4388,7 @@ await step('manual order lines: channel and order number are fixed while the ord
   return 'with a manual product: channel, number and a move onto an Amazon order ID refused (409, order and line unchanged); value edit fine; products removed → number changes; no products → channel and number change as before';
 });
 await step('manual order lines: a hand-entered Amazon order (no manual products possible) gets its Amazon lines from the import exactly once', async () => {
-  // A real Amazon order number (3-7-7 digits); CI's fresh database makes the one order outside the TEST_ORDER prefix harmless.
-  const HAND = '999-0000000-0000002';
+  const HAND = AMZ_REAL(2);
   const id = await createOrder({ ...R('amazon'), channel: 'amazon', source_order_id: HAND, order_value: 1 }, { actor: ACTOR });
   await expectErr('manual line', () => addManualOrderLine(id, { sku_id: ML.a, quantity: 1 }, { actor: ACTOR }), (e) => e.status === 409);
   const file = amzCsv([amzRow({ 'order-id': HAND, 'order-item-id': 'MLH-1', sku: 'SKU-MLH', 'quantity-purchased': '2' })]);
@@ -5168,7 +5169,7 @@ await step('new shipment with products: bad lines, Amazon orders and "dispatched
   await refused('inactive', { lines: [{ sku_id: MP.d3, quantity: 1 }, { sku_id: off, quantity: 1 }] }, (e) => e.status === 400 && /inactive/.test(e.message));
   const dl = await mpCourier();
   // A real Amazon order number (3-7-7 digits) takes its products from the Amazon sync, never by hand.
-  const AMZ_NO = '999-0000000-0000001';
+  const AMZ_NO = AMZ_REAL(1);
   await expectErr('amazon', () => createShipment({ ...R('amazon'), channel: 'amazon', source_order_id: AMZ_NO, courier_partner_id: dl.id, tracking_id: 'AWB-MP-AMZ',
     lines: [{ sku_id: MP.d3, quantity: 1 }] }, { actor: ACTOR }), (e) => e.status === 409 && /Amazon order products come from the Amazon order sync/.test(e.message));
   if ((await getPool().query('SELECT count(*)::int n FROM orders WHERE source_order_id = $1', [AMZ_NO])).rows[0].n) bad.push('Amazon order left behind');
