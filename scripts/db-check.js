@@ -5161,10 +5161,17 @@ await step('new shipment with products: bad lines, Amazon orders and "dispatched
   await updateSku(off, { active: false }, { actor: ACTOR, version: (await getSku(off)).version });
   await refused('inactive', { lines: [{ sku_id: MP.d3, quantity: 1 }, { sku_id: off, quantity: 1 }] }, (e) => e.status === 400 && /inactive/.test(e.message));
   const dl = await mpCourier();
-  await expectErr('amazon', () => createShipment({ ...R('amazon'), channel: 'amazon', source_order_id: `${TEST_ORDER}-MP-AMZ`, courier_partner_id: dl.id, tracking_id: 'AWB-MP-AMZ',
-    lines: [{ sku_id: MP.d3, quantity: 1 }] }, { actor: ACTOR }), (e) => e.status === 409 && /Amazon order products come from the Amazon order report/.test(e.message));
-  if ((await getPool().query('SELECT count(*)::int n FROM orders WHERE source_order_id = $1', [`${TEST_ORDER}-MP-AMZ`])).rows[0].n) bad.push('Amazon order left behind');
+  // A real Amazon order number (3-7-7 digits) takes its products from the Amazon sync, never by hand.
+  const AMZ_NO = '999-0000000-0000001';
+  await expectErr('amazon', () => createShipment({ ...R('amazon'), channel: 'amazon', source_order_id: AMZ_NO, courier_partner_id: dl.id, tracking_id: 'AWB-MP-AMZ',
+    lines: [{ sku_id: MP.d3, quantity: 1 }] }, { actor: ACTOR }), (e) => e.status === 409 && /Amazon order products come from the Amazon order sync/.test(e.message));
+  if ((await getPool().query('SELECT count(*)::int n FROM orders WHERE source_order_id = $1', [AMZ_NO])).rows[0].n) bad.push('Amazon order left behind');
   if ((await mpOrders()) !== n0 || (await mpMoves()) !== mv0) bad.push('a refused shipment left an order or a movement');
+  // Anything else on the Amazon channel — an FBA stock transfer (FBA15MSVQLSF) — never comes from Amazon's order feed: it takes products.
+  const fba = await createShipment({ ...R('amazon'), channel: 'amazon', source_order_id: `${TEST_ORDER}-MP-FBA`, courier_partner_id: dl.id, tracking_id: 'AWB-MP-FBA',
+    lines: [{ sku_id: MP.d3, quantity: 2 }] }, { actor: ACTOR });
+  const fbaLines = (await getPool().query('SELECT coalesce(sum(i.quantity), 0)::int q FROM order_items i JOIN orders o ON o.id = i.order_id WHERE o.source_order_id = $1', [`${TEST_ORDER}-MP-FBA`])).rows[0].q;
+  if (!fba || fbaLines !== 2) bad.push(`an FBA transfer on the Amazon channel should take its products by hand (got ${fbaLines} units)`);
   // Insufficient: 1 unit in stock, 5 in the parcel.
   const few = (await createSku({ sku: `${TS}-MP-FEW`, product_name: 'Few left' }, { actor: ACTOR })).id;
   const fewB = (await receiveInventory({ sku_id: few, batch_number: 'MP-FEW-1', expiry_date: dayOffset(300), quantity: 1, request_id: rid() }, { actor: ACTOR })).batchId;
