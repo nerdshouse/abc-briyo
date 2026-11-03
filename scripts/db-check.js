@@ -4253,9 +4253,13 @@ await step('manual order lines: a master SKU and a whole quantity; one line per 
   if (items.length !== 1 || items[0].quantity !== 3) throw new Error(JSON.stringify(items));
   const ev = (await orderEvents(o)).map((e) => e.event_type);
   for (const t of ['item_added', 'item_quantity_changed', 'item_removed']) if (!ev.includes(t)) throw new Error(`no ${t} event`);
-  // Not on Amazon (its report adds the real lines) nor on imported orders; import lines cannot be edited here.
-  const amz = await mlOrder('AMZ', { channel: 'amazon' });
+  // Not on a real Amazon order number (the sync/report adds its lines) nor on imported orders; import lines cannot be edited here.
+  // CI runs on a fresh database, so this one order outside the TEST_ORDER prefix is harmless (orders are append-only).
+  const amz = await createOrder({ ...R('amazon'), channel: 'amazon', source_order_id: '999-0000000-0000003', order_value: 100 }, { actor: ACTOR });
   await expectErr('amazon', () => addManualOrderLine(amz, { sku_id: ML.a, quantity: 1 }, { actor: ACTOR }), (e) => e.status === 409 && /Amazon/.test(e.message));
+  // An FBA stock transfer on the Amazon channel is never in Amazon's order feed: it takes products here.
+  const fbaT = await mlOrder('FBA', { channel: 'amazon' });
+  await addManualOrderLine(fbaT, { sku_id: ML.a, quantity: 1 }, { actor: ACTOR });
   const imp = await mlOrder('IMP', { channel: 'website' });
   await getPool().query(`UPDATE orders SET source = 'shopify_sync' WHERE id = $1`, [imp]);
   await expectErr('imported', () => addManualOrderLine(imp, { sku_id: ML.a, quantity: 1 }, { actor: ACTOR }), (e) => e.status === 409);
@@ -4265,7 +4269,7 @@ await step('manual order lines: a master SKU and a whole quantity; one line per 
   const impLine = (await orderItems(other))[0];
   await expectErr('import line', () => updateManualOrderLine(other, impLine.id, { quantity: 2 }, { actor: ACTOR }), (e) => e.status === 409);
   ML.o1 = o;
-  return 'line = master code + title, quantity 2; 0/−1/1.5/abc/blank/null/too large refused; inactive, unknown, missing SKU refused; same SKU twice refused (no merge); quantity edit and remove audited; Amazon and imported orders refused; hand-entered website order allowed; import lines not editable';
+  return 'line = master code + title, quantity 2; 0/−1/1.5/abc/blank/null/too large refused; inactive, unknown, missing SKU refused; same SKU twice refused (no merge); quantity edit and remove audited; real Amazon order numbers and imported orders refused; FBA transfer and hand-entered website order allowed; import lines not editable';
 });
 await step('manual order lines: master units directly — no platform multiplier, even when the SKU has a ×3 listing on the channel', async () => {
   await addPlatformMappings(ML.a, PF.blinkit, [`${TS}-ML-A-PACK3`], { actor: ACTOR, unitsPerListing: 3 });
@@ -4382,9 +4386,11 @@ await step('manual order lines: channel and order number are fixed while the ord
   return 'with a manual product: channel, number and a move onto an Amazon order ID refused (409, order and line unchanged); value edit fine; products removed → number changes; no products → channel and number change as before';
 });
 await step('manual order lines: a hand-entered Amazon order (no manual products possible) gets its Amazon lines from the import exactly once', async () => {
-  const id = await createOrder({ ...R('amazon'), channel: 'amazon', source_order_id: AZ('ML-HAND'), order_value: 1 }, { actor: ACTOR });
+  // A real Amazon order number (3-7-7 digits); CI's fresh database makes the one order outside the TEST_ORDER prefix harmless.
+  const HAND = '999-0000000-0000002';
+  const id = await createOrder({ ...R('amazon'), channel: 'amazon', source_order_id: HAND, order_value: 1 }, { actor: ACTOR });
   await expectErr('manual line', () => addManualOrderLine(id, { sku_id: ML.a, quantity: 1 }, { actor: ACTOR }), (e) => e.status === 409);
-  const file = amzCsv([amzRow({ 'order-id': AZ('ML-HAND'), 'order-item-id': 'MLH-1', sku: 'SKU-MLH', 'quantity-purchased': '2' })]);
+  const file = amzCsv([amzRow({ 'order-id': HAND, 'order-item-id': 'MLH-1', sku: 'SKU-MLH', 'quantity-purchased': '2' })]);
   const r = await commitAmazonImport(file, 'ml-hand.csv', { actor: IMPORTER });
   let items = await orderItems(id);
   if (r.summary.ordersUpdated !== 1 || items.length !== 1 || items[0].source_line_item_id !== 'MLH-1' || items[0].quantity !== 2 || items[0].sku !== 'SKU-MLH') throw new Error(JSON.stringify({ s: r.summary, items }));
