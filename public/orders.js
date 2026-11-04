@@ -355,6 +355,7 @@ function closeDrawer() {
   state.openId = null;
   state.detail = null;
   state.dispatchOpen = null;
+  state.returnOpen = null;
   state.shipId = null;
   writeUrl();
   $('#drawer').hidden = true;
@@ -1060,6 +1061,7 @@ function describeEvent(e) {
     case 'item_unmatched_manually': return ['unlink', 'warn', `Hand match removed · ${esc(md.title || 'line')} (was ${esc(md.sku || '—')}) — ${esc(md.reason)}`];
     case 'item_match_superseded': return ['link', 'warn', `Shopify now sends code ${esc(md.code)} for a line matched by hand (was ${esc(md.from?.sku || '—')}, ${esc(md.from?.units_per_listing)} per listing) → ${md.to?.resolved ? `<b>${esc(md.to.sku)}</b>` : 'not mapped yet'}`];
     case 'item_removed': return ['package-minus', 'warn', `Product removed · ${esc(md.sku || md.retailer_product || 'line')} × ${esc(md.quantity)}`];
+    case 'stock_returned': return ['undo-2', md.held ? 'warn' : 'info', `Return received${md.source === 'courier_rto' ? ' (RTO)' : ''} · ${(md.lines || []).map((x) => `${esc(x.sku)} ${esc(x.batch)} × ${esc(x.quantity)} ${x.condition === 'sellable' ? 'to stock' : esc(x.condition)}`).join(', ')}${md.reason ? ` — ${esc(md.reason)}` : ''}`];
     case 'stock_released': return ['package-open', 'warn', `Reserved stock released${md.reason === 'order cancelled' ? ' — order cancelled' : ''}`];
     case 'amazon_import_lines_locked': return ['lock', 'warn', `Amazon import did not change ${md.lines} item${md.lines > 1 ? 's' : ''}: stock for this order has already been dispatched`];
     default: return ['activity', '', esc(label(e.event_type))];
@@ -1252,6 +1254,13 @@ dBody.addEventListener('click', async (e) => {
   const editShip = e.target.closest('[data-edit-ship]');
   if (editShip) return openShipEdit(Number(editShip.dataset.editShip));
   if (e.target.closest('#dShipSave')) return patchOrder(shipmentFields(), 'Shipment saved', { shipment: true });
+  if (e.target.closest('#dReturnOpen, #dReturnCancel')) {
+    state.returnOpen = e.target.closest('#dReturnOpen') ? currentShip().id : null;
+    state.returnReq = crypto.randomUUID();
+    renderStock();
+    if (state.returnOpen) $('#dReturnForm [name="reason"]')?.focus();
+    return;
+  }
   if (e.target.closest('#dReserve')) return reserveStock();
   if (e.target.closest('#dRelease')) return releaseStock();
   if (e.target.closest('[data-alloc-add]')) {
@@ -1388,6 +1397,7 @@ dBody.addEventListener('click', async (e) => {
 
 dBody.addEventListener('submit', async (e) => {
   if (e.target.id === 'dDispatchForm') { e.preventDefault(); return submitDispatch(e.target); }
+  if (e.target.id === 'dReturnForm') { e.preventDefault(); return submitReturn(e.target); }
   if (e.target.id === 'shipForm') { e.preventDefault(); return patchOrder(shipmentFields(), 'Shipment saved', { shipment: true }); }
   if (e.target.id !== 'uploadForm') return;
   e.preventDefault();
@@ -1979,7 +1989,7 @@ function renderStock() {
           ? `<b>${count(l.required)}</b> left to send of ${count(l.ordered)} ordered`
           : `<b>${count(l.required)}</b> needed`}${done ? '' : ` · ${count(l.available)} available to dispatch ${l.enough ? '<span class="ok-mark">✓</span>' : '<span class="mini-tag warn">Insufficient</span>'}`}</span>
       </div>
-      ${done ? `<div class="soft stock-from">Deducted from ${l.dispatched.map((d) => `<span class="mono">${esc(d.batch_number)}</span> −${count(d.quantity)}`).join(', ')}</div>`
+      ${done ? `<div class="soft stock-from">Deducted from ${l.dispatched.map((d) => `<span class="mono">${esc(d.batch_number)}</span> −${count(d.quantity)}${returnedText(d.returned)}`).join(', ')}</div>`
         : editable ? `<div class="alloc">${allocFor(l).map((a) => `<div class="alloc-row"><select class="select" data-alloc-batch aria-label="Batch for ${esc(l.sku)}">${batchOpts(l, a.batch_id)}</select>
             <input class="input" data-alloc-qty inputmode="numeric" value="${esc(a.quantity)}" aria-label="Quantity" /></div>`).join('')}
             <button type="button" class="linkish" data-alloc-add>+ another batch</button></div>`
@@ -1988,10 +1998,73 @@ function renderStock() {
     </div>`).join('')}
     ${st.split && !done ? '<p class="imp-note">This order is split across several shipments. Reserve only what goes in this parcel; the rest stays for the others.</p>' : ''}
     ${st.untracked?.length ? `<p class="imp-note">${st.untracked.map((u) => `<span class="mono">${esc(u.sku)}</span>`).join(', ')} not inventory-tracked — no stock needed.</p>` : ''}
+    ${done && canEdit() ? returnBlock(st) : ''}
     ${editable && st.lines.length && !st.unmapped.length ? `<div class="form-actions">
       <button class="btn" type="button" id="dReserve">${st.state === 'reserved' ? 'Update reservation' : 'Reserve stock'}</button>
       ${st.lines.some((l) => l.reserved.length) ? '<button class="btn" type="button" id="dRelease">Release</button>' : ''}</div>` : ''}`;
   renderIcons();
+}
+
+/** " · 2 back (1 held)" after a batch that left, once a return was received for it. */
+function returnedText(r) {
+  if (!r?.total) return '';
+  const held = r.damaged + r.quarantined;
+  return ` <span class="mini-tag">${count(r.total)} returned${held ? ` · ${count(r.sellable)} to stock, ${count(held)} held` : ' to stock'}</span>`;
+}
+
+/**
+ * Receive return: for a parcel that came back (RTO or a customer return), the units checked per batch it left from —
+ * sellable back into that batch, damaged held apart. Never more than left on the shipment.
+ */
+function returnBlock(st) {
+  const left = st.lines.flatMap((l) => l.dispatched.map((d) => ({ ...d, sku: l.sku, product: l.product_name }))).filter((d) => d.returnable > 0);
+  if (!left.length) return '';
+  if (state.returnOpen !== st.shipment_id) {
+    return `<div class="form-actions"><button class="btn" type="button" id="dReturnOpen">${icon('undo-2')}Receive return</button></div>`;
+  }
+  return `<form class="ret-form" id="dReturnForm" novalidate>
+      <h4 class="dsec-title" style="margin:12px 0 6px">Receive return</h4>
+      <p class="imp-note" style="margin:0 0 8px">Open the parcel and count what came back. Sellable units go back into the batch they left from and can be sold again; damaged ones are held apart and never sold. Leave 0 for what did not come back.</p>
+      <div class="ret-rows">${left.map((d) => `<div class="ret-row" data-ret-batch="${d.batch_id}">
+        <div class="ret-what"><b class="mono">${esc(d.sku)}</b> <span class="soft">${esc(d.product || '')}</span><div class="soft">Batch <span class="mono">${esc(d.batch_number)}</span> · ${count(d.returnable)} can come back</div></div>
+        <label class="ret-n"><span>Sellable</span><input class="input" data-ret="sellable" type="number" min="0" max="${d.returnable}" step="1" inputmode="numeric" value="${d.returnable}" /></label>
+        <label class="ret-n"><span>Damaged</span><input class="input" data-ret="damaged" type="number" min="0" max="${d.returnable}" step="1" inputmode="numeric" value="0" /></label>
+      </div>`).join('')}</div>
+      <div class="ret-meta">
+        <label class="fld"><span>Came back as</span><select class="select" name="source">${opt('courier_rto', 'Courier RTO', true)}${opt('customer', 'Customer return')}${opt('marketplace', 'Marketplace return')}</select></label>
+        <label class="fld"><span>Reason</span><input class="input" name="reason" maxlength="300" required placeholder="RTO — customer not reachable" /></label>
+      </div>
+      <p class="saved failed" id="dReturnError" hidden></p>
+      <div class="form-actions"><button class="btn primary" type="submit" id="dReturnGo">Add to stock</button><button class="btn" type="button" id="dReturnCancel">Cancel</button></div>
+    </form>`;
+}
+
+async function submitReturn(form) {
+  const err = $('#dReturnError');
+  err.hidden = true;
+  const lines = [...form.querySelectorAll('[data-ret-batch]')].map((r) => ({
+    batch_id: r.dataset.retBatch,
+    sellable: r.querySelector('[data-ret="sellable"]').value.trim(),
+    damaged: r.querySelector('[data-ret="damaged"]').value.trim(),
+  }));
+  const btn = $('#dReturnGo');
+  btn.disabled = true;
+  try {
+    const shipmentId = currentShip().id;
+    const r = await api(`/api/inventory/shipments/${shipmentId}/return`, { method: 'POST',
+      body: JSON.stringify({ lines, source: form.source.value, reason: form.reason.value, request_id: state.returnReq }) });
+    state.returnOpen = null;
+    state.stock = r.stock;
+    const back = (r.returned || []).reduce((n, x) => n + (x.condition === 'sellable' ? x.quantity : 0), 0);
+    const held = (r.returned || []).reduce((n, x) => n + (x.condition === 'sellable' ? 0 : x.quantity), 0);
+    await openOrder(state.detail.order.id, { shipmentId });
+    $('#dSaved').className = 'saved';
+    $('#dSaved').textContent = r.repeated ? 'Return already recorded' : `Return received — ${back} back in stock${held ? `, ${held} held as damaged` : ''}`;
+  } catch (e) {
+    err.textContent = e.message;
+    err.hidden = false;
+    btn.disabled = false;
+  }
 }
 
 async function reserveStock() {

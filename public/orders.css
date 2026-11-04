@@ -715,3 +715,15 @@ dl.facts dd { margin: 0; min-width: 0; overflow-wrap: anywhere; }
   .cp-table td.r { display: inline-block; width: auto; float: right; margin-top: -2px; }
   .cp-table tr::after { content: ''; display: block; clear: both; }
 }
+
+/* Receive return: one row per batch that left — what it is, then sellable / damaged counts. */
+.ret-form { border-top: 1px solid var(--border); margin-top: 10px; }
+.ret-row { display: grid; grid-template-columns: minmax(0, 1fr) 84px 84px; gap: 8px; align-items: end; padding: 6px 0; font-size: 12.5px; }
+.ret-n { display: grid; gap: 2px; font-size: 12px; }
+.ret-n .input { height: 30px; width: 100%; min-width: 0; }
+.ret-meta { display: grid; grid-template-columns: 180px minmax(0, 1fr); gap: 8px; margin-top: 8px; }
+@media (max-width: 560px) {
+  .ret-row { grid-template-columns: 1fr 1fr; }
+  .ret-what { grid-column: 1 / -1; }
+  .ret-meta { grid-template-columns: 1fr; }
+}
