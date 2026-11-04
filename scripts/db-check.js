@@ -4736,6 +4736,66 @@ await step('order Dispatch button: courier + AWB → shipment, FEFO reservation,
   return 'bad AWB / Excel number / no courier / unknown order refused; one step → dispatched with AWB, 3 units FEFO (2 early + 1 late); second click and another AWB refused; short stock, cancelled order and an AWB in use refused with nothing changed; button on the drawer';
 });
 
+await step('Receive return: a dispatched parcel that came back is put back per batch it left from — sellable to stock, damaged held; never more than left; one transaction; idempotent; logged on the order', async () => {
+  const bad = [];
+  const { receiveShipmentReturn } = await import('../lib/inventory-inbound.js');
+  const sku = (await createSku({ sku: `${TS}-RR-A`, product_name: 'Receive return test product' }, { actor: ACTOR })).id;
+  await addPlatformMappings(sku, PF.amazon, [`${TS}-RR-AMZ`], { actor: ACTOR });
+  const early = (await receiveInventory({ sku_id: sku, batch_number: 'RR-EARLY', expiry_date: dayOffset(60), quantity: 2, request_id: rid() }, { actor: ACTOR })).batchId;
+  const late = (await receiveInventory({ sku_id: sku, batch_number: 'RR-LATE', expiry_date: dayOffset(300), quantity: 5, request_id: rid() }, { actor: ACTOR })).batchId;
+  const other = (await receiveInventory({ sku_id: sku, batch_number: 'RR-OTHER', expiry_date: dayOffset(400), quantity: 1, request_id: rid() }, { actor: ACTOR })).batchId;
+  const delhivery = (await listCouriers()).find((x) => x.name === 'Delhivery').id;
+  const order = await lineOn('amazon', 'RR-1', `${TS}-RR-AMZ`, 3);   // 2 from the early batch, 1 from the late one
+  const d = await dispatchOrder(order, { courier_partner_id: delhivery, tracking_id: 'RR-AWB-1' }, { actor: ACTOR });
+  const ship = Number(d.shipmentId);
+  const onHand = async (b) => (await getPool().query('SELECT on_hand FROM inventory_batches WHERE id = $1', [b])).rows[0].on_hand;
+  const snap = async () => [await onHand(early), await onHand(late), await onHand(other),
+    (await getPool().query('SELECT count(*)::int n FROM stock_returns WHERE shipment_id = $1', [ship])).rows[0].n];
+  const before = await snap();
+  if (before.join() !== '0,4,1,0') bad.push(`after dispatch ${before}`);
+  const st0 = await shipmentStock(ship);
+  const left0 = st0.lines[0]?.dispatched.map((x) => `${x.batch_number}:${x.returnable}`).sort().join();
+  if (left0 !== 'RR-EARLY:2,RR-LATE:1') bad.push(`returnable ${left0}`);
+  // Refused with nothing changed.
+  const R = (lines, extra = {}) => receiveShipmentReturn(ship, { lines, reason: 'RTO — customer not reachable', ...extra }, { actor: ACTOR });
+  await expectErr('nothing', () => R([{ batch_id: early, sellable: '0', damaged: '' }]), (e) => e.status === 400);
+  await expectErr('no reason', () => R([{ batch_id: early, sellable: 1 }], { reason: ' ' }), (e) => e.status === 400);
+  await expectErr('decimal', () => R([{ batch_id: early, sellable: '1.5' }]), (e) => e.status === 400);
+  await expectErr('more than left', () => R([{ batch_id: early, sellable: 2, damaged: 1 }]), (e) => e.status === 409 && e.overReturn);
+  await expectErr('not on this shipment', () => R([{ batch_id: other, sellable: 1 }]), (e) => e.status === 400);
+  await expectErr('part bad', () => R([{ batch_id: late, sellable: 1 }, { batch_id: early, sellable: 3 }]), (e) => e.status === 409);
+  if ((await snap()).join() !== before.join()) bad.push(`refused return changed stock ${await snap()}`);
+  // The parcel: early 1 sellable + 1 damaged, late 1 sellable.
+  const req = rid();
+  const r = await R([{ batch_id: early, sellable: 1, damaged: 1 }, { batch_id: late, sellable: 1, damaged: 0 }], { request_id: req });
+  if (r.returned?.length !== 3) bad.push(`returned ${JSON.stringify(r)}`);
+  const after = await snap();
+  if (after.join() !== '1,5,1,3') bad.push(`after return ${after}`);
+  const held = (await getPool().query(`SELECT b.on_hand, b.status FROM inventory_batches b WHERE b.sku_id = $1 AND b.batch_number LIKE 'RR-EARLY-RET%'`, [sku])).rows;
+  if (held.length !== 1 || held[0].on_hand !== 1 || held[0].status !== 'blocked') bad.push(`held ${JSON.stringify(held)}`);
+  const mv = (await getPool().query(`SELECT count(*)::int n FROM inventory_movements WHERE shipment_id = $1 AND movement_type = 'customer_return' AND order_id = $2`, [ship, order])).rows[0].n;
+  if (mv !== 3) bad.push(`return movements ${mv}`);
+  const ref = (await getPool().query('SELECT DISTINCT source, reference FROM stock_returns WHERE shipment_id = $1', [ship])).rows;
+  if (ref.length !== 1 || ref[0].source !== 'courier_rto' || ref[0].reference !== 'AWB RR-AWB-1') bad.push(`reference ${JSON.stringify(ref)}`);
+  const ev = (await getPool().query(`SELECT metadata FROM order_events WHERE order_id = $1 AND event_type = 'stock_returned'`, [order])).rows;
+  if (ev.length !== 1 || ev[0].metadata.sellable !== 2 || ev[0].metadata.held !== 1) bad.push(`event ${JSON.stringify(ev)}`);
+  // A retry (same request) is a no-op; nothing is left to come back now.
+  const again = await R([{ batch_id: early, sellable: 1, damaged: 1 }, { batch_id: late, sellable: 1, damaged: 0 }], { request_id: req });
+  if (!again.repeated || (await snap()).join() !== after.join()) bad.push(`retry ${JSON.stringify(again)} ${await snap()}`);
+  await expectErr('nothing left', () => R([{ batch_id: late, sellable: 1 }]), (e) => e.status === 409 && e.overReturn);
+  const st1 = await shipmentStock(ship);
+  const e1 = st1.lines[0].dispatched.find((x) => x.batch_id === early);
+  if (e1.returnable !== 0 || e1.returned.sellable !== 1 || e1.returned.damaged !== 1 || st1.state !== 'dispatched') bad.push(`stock view ${JSON.stringify(e1)} ${st1.state}`);
+  // A shipment that never left has nothing to return.
+  const notYet = await lineOn('amazon', 'RR-2', `${TS}-RR-AMZ`, 1);
+  const nyShip = (await getPool().query('SELECT id FROM order_shipments WHERE order_id = $1 ORDER BY id LIMIT 1', [notYet])).rows[0]?.id;
+  if (nyShip) await expectErr('not dispatched', () => receiveShipmentReturn(nyShip, { lines: [{ batch_id: late, sellable: 1 }], reason: 'x' }, { actor: ACTOR }), (e) => e.status === 409);
+  const page = await fsp.readFile(new URL('../public/orders.js', import.meta.url), 'utf8');
+  if (!page.includes('id="dReturnOpen"') || !page.includes('/return`') || !page.includes("case 'stock_returned'")) bad.push('page button');
+  if (bad.length) throw new Error(bad.join('; '));
+  return 'after dispatch 2 + 1 can come back; nothing/no reason/decimal/over/foreign batch/one bad line refused with nothing changed; 1 sellable + 1 damaged (early) + 1 sellable (late) → early 1, late 5, held batch 1 blocked; 3 movements on the shipment and order; reference = AWB, source Courier RTO; one order event; retry no-op; nothing left → refused; stock view shows returned and 0 left; undispatched shipment refused; button on the drawer';
+});
+
 await step('bundles: contents rules; a bundle holds no stock; its orders reserve and deduct each product inside (by hand, in bulk dispatch, mixed with a loose line)', async () => {
   const bad = [];
   const mk = async (code, name) => (await createSku({ sku: `${TS}-BN-${code}`, product_name: name }, { actor: ACTOR })).id;
