@@ -4784,8 +4784,29 @@ await step('Receive return: a dispatched parcel that came back is put back per b
   if (!again.repeated || (await snap()).join() !== after.join()) bad.push(`retry ${JSON.stringify(again)} ${await snap()}`);
   await expectErr('nothing left', () => R([{ batch_id: late, sellable: 1 }]), (e) => e.status === 409 && e.overReturn);
   const st1 = await shipmentStock(ship);
-  const e1 = st1.lines[0].dispatched.find((x) => x.batch_id === early);
+  const e1 = st1.left.find((x) => x.batch_id === early);
   if (e1.returnable !== 0 || e1.returned.sellable !== 1 || e1.returned.damaged !== 1 || st1.state !== 'dispatched') bad.push(`stock view ${JSON.stringify(e1)} ${st1.state}`);
+  // Already returned by hand (Inventory → Return stock) with the AWB as the reference: counted, never restocked twice.
+  const { recordReturn } = await import('../lib/inventory-inbound.js');
+  const byHand = await lineOn('amazon', 'RR-3', `${TS}-RR-AMZ`, 1);
+  const d3 = await dispatchOrder(byHand, { courier_partner_id: delhivery, tracking_id: 'RR-AWB-3' }, { actor: ACTOR });
+  const b3 = (await shipmentStock(Number(d3.shipmentId))).left[0].batch_id;   // FEFO: whichever batch it took
+  await recordReturn({ sku_id: sku, batch_id: b3, quantity: 1, condition: 'sellable', source: 'courier_rto', returned_by: 'Courier', reason: 'RTO', reference: 'rr-awb-3' }, { actor: ACTOR });
+  const s3 = (await shipmentStock(Number(d3.shipmentId))).left;
+  if (s3.length !== 1 || s3[0].returnable !== 0) bad.push(`hand return not counted ${JSON.stringify(s3)}`);
+  await expectErr('returned by hand already', () => receiveShipmentReturn(Number(d3.shipmentId), { lines: [{ batch_id: b3, sellable: 1 }], reason: 'RTO' }, { actor: ACTOR }), (e) => e.status === 409 && e.overReturn);
+  // RTO, then the order is cancelled: the parcel still lists what left and is received back.
+  const rto = await lineOn('amazon', 'RR-4', `${TS}-RR-AMZ`, 1);
+  const d4 = await dispatchOrder(rto, { courier_partner_id: delhivery, tracking_id: 'RR-AWB-4' }, { actor: ACTOR });
+  await getPool().query(`UPDATE orders SET order_status = 'cancelled' WHERE id = $1`, [rto]);
+  const s4 = await shipmentStock(Number(d4.shipmentId));
+  if (s4.state !== 'dispatched' || s4.lines.length || s4.left.length !== 1 || s4.left[0].returnable !== 1 || s4.left[0].sku !== `${TS}-RR-A`) bad.push(`cancelled order view ${JSON.stringify({ state: s4.state, lines: s4.lines.length, left: s4.left })}`);
+  const b4 = s4.left[0]?.batch_id;
+  if (b4) {
+    const before4 = await onHand(b4);
+    await receiveShipmentReturn(Number(d4.shipmentId), { lines: [{ batch_id: b4, sellable: 1 }], reason: 'RTO — refused at door' }, { actor: ACTOR });
+    if (await onHand(b4) !== before4 + 1) bad.push('cancelled order return not restocked');
+  }
   // A shipment that never left has nothing to return.
   const notYet = await lineOn('amazon', 'RR-2', `${TS}-RR-AMZ`, 1);
   const nyShip = (await getPool().query('SELECT id FROM order_shipments WHERE order_id = $1 ORDER BY id LIMIT 1', [notYet])).rows[0]?.id;
@@ -4793,7 +4814,7 @@ await step('Receive return: a dispatched parcel that came back is put back per b
   const page = await fsp.readFile(new URL('../public/orders.js', import.meta.url), 'utf8');
   if (!page.includes('id="dReturnOpen"') || !page.includes('/return`') || !page.includes("case 'stock_returned'")) bad.push('page button');
   if (bad.length) throw new Error(bad.join('; '));
-  return 'after dispatch 2 + 1 can come back; nothing/no reason/decimal/over/foreign batch/one bad line refused with nothing changed; 1 sellable + 1 damaged (early) + 1 sellable (late) → early 1, late 5, held batch 1 blocked; 3 movements on the shipment and order; reference = AWB, source Courier RTO; one order event; retry no-op; nothing left → refused; stock view shows returned and 0 left; undispatched shipment refused; button on the drawer';
+  return 'after dispatch 2 + 1 can come back; nothing/no reason/decimal/over/foreign batch/one bad line refused with nothing changed; 1 sellable + 1 damaged (early) + 1 sellable (late) → early 1, late 5, held batch 1 blocked; 3 movements on the shipment and order; reference = AWB, source Courier RTO; one order event; retry no-op; nothing left → refused; stock view shows returned and 0 left; a hand Return stock with the AWB counted (refused again); an order cancelled after dispatch still lists and returns its parcel; undispatched shipment refused; button on the drawer';
 });
 
 await step('bundles: contents rules; a bundle holds no stock; its orders reserve and deduct each product inside (by hand, in bulk dispatch, mixed with a loose line)', async () => {
@@ -9822,6 +9843,7 @@ await step('rbac: route matrix on the real server — granted only by capability
     ['/api/inventory/shipments/999999999', 'GET', null, { log: 'ok', lview: 'ok', invOnly: 'ok', call: 403 }],
     ['/api/inventory/shipments/999999999/reserve', 'POST', {}, { log: 'ok', multi: 'ok', adm: 'ok', invOnly: 403, lview: 403, call: 403 }],
     ['/api/inventory/shipments/999999999/release', 'POST', {}, { log: 'ok', invOnly: 403 }],
+    ['/api/inventory/shipments/999999999/return', 'POST', {}, { log: 403, lview: 403, call: 403, invOnly: 'ok', adm: 'ok' }],
     ['/api/members', 'GET', null, { adm: 'ok', env: 'ok', log: 403, multi: 403, call: 403 }],
     ['/dashboard', 'GET', null, { adm: 'ok', multi: 403, log: 403 }],
     ['/api/admin/overview?days=1', 'GET', null, { adm: 'ok', multi: 403 }],
