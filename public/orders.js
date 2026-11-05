@@ -36,6 +36,8 @@ const pickable = (o) => !o.shipment_id && o.order_status !== 'cancelled';
 // A Logistics viewer sees every order and shipment detail but no controls that
 // change them (the server refuses those anyway). Operators and managers: unchanged.
 const canEdit = () => Boolean(state.me?.caps?.includes('logistics.edit'));
+/** Receive return puts stock back, so it needs the Return stock permission (inventory.move), as the API does. */
+const canMoveStock = () => Boolean(state.me?.caps?.includes('inventory.move'));
 const pickBox = (o) => (canEdit() && pickable(o) ? `<label class="pick" title="Choose for a shipment"><input type="checkbox" data-pick="${o.id}"${state.sel.has(o.id) ? ' checked' : ''} aria-label="Choose order ${esc(o.source_order_id)}" /></label>` : '');
 
 // The usual next move from each shipment state. Anything else is in the select.
@@ -1395,6 +1397,13 @@ dBody.addEventListener('click', async (e) => {
   }
 });
 
+// Receive return: what is damaged is not sellable — typing a damaged count lowers the sellable one to match.
+dBody.addEventListener('input', (e) => {
+  const dmg = e.target.closest('[data-ret="damaged"]');
+  if (!dmg) return;
+  const n = Math.max(0, Math.min(Number(dmg.dataset.retMax) || 0, Number.parseInt(dmg.value, 10) || 0));
+  dmg.closest('[data-ret-batch]').querySelector('[data-ret="sellable"]').value = String(Math.max((Number(dmg.dataset.retMax) || 0) - n, 0));
+});
 dBody.addEventListener('submit', async (e) => {
   if (e.target.id === 'dDispatchForm') { e.preventDefault(); return submitDispatch(e.target); }
   if (e.target.id === 'dReturnForm') { e.preventDefault(); return submitReturn(e.target); }
@@ -1998,7 +2007,7 @@ function renderStock() {
     </div>`).join('')}
     ${st.split && !done ? '<p class="imp-note">This order is split across several shipments. Reserve only what goes in this parcel; the rest stays for the others.</p>' : ''}
     ${st.untracked?.length ? `<p class="imp-note">${st.untracked.map((u) => `<span class="mono">${esc(u.sku)}</span>`).join(', ')} not inventory-tracked — no stock needed.</p>` : ''}
-    ${done && canEdit() ? returnBlock(st) : ''}
+    ${done && canMoveStock() ? returnBlock(st) : ''}
     ${editable && st.lines.length && !st.unmapped.length ? `<div class="form-actions">
       <button class="btn" type="button" id="dReserve">${st.state === 'reserved' ? 'Update reservation' : 'Reserve stock'}</button>
       ${st.lines.some((l) => l.reserved.length) ? '<button class="btn" type="button" id="dRelease">Release</button>' : ''}</div>` : ''}`;
@@ -2017,7 +2026,8 @@ function returnedText(r) {
  * sellable back into that batch, damaged held apart. Never more than left on the shipment.
  */
 function returnBlock(st) {
-  const left = st.lines.flatMap((l) => l.dispatched.map((d) => ({ ...d, sku: l.sku, product: l.product_name }))).filter((d) => d.returnable > 0);
+  // Every batch that left (st.left), not only the lines still needed: an order cancelled after dispatch still returns.
+  const left = (st.left || []).filter((d) => d.returnable > 0);
   if (!left.length) return '';
   if (state.returnOpen !== st.shipment_id) {
     return `<div class="form-actions"><button class="btn" type="button" id="dReturnOpen">${icon('undo-2')}Receive return</button></div>`;
@@ -2026,9 +2036,9 @@ function returnBlock(st) {
       <h4 class="dsec-title" style="margin:12px 0 6px">Receive return</h4>
       <p class="imp-note" style="margin:0 0 8px">Open the parcel and count what came back. Sellable units go back into the batch they left from and can be sold again; damaged ones are held apart and never sold. Leave 0 for what did not come back.</p>
       <div class="ret-rows">${left.map((d) => `<div class="ret-row" data-ret-batch="${d.batch_id}">
-        <div class="ret-what"><b class="mono">${esc(d.sku)}</b> <span class="soft">${esc(d.product || '')}</span><div class="soft">Batch <span class="mono">${esc(d.batch_number)}</span> · ${count(d.returnable)} can come back</div></div>
+        <div class="ret-what"><b class="mono">${esc(d.sku)}</b> <span class="soft">${esc(d.product_name || '')}</span><div class="soft">Batch <span class="mono">${esc(d.batch_number)}</span> · ${count(d.returnable)} can come back</div></div>
         <label class="ret-n"><span>Sellable</span><input class="input" data-ret="sellable" type="number" min="0" max="${d.returnable}" step="1" inputmode="numeric" value="${d.returnable}" /></label>
-        <label class="ret-n"><span>Damaged</span><input class="input" data-ret="damaged" type="number" min="0" max="${d.returnable}" step="1" inputmode="numeric" value="0" /></label>
+        <label class="ret-n"><span>Damaged</span><input class="input" data-ret="damaged" data-ret-max="${d.returnable}" type="number" min="0" max="${d.returnable}" step="1" inputmode="numeric" value="0" /></label>
       </div>`).join('')}</div>
       <div class="ret-meta">
         <label class="fld"><span>Came back as</span><select class="select" name="source">${opt('courier_rto', 'Courier RTO', true)}${opt('customer', 'Customer return')}${opt('marketplace', 'Marketplace return')}</select></label>
