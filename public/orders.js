@@ -717,6 +717,9 @@ const PARCEL_LEFT = new Set(['dispatched', 'in_transit', 'out_for_delivery', 'de
  * the Amazon sync, but an FBA stock transfer (FBA15MSVQLSF) does. lib/orders.js decides again.
  */
 const isAmazonOrderNo = (v) => /^\d{3}-\d{7}-\d{7}$/.test(String(v || '').trim());
+/** An order straight from Amazon may ship without an AWB (Amazon tracks it); lib/orders.js awbOptional decides again. */
+const awbOptional = (channel, number) => channel === 'amazon' && isAmazonOrderNo(number);
+const AWB_OPTIONAL_NOTE = 'optional for orders straight from Amazon';
 const takesManualLines = (o) => o.source === 'manual' && (o.channel !== 'amazon' || !isAmazonOrderNo(o.source_order_id));
 const manualLinesOpen = (o) => takesManualLines(o) && canEdit() && o.order_status !== 'cancelled'
   && !(state.detail?.shipments || []).some((x) => PARCEL_LEFT.has(x.shipment_status));
@@ -934,7 +937,7 @@ function dispatchForm(o) {
   return `<form id="dDispatchForm" novalidate>
     <div class="form-grid">
       <label class="fld"><span>Courier</span><select class="select" name="courier_partner_id">${opt('', 'Choose courier', true)}${state.meta.couriers.filter((c) => c.active).map((c) => opt(c.id, c.name)).join('')}</select></label>
-      <label class="fld"><span>AWB / Tracking ID</span><input class="input mono" name="tracking_id" maxlength="80" autocomplete="off" spellcheck="false" /></label>
+      <label class="fld"><span>AWB / Tracking ID${awbOptional(o.channel, o.source_order_id) ? ` <span class="soft">(${AWB_OPTIONAL_NOTE})</span>` : ''}</span><input class="input mono" name="tracking_id" maxlength="80" autocomplete="off" spellcheck="false" /></label>
     </div>
     <p class="imp-note">This creates the shipment, takes the stock from the earliest-expiring batches and marks it <b>dispatched</b>: the stock is deducted now.${website
     ? ' <b>Delta Velocity orders:</b> don\'t dispatch them here. Their parcel and AWB come from Shopify by themselves, and the stock comes off when the courier picks them up.' : ''}</p>
@@ -951,7 +954,7 @@ async function submitDispatch(form) {
   const courier = form.courier_partner_id.value;
   const awb = form.tracking_id.value.trim();
   if (!courier) { err.textContent = 'Choose the courier.'; err.hidden = false; form.courier_partner_id.focus(); return; }
-  if (!awb) { err.textContent = 'Enter the AWB / tracking ID.'; err.hidden = false; form.tracking_id.focus(); return; }
+  if (!awb && !awbOptional(o.channel, o.source_order_id)) { err.textContent = 'Enter the AWB / tracking ID.'; err.hidden = false; form.tracking_id.focus(); return; }
   const btn = $('#dDispatchGo');
   btn.disabled = true;
   try {
@@ -1730,6 +1733,9 @@ function syncExtras() {
   $('#cProdSec').hidden = fromAmazon;
   $('#cProdAmazon').hidden = !fromAmazon;
   if (fromAmazon) { $('#cProds').innerHTML = ''; prodSummary(); }
+  // The AWB is optional for an order straight from Amazon.
+  $('#cAwbReq').hidden = fromAmazon;
+  $('#cAwbOpt').hidden = !fromAmazon;
 }
 
 // ---- New Shipment products: one row per product (a master SKU and the units packed), checked before saving.
@@ -1823,8 +1829,9 @@ $('#createForm').addEventListener('submit', async (e) => {
   if (new Set(nums).size !== nums.length) { err.textContent = 'The same order number is entered twice.'; err.hidden = false; return; }
   const needsDest = !$('#cDestField').hidden;
   if (!needsDest) delete body.destination_id;
+  const noAwb = awbOptional(body.channel, body.source_order_id) && extras.every((x) => awbOptional(body.channel, x.source_order_id));
   const missing = [['dispatch_type', 'dispatch type'], ['channel', 'channel'], ...(needsDest ? [['destination_id', 'destination']] : []),
-    ['source_order_id', 'order number'], ['courier_partner_id', 'courier partner'], ['tracking_id', 'tracking ID / AWB']]
+    ['source_order_id', 'order number'], ['courier_partner_id', 'courier partner'], ...(noAwb ? [] : [['tracking_id', 'tracking ID / AWB']])]
     .filter(([k]) => !String(body[k] || '').trim()).map(([, l]) => l);
   if (missing.length) { err.textContent = `Enter the ${missing.join(', ')}.`; err.hidden = false; return; }
   const prods = $('#cProdSec').hidden ? { lines: [], problems: [] } : prodLines();
@@ -2141,6 +2148,7 @@ function openShipNew() {
     + state.meta.couriers.filter((c) => c.active).map((c) => opt(c.id, c.name)).join('');
   $('#sTitle').textContent = list.length > 1 ? `Create shipment · ${list.length} orders` : 'Create shipment';
   const total = list.reduce((n, o) => n + (o.order_value || 0), 0);
+  $('#sAwbOpt').hidden = !list.every((o) => awbOptional(o.channel, o.source_order_id));
   $('#sTotal').textContent = `${list[0].channel_label}${list[0].dispatch_type ? ` · ${typeLabel(list[0].dispatch_type)}` : ''} · ${money(total)}`;
   $('#sOrders').innerHTML = list.map((o, i) => `<li><span class="mono">${esc(o.source_order_id)}</span>
     ${i === 0 ? '<span class="mini-tag">Main</span>' : ''}<span class="soft">${esc(day(o.order_date))}</span><span class="num">${esc(amount(o.order_value))}</span>
@@ -2162,7 +2170,9 @@ async function submitShipNew(e) {
   const err = $('#sError');
   err.hidden = true;
   if (!f.courier_partner_id.value) { err.textContent = 'Choose the courier partner.'; err.hidden = false; return; }
-  if (!f.tracking_id.value.trim()) { err.textContent = 'Enter the AWB / tracking ID.'; err.hidden = false; return; }
+  if (!f.tracking_id.value.trim() && ![...state.sel.values()].every((o) => awbOptional(o.channel, o.source_order_id))) {
+    err.textContent = 'Enter the AWB / tracking ID.'; err.hidden = false; return;
+  }
   $('#sSubmit').disabled = true;
   $('#sSaved').textContent = 'Creating…';
   try {
@@ -2337,7 +2347,7 @@ const BULK_CHUNK = 25;
 const bulk = { file: null, rows: [], busy: false, done: false, channel: 'amazon' };
 // The channels a file can be for (lib/bulk-dispatch.js CHANNELS): what the order id is, and a template row.
 const BULK_CHANNELS = {
-  amazon: { help: 'Amazon order ids, from orders already imported from the order report.', example: '402-1234567-1234567,AWB-FOR-THIS-ORDER,Amazon Shipping' },
+  amazon: { help: 'Amazon order ids, from orders already imported from the order report. The AWB is optional for them (leave the cell blank); an FBA transfer still needs one.', example: '402-1234567-1234567,AWB-FOR-THIS-ORDER,Amazon Shipping' },
   website: { help: 'Shopify order numbers (#1001 or 1001). Buy with Amazon and Delta Velocity orders are refused: their parcels come from Shopify.', example: '#1001,AWB-FOR-THIS-ORDER,Delhivery' },
 };
 const bulkError = (msg) => { $('#bError').textContent = msg; $('#bError').hidden = !msg; };

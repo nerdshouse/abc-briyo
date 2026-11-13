@@ -4544,7 +4544,8 @@ await step('bulk dispatch: file parser — column names, Excel-mangled AWB, repe
   // Same AWB at the same courier (any letter case of its name) is refused; at another courier it is a different parcel.
   if (at(9).status !== 'error' || at(10).status !== 'error' || !/more than one order/.test(at(9).reason) || at(11).status) bad.push(`shared AWB ${JSON.stringify([at(9), at(10), at(11)])}`);
   if (at(12).status !== 'error' || at(12).reason !== 'No AWB.') bad.push('no AWB');
-  await expectErr('no awb column', async () => planSheet([['order-id', 'x'], ['A', 'B']], couriers, 1), (e) => e.status === 400);
+  // An Amazon file may leave the AWB out (orders straight from Amazon need none); a website file may not.
+  await expectErr('no awb column', async () => planSheet([['order-id', 'x'], ['A', 'B']], couriers, 1, { channel: 'website' }), (e) => e.status === 400);
   if (!/Choose the courier/.test(planSheet([['order-id', 'awb'], ['A', 'B']], couriers, null)[0].reason || '')) bad.push('no courier');
   if (bad.length) throw new Error(bad.join('; '));
   return 'aliases and BOM read; blank rows skipped; Excel number, unknown courier, repeat, two AWBs, shared AWB and missing AWB each named';
@@ -4815,6 +4816,75 @@ await step('Receive return: a dispatched parcel that came back is put back per b
   if (!page.includes('id="dReturnOpen"') || !page.includes('/return`') || !page.includes("case 'stock_returned'")) bad.push('page button');
   if (bad.length) throw new Error(bad.join('; '));
   return 'after dispatch 2 + 1 can come back; nothing/no reason/decimal/over/foreign batch/one bad line refused with nothing changed; 1 sellable + 1 damaged (early) + 1 sellable (late) → early 1, late 5, held batch 1 blocked; 3 movements on the shipment and order; reference = AWB, source Courier RTO; one order event; retry no-op; nothing left → refused; stock view shows returned and 0 left; a hand Return stock with the AWB counted (refused again); an order cancelled after dispatch still lists and returns its parcel; undispatched shipment refused; button on the drawer';
+});
+
+await step('Amazon orders: the AWB is optional for an order straight from Amazon (real Amazon order number) — New shipment, Create shipment, Dispatch button, status change, edit, bulk file; still required for an FBA transfer and every other channel', async () => {
+  const bad = [];
+  const { editShipment } = await import('../lib/orders.js');
+  const sku = (await createSku({ sku: `${TS}-NA-A`, product_name: 'No-AWB test product' }, { actor: ACTOR })).id;
+  await addPlatformMappings(sku, PF.amazon, [`${TS}-NA-AMZ`], { actor: ACTOR });
+  const batch = (await receiveInventory({ sku_id: sku, batch_number: 'NA-1', expiry_date: dayOffset(200), quantity: 20, request_id: rid() }, { actor: ACTOR })).batchId;
+  const amazonShipping = (await listCouriers())[0].id;
+  // A test order with one line, renumbered to a real Amazon order number (unique per run: db-check runs twice).
+  const real = async (n, qty = 1) => {
+    const id = await lineOn('amazon', `NA-${n}`, `${TS}-NA-AMZ`, qty);
+    await getPool().query('UPDATE orders SET source_order_id = $1 WHERE id = $2', [AMZ_REAL(100 + n), id]);
+    return id;
+  };
+  const ship = async (id) => (await getPool().query(`SELECT id, shipment_status, tracking_id, courier_partner_id, version FROM order_shipments WHERE order_id = $1 AND shipment_status <> 'cancelled' ORDER BY id DESC LIMIT 1`, [id])).rows[0];
+  // 1. The order's Dispatch button: no AWB → dispatched, stock deducted, no AWB stored.
+  const a1 = await real(1, 2);
+  const d1 = await dispatchOrder(a1, { courier_partner_id: amazonShipping, tracking_id: '' }, { actor: ACTOR });
+  const s1 = await ship(a1);
+  if (d1.status !== 'dispatched' || d1.units !== 2 || s1.shipment_status !== 'dispatched' || s1.tracking_id) bad.push(`dispatch button ${JSON.stringify([d1, s1])}`);
+  await expectErr('dispatched twice', () => dispatchOrder(a1, { courier_partner_id: amazonShipping, tracking_id: '' }, { actor: ACTOR }), (e) => e.status === 409);
+  // …still required for an Amazon-channel order that is not a real Amazon order (an FBA transfer) and for a website order.
+  const fba = await lineOn('amazon', 'NA-FBA', `${TS}-NA-AMZ`, 1);
+  await expectErr('FBA without AWB', () => dispatchOrder(fba, { courier_partner_id: amazonShipping, tracking_id: ' ' }, { actor: ACTOR }), (e) => e.status === 400 && e.field === 'tracking_id');
+  const web = await lineOn('website', 'NA-WEB', `${TS}-NA-A`, 1);
+  await expectErr('website without AWB', () => dispatchOrder(web, { courier_partner_id: amazonShipping, tracking_id: '' }, { actor: ACTOR }), (e) => e.status === 400 && e.field === 'tracking_id');
+  if ((await ship(fba))?.shipment_status === 'dispatched' || (await ship(web))?.shipment_status === 'dispatched') bad.push('refused dispatch changed a shipment');
+  // 2. Create shipment from ticked orders, then reserve and mark dispatched (the status change) — no AWB throughout.
+  const a2 = await real(2, 1);
+  await createShipmentForOrders([a2], { courier_partner_id: amazonShipping }, { actor: ACTOR });
+  const s2 = await ship(a2);
+  if (s2?.shipment_status !== 'packed' || s2.tracking_id) bad.push(`from orders ${JSON.stringify(s2)}`);
+  await reserveShipmentStock(s2.id, [{ batch_id: batch, quantity: 1 }], { actor: ACTOR });
+  await updateShipment(a2, s2.id, { shipment_status: 'dispatched' }, { actor: ACTOR, version: (await ship(a2)).version });
+  if ((await ship(a2)).shipment_status !== 'dispatched') bad.push('status change without AWB refused');
+  await expectErr('FBA from orders', () => createShipmentForOrders([fba], { courier_partner_id: amazonShipping }, { actor: ACTOR }), (e) => e.status === 400 && /AWB/.test(e.message));
+  const a3 = await real(3);
+  await expectErr('mixed parcel', () => createShipmentForOrders([a3, fba], { courier_partner_id: amazonShipping }, { actor: ACTOR }), (e) => e.status === 400 && /AWB/.test(e.message));
+  // 3. New shipment: a real Amazon order number may leave the AWB blank; an FBA transfer or a website order may not.
+  const made = await createShipment({ ...R('amazon'), channel: 'amazon', source_order_id: AMZ_REAL(110), order_date: NOW(), courier_partner_id: amazonShipping }, { actor: ACTOR });
+  if (!made) bad.push('new shipment without AWB refused');
+  await expectErr('new FBA', () => createShipment({ ...R('amazon'), channel: 'amazon', source_order_id: `${TEST_ORDER}-NA-FBA2`, order_date: NOW(), courier_partner_id: amazonShipping }, { actor: ACTOR }), (e) => e.status === 400 && /AWB/.test(e.message));
+  await expectErr('new website', () => createShipment({ ...R('website'), channel: 'website', source_order_id: `${TEST_ORDER}-NA-WEB2`, order_date: NOW(), courier_partner_id: amazonShipping }, { actor: ACTOR }), (e) => e.status === 400 && /AWB/.test(e.message));
+  // 4. Edit shipment: a dispatched Amazon order's AWB may be cleared; an FBA transfer's may not.
+  const a4 = await real(4);
+  await dispatchOrder(a4, { courier_partner_id: amazonShipping, tracking_id: `NA-AWB-${RUN7}` }, { actor: ACTOR });
+  const s4 = await ship(a4);
+  await editShipment(a4, s4.id, { tracking_id: '' }, { actor: ACTOR, shipmentVersion: s4.version });
+  if ((await ship(a4)).tracking_id) bad.push('AWB not cleared on an Amazon order');
+  const f5 = await lineOn('amazon', 'NA-FBA5', `${TS}-NA-AMZ`, 1);
+  await dispatchOrder(f5, { courier_partner_id: amazonShipping, tracking_id: `NA-FBA5-${RUN7}` }, { actor: ACTOR });
+  const s5 = await ship(f5);
+  await expectErr('clear FBA AWB', () => editShipment(f5, s5.id, { tracking_id: '' }, { actor: ACTOR, shipmentVersion: s5.version }), (e) => e.status === 400);
+  // 5. Bulk dispatch file: blank AWB fine for a real Amazon order (no AWB column needed); "No AWB." for anything else.
+  const couriers = await listCouriers();
+  const rows = planSheet([['order-id'], [AMZ_REAL(120)], [`${TEST_ORDER}-NA-FBA`], [AMZ_REAL(121)]], couriers, amazonShipping, { channel: 'amazon' });
+  if (rows[0].status || rows[2].status || rows[1].reason !== 'No AWB.') bad.push(`file ${JSON.stringify(rows)}`);
+  const a6 = await real(6);
+  const pv = await previewBulkDispatch(Buffer.from(`order-id,awb\n${AMZ_REAL(106)},\n`), 'na.csv', { courierId: amazonShipping, channel: 'amazon' });
+  if (pv.rows[0]?.status !== 'ready') bad.push(`preview ${JSON.stringify(pv.rows)}`);
+  const cm = await commitBulkDispatch({ channel: 'amazon', rows: [{ row: 2, orderId: AMZ_REAL(106), awb: '', courierId: amazonShipping }] }, { actor: ACTOR });
+  if (cm.results[0]?.status !== 'dispatched' || (await ship(a6)).shipment_status !== 'dispatched') bad.push(`bulk ${JSON.stringify(cm.results)}`);
+  const cf = await commitBulkDispatch({ channel: 'amazon', rows: [{ row: 3, orderId: `${TEST_ORDER}-NA-FBA`, awb: '', courierId: amazonShipping }] }, { actor: ACTOR });
+  if (cf.results[0]?.status !== 'error' || cf.results[0].reason !== 'No AWB.') bad.push(`bulk FBA ${JSON.stringify(cf.results)}`);
+  const page = await fsp.readFile(new URL('../public/orders.js', import.meta.url), 'utf8');
+  if (!page.includes('const awbOptional = ') || !page.includes("$('#cAwbOpt')")) bad.push('page');
+  if (bad.length) throw new Error(bad.join('; '));
+  return 'Dispatch button without AWB: dispatched, 2 units deducted, no AWB; again refused; FBA and website refused (field tracking_id), nothing changed; Create shipment from orders → packed, reserved, status → dispatched with no AWB; FBA and a mixed parcel refused; New shipment without AWB for a real Amazon number, refused for FBA and website; Amazon AWB cleared after dispatch, FBA refused; bulk file without an AWB column: real Amazon rows fine, FBA "No AWB.", preview ready, commit dispatched, FBA commit refused';
 });
 
 await step('bundles: contents rules; a bundle holds no stock; its orders reserve and deduct each product inside (by hand, in bulk dispatch, mixed with a loose line)', async () => {
