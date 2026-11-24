@@ -149,15 +149,37 @@ function typeUrl(type) {
 
 /* ------------------------------------------------------------------ list */
 
-const ordersUrl = (append) => {
+/** The list's filters, without paging: the same key means the same result set. */
+const listKey = () => {
   const u = new URLSearchParams();
   if (state.type) u.set('type', state.type);
   if (state.view) u.set('view', state.view);
   for (const k of FILTER_KEYS) if (state.f[k]) u.set(k, state.f[k]);
-  u.set('limit', PAGE);
-  u.set('offset', append ? state.offset : 0);
+  return u.toString();
+};
+const ordersUrl = (append, { limit = PAGE, offset = append ? state.offset : 0 } = {}) => {
+  const u = new URLSearchParams(listKey());
+  u.set('limit', limit);
+  u.set('offset', offset);
   return `/api/orders?${u}`;
 };
+// The API returns at most this many rows a request.
+const MAX_PAGE = 500;
+/**
+ * A refresh with the same filters (after a save, or the refresh button) keeps every row "Show more" brought in, so
+ * the team stays where they were in the list instead of being sent back to the first page. Fetched in chunks of
+ * MAX_PAGE; the total comes from the first answer.
+ */
+async function fetchShown(count) {
+  const first = await api(ordersUrl(false, { limit: Math.min(count, MAX_PAGE) }));
+  const orders = [...first.orders];
+  while (orders.length < count && orders.length < first.total) {
+    const next = await api(ordersUrl(false, { limit: Math.min(count - orders.length, MAX_PAGE), offset: orders.length }));
+    if (!next.orders.length) break;
+    orders.push(...next.orders);
+  }
+  return { ...first, orders };
+}
 
 /** `pending` is an orders request already in flight (the first load starts it early). */
 // Filters can change faster than answers arrive: only the newest reload's answer is shown. "Show more" never
@@ -178,9 +200,14 @@ async function load({ append = false, pending = null } = {}) {
     $('#rows').innerHTML = `<tr><td colspan="8">${stateBlock('loading', 'Loading orders…', '', { compact: true })}</td></tr>`;
     $('#clist').innerHTML = `<li class="oitem">${stateBlock('loading', 'Loading orders…', '', { compact: true })}</li>`;
   }
+  // Same filters as the rows on screen, with more than a page of them: refresh them all, not just the first page.
+  const key = listKey();
+  const keep = !append && !pending && key === state.listKey && state.orders.length > PAGE ? state.orders.length : 0;
   try {
-    const data = await (pending || api(ordersUrl(append)));
+    const data = await (pending || (keep ? fetchShown(keep) : api(ordersUrl(append))));
     if (seq !== loadSeq) return;
+    if (key !== state.listKey) state.navIndex = null;   // another list: the old place means nothing in it
+    state.listKey = key;
     state.orders = append ? [...state.orders, ...data.orders] : data.orders;
     state.offset = state.orders.length;
     state.total = data.total;
@@ -321,16 +348,50 @@ function renderRows() {
         ${o.order_value !== null ? `<span class="soft" style="font-size:12.5px">${esc(amount(o.order_value))}${payText(o) ? ` · ${esc(payText(o))}` : ''}</span>` : ''}</div>
     </li>`).join('');
   renderSelection();
+  if (state.openId) syncOrderNav();
   renderIcons();
 }
 
 /* ------------------------------------------------------------------ drawer */
+
+/**
+ * Previous / next order: the neighbours of the open order in the list behind the drawer, with its filters. Its place
+ * is remembered, so when a save takes the order out of the list (e.g. dispatched, under Awaiting dispatch), Next
+ * opens the order that moved up into that place. At the end of the loaded rows, Next brings in more (Show more).
+ */
+function orderPlace() {
+  const i = state.orders.findIndex((o) => o.id === state.openId);
+  if (i >= 0) state.navIndex = i;
+  return { i, base: state.navIndex ?? -1 };
+}
+function syncOrderNav() {
+  if (!$('#dNext')) return;
+  const { i, base } = orderPlace();
+  const more = state.orders.length < state.total;
+  $('#dPrev').disabled = (i >= 0 ? i : base) <= 0;
+  // An order opened from a link that is not in the list has no neighbours.
+  $('#dNext').disabled = (i < 0 && base < 0) || !((i >= 0 ? i + 1 : base) < state.orders.length || more);
+  $('#dPos').textContent = i >= 0 ? `${count(i + 1)} of ${count(state.total)}` : '';
+}
+async function stepOrder(dir) {
+  const { i, base } = orderPlace();
+  // Out of the list now (a save moved it out): the order in its old place is the next one; the previous is above it.
+  let target = i >= 0 ? i + dir : (dir > 0 ? base : base - 1);
+  if (target < 0) return;
+  if (target >= state.orders.length && state.orders.length < state.total) await load({ append: true });
+  if (target >= state.orders.length) { $('#dSaved').className = 'saved'; $('#dSaved').textContent = 'That was the last order in this list.'; return; }
+  const next = state.orders[target];
+  state.navIndex = target;
+  await openOrder(next.id);
+  document.querySelector(`#rows [data-id="${next.id}"], #clist [data-id="${next.id}"]`)?.scrollIntoView({ block: 'nearest' });
+}
 
 /** Opens an order; `shipmentId` picks which of its shipments to show. */
 async function openOrder(id, { shipmentId = null } = {}) {
   if (state.openId !== id) state.shipId = null;
   if (shipmentId) state.shipId = shipmentId;
   state.openId = id;
+  syncOrderNav();
   writeUrl();
   $$('.orow').forEach((r) => r.classList.toggle('open', Number(r.dataset.id) === id));
   $('#drawer').hidden = false;
@@ -358,6 +419,7 @@ function closeDrawer() {
   state.detail = null;
   state.dispatchOpen = null;
   state.returnOpen = null;
+  state.navIndex = null;
   state.shipId = null;
   writeUrl();
   $('#drawer').hidden = true;
@@ -2778,6 +2840,8 @@ function bind() {
   $('#cClose').addEventListener('click', closeCreate);
   $('#cCancel').addEventListener('click', closeCreate);
   $('#dClose').addEventListener('click', closeDrawer);
+  $('#dPrev').addEventListener('click', () => stepOrder(-1));
+  $('#dNext').addEventListener('click', () => stepOrder(1));
   $('#fClose').addEventListener('click', closeForm);
   $('#fCancel').addEventListener('click', closeForm);
   const closeTop = () => {
@@ -2790,6 +2854,12 @@ function bind() {
   };
   $('#drawerScrim').addEventListener('click', closeTop);
   document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeTop(); }, { signal: pageSignal() });
+  // J / K: next / previous order while the order drawer is open (never while typing in a field).
+  document.addEventListener('keydown', (e) => {
+    if ($('#drawer').hidden || e.ctrlKey || e.metaKey || e.altKey || e.target.closest('input, textarea, select, [contenteditable]')) return;
+    if (e.key === 'j' || e.key === 'J') { e.preventDefault(); stepOrder(1); }
+    if (e.key === 'k' || e.key === 'K') { e.preventDefault(); stepOrder(-1); }
+  }, { signal: pageSignal() });
   onLeave(() => clearTimeout(t));
   // Same page, new query (a sidebar channel or queue link, Back/Forward):
   // refresh the list in place, keeping scroll, instead of reloading the page.

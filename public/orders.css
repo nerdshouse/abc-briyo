@@ -727,3 +727,9 @@ dl.facts dd { margin: 0; min-width: 0; overflow-wrap: anywhere; }
   .ret-what { grid-column: 1 / -1; }
   .ret-meta { grid-template-columns: 1fr; }
 }
+
+/* Previous / next order in the drawer header. */
+#drawer .drawer-nav { display: flex; align-items: center; gap: 6px; }
+#drawer .order-pos { font-size: 12px; white-space: nowrap; }
+#dNext { height: 32px; gap: 4px; }
+@media (max-width: 560px) { #drawer .order-pos { display: none; } }
