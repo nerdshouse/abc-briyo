@@ -4737,6 +4737,83 @@ await step('order Dispatch button: courier + AWB → shipment, FEFO reservation,
   return 'bad AWB / Excel number / no courier / unknown order refused; one step → dispatched with AWB, 3 units FEFO (2 early + 1 late); second click and another AWB refused; short stock, cancelled order and an AWB in use refused with nothing changed; button on the drawer';
 });
 
+await step('stock alerts: A/B/C classes and PO suggestions from dispatched units; platform shelf-life minimums alert and keep old batches off that platform (not Easy Ship); settings validated and audited; the daily WhatsApp digest is one line and latched per day', async () => {
+  const bad = [];
+  const SA = await import('../lib/stock-alerts.js');
+  // Pure parts.
+  const cls = SA.classify([{ sku_id: 1, units: 70 }, { sku_id: 2, units: 20 }, { sku_id: 3, units: 10 }, { sku_id: 4, units: 0 }], { a_share: 70, b_share: 90 });
+  if ([1, 2, 3, 4].map((i) => cls.get(i)).join('') !== 'ABCC') bad.push(`classify ${[...cls]}`);
+  const s0 = SA.DEFAULT_SETTINGS;
+  const r1 = SA.reorderOf({ cls: 'A', daily: 10, available: 300, incoming: 100 }, s0);   // point 10×(7+45)=520, up to 10×(7+90)=970
+  if (!r1.needs_po || r1.reorder_point !== 520 || r1.suggested_qty !== 570 || r1.days_left !== 30) bad.push(`reorder ${JSON.stringify(r1)}`);
+  const r2 = SA.reorderOf({ cls: 'C', daily: 0, available: 5, incoming: 0, reorder_level: 10, reorder_quantity: 50 }, s0);
+  if (!r2.needs_po || !r2.fixed_level || r2.suggested_qty !== 55) bad.push(`fixed level ${JSON.stringify(r2)}`);
+  if (SA.reorderOf({ cls: 'B', daily: 0, available: 0, incoming: 0 }, s0).needs_po) bad.push('no sales and no level should not need a PO');
+  if (SA.crossingDay('2026-01-01', '2028-01-01', 70) !== '2026-08-08') bad.push(`crossing ${SA.crossingDay('2026-01-01', '2028-01-01', 70)}`);
+  const longText = SA.digestText({ po: Array.from({ length: 80 }, (_, i) => ({ product_name: `Product ${i}`, sku: `SKU${i}`, class: 'A', days_left: i, available: 5, suggested_qty: 100 })), shelf: [] });
+  if (longText.length > 900 || /\n/.test(longText) || !/\+\d+ more/.test(longText)) bad.push(`digest length/lines ${longText.length}`);
+  if (SA.digestText({ po: [], shelf: [] }) !== '') bad.push('empty digest');
+  // Settings: validation and the platform minimum.
+  const orig = await SA.getAlertSettings();
+  await expectErr('bad number', () => SA.saveAlertSettings({ cover_a: 'x' }, { actor: ACTOR }), (e) => e.status === 400);
+  await expectErr('B under A', () => SA.saveAlertSettings({ a_share: 80, b_share: 70 }, { actor: ACTOR }), (e) => e.status === 400);
+  await expectErr('bad phone', () => SA.saveAlertSettings({ whatsapp_to: '12345' }, { actor: ACTOR }), (e) => e.status === 400);
+  await expectErr('stale', () => SA.saveAlertSettings({ lead_days: 7 }, { actor: ACTOR, version: orig.version + 99 }), (e) => e.status === 409);
+  const saved = await SA.saveAlertSettings({ whatsapp_to: '+91 90000 00071\n9000000072, 9000000071', platforms: [{ channel: 'blinkit', min_pct: '70' }, { channel: 'amazon', min_pct: '70' }] }, { actor: ACTOR });
+  if (saved.whatsapp_to.join() !== '919000000071,919000000072' || saved.platforms.find((p) => p.channel === 'blinkit')?.min_pct !== 70) bad.push(`saved ${JSON.stringify(saved.whatsapp_to)}`);
+  // Two batches: OLD (25% life left, under 70%) and FRESH. FEFO alone would pick OLD.
+  const sku = (await createSku({ sku: `${TS}-SA-A`, product_name: 'Stock alert test product' }, { actor: ACTOR })).id;
+  await addPlatformMappings(sku, PF.blinkit, [`${TS}-SA-BLK`], { actor: ACTOR });
+  await addPlatformMappings(sku, PF.amazon, [`${TS}-SA-AMZ`], { actor: ACTOR });
+  const old = (await receiveInventory({ sku_id: sku, batch_number: 'SA-OLD', mfg_date: dayOffset(-600), expiry_date: dayOffset(200), quantity: 5, request_id: rid() }, { actor: ACTOR })).batchId;
+  const fresh = (await receiveInventory({ sku_id: sku, batch_number: 'SA-FRESH', mfg_date: dayOffset(-10), expiry_date: dayOffset(700), quantity: 20, request_id: rid() }, { actor: ACTOR })).batchId;
+  const takenFrom = async (orderId) => (await getPool().query(`SELECT m.batch_id, -sum(m.quantity)::int q FROM inventory_movements m JOIN order_shipments s ON s.id = m.shipment_id
+    WHERE s.order_id = $1 AND m.movement_type = 'shipment_dispatched' GROUP BY m.batch_id`, [orderId])).rows.map((r) => `${Number(r.batch_id) === old ? 'OLD' : Number(r.batch_id) === fresh ? 'FRESH' : r.batch_id}:${r.q}`).join();
+  const courier = (await listCouriers())[0].id;
+  // Blinkit (quick commerce) with a 70% minimum: the Dispatch button takes FRESH.
+  const blk = await lineOn('blinkit', 'SA-1', `${TS}-SA-BLK`, 2);
+  await dispatchOrder(blk, { courier_partner_id: courier, tracking_id: `SA-AWB-1-${RUN7}` }, { actor: ACTOR });
+  if (await takenFrom(blk) !== 'FRESH:2') bad.push(`blinkit took ${await takenFrom(blk)}`);
+  // Choosing OLD by hand for a Blinkit shipment is refused, naming the rule; the stock panel says why.
+  const blk2 = await lineOn('blinkit', 'SA-2', `${TS}-SA-BLK`, 1);
+  await createShipmentForOrders([blk2], { courier_partner_id: courier, tracking_id: `SA-AWB-2-${RUN7}` }, { actor: ACTOR });
+  const sh2 = (await getPool().query('SELECT id FROM order_shipments WHERE order_id = $1 ORDER BY id DESC LIMIT 1', [blk2])).rows[0].id;
+  await expectErr('old batch by hand', () => reserveShipmentStock(sh2, [{ batch_id: old, quantity: 1 }], { actor: ACTOR }), (e) => e.status === 409 && e.shelfLife && /70%/.test(e.message));
+  const st2 = await shipmentStock(sh2);
+  if (st2.shelf_rule?.min_pct !== 70 || st2.lines[0].batches.find((b) => b.id === old)?.effective_status !== 'shelf_life') bad.push(`stock panel ${JSON.stringify(st2.shelf_rule)}`);
+  // Easy Ship (an Amazon customer parcel) is not inspected by a platform: FEFO as before, OLD first.
+  const es = await createOrder({ channel: 'amazon', dispatch_type: 'easy_ship', source_order_id: `${TEST_ORDER}-SA-ES`, order_date: NOW(), order_value: 1 }, { actor: ACTOR });
+  await getPool().query(`INSERT INTO order_items (order_id, source_line_item_id, sku, title, quantity, item_price, sku_id) VALUES ($1, 'L1', $2, 'Test line', 1, 1, $3)`, [es, `${TS}-SA-AMZ`, sku]);
+  await dispatchOrder(es, { courier_partner_id: courier, tracking_id: `SA-AWB-3-${RUN7}` }, { actor: ACTOR });
+  if (await takenFrom(es) !== 'OLD:1') bad.push(`easy ship took ${await takenFrom(es)}`);
+  // The alerts: OLD is too old for Blinkit and Amazon; the SKU needs a PO once its own reorder level is above stock.
+  await getPool().query('UPDATE skus SET reorder_level = 1000, reorder_quantity = 0 WHERE id = $1', [sku]);
+  const a = await SA.stockAlerts();
+  const oldRow = a.shelf.find((x) => x.batch_id === old);
+  if (!oldRow || oldRow.shelf_pct > 30 || !oldRow.below.some((r) => r.channel === 'blinkit') || a.shelf.some((x) => x.batch_id === fresh)) bad.push(`shelf ${JSON.stringify(oldRow)}`);
+  const p = a.po.find((x) => x.sku_id === sku);
+  if (!p || !p.fixed_level || p.sold !== 3 || p.suggested_qty !== 1000 - p.available - p.incoming) bad.push(`po ${JSON.stringify(p)}`);
+  await SA.setSkuClass(sku, 'A', { actor: ACTOR });
+  if ((await SA.stockAlerts()).products.find((x) => x.sku_id === sku)?.class !== 'A') bad.push('class by hand');
+  await expectErr('bad class', () => SA.setSkuClass(sku, 'D', { actor: ACTOR }), (e) => e.status === 400);
+  // The daily digest: one claim per day (no WhatsApp in tests: the console driver records why nothing was delivered).
+  const DAYKEY = '2000-01-01';
+  await getPool().query('DELETE FROM stock_alert_sends WHERE day = $1', [DAYKEY]);
+  const d1 = await SA.sendStockDigest({ day: DAYKEY, actor: ACTOR });
+  const d2 = await SA.sendStockDigest({ day: DAYKEY, actor: ACTOR });
+  const row = (await getPool().query('SELECT recipients, delivered, errors FROM stock_alert_sends WHERE day = $1', [DAYKEY])).rows[0];
+  if (d1.recipients !== 2 || d1.delivered !== 0 || d1.errors.length !== 2 || !/\d+ products? need a PO/.test(d1.text) || /\n/.test(d1.text)) bad.push(`digest ${JSON.stringify(d1)}`);
+  if (d2.reason !== 'Already sent today.' || row?.recipients !== 2) bad.push(`latch ${JSON.stringify([d2, row])}`);
+  // Clean up the rules and settings so the rest of the suite (and the next run) dispatch as before.
+  await getPool().query('DELETE FROM stock_alert_sends WHERE day = $1', [DAYKEY]);
+  await SA.saveAlertSettings({ whatsapp_to: orig.whatsapp_to, platforms: [{ channel: 'blinkit', min_pct: orig.platforms.find((x) => x.channel === 'blinkit')?.min_pct ?? '' }, { channel: 'amazon', min_pct: orig.platforms.find((x) => x.channel === 'amazon')?.min_pct ?? '' }] }, { actor: ACTOR });
+  await getPool().query('UPDATE skus SET reorder_level = 0, abc_class = NULL WHERE id = $1', [sku]);
+  const page = await fsp.readFile(new URL('../public/stock-alerts.js', import.meta.url), 'utf8');
+  if (!page.includes("/api/inventory/alerts/settings") || !page.includes('data-platform')) bad.push('page');
+  if (bad.length) throw new Error(bad.join('; '));
+  return 'ABCC from 70/20/10/0 units; reorder point 520 / suggestion 570 at 10 a day; a fixed level of 10 with quantity 50 → 55; 70% of a two-year life (730 days) crossed 511 days before expiry, on 8 Aug; digest one line, ≤900 chars, "+N more"; bad numbers, B under A, bad phone, stale version refused; phones normalised and de-duplicated; Blinkit 70%: Dispatch took FRESH, OLD by hand refused (stock panel marks it); Easy Ship still FEFO (OLD); OLD listed under 70% for Blinkit; fixed level → PO for the shortfall; class by hand; digest latched per day; rules restored';
+});
+
 await step('Receive return: a dispatched parcel that came back is put back per batch it left from — sellable to stock, damaged held; never more than left; one transaction; idempotent; logged on the order', async () => {
   const bad = [];
   const { receiveShipmentReturn } = await import('../lib/inventory-inbound.js');

@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <link rel="icon" type="image/png" href="/brand/briyo-logo-square.png" />
+  <link rel="apple-touch-icon" href="/brand/apple-touch-icon.png" />
+  <title>Stock alerts — Briyo OS</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/ui.css" />
+  <link rel="stylesheet" href="/orders.css" />
+  <script src="https://cdn.jsdelivr.net/npm/lucide@0.469.0/dist/umd/lucide.min.js" defer></script>
+</head>
+<body>
+<div class="app">
+
+  <aside class="sidebar" id="sidebar" aria-label="Main navigation"></aside>
+  <div class="scrim" id="scrim"></div>
+
+  <div class="main">
+    <header class="topbar">
+      <button class="icon-btn" id="navOpen" type="button" aria-label="Open navigation"><i data-lucide="menu"></i></button>
+      <span class="topbar-title" id="topTitle">Stock alerts</span>
+    </header>
+
+    <main class="page" data-section="inventory">
+      <div class="crumbs">
+        <i data-lucide="boxes"></i><span>Inventory</span><span class="sep">/</span><span class="here">Alerts</span>
+      </div>
+      <div class="page-head">
+        <div>
+          <h1 class="page-title">Stock alerts</h1>
+          <p class="page-sub">What to reorder (by A / B / C class), and which batches are getting too old for the platforms that check shelf life.</p>
+        </div>
+        <div class="page-actions">
+          <button class="icon-btn" id="refresh" type="button" title="Refresh" aria-label="Refresh"><i data-lucide="refresh-cw"></i></button>
+          <button class="btn" id="sendNow" type="button" hidden><i data-lucide="send"></i>Send WhatsApp now</button>
+        </div>
+      </div>
+      <div id="alerts"></div>
+      <div class="imp-stats inv-cards" id="cards"></div>
+      <div id="body"><section class="card"><div class="pane"><div class="empty-note" role="status">Loading…</div></div></section></div>
+    </main>
+  </div>
+</div>
+<script type="module" src="/stock-alerts.js"></script>
+</body>
+</html>

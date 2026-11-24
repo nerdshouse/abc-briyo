@@ -736,6 +736,7 @@ async function renderOrdersNav(me) {
     + navLink('/inventory?stock=low', 'Low stock')
     + navLink('/inventory?expiring=90', 'Expiring soon')
     + navLink('/inventory?view=unmapped', 'Unmapped SKUs', '', { count: meta.inventory?.unmappedSkus })
+    + navLink('/stock-alerts', 'Alerts')
     + navLink('/stock-outward', 'Stock outward'), 'inventory') : ''}`;
   // Re-rendered on every page; replaced only if something (a count) changed.
   if (host.dataset.html === html) return;
