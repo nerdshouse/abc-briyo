@@ -349,6 +349,9 @@ const BODIES = {
           : `<p class="ox-quiet">${waiting}.</p>`)}
         ${group('Batches', `${signal('Expired, still holding stock', s.expired_batches, { href: '/inventory?expiring=expired', tone: 'critical' })}
           ${signal('Expiring within 30 days', s.expiring_30, { href: '/inventory?expiring=30', tone: 'attention' })}`)}
+        ${s.alerts ? group('Alerts', `${signal('Need a PO', s.alerts.po, { href: '/stock-alerts', tone: s.alerts.po_class_a ? 'warning' : 'attention' })}
+          ${signal('Too old for a platform', s.alerts.below, { href: '/stock-alerts', tone: 'warning' })}
+          ${signal('Near a shelf-life limit', s.alerts.soon, { href: '/stock-alerts', tone: 'attention' })}`) : ''}
       </div>
       ${s.mappings === undefined ? '' : group('Setup and ledger', `<div class="ox-kv c3">
         <a href="/inventory"><span class="ox-k">Mappings</span><span class="ox-v num">${n(s.mappings)}</span></a>

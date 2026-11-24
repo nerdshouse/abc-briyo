@@ -2074,6 +2074,7 @@ function renderStock() {
           : `<div class="soft stock-from">${l.reserved.map((r) => `<span class="mono">${esc(r.batch_number)}</span> × ${count(r.quantity)}`).join(', ') || 'Nothing reserved'}</div>`}
       ${!done && l.suggestion.short && !l.reserved_quantity ? `<div class="warn-text stock-from">Short by ${count(l.suggestion.short)}</div>` : ''}
     </div>`).join('')}
+    ${st.shelf_rule && !done ? `<p class="imp-note">${esc(st.shelf_rule.label)} accepts only batches with ${st.shelf_rule.min_pct}% or more shelf life left: older batches are not offered here (Inventory → Alerts).</p>` : ''}
     ${st.split && !done ? '<p class="imp-note">This order is split across several shipments. Reserve only what goes in this parcel; the rest stays for the others.</p>' : ''}
     ${st.untracked?.length ? `<p class="imp-note">${st.untracked.map((u) => `<span class="mono">${esc(u.sku)}</span>`).join(', ')} not inventory-tracked — no stock needed.</p>` : ''}
     ${done && canMoveStock() ? returnBlock(st) : ''}
