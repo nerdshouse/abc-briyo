@@ -4887,6 +4887,22 @@ await step('Amazon orders: the AWB is optional for an order straight from Amazon
   return 'Dispatch button without AWB: dispatched, 2 units deducted, no AWB; again refused; FBA and website refused (field tracking_id), nothing changed; Create shipment from orders → packed, reserved, status → dispatched with no AWB; FBA and a mixed parcel refused; New shipment without AWB for a real Amazon number, refused for FBA and website; Amazon AWB cleared after dispatch, FBA refused; bulk file without an AWB column: real Amazon rows fine, FBA "No AWB.", preview ready, commit dispatched, FBA commit refused';
 });
 
+await step('orders list: a refresh with the same filters (after a save) keeps every row "Show more" brought in; a filter change starts from the first page; Previous / Next order in the drawer', async () => {
+  const page = await fsp.readFile(new URL('../public/orders.js', import.meta.url), 'utf8');
+  const bad = [];
+  if (!/const keep = !append && !pending && key === state\.listKey && state\.orders\.length > PAGE \? state\.orders\.length : 0;/.test(page)) bad.push('same-filter refresh does not keep the rows on screen');
+  if (!page.includes('async function fetchShown(count)') || !page.includes('const MAX_PAGE = 500;')) bad.push('rows beyond the API page size are not fetched in chunks');
+  // The API caps a page at 500, which fetchShown relies on.
+  const lib = await fsp.readFile(new URL('../lib/orders.js', import.meta.url), 'utf8');
+  if (!lib.includes('Math.min(Math.max(Number(limit) || 100, 1), 500)')) bad.push('API page cap changed: update MAX_PAGE in public/orders.js');
+  // Previous / Next order in the drawer: the list's neighbours, J / K, and the place kept when a save drops the order.
+  const html = await fsp.readFile(new URL('../public/orders.html', import.meta.url), 'utf8');
+  if (!html.includes('id="dNext"') || !html.includes('id="dPrev"')) bad.push('no Previous / Next order buttons in the drawer');
+  if (!page.includes('async function stepOrder(dir)') || !page.includes("if (e.key === 'j' || e.key === 'J')") || !page.includes('(dir > 0 ? base : base - 1)')) bad.push('Next order wiring');
+  if (bad.length) throw new Error(bad.join('; '));
+  return 'same filters → refreshes as many rows as shown (chunks of 500); new filters → first page; drawer has Previous / Next order (J / K) that keeps its place when a save drops the order';
+});
+
 await step('bundles: contents rules; a bundle holds no stock; its orders reserve and deduct each product inside (by hand, in bulk dispatch, mixed with a loose line)', async () => {
   const bad = [];
   const mk = async (code, name) => (await createSku({ sku: `${TS}-BN-${code}`, product_name: name }, { actor: ACTOR })).id;
