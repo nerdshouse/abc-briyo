@@ -4917,6 +4917,92 @@ await step('Flipkart: orders from the Seller API (open, dispatched and cancelled
   return 'token by app id/secret; open (2 pages via nextPageUrl), dispatched and cancelled shipments read (6 searches); A1 created as Easy Ship from the API, value 299+40+100+40 = 479, buyer name, mapped and unmapped lines, Ekart AWB kept; hand-entered order cancelled by Flipkart; hand-added products never doubled (conflict logged); unmapped code reported; rerun changes nothing; a second sync at once refused; stock plan 11 / 5 (pack of 2) / 0, sent once, not again unless changed, a Flipkart refusal kept per SKU';
 });
 
+await step('purchase orders: BR number suggested, PO with pack size/type per line, deliveries straight into stock (damaged kept out, discrepancies need remarks), pending/short/excess, open POs count as incoming, COA on the received batch, close and cancel rules, print', async () => {
+  const bad = [];
+  const PO = await import('../lib/purchase-orders.js');
+  const { purchaseOrderPrintHtml } = await import('../lib/po-print.js');
+  const { incomingBySku } = await import('../lib/inventory-inbound.js');
+  await PO.ensurePurchaseOrders();
+  const a = (await createSku({ sku: `${TS}-PO-A`, product_name: 'PO test D3 2000' }, { actor: ACTOR })).id;
+  const b = (await createSku({ sku: `${TS}-PO-B`, product_name: 'PO test Melatonin' }, { actor: ACTOR })).id;
+  const sup = (await getPool().query(`INSERT INTO suppliers (name, created_by) VALUES ($1, $2) ON CONFLICT ((lower(name))) DO UPDATE SET name = EXCLUDED.name RETURNING id`, [`${TS} PO Manufacturer`, ACTOR])).rows[0].id;
+  const yy = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' }).slice(2, 4);
+  const NUM = `BR${yy}Z9${RUN7.slice(-4)}`;
+  const NUM2 = `DBCHK-PO-${RUN7}`;
+  try {
+    const line = (sku, pack, type, qty, mrp, price, gst) => ({ sku_id: sku, pack_size: pack, pack_type: type, ordered_qty: qty, mrp, unit_price: price, gst_pct: gst, unit_label: 'Softgels' });
+    await expectErr('no lines', () => PO.createPurchaseOrder({ po_number: NUM, supplier_id: sup, lines: [] }, { actor: ACTOR }), (e) => e.status === 400);
+    await expectErr('pack type', () => PO.createPurchaseOrder({ po_number: NUM, supplier_id: sup, lines: [line(a, 60, 'crate', 10)] }, { actor: ACTOR }), (e) => e.status === 400);
+    await expectErr('bad number', () => PO.createPurchaseOrder({ po_number: 'BR 26', supplier_id: sup, lines: [line(a, 60, 'bottle', 10)] }, { actor: ACTOR }), (e) => e.status === 400);
+    await expectErr('bad gst', () => PO.createPurchaseOrder({ po_number: NUM, supplier_id: sup, lines: [line(a, 60, 'bottle', 10, null, '90', 'five')] }, { actor: ACTOR }), (e) => e.status === 400);
+    await expectErr('bad supplier gstin', () => PO.createPurchaseOrder({ po_number: NUM, supplier_id: sup, supplier_gstin: '12', lines: [line(a, 60, 'bottle', 10)] }, { actor: ACTOR }), (e) => e.status === 400);
+    const po = await PO.createPurchaseOrder({ po_number: NUM.toLowerCase(), supplier_id: sup, manufacturer_unit: 'Vapi plant', remarks: 'Test PO',
+      supplier_address: 'Jarod, Rasulabad Road', supplier_gstin: '24aaccb5247k1zp', payment_terms: '30 days', transport: 'Tempo', booking_station: 'Vadodara',
+      lines: [line(a, 60, 'bottle', 100, '495', '90', '5'), line(b, 30, 'carton', 50)] }, { actor: ACTOR });
+    if (po.po_number !== NUM || po.lines.length !== 2 || po.lines[0].unit_qty !== 6000 || po.state !== 'open') bad.push(`create ${JSON.stringify({ n: po.po_number, u: po.lines[0]?.unit_qty, s: po.state })}`);
+    // 100 × ₹90 = 9,000 taxable + 5% = 450 → 9,450; the unpriced line leaves the total incomplete.
+    if (po.lines[0].taxable !== 9000 || po.lines[0].gst_amount !== 450 || po.lines[0].total !== 9450 || po.totals.priced || po.supplier_gstin !== '24AACCB5247K1ZP' || po.payment_terms !== '30 days') bad.push(`amounts ${JSON.stringify([po.lines[0], po.totals, po.supplier_gstin])}`);
+    if ((await PO.poSuppliers()).find((x) => x.id === Number(sup))?.address !== 'Jarod, Rasulabad Road') bad.push('supplier address not kept for the next PO');
+    await expectErr('duplicate number', () => PO.createPurchaseOrder({ po_number: NUM, supplier_id: sup, lines: [line(a, 60, 'bottle', 1)] }, { actor: ACTOR }), (e) => e.status === 409 && e.duplicate);
+    const sug = await PO.suggestPoNumber();
+    if (sug !== `BR${yy}${sug.charAt(4)}${Number(NUM.slice(5)) + 1}` || !/^BR\d{2}[A-Z]\d+$/.test(sug)) bad.push(`suggest ${sug}`);
+    const la = po.lines[0].id; const lb = po.lines[1].id;
+    const onHand = async () => (await getPool().query('SELECT coalesce(sum(on_hand), 0)::int n FROM inventory_batches WHERE sku_id = $1', [a])).rows[0].n;
+    // Delivery 1: 60 packs, 2 damaged → 58 into stock, batch carries MRP and the PO number.
+    await expectErr('damaged > received', () => PO.receiveAgainstLine(la, { received_qty: 5, damaged_qty: 6, batch_number: 'POB1' }, { actor: ACTOR }), (e) => e.status === 400);
+    await expectErr('discrepancy without remarks', () => PO.receiveAgainstLine(la, { received_qty: 5, batch_number: 'POB1', discrepancies: ['short'] }, { actor: ACTOR }), (e) => e.status === 400);
+    await expectErr('future date', () => PO.receiveAgainstLine(la, { received_qty: 5, batch_number: 'POB1', received_date: dayOffset(3) }, { actor: ACTOR }), (e) => e.status === 400);
+    const req = rid();
+    const r1 = await PO.receiveAgainstLine(la, { received_qty: 60, damaged_qty: 2, batch_number: 'POB1', mfg_date: dayOffset(-20), expiry_date: dayOffset(700), remarks: '2 bottles broken', request_id: req }, { actor: ACTOR });
+    const r1b = await PO.receiveAgainstLine(la, { received_qty: 60, damaged_qty: 2, batch_number: 'POB1', remarks: '2 bottles broken', request_id: req }, { actor: ACTOR });
+    const batch = (await getPool().query('SELECT on_hand, mrp, po_number FROM inventory_batches WHERE id = $1', [r1.batchId])).rows[0];
+    if (r1.stocked !== 58 || !r1b.repeated || await onHand() !== 58 || Number(batch.mrp) !== 495 || batch.po_number !== NUM) bad.push(`receive 1 ${JSON.stringify([r1, r1b, batch])}`);
+    let cur = await PO.getPurchaseOrder(po.id);
+    const A1 = cur.lines.find((l) => l.id === la);
+    if (A1.state !== 'partly_received' || A1.pending_qty !== 40 || A1.damaged_qty !== 2 || cur.state !== 'partly_received' || !A1.receipts[0].discrepancies.includes('damaged')) bad.push(`after 1 ${JSON.stringify(A1)}`);
+    const inc = await incomingBySku();
+    if (inc.get(a) !== 40 || inc.get(b) !== 50) bad.push(`incoming ${inc.get(a)} ${inc.get(b)}`);
+    // Delivery 2: 45 more (5 excess), noted.
+    await PO.receiveAgainstLine(la, { received_qty: 45, batch_number: 'POB2', discrepancies: ['excess'], remarks: '5 packs extra', mrp: '499' }, { actor: ACTOR });
+    cur = await PO.getPurchaseOrder(po.id);
+    if (cur.lines.find((l) => l.id === la).state !== 'over_received' || cur.lines.find((l) => l.id === la).excess_qty !== 5 || await onHand() !== 103) bad.push('over-received');
+    // COA on the received batch shows on the PO and in the history.
+    await uploadBatchDocument({ batchId: r1.batchId, filename: 'COA-POB1.pdf', buffer: COA_PDF, documentType: 'coa', actor: ACTOR });
+    cur = await PO.getPurchaseOrder(po.id);
+    const hist = await PO.receiptHistory({ supplier: String(sup) });
+    if (!cur.lines.find((l) => l.id === la).receipts.find((x) => x.batch_number === 'POB1').coa || hist.length !== 2 || !hist.find((h) => h.batch_number === 'POB1').coa) bad.push(`coa ${JSON.stringify(hist.map((h) => [h.batch_number, h.coa]))}`);
+    // Products are fixed once something is received; the header is not. Versions are checked.
+    await expectErr('lines after receipt', () => PO.updatePurchaseOrder(po.id, { lines: [line(a, 60, 'bottle', 1)] }, { actor: ACTOR, version: cur.version }), (e) => e.status === 409);
+    await expectErr('stale', () => PO.updatePurchaseOrder(po.id, { remarks: 'x' }, { actor: ACTOR, version: cur.version + 5 }), (e) => e.status === 409);
+    cur = await PO.updatePurchaseOrder(po.id, { remarks: 'Rest by next week', expected_date: dayOffset(7) }, { actor: ACTOR, version: cur.version });
+    if (cur.remarks !== 'Rest by next week') bad.push('header edit');
+    // Closing: what is still pending is short; nothing more can be received; a PO with receipts cannot be cancelled.
+    await expectErr('cancel with receipts', () => PO.setPurchaseOrderStatus(po.id, 'cancelled', { actor: ACTOR, reason: 'x' }), (e) => e.status === 409);
+    await expectErr('close without reason', () => PO.setPurchaseOrderStatus(po.id, 'closed', { actor: ACTOR, reason: ' ' }), (e) => e.status === 400);
+    cur = await PO.setPurchaseOrderStatus(po.id, 'closed', { actor: ACTOR, reason: 'Manufacturer short of carton material' });
+    const B = cur.lines.find((l) => l.id === lb);
+    if (cur.state !== 'closed_short' || B.state !== 'closed_short' || B.short_qty !== 50 || B.pending_qty !== 0) bad.push(`closed ${JSON.stringify({ s: cur.state, b: B.state, short: B.short_qty })}`);
+    if ((await incomingBySku()).get(b)) bad.push('a closed PO still counts as incoming');
+    await expectErr('receive on closed', () => PO.receiveAgainstLine(lb, { received_qty: 1, batch_number: 'X' }, { actor: ACTOR }), (e) => e.status === 409);
+    const po2 = await PO.createPurchaseOrder({ po_number: NUM2, supplier_id: sup, lines: [line(b, 30, 'sachet', 5)] }, { actor: ACTOR });
+    const c2 = await PO.setPurchaseOrderStatus(po2.id, 'cancelled', { actor: ACTOR, reason: 'Raised by mistake' });
+    if (c2.state !== 'cancelled') bad.push('cancel');
+    const list = await PO.listPurchaseOrders({ supplier: String(sup) });
+    if (list.length !== 2 || list.find((x) => x.id === po.id).short_qty !== 50) bad.push(`list ${JSON.stringify(list.map((x) => [x.po_number, x.state, x.short_qty]))}`);
+    const html = await purchaseOrderPrintHtml(po.id);
+    if (!html.includes(NUM) || !html.includes('PO test D3 2000') || !html.includes('60 Softgels') || !html.includes('9,450.00') || !html.includes('24AACCB5247K1ZP') || !html.includes('briyo-logo.png') || !html.includes('Material booking station') || !html.includes('Generated on <b>Briyo OS</b>')) bad.push('print');
+  } finally {
+    // The PO rows go before the products are purged later in the run (lines reference skus, receipts batches).
+    await getPool().query(`DELETE FROM purchase_order_receipts WHERE line_id IN (SELECT l.id FROM purchase_order_lines l JOIN purchase_orders p ON p.id = l.po_id WHERE p.po_number = ANY($1))`, [[NUM, NUM2]]);
+    await getPool().query(`DELETE FROM purchase_order_lines WHERE po_id IN (SELECT id FROM purchase_orders WHERE po_number = ANY($1))`, [[NUM, NUM2]]);
+    await getPool().query(`DELETE FROM purchase_orders WHERE po_number = ANY($1)`, [[NUM, NUM2]]);
+  }
+  const page = await fsp.readFile(new URL('../public/purchase-orders.js', import.meta.url), 'utf8');
+  if (!page.includes('/receipts`') || !page.includes('data-coa') || !page.includes('/print')) bad.push('page');
+  if (bad.length) throw new Error(bad.join('; '));
+  return 'empty, bad pack type and bad number refused; number upper-cased, duplicate refused (any case); suggestion = BR + year + month letter + highest series + 1; 60 received / 2 damaged → 58 stocked, batch has MRP 495 and the PO number, retry no-op; damaged > received, discrepancy without remarks, future date refused; pending 40 and the other line 50 count as incoming; 45 more → over-received by 5; COA on the batch shows on the PO and in the history; lines fixed after a receipt, header editable, stale refused; closed → other line short 50, no longer incoming, nothing more received; cancel only without receipts; price × qty + GST per line, manufacturer address and GST kept on the supplier; print shows number, product, packing style, amounts, manufacturer GST and the footer';
+});
+
 await step('Receive return: a dispatched parcel that came back is put back per batch it left from — sellable to stock, damaged held; never more than left; one transaction; idempotent; logged on the order', async () => {
   const bad = [];
   const { receiveShipmentReturn } = await import('../lib/inventory-inbound.js');

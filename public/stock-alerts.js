@@ -50,7 +50,7 @@ function render() {
         <td class="r num">${num(p.available)}</td><td class="r num">${num(p.incoming)}</td>
         <td class="r num">${p.days_left === null ? '—' : `<b${p.days_left <= s.lead_days ? ' class="warn-text"' : ''}>${count(p.days_left)}</b>`}</td>
         <td class="r num" title="${p.fixed_level ? 'The SKU’s own reorder level' : `${p.daily}/day × (${s.lead_days} lead + ${p.cover_days} cover days)`}">${num(p.reorder_point)}${p.fixed_level ? ' <span class="soft">(set)</span>' : ''}</td>
-        <td class="r num"><b>${num(p.suggested_qty)}</b></td></tr>`).join('')}</tbody></table></div>`
+        <td class="r num"><b>${num(p.suggested_qty)}</b>${hasCap(state.me, 'inventory.move') ? `<div><a href="/purchase-orders?new=1&sku=${p.sku_id}&qty=${p.suggested_qty}" style="font-size:12px">Raise PO</a></div>` : ''}</td></tr>`).join('')}</tbody></table></div>`
       : '<div class="pane"><div class="empty-note"><b>Nothing to reorder.</b>Every product has enough stock for its lead time and cover.</div></div>');
 
   const shelfBody = !rules.length
