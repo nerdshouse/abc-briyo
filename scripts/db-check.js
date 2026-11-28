@@ -4814,6 +4814,109 @@ await step('stock alerts: A/B/C classes and PO suggestions from dispatched units
   return 'ABCC from 70/20/10/0 units; reorder point 520 / suggestion 570 at 10 a day; a fixed level of 10 with quantity 50 → 55; 70% of a two-year life (730 days) crossed 511 days before expiry, on 8 Aug; digest one line, ≤900 chars, "+N more"; bad numbers, B under A, bad phone, stale version refused; phones normalised and de-duplicated; Blinkit 70%: Dispatch took FRESH, OLD by hand refused (stock panel marks it); Easy Ship still FEFO (OLD); OLD listed under 70% for Blinkit; fixed level → PO for the shortfall; class by hand; digest latched per day; rules restored';
 });
 
+await step('Flipkart: orders from the Seller API (open, dispatched and cancelled shipments) into Briyo orders — new, merged with a hand-entered order, never doubling hand-added products, cancellations, idempotent; stock sent to mapped Flipkart SKUs only, when it changes', async () => {
+  const bad = [];
+  const { createFlipkartClient, nextPath } = await import('../lib/flipkart.js');
+  const FK = await import('../lib/flipkart-sync.js');
+  if (nextPath('/v3/shipments/filter/?p=2') !== '/sellers/v3/shipments/filter/?p=2' || nextPath('https://x.test/a') !== 'https://x.test/a') bad.push('nextPath');
+  // Products: one mapped Flipkart SKU (×1), one pack of 2 (×2), and an unmapped code.
+  const a = (await createSku({ sku: `${TS}-FK-A`, product_name: 'Flipkart test product' }, { actor: ACTOR })).id;
+  const z = (await createSku({ sku: `${TS}-FK-Z`, product_name: 'Flipkart test empty product' }, { actor: ACTOR })).id;
+  await receiveInventory({ sku_id: a, batch_number: 'FK-1', expiry_date: dayOffset(300), quantity: 11, request_id: rid() }, { actor: ACTOR });
+  await addPlatformMappings(a, 'flipkart', [`${TS}-FK-SKU1`], { actor: ACTOR });
+  await addPlatformMappings(a, 'flipkart', [`${TS}-FK-PACK2`], { actor: ACTOR, unitsPerListing: 2 });
+  await addPlatformMappings(z, 'flipkart', [`${TS}-FK-ZERO`], { actor: ACTOR });
+  const O = (n) => `${TEST_ORDER}-FK-${n}`;
+  // A hand-entered order (no products) Flipkart later cancels, and one with a product added by hand.
+  const hand = await createOrder({ ...R('website'), channel: 'flipkart', dispatch_type: 'easy_ship', source_order_id: O('HAND'), order_date: NOW(), order_value: 1 }, { actor: ACTOR });
+  const man = await createOrder({ ...R('website'), channel: 'flipkart', dispatch_type: 'easy_ship', source_order_id: O('MAN'), order_date: NOW(), order_value: 1 }, { actor: ACTOR });
+  await addManualOrderLine(man, { sku_id: a, quantity: 1 }, { actor: ACTOR });
+  const item = (order, id, sku, qty, price, status) => ({ orderId: order, orderItemId: id, sku, quantity: qty, fsn: 'FSN1', listingId: 'LST1', status,
+    orderDate: '2026-11-20T10:00:00+05:30', priceComponents: { customerPrice: price, shippingCharge: 40, sellingPrice: price } });
+  const shipments = {
+    pre1: [{ shipmentId: 'SH1', dispatchByDate: '2026-11-22T00:00:00+05:30', orderItems: [item(O('A1'), 'I1', `${TS}-FK-SKU1`, 1, 299, 'APPROVED'), item(O('A1'), 'I2', `${TS}-FK-NOMAP`, 1, 100, 'APPROVED')] }],
+    pre2: [{ shipmentId: 'SH2', orderItems: [item(O('A2'), 'I3', `${TS}-FK-PACK2`, 2, 500, 'PACKED')] }, { shipmentId: 'SH5', orderItems: [item(O('MAN'), 'I6', `${TS}-FK-SKU1`, 1, 299, 'APPROVED')] }],
+    NORMAL: [{ shipmentId: 'SH3', orderItems: [item(O('A3'), 'I4', `${TS}-FK-SKU1`, 1, 299, 'SHIPPED')] }],
+    marketplaceCancellation: [{ shipmentId: 'SH4', orderItems: [item(O('HAND'), 'I5', `${TS}-FK-SKU1`, 1, 299, 'CANCELLED')] }],
+  };
+  const calls = [];
+  let listingFail = false;
+  const json = (body, status = 200) => ({ ok: status < 400, status, text: async () => JSON.stringify(body) });
+  const transport = async (url, init) => {
+    const u = new URL(url);
+    calls.push(`${init.method} ${u.pathname}`);
+    if (u.pathname === '/oauth-service/oauth/token') return init.headers.Authorization === `Basic ${Buffer.from('app:secret').toString('base64')}` ? json({ access_token: 'tok', expires_in: 3600000 }) : json({ error: 'bad' }, 401);
+    if (init.headers.Authorization !== 'Bearer tok') return json({ error: 'unauthorized' }, 401);
+    if (u.pathname === '/sellers/v3/shipments/filter/' && init.method === 'POST') {
+      const f = JSON.parse(init.body).filter;
+      if (f.type === 'preDispatch') return json({ shipments: shipments.pre1, hasMore: true, nextPageUrl: '/v3/shipments/filter/?page=2' });
+      if (f.type === 'postDispatch') return json({ shipments: shipments[f.shipmentTypes[0]] || [], hasMore: false });
+      return json({ shipments: shipments[f.cancellationType] || [], hasMore: false });
+    }
+    if (u.pathname === '/sellers/v3/shipments/filter/') return json({ shipments: shipments.pre2, hasMore: false });
+    if (u.pathname.startsWith('/sellers/v3/shipments/')) {
+      return json({ shipments: decodeURIComponent(u.pathname.split('/').pop()).split(',').map((id) => ({ shipmentId: id,
+        deliveryAddress: { firstName: 'Test', lastName: 'Buyer', city: 'Surat', stateName: 'Gujarat', pincode: '395007' },
+        subShipments: [{ courierDetails: { deliveryDetails: { vendorName: 'Ekart Logistics', trackingId: `FMPP${id}` } } }] })) });
+    }
+    if (u.pathname === '/sellers/listings/v3/update/inventory') {
+      const body = JSON.parse(init.body);
+      return json(Object.fromEntries(Object.keys(body).map((k) => [k, listingFail && k.endsWith('ZERO') ? { status: 'failure', errors: [{ description: 'Listing is blocked' }] } : { status: 'success' }])));
+    }
+    if (u.pathname.startsWith('/sellers/listings/v3/')) {
+      const skus = decodeURIComponent(u.pathname.split('/').pop()).split(',');
+      return json({ available: Object.fromEntries(skus.map((k) => [k, { product_id: `PID-${k.slice(-4)}`, locations: [{ id: 'LOC1', status: 'ENABLED', inventory: 3 }] }])) });
+    }
+    return json({ error: 'unknown' }, 404);
+  };
+  const client = createFlipkartClient({ transport, appId: 'app', appSecret: 'secret', apiBase: 'https://fk.test', wait: async () => {} });
+  FK._setFlipkartClientForTest(client);
+  try {
+    const r1 = await FK.syncFlipkartOrders({ days: 7, actor: ACTOR });
+    const ord = async (n) => (await getPool().query('SELECT id, order_status, order_value, customer_name, source, dispatch_type, source_payload FROM orders WHERE channel = $1 AND source_order_id = $2', ['flipkart', O(n)])).rows[0];
+    const lines = async (id) => (await getPool().query('SELECT source_line_item_id, sku, sku_id, quantity, item_price, shipping_price FROM order_items WHERE order_id = $1 ORDER BY source_line_item_id', [id])).rows;
+    const a1 = await ord('A1');
+    const a1l = await lines(a1.id);
+    if (!a1 || a1.source !== 'flipkart_api' || a1.dispatch_type !== 'easy_ship' || Number(a1.order_value) !== 479 || a1.customer_name !== 'Test Buyer') bad.push(`A1 ${JSON.stringify(a1)}`);
+    if (a1l.length !== 2 || Number(a1l[0].sku_id) !== a || a1l[1].sku_id !== null) bad.push(`A1 lines ${JSON.stringify(a1l)}`);
+    if (a1?.source_payload?.flipkart?.tracking_id !== 'FMPPSH1' || a1.source_payload.flipkart.courier !== 'Ekart Logistics' || a1.source_payload.flipkart.city !== 'Surat') bad.push('A1 payload');
+    if (!(await ord('A2')) || !(await ord('A3'))) bad.push('second page / dispatched order missing');
+    if ((await ord('HAND')).order_status !== 'cancelled') bad.push('cancellation not applied to a hand-entered order with no shipment');
+    const manLines = await lines(man);
+    if (manLines.length !== 1 || !manLines[0].source_line_item_id.startsWith('manual:')) bad.push(`hand lines doubled ${JSON.stringify(manLines)}`);
+    if (!(await getPool().query(`SELECT 1 FROM order_events WHERE order_id = $1 AND event_type = 'flipkart_sync_conflict' AND metadata->>'kind' = 'hand_lines'`, [man])).rows.length) bad.push('hand lines conflict not logged');
+    if (r1.created !== 3 || !r1.unmapped.some((u) => u.code === `${TS}-FK-NOMAP`)) bad.push(`result ${JSON.stringify({ created: r1.created, unmapped: r1.unmapped })}`);
+    if (!calls.includes('GET /sellers/v3/shipments/filter/') || calls.filter((c) => c === 'POST /sellers/v3/shipments/filter/').length !== 6) bad.push(`calls ${calls.join(' | ')}`);
+    const r2 = await FK.syncFlipkartOrders({ days: 7, actor: ACTOR });
+    if (r2.created !== 0 || r2.items_added !== 0 || (await lines(a1.id)).length !== 2) bad.push(`rerun ${JSON.stringify({ c: r2.created, i: r2.items_added })}`);
+    const both = await Promise.allSettled([FK.syncFlipkartOrders({ days: 7, actor: ACTOR }), FK.syncFlipkartOrders({ days: 7, actor: ACTOR })]);
+    if (both.filter((x) => x.status === 'rejected' && x.reason.status === 409).length !== 1) bad.push(`two syncs at once ${JSON.stringify(both.map((x) => x.status))}`);
+    // Stock: 11 available → SKU1 11, PACK2 5 (11 ÷ 2), ZERO 0. Sent once; again only when it changes.
+    const plan = await FK.flipkartStockPlan();
+    const q = (k) => plan.find((p) => p.flipkart_sku === `${TS}-FK-${k}`)?.qty;
+    if (q('SKU1') !== 11 || q('PACK2') !== 5 || q('ZERO') !== 0) bad.push(`plan ${JSON.stringify(plan.map((p) => [p.flipkart_sku, p.qty]))}`);
+    calls.length = 0;
+    const p1 = await FK.pushFlipkartStock({ actor: ACTOR });
+    const sentBody = calls.filter((c) => c.includes('update/inventory')).length;
+    if (p1.sent < 3 || p1.failed !== 0 || !sentBody) bad.push(`push ${JSON.stringify(p1)}`);
+    const p2 = await FK.pushFlipkartStock({ actor: ACTOR });
+    if (p2.due !== 0) bad.push(`push again ${JSON.stringify(p2)}`);
+    listingFail = true;
+    const p3 = await FK.pushFlipkartStock({ actor: ACTOR, force: true });
+    const zero = (await FK.flipkartStockPlan()).find((p) => p.flipkart_sku === `${TS}-FK-ZERO`);
+    if (p3.failed !== 1 || zero.last_error !== 'Listing is blocked') bad.push(`failure ${JSON.stringify([p3, zero?.last_error])}`);
+    const st = await FK.flipkartStatus();
+    if (!st.connected || st.last_sync?.created !== 0 || !st.last_stock) bad.push('status');
+  } finally {
+    FK._setFlipkartClientForTest(null);
+    await getPool().query(`DELETE FROM flipkart_listings WHERE sku LIKE $1`, [`${TS}-FK-%`]);
+  }
+  const page = await fsp.readFile(new URL('../public/orders.js', import.meta.url), 'utf8');
+  if (!page.includes('o.source_payload?.flipkart')) bad.push('dispatch form prefill');
+  if (bad.length) throw new Error(bad.join('; '));
+  return 'token by app id/secret; open (2 pages via nextPageUrl), dispatched and cancelled shipments read (6 searches); A1 created as Easy Ship from the API, value 299+40+100+40 = 479, buyer name, mapped and unmapped lines, Ekart AWB kept; hand-entered order cancelled by Flipkart; hand-added products never doubled (conflict logged); unmapped code reported; rerun changes nothing; a second sync at once refused; stock plan 11 / 5 (pack of 2) / 0, sent once, not again unless changed, a Flipkart refusal kept per SKU';
+});
+
 await step('Receive return: a dispatched parcel that came back is put back per batch it left from — sellable to stock, damaged held; never more than left; one transaction; idempotent; logged on the order', async () => {
   const bad = [];
   const { receiveShipmentReturn } = await import('../lib/inventory-inbound.js');

@@ -45,6 +45,7 @@ import { recoveryReport, decideMatch, revertDecision, decisionHistory, ensureRec
 import { router as marketingRouter } from './lib/marketing-routes.js';
 import { router as ordersRouter, courierRouter, destinationRouter } from './lib/orders-routes.js';
 import { startStockAlerts } from './lib/stock-alerts.js';
+import { startFlipkartSync } from './lib/flipkart-sync.js';
 import { router as inventoryRouter } from './lib/inventory-routes.js';
 import { ensureInventorySchema } from './lib/inventory.js';
 import { ensureOrderFinancialSnapshotSchema } from './lib/order-financial-snapshots.js';
@@ -509,9 +510,9 @@ app.get('/no-access', (req, res) => {
   if ((req.session?.caps || []).length) return res.redirect(homeFor(req.session.caps));
   return res.sendFile(path.join(PUBLIC, 'no-access.html'));
 });
-const ORDER_PAGES = { '/orders': 'orders.html', '/couriers': 'couriers.html', '/destinations': 'destinations.html', '/inventory': 'inventory.html', '/stock-outward': 'stock-outward.html', '/stock-alerts': 'stock-alerts.html' };
-const PAGE_CAP = { '/orders': 'logistics.view', '/couriers': 'logistics.view', '/destinations': 'logistics.view', '/inventory': 'inventory.view', '/stock-outward': 'inventory.view', '/stock-alerts': 'inventory.view' };
-app.get(['/orders', '/orders.html', '/couriers', '/couriers.html', '/destinations', '/destinations.html', '/inventory', '/inventory.html', '/stock-outward', '/stock-outward.html', '/stock-alerts', '/stock-alerts.html'],
+const ORDER_PAGES = { '/orders': 'orders.html', '/couriers': 'couriers.html', '/destinations': 'destinations.html', '/inventory': 'inventory.html', '/stock-outward': 'stock-outward.html', '/stock-alerts': 'stock-alerts.html', '/flipkart': 'flipkart.html' };
+const PAGE_CAP = { '/orders': 'logistics.view', '/couriers': 'logistics.view', '/destinations': 'logistics.view', '/inventory': 'inventory.view', '/stock-outward': 'inventory.view', '/stock-alerts': 'inventory.view', '/flipkart': 'logistics.view' };
+app.get(['/orders', '/orders.html', '/couriers', '/couriers.html', '/destinations', '/destinations.html', '/inventory', '/inventory.html', '/stock-outward', '/stock-outward.html', '/stock-alerts', '/stock-alerts.html', '/flipkart', '/flipkart.html'],
   (req, res, next) => requirePage(PAGE_CAP[req.path.replace(/\.html$/, '')])(req, res, next),
   (req, res) => res.sendFile(path.join(PUBLIC, ORDER_PAGES[req.path.replace(/\.html$/, '')])));
 app.use('/api/orders', requirePermission('logistics.view'), ordersRouter);
@@ -1358,4 +1359,5 @@ app.listen(port, async () => {
   if (!MOCK) startAmazonOrdersPoll();
   if (!MOCK) startShopifyWebhookSweep();
   if (!MOCK) startStockAlerts();
+  if (!MOCK) startFlipkartSync();
 });

@@ -996,11 +996,16 @@ function orderDetailsSection(o, m) {
  */
 function dispatchForm(o) {
   const website = o.channel === 'website';
+  // Flipkart gives the courier and AWB once the label is made (lib/flipkart-sync.js): filled in, still editable.
+  const fk = o.source_payload?.flipkart || {};
+  const fkCourier = fk.courier ? state.meta.couriers.find((c) => c.active && (fk.courier.toLowerCase().replace(/[^a-z]/g, '').includes(c.name.toLowerCase().replace(/[^a-z]/g, ''))
+    || c.name.toLowerCase().replace(/[^a-z]/g, '').includes(fk.courier.toLowerCase().replace(/[^a-z]/g, '')))) : null;
   return `<form id="dDispatchForm" novalidate>
     <div class="form-grid">
-      <label class="fld"><span>Courier</span><select class="select" name="courier_partner_id">${opt('', 'Choose courier', true)}${state.meta.couriers.filter((c) => c.active).map((c) => opt(c.id, c.name)).join('')}</select></label>
-      <label class="fld"><span>AWB / Tracking ID${awbOptional(o.channel, o.source_order_id) ? ` <span class="soft">(${AWB_OPTIONAL_NOTE})</span>` : ''}</span><input class="input mono" name="tracking_id" maxlength="80" autocomplete="off" spellcheck="false" /></label>
+      <label class="fld"><span>Courier</span><select class="select" name="courier_partner_id">${opt('', 'Choose courier', !fkCourier)}${state.meta.couriers.filter((c) => c.active).map((c) => opt(c.id, c.name, fkCourier?.id === c.id)).join('')}</select></label>
+      <label class="fld"><span>AWB / Tracking ID${awbOptional(o.channel, o.source_order_id) ? ` <span class="soft">(${AWB_OPTIONAL_NOTE})</span>` : ''}</span><input class="input mono" name="tracking_id" maxlength="80" autocomplete="off" spellcheck="false" value="${esc(fk.tracking_id || '')}" /></label>
     </div>
+    ${fk.tracking_id ? `<p class="imp-note">Courier and AWB filled in from Flipkart (${esc(fk.courier || 'courier')} · ${esc(fk.tracking_id)}). Check them before dispatching.</p>` : ''}
     <p class="imp-note">This creates the shipment, takes the stock from the earliest-expiring batches and marks it <b>dispatched</b>: the stock is deducted now.${website
     ? ' <b>Delta Velocity orders:</b> don\'t dispatch them here. Their parcel and AWB come from Shopify by themselves, and the stock comes off when the courier picks them up.' : ''}</p>
     <div class="form-error" id="dDispatchError" role="alert" hidden></div>
