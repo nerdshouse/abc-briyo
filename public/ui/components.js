@@ -731,7 +731,7 @@ async function renderOrdersNav(me) {
     navLink('/orders', 'All orders')
     + Object.entries(meta.views || {}).map(([k, label]) => navLink(`/orders?view=${k}`, label, '', { count: meta.viewCounts?.[k] })).join('')
     + (meta.dispatchTypes || []).map((t) => navLink(`/orders?type=${encodeURIComponent(t.key)}`, t.label)).join('')
-    + navLink('/couriers', 'Couriers') + navLink('/destinations', 'Destinations'), 'logistics') : ''}${inventory ? navDept('Inventory', 'boxes', '/inventory',
+    + navLink('/flipkart', 'Flipkart') + navLink('/couriers', 'Couriers') + navLink('/destinations', 'Destinations'), 'logistics') : ''}${inventory ? navDept('Inventory', 'boxes', '/inventory',
     navLink('/inventory', 'Stock')
     + navLink('/inventory?stock=low', 'Low stock')
     + navLink('/inventory?expiring=90', 'Expiring soon')
