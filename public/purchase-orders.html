@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <link rel="icon" type="image/png" href="/brand/briyo-logo-square.png" />
+  <link rel="apple-touch-icon" href="/brand/apple-touch-icon.png" />
+  <title>Purchase orders — Briyo OS</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/ui.css" />
+  <link rel="stylesheet" href="/orders.css" />
+  <script src="https://cdn.jsdelivr.net/npm/lucide@0.469.0/dist/umd/lucide.min.js" defer></script>
+</head>
+<body>
+<div class="app">
+
+  <aside class="sidebar" id="sidebar" aria-label="Main navigation"></aside>
+  <div class="scrim" id="scrim"></div>
+
+  <div class="main">
+    <header class="topbar">
+      <button class="icon-btn" id="navOpen" type="button" aria-label="Open navigation"><i data-lucide="menu"></i></button>
+      <span class="topbar-title" id="topTitle">Purchase orders</span>
+    </header>
+
+    <main class="page" data-section="inventory">
+      <div class="crumbs">
+        <i data-lucide="boxes"></i><span>Inventory</span><span class="sep">/</span><span class="here">Purchase orders</span>
+      </div>
+      <div class="page-head">
+        <div>
+          <h1 class="page-title">Purchase orders</h1>
+          <p class="page-sub">What was ordered from each manufacturer, what actually arrived, and what is still pending. Deliveries go straight into stock.</p>
+        </div>
+        <div class="page-actions">
+          <div class="seg" role="tablist" aria-label="View">
+            <button type="button" class="on" data-tab="list" role="tab">Purchase orders</button>
+            <button type="button" data-tab="received" role="tab">Received</button>
+          </div>
+          <button class="btn" id="company" type="button" hidden><i data-lucide="building-2"></i>Company details</button>
+          <button class="btn primary" id="newPo" type="button" hidden><i data-lucide="plus"></i>New purchase order</button>
+        </div>
+      </div>
+      <div id="alerts"></div>
+
+      <section id="listView">
+        <div class="filters so-filters">
+          <input class="input" id="fQ" type="search" placeholder="PO number, product or SKU" aria-label="Search" />
+          <select class="select" id="fStatus" aria-label="Status">
+            <option value="">All statuses</option><option value="active">Open (anything pending)</option><option value="open">Nothing received yet</option>
+            <option value="partly_received">Partly received</option><option value="received">Fully received</option><option value="closed_short">Closed short</option>
+            <option value="closed">Closed</option><option value="cancelled">Cancelled</option>
+          </select>
+          <select class="select" id="fSupplier" aria-label="Manufacturer"><option value="">All manufacturers</option></select>
+        </div>
+        <section class="card"><div class="table-wrap"><table class="table">
+          <thead><tr><th>PO number</th><th>Date</th><th>Manufacturer</th><th>Products</th><th class="r">Ordered</th><th class="r">Received</th><th class="r">Pending</th><th class="r">Short / excess</th><th>Status</th></tr></thead>
+          <tbody id="rows"><tr><td colspan="9"><div class="empty-note" role="status">Loading…</div></td></tr></tbody>
+        </table></div></section>
+      </section>
+
+      <section id="receivedView" hidden>
+        <div class="filters so-filters">
+          <select class="select" id="rSupplier" aria-label="Manufacturer"><option value="">All manufacturers</option></select>
+          <select class="select" id="rSku" aria-label="Product"><option value="">All products</option></select>
+          <label class="fld"><span>From</span><input class="input" id="rFrom" type="date" /></label>
+          <label class="fld"><span>To</span><input class="input" id="rTo" type="date" /></label>
+          <a class="btn" id="rCsv" href="/api/inventory/purchase-orders/received?format=csv"><i data-lucide="download"></i>Excel (CSV)</a>
+        </div>
+        <section class="card"><div class="table-wrap"><table class="table">
+          <thead><tr><th>Received</th><th>PO</th><th>Manufacturer</th><th>Product</th><th>Packing</th><th class="r">Ordered</th><th class="r">Received</th><th class="r">Damaged</th><th>Batch</th><th>Mfg / Expiry</th><th class="r">MRP</th><th>COA</th><th>Remarks</th></tr></thead>
+          <tbody id="recRows"></tbody>
+        </table></div></section>
+      </section>
+    </main>
+  </div>
+</div>
+
+<div class="drawer-scrim" id="drawerScrim" hidden></div>
+<aside class="drawer drawer-wide" id="drawer" hidden aria-label="Purchase order">
+  <div class="drawer-head">
+    <div style="min-width:0"><h2 class="drawer-title" id="dTitle"></h2><div class="drawer-sub" id="dSub"></div></div>
+    <div class="drawer-nav"><button class="icon-btn" id="dClose" type="button" title="Close" aria-label="Close"><i data-lucide="x"></i></button></div>
+  </div>
+  <div class="drawer-body" id="dBody"></div>
+  <div class="drawer-foot"><span class="saved" id="dSaved"></span><div class="drawer-foot-actions" id="dActions"></div></div>
+</aside>
+<script type="module" src="/purchase-orders.js"></script>
+</body>
+</html>

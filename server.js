@@ -46,6 +46,7 @@ import { router as marketingRouter } from './lib/marketing-routes.js';
 import { router as ordersRouter, courierRouter, destinationRouter } from './lib/orders-routes.js';
 import { startStockAlerts } from './lib/stock-alerts.js';
 import { startFlipkartSync } from './lib/flipkart-sync.js';
+import { purchaseOrderPrintHtml } from './lib/po-print.js';
 import { router as inventoryRouter } from './lib/inventory-routes.js';
 import { ensureInventorySchema } from './lib/inventory.js';
 import { ensureOrderFinancialSnapshotSchema } from './lib/order-financial-snapshots.js';
@@ -510,11 +511,20 @@ app.get('/no-access', (req, res) => {
   if ((req.session?.caps || []).length) return res.redirect(homeFor(req.session.caps));
   return res.sendFile(path.join(PUBLIC, 'no-access.html'));
 });
-const ORDER_PAGES = { '/orders': 'orders.html', '/couriers': 'couriers.html', '/destinations': 'destinations.html', '/inventory': 'inventory.html', '/stock-outward': 'stock-outward.html', '/stock-alerts': 'stock-alerts.html', '/flipkart': 'flipkart.html' };
-const PAGE_CAP = { '/orders': 'logistics.view', '/couriers': 'logistics.view', '/destinations': 'logistics.view', '/inventory': 'inventory.view', '/stock-outward': 'inventory.view', '/stock-alerts': 'inventory.view', '/flipkart': 'logistics.view' };
-app.get(['/orders', '/orders.html', '/couriers', '/couriers.html', '/destinations', '/destinations.html', '/inventory', '/inventory.html', '/stock-outward', '/stock-outward.html', '/stock-alerts', '/stock-alerts.html', '/flipkart', '/flipkart.html'],
+const ORDER_PAGES = { '/orders': 'orders.html', '/couriers': 'couriers.html', '/destinations': 'destinations.html', '/inventory': 'inventory.html', '/stock-outward': 'stock-outward.html', '/stock-alerts': 'stock-alerts.html', '/flipkart': 'flipkart.html', '/purchase-orders': 'purchase-orders.html' };
+const PAGE_CAP = { '/orders': 'logistics.view', '/couriers': 'logistics.view', '/destinations': 'logistics.view', '/inventory': 'inventory.view', '/stock-outward': 'inventory.view', '/stock-alerts': 'inventory.view', '/flipkart': 'logistics.view', '/purchase-orders': 'inventory.view' };
+app.get(['/orders', '/orders.html', '/couriers', '/couriers.html', '/destinations', '/destinations.html', '/inventory', '/inventory.html', '/stock-outward', '/stock-outward.html', '/stock-alerts', '/stock-alerts.html', '/flipkart', '/flipkart.html', '/purchase-orders', '/purchase-orders.html'],
   (req, res, next) => requirePage(PAGE_CAP[req.path.replace(/\.html$/, '')])(req, res, next),
   (req, res) => res.sendFile(path.join(PUBLIC, ORDER_PAGES[req.path.replace(/\.html$/, '')])));
+// The printable purchase order (lib/po-print.js): Inventory members; the browser saves it as a PDF.
+app.get('/purchase-orders/:id(\\d+)/print', requirePage('inventory.view'), async (req, res) => {
+  try {
+    const html = await purchaseOrderPrintHtml(req.params.id);
+    if (!html) return res.status(404).send('No such purchase order.');
+    res.set('Cache-Control', 'private, no-store');
+    res.send(html);
+  } catch (err) { console.error('PO print failed:', err.message?.slice(0, 200)); res.status(500).send('The purchase order could not be printed.'); }
+});
 app.use('/api/orders', requirePermission('logistics.view'), ordersRouter);
 app.use('/api/couriers', requirePermission('logistics.view'), courierRouter);
 app.use('/api/destinations', requirePermission('logistics.view'), destinationRouter);
